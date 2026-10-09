@@ -126,7 +126,7 @@ fn is_fs_path(p: &str) -> bool {
 }
 
 /// The folder holding `path`, short: relative to the profile folder ("Escritorio\project"), the profile
-/// folder's own name for its direct children, empty for items that are not filesystem paths.
+/// "Stored locally" for its direct children (as Explorer labels the known folders), empty for non-filesystem items.
 fn parent_label(path: &str, profile: &str) -> String {
     if !is_fs_path(path) {
         return String::new();
@@ -138,7 +138,7 @@ fn parent_label(path: &str, profile: &str) -> String {
         return parent.to_string();
     }
     if parent.eq_ignore_ascii_case(p) {
-        return p.rsplit('\\').next().unwrap_or(p).to_string();
+        return "Stored locally".to_string();
     }
     match (parent.get(..p.len()), parent.get(p.len()..)) {
         (Some(head), Some(rest)) if head.eq_ignore_ascii_case(p) && rest.starts_with('\\') => rest[1..].to_string(),
@@ -973,7 +973,7 @@ mod tests {
     fn subtitles_relative_to_the_profile() {
         let p = r"C:\Users\v";
         assert_eq!(parent_label(r"C:\Users\v\Escritorio\project\dist", p), r"Escritorio\project");
-        assert_eq!(parent_label(r"C:\Users\v\Downloads", p), "v");
+        assert_eq!(parent_label(r"C:\Users\v\Downloads", p), "Stored locally");
         assert_eq!(parent_label(r"C:\Users\v\Downloads\a.txt", r"C:\Users\v\"), "Downloads");
         assert_eq!(parent_label(r"C:\Users\vx\a.txt", p), r"C:\Users\vx", "a name prefix is no parent");
         assert_eq!(parent_label(r"D:\x\y.txt", p), r"D:\x");
