@@ -6,7 +6,8 @@ use windows::Win32::Graphics::Gdi::{
     CreateSolidBrush, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DrawTextW, FillRect, SetBkMode,
     SetTextColor, TRANSPARENT,
 };
-use crate::nav::{activate, cur, go_up, listing, open_in_background, sort_listing};
+use crate::nav::{cur, go_up, listing, open_in_background, sort_listing, source};
+use crate::source::{Source, activate};
 use rexplorer_core::dragdrop;
 use std::cell::RefCell;
 use windows::Win32::Foundation::POINTL;
@@ -48,6 +49,8 @@ pub(crate) unsafe fn on_notify(app: *mut App, lparam: LPARAM) -> LRESULT {
             let nm = &*(lparam.0 as *const NMLVKEYDOWN);
             on_key(app, VIRTUAL_KEY(nm.wVKey));
         }
+        // Only shell items can be renamed.
+        LVN_BEGINLABELEDITW => return LRESULT(listing(app).is_none() as isize),
         LVN_ENDLABELEDITW => {
             let di = &*(lparam.0 as *const NMLVDISPINFOW);
             on_end_edit(app, &di.item);
@@ -55,13 +58,13 @@ pub(crate) unsafe fn on_notify(app: *mut App, lparam: LPARAM) -> LRESULT {
         LVN_ODFINDITEMW => {
             // Type-to-select: a virtual list holds no text, so it asks us. 0 would mean "item 0 matches".
             let nm = &*(lparam.0 as *const NMLVFINDITEMW);
-            let Some(l) = listing(app) else { return LRESULT(-1) };
+            let Some(s) = source(app) else { return LRESULT(-1) };
             if !nm.lvfi.flags.contains(LVFI_STRING) || nm.lvfi.psz.is_null() {
                 return LRESULT(-1);
             }
             let needle = nm.lvfi.psz.to_string().unwrap_or_default();
             let wrap = nm.lvfi.flags.contains(LVFI_WRAP);
-            let found = find_prefix(l.items.len(), nm.iStart.max(0) as usize, wrap, &needle, |i| l.items[i].display_name());
+            let found = find_prefix(s.len(), nm.iStart.max(0) as usize, wrap, &needle, |i| s.text(i, 0));
             return LRESULT(found.map_or(-1, |i| i as isize));
         }
         _ => {}
@@ -81,28 +84,21 @@ unsafe fn fill_dispinfo(app: *mut App, item: &mut LVITEMW) {
     if item.mask.contains(LVIF_IMAGE) && item.iSubItem == 0 && icon_view {
         item.iImage = views::image(app, i);
     }
-    let Some(l) = &mut cur(app).listing else { return };
-    let Some(entry) = l.items.get(i) else { return };
+    let Some(s) = source(app) else { return };
+    if i >= s.len() {
+        return;
+    }
     if item.mask.contains(LVIF_TEXT) {
-        let text = if item.iSubItem == 0 {
-            entry.display_name()
-        } else {
-            l.columns.get(item.iSubItem as usize).map(|c| entry.detail(c.index)).unwrap_or_default()
-        };
-        copy_text(&text, item.pszText, item.cchTextMax);
+        copy_text(&s.text(i, item.iSubItem as usize), item.pszText, item.cchTextMax);
     }
     if item.mask.contains(LVIF_IMAGE) && item.iSubItem == 0 && !icon_view {
-        if l.icons[i] == ICON_UNKNOWN {
-            // shortcut: icon lookup runs on the UI thread, move it to a worker when a slow folder visibly stutters
-            l.icons[i] = views::theme_icon(app, entry).unwrap_or_else(|| entry.icon_index(&l.folder.pidl).1);
-        }
-        item.iImage = l.icons[i];
+        item.iImage = source::small_icon(app, i);
     }
 }
 
 unsafe fn on_column_click(app: *mut App, sub: usize) {
     let list = (*app).list;
-    let Some(l) = &mut cur(app).listing else { return };
+    let Some(Source::Shell(l)) = &mut cur(app).source else { return };
     let Some(col) = l.columns.get(sub) else { return };
     if col.index == l.sort_col {
         l.sort_desc = !l.sort_desc;
@@ -134,7 +130,7 @@ unsafe fn begin_drag(app: *mut App) {
 pub(crate) unsafe fn register_drop(app: *mut App) {
     let ptr = app as usize;
     // The forwarder re-enters a target only when pick returns a different object, so reuse it per (listing, item).
-    let last: RefCell<Option<((usize, isize), IDropTarget)>> = RefCell::new(None);
+    let last: RefCell<Option<((String, isize), IDropTarget)>> = RefCell::new(None);
     let pick = move |pt: POINTL| -> Option<IDropTarget> {
         let app = ptr as *mut App;
         unsafe {
@@ -145,7 +141,8 @@ pub(crate) unsafe fn register_drop(app: *mut App) {
             let mut ht = LVHITTESTINFO { pt: p, ..Default::default() };
             let i = SendMessageW(list, LVM_HITTEST, None, Some(LPARAM(&mut ht as *mut _ as isize))).0;
             let folder_item = usize::try_from(i).ok().and_then(|i| l.items.get(i)).filter(|it| it.is_folder());
-            let key = (l.folder.pidl.as_ptr() as usize, if folder_item.is_some() { i } else { -1 });
+            // By parsing name: a PIDL's address can be reused by a later folder's allocation.
+            let key = (l.folder.parsing_name.clone(), if folder_item.is_some() { i } else { -1 });
             if let Some((k, t)) = &*last.borrow() {
                 if *k == key {
                     return Some(t.clone());
@@ -167,20 +164,15 @@ unsafe fn show_menu(app: *mut App, on_item: bool) {
     let hwnd = (*app).hwnd;
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
-    let menu = {
-        let Some(l) = listing(app) else { return };
-        if on_item {
-            let sel = selected_indices((*app).list);
-            let items: Vec<&ShellItem> = sel.iter().filter_map(|&i| l.items.get(i)).collect();
-            if items.is_empty() {
-                return;
-            }
-            ContextMenu::for_items(&l.folder, &items, hwnd)
-        } else {
-            ContextMenu::for_background(&l.folder, hwnd)
-        }
+    if let Some(Source::Archive(_)) = source(app) {
+        return source::archive_menu(app);
+    }
+    let menu = if on_item {
+        selection_menu(app, &selected_indices((*app).list))
+    } else {
+        listing(app).and_then(|l| ContextMenu::for_background(&l.folder, hwnd).ok())
     };
-    let Ok(menu) = menu else { return };
+    let Some(menu) = menu else { return };
     let extended = GetKeyState(VK_SHIFT.0 as i32) < 0;
     (*app).active_menu = Some(menu);
     let picked = (*app).active_menu.as_ref().unwrap().show(hwnd, pt.x, pt.y, extended);
@@ -195,7 +187,7 @@ unsafe fn on_key(app: *mut App, key: VIRTUAL_KEY) {
     let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
     match key {
         VK_BACK => go_up(app),
-        VK_F2 => begin_rename(app),
+        VK_F2 if listing(app).is_some() => begin_rename(app),
         VK_DELETE => verb_on_selection(app, "delete", shift),
         VK_C if ctrl => verb_on_selection(app, "copy", false),
         VK_X if ctrl => verb_on_selection(app, "cut", false),
@@ -205,18 +197,24 @@ unsafe fn on_key(app: *mut App, key: VIRTUAL_KEY) {
     }
 }
 
+/// The shell context menu for rows of the active tab: shell items, or search results from one folder.
+pub(crate) unsafe fn selection_menu(app: *mut App, rows: &[usize]) -> Option<ContextMenu> {
+    match source(app)? {
+        Source::Shell(l) => {
+            let items: Vec<&ShellItem> = rows.iter().filter_map(|&i| l.items.get(i)).collect();
+            if items.is_empty() {
+                return None;
+            }
+            ContextMenu::for_items(&l.folder, &items, (*app).hwnd).ok()
+        }
+        Source::Search(_) => source::search_menu(app, rows),
+        _ => None,
+    }
+}
+
 pub(crate) unsafe fn verb_on_selection(app: *mut App, verb: &str, shift: bool) {
     let hwnd = (*app).hwnd;
-    let menu = {
-        let Some(l) = listing(app) else { return };
-        let sel = selected_indices((*app).list);
-        let items: Vec<&ShellItem> = sel.iter().filter_map(|&i| l.items.get(i)).collect();
-        if items.is_empty() {
-            return;
-        }
-        ContextMenu::for_items(&l.folder, &items, hwnd)
-    };
-    if let Ok(menu) = menu {
+    if let Some(menu) = selection_menu(app, &selected_indices((*app).list)) {
         let _ = menu.invoke_verb(hwnd, verb, shift);
     }
 }

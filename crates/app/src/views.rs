@@ -128,11 +128,15 @@ unsafe fn load_icon_theme(dir: &std::path::Path, size: i32) -> Option<ThemeIcons
 
 /// Small-icon index from the icon theme, or None when no theme is active.
 pub(crate) unsafe fn theme_icon(app: *mut App, item: &ShellItem) -> Option<i32> {
+    (*app).views.icon_theme.as_ref()?;
+    theme_icon_for(app, &item.display_name(), item.is_folder())
+}
+
+/// Small-icon index from the icon theme for a name, or None when no theme is active.
+pub(crate) unsafe fn theme_icon_for(app: *mut App, name: &str, folder: bool) -> Option<i32> {
     let t = (*app).views.icon_theme.as_mut()?;
-    let name = item.display_name();
-    let folder = item.is_folder();
     // A theme without folder.png still gives folders its file icon.
-    let bmp = t.theme.bitmap_for(&name, folder).or_else(|| t.theme.bitmap_for(&name, false))?;
+    let bmp = t.theme.bitmap_for(name, folder).or_else(|| t.theme.bitmap_for(name, false))?;
     let list = t.list;
     Some(*t.index.entry(bmp.0 as isize).or_insert_with(|| ImageList_Add(list, bmp, None).max(0)))
 }
@@ -175,7 +179,7 @@ pub(crate) unsafe fn apply(app: *mut App) {
         SendMessageW(list, LVM_SETICONSPACING, Some(WPARAM(0)), Some(LPARAM(((cy as isize) << 16) | cx as isize)));
         SendMessageW(list, LVM_SETVIEW, Some(WPARAM(LV_VIEW_ICON as usize)), None);
     }
-    let count = listing(app).map_or(0, |l| l.items.len());
+    let count = nav::source(app).map_or(0, |s| s.len());
     reset(app, count);
     let _ = InvalidateRect(Some(list), None, true);
 }

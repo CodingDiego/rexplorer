@@ -5,7 +5,7 @@ use super::*;
 use crate::nav::{Target, go, listing};
 use rexplorer_core::tree::{self, TreePane};
 use windows::Win32::Graphics::Gdi::ScreenToClient;
-use windows::Win32::UI::Shell::{IShellFolder2, ILIsEqual};
+use windows::Win32::UI::Shell::{ILIsEqual, IShellFolder, IShellFolder2};
 use windows::core::{GUID, Interface};
 
 /// lparam = Box<Pidl> picked in the tree.
@@ -29,6 +29,8 @@ pub(crate) struct Panes {
     drag: Option<Split>,
     split_tree: RECT,
     split_preview: RECT,
+    /// Where the list (or the embedded browser in its place) goes, in client coordinates.
+    pub list_rect: RECT,
 }
 
 fn scale(px: i32, dpi: u32) -> i32 {
@@ -164,6 +166,10 @@ pub(crate) unsafe fn layout(app: *mut App, top: i32, bottom: i32, w: i32) {
         left = tw + gap;
     }
     let _ = MoveWindow(a.list, left, top, (right - left).max(0), h, true);
+    a.panes.list_rect = RECT { left, top, right: right.max(left), bottom: top + h };
+    if let Some(b) = &a.browser {
+        let _ = b.set_rect(a.panes.list_rect);
+    }
 }
 
 fn hit(r: &RECT, x: i32, y: i32) -> bool {
@@ -258,7 +264,7 @@ pub(crate) unsafe fn update_preview(app: *mut App) {
         }
         let item = l.items.get(usize::try_from(i).ok()?)?;
         let parsing = item.parsing_name();
-        let (size_col, type_col) = size_and_type_columns(&l.folder);
+        let (size_col, type_col) = size_and_type_columns(&l.folder.folder);
         Some(preview_pane::Subject {
             path: ui::is_fs_path(&parsing).then(|| PathBuf::from(&parsing)),
             abs_pidl: l.folder.child_pidl(item),
@@ -272,12 +278,12 @@ pub(crate) unsafe fn update_preview(app: *mut App) {
 }
 
 /// Shell column indices of System.Size and System.ItemTypeText (column titles are localized, keys are not).
-fn size_and_type_columns(folder: &ShellFolder) -> (Option<u32>, Option<u32>) {
+pub(crate) fn size_and_type_columns(folder: &IShellFolder) -> (Option<u32>, Option<u32>) {
     // PKEY_Size is (STORAGE, 12), PKEY_ItemTypeText is (SUMMARY, 11).
     const STORAGE: GUID = GUID::from_u128(0xB725F130_47EF_101A_A5F1_02608C9EEBAC);
     const SUMMARY: GUID = GUID::from_u128(0x28636AA6_953D_11D2_B5D6_00C04FD918D0);
     let (mut size, mut kind) = (None, None);
-    let Ok(f2) = folder.folder.cast::<IShellFolder2>() else { return (None, None) };
+    let Ok(f2) = folder.cast::<IShellFolder2>() else { return (None, None) };
     for c in 0..128 {
         let mut key = windows::Win32::Foundation::PROPERTYKEY::default();
         if unsafe { f2.MapColumnToSCID(c, &mut key) }.is_err() {
@@ -341,7 +347,7 @@ mod tests {
     fn storage_columns_of_a_filesystem_folder() {
         let _com = ComInit::sta();
         let f = ShellFolder::parse(&std::env::temp_dir().display().to_string()).unwrap();
-        let (size, kind) = size_and_type_columns(&f);
+        let (size, kind) = size_and_type_columns(&f.folder);
         assert!(size.is_some() && kind.is_some(), "size={size:?} type={kind:?}");
         assert_ne!(size, kind);
     }

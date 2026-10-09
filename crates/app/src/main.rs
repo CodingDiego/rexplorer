@@ -1,4 +1,4 @@
-//! The window: tabs, a nav row (buttons + breadcrumb address bar) over a virtual ListView, and a status bar.
+//! The window: tabs, a nav row (buttons, breadcrumb address bar, search box) over a virtual ListView, and a status bar.
 //! All shell logic lives in rexplorer-core; this crate is plumbing and drawing.
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 #![allow(unsafe_op_in_unsafe_fn)]
@@ -15,6 +15,7 @@ mod palette;
 mod panes;
 mod preview_pane;
 mod session;
+mod source;
 mod statusbar;
 #[allow(dead_code)] // parts of the API are for later steps
 mod tabs;
@@ -54,6 +55,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Error, HSTRING, PCWSTR, PWSTR, Result, w};
 
 use nav::{Tab, cur, go, listing};
+use source::Source;
 
 const WM_ENUM_DONE: u32 = WM_APP + 1;
 const WM_SHELL_CHANGE: u32 = WM_APP + 2;
@@ -73,6 +75,7 @@ const ID_CRUMBS: usize = 105;
 const ID_STATUS: usize = 106;
 const ID_PALETTE: usize = 107;
 const ID_PREVIEW: usize = 108;
+const ID_SEARCH: usize = 109;
 
 const CMD_BACK: u16 = 1;
 const CMD_FORWARD: u16 = 2;
@@ -98,6 +101,7 @@ const CMD_SETTINGS: u16 = 21;
 const CMD_ABOUT: u16 = 22;
 const CMD_TOGGLE_TREE: u16 = 23;
 const CMD_TOGGLE_PREVIEW: u16 = 24;
+const CMD_SEARCH: u16 = 28;
 /// Ctrl+Shift+1..3 send CMD_VIEW1..CMD_VIEW1 + 2 (details, icons, thumbnails).
 const CMD_VIEW1: u16 = 25;
 /// Ctrl+1..Ctrl+9 send CMD_TAB1..CMD_TAB1 + 8.
@@ -107,7 +111,7 @@ const fn accel(flags: u8, key: VIRTUAL_KEY, cmd: u16) -> ACCEL {
     ACCEL { fVirt: ACCEL_VIRT_FLAGS(FVIRTKEY.0 | flags), key: key.0, cmd }
 }
 
-const ACCELS: [ACCEL; 22] = [
+const ACCELS: [ACCEL; 23] = [
     accel(FALT.0, VK_LEFT, CMD_BACK),
     accel(FALT.0, VK_RIGHT, CMD_FORWARD),
     accel(FALT.0, VK_UP, CMD_UP),
@@ -127,6 +131,7 @@ const ACCELS: [ACCEL; 22] = [
     accel(FCONTROL.0, VK_OEM_3, CMD_TERMINAL),
     accel(FCONTROL.0, VK_B, CMD_TOGGLE_TREE),
     accel(FALT.0, VK_P, CMD_TOGGLE_PREVIEW),
+    accel(FCONTROL.0, VK_F, CMD_SEARCH),
     accel(FCONTROL.0 | FSHIFT.0, VK_1, CMD_VIEW1),
     accel(FCONTROL.0 | FSHIFT.0, VK_2, CMD_VIEW1 + 1),
     accel(FCONTROL.0 | FSHIFT.0, VK_3, CMD_VIEW1 + 2),
@@ -142,6 +147,7 @@ pub(crate) struct App {
     crumbs: HWND,
     status: HWND,
     palette: HWND,
+    search: HWND,
     /// Owned copy of the current folder's icon shown in the breadcrumb.
     crumb_icon: HICON,
     font: HFONT,
@@ -158,6 +164,12 @@ pub(crate) struct App {
     recent: Recent,
     panes: panes::Panes,
     views: views::Views,
+    /// The embedded Explorer view of the active tab, when it is in browser mode.
+    browser: Option<rexplorer_core::browser::EmbeddedBrowser>,
+    /// Where the embedded view is (or was last told to go).
+    browser_at: Option<Pidl>,
+    /// Volume indexes for elevated searches, built once per drive.
+    usn: source::UsnCache,
 }
 
 fn main() -> Result<()> {
@@ -222,6 +234,7 @@ fn main() -> Result<()> {
             crumbs: HWND::default(),
             status: HWND::default(),
             palette: HWND::default(),
+            search: HWND::default(),
             crumb_icon: HICON::default(),
             font: HFONT::default(),
             theme,
@@ -237,6 +250,9 @@ fn main() -> Result<()> {
             debounce: session::Debounce::new(Duration::from_secs(2)),
             recent: Recent::load(dir.join("recent.txt")),
             panes: panes::Panes::default(),
+            browser: None,
+            browser_at: None,
+            usn: Default::default(),
         }));
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -261,9 +277,11 @@ fn main() -> Result<()> {
         let accel_table = CreateAcceleratorTableW(&accels())?;
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            // Accelerators only when our own controls have focus; the ListView's label editor and the palette keep their keys.
-            let focus = GetFocus();
-            let ours = focus == (*app).list || focus == (*app).addr || focus == hwnd || tree_accel(app, &msg, focus);
+            // Accelerators only for keys aimed at our own controls; the ListView's label editor, the palette and the
+            // search box's Enter / Escape keep their keys. Key messages go to the focus window, so their target
+            // is the focus (and a key posted to one control is not taken for another).
+            let focus = msg.hwnd;
+            let ours = focus == (*app).list || focus == (*app).addr || focus == hwnd || pane_accel(app, &msg, focus);
             if ours && TranslateAcceleratorW(hwnd, accel_table, &msg) != 0 {
                 continue;
             }
@@ -289,15 +307,14 @@ fn startup_session(profile: &Profile, explicit_profile: bool) -> session::Sessio
     s
 }
 
-/// The tree keeps Enter and Escape; every other shortcut works while it has the focus.
-unsafe fn tree_accel(app: *mut App, msg: &MSG, focus: HWND) -> bool {
+/// The tree, the embedded browser and the search box keep Enter and Escape; every other shortcut works while
+/// they have the focus.
+unsafe fn pane_accel(app: *mut App, msg: &MSG, focus: HWND) -> bool {
     if !matches!(msg.message, WM_KEYDOWN | WM_SYSKEYDOWN) || matches!(VIRTUAL_KEY(msg.wParam.0 as u16), VK_RETURN | VK_ESCAPE) {
         return false;
     }
-    (*app).panes.tree.as_ref().is_some_and(|t| {
-        let h = t.hwnd();
-        focus == h || IsChild(h, focus).as_bool()
-    })
+    let inside = |h: HWND| focus == h || IsChild(h, focus).as_bool();
+    focus == (*app).search || (*app).panes.tree.as_ref().is_some_and(|t| inside(t.hwnd())) || source::browser_hwnd(app).is_some_and(inside)
 }
 
 fn accels() -> Vec<ACCEL> {
@@ -318,6 +335,7 @@ unsafe fn open_startup_tabs(app: *mut App, args: &cli::Args) {
     } else if !nav::open_args(app, args) {
         nav::new_tab(app, nav::Target::Name((*app).profile.start.clone()), true, None);
     }
+    nav::apply_search(app, args);
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -345,7 +363,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     match msg {
         WM_SIZE => ui::layout(app),
         WM_SETFOCUS => {
-            let _ = SetFocus(Some((*app).list));
+            let _ = SetFocus(Some(source::browser_hwnd(app).unwrap_or((*app).list)));
         }
         WM_NOTIFY => return on_notify(app, lparam),
         WM_COMMAND => {
@@ -354,7 +372,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if code == EN_KILLFOCUS as usize {
                     ui::hide_edit(app);
                 }
-            } else {
+            } else if id != ID_SEARCH {
                 on_command(app, id as u16);
             }
         }
@@ -363,7 +381,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_COPYDATA => {
             if let Some(text) = instance::receive(lparam) {
-                nav::open_args(app, &cli::parse_payload(&text));
+                let args = cli::parse_payload(&text);
+                nav::open_args(app, &args);
+                nav::apply_search(app, &args);
                 if IsIconic(hwnd).as_bool() {
                     let _ = ShowWindow(hwnd, SW_RESTORE);
                 }
@@ -382,6 +402,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             return LRESULT(1);
         }
         WM_ENUM_DONE => nav::on_enum_done(app, Box::from_raw(lparam.0 as *mut nav::EnumDone)),
+        source::WM_SEARCH_BATCH => source::on_search_batch(app, Box::from_raw(lparam.0 as *mut source::SearchBatch)),
+        source::WM_BROWSER_NAV => source::on_browser_nav(app, Box::from_raw(lparam.0 as *mut Pidl)),
+        source::WM_WORKER_ERROR => message(hwnd, &Box::from_raw(lparam.0 as *mut String)),
         panes::WM_TREE_SELECT => panes::on_tree_select(app, Box::from_raw(lparam.0 as *mut Pidl)),
         views::WM_THUMB_DONE => views::on_thumb_done(app, wparam, lparam),
         WM_SETCURSOR => {
@@ -423,8 +446,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let r = &*(lparam.0 as *const RECT);
             let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
             ui::apply_font(app);
-            if let Some(l) = listing(app) {
-                nav::set_columns(app, &l.columns);
+            if let Some(s) = nav::source(app) {
+                nav::set_columns(app, &s.columns());
             }
             views::apply(app);
             ui::layout(app);
@@ -434,7 +457,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             nav::save_session(app);
             for t in &mut (*app).tabs {
                 t.watch = None;
+                if let Some(Source::Search(s)) = &mut t.source {
+                    s.stop();
+                }
             }
+            (*app).browser = None;
             rexplorer_core::dragdrop::unregister((*app).list);
             views::destroy(app);
             (*app).panes.tree = None;
@@ -467,7 +494,11 @@ unsafe fn on_notify(app: *mut App, lparam: LPARAM) -> LRESULT {
                 if nm.index + 1 >= tab.crumbs.len() {
                     nav::refresh(app);
                 } else if let Some(c) = tab.crumbs.get(nm.index) {
-                    go(app, nav::Target::Pidl(c.pidl.clone()), nav::History::Push);
+                    let target = match &c.pidl {
+                        Some(p) => nav::Target::Pidl(p.clone()),
+                        None => nav::Target::Name(c.parsing.clone()),
+                    };
+                    go(app, target, nav::History::Push);
                 }
             }
             breadcrumb::CN_EDIT => ui::show_edit(app),
@@ -492,14 +523,14 @@ unsafe fn on_command(app: *mut App, cmd: u16) {
         CMD_REFRESH => nav::refresh(app),
         CMD_ADDRESS => ui::show_edit(app),
         CMD_EXPLORER => {
-            if let Some(l) = listing(app) {
-                let _ = open_in_explorer(&l.folder.parsing_name);
+            if let Some(s) = nav::source(app) {
+                let _ = open_in_explorer(&s.explorer_name());
             }
         }
         CMD_ENTER => {
             if GetFocus() == addr {
                 let text = window_text(addr);
-                let current = listing(app).map(|l| l.folder.editing_name.clone()).unwrap_or_default();
+                let current = nav::source(app).map(|s| s.editing_name()).unwrap_or_default();
                 if text.trim().is_empty() || text == current {
                     nav::refresh(app);
                 } else {
@@ -509,7 +540,7 @@ unsafe fn on_command(app: *mut App, cmd: u16) {
             } else {
                 let i = SendMessageW(list, LVM_GETNEXTITEM, Some(WPARAM(usize::MAX)), Some(LPARAM(LVNI_FOCUSED as isize))).0;
                 if i >= 0 {
-                    nav::activate(app, i as usize);
+                    source::activate(app, i as usize);
                 }
             }
         }
@@ -517,6 +548,8 @@ unsafe fn on_command(app: *mut App, cmd: u16) {
             if GetFocus() == addr {
                 // Losing focus hides the Edit and restores its text.
                 let _ = SetFocus(Some(list));
+            } else {
+                source::cancel_search(app);
             }
         }
         CMD_PROPERTIES => {
@@ -538,8 +571,15 @@ unsafe fn on_command(app: *mut App, cmd: u16) {
         c if c == CMD_VIEW1 + 2 => views::set_view(app, views::View::Thumbnails),
         CMD_TOGGLE_TREE => panes::toggle_tree(app),
         CMD_TOGGLE_PREVIEW => panes::toggle_preview(app),
-        // The connect dialog arrives in step 3.
-        CMD_CONNECT => {}
+        CMD_CONNECT => {
+            if let Some(url) = connect::dialog((*app).hwnd, &(*app).theme, (*app).font) {
+                nav::new_tab(app, nav::Target::Name(url), true, None);
+            }
+        }
+        CMD_SEARCH => {
+            let _ = SetFocus(Some((*app).search));
+            SendMessageW((*app).search, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
+        }
         CMD_MORE => ui::more_menu(app),
         CMD_REGISTER | CMD_UNREGISTER => ui::register_flow(Some((*app).hwnd), cmd == CMD_UNREGISTER),
         CMD_SETTINGS => nav::new_tab(app, nav::Target::Name(settings::dir().display().to_string()), true, None),

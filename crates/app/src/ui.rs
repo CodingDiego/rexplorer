@@ -1,7 +1,7 @@
 //! Window chrome: child controls, theme and fonts, layout, the address Edit, popup menus, palette and status.
 
 use super::*;
-use crate::nav::{Target, cur, go, listing};
+use crate::nav::{Target, cur, go, listing, source};
 
 const THIS_PC: &str = "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}";
 
@@ -56,6 +56,23 @@ pub(crate) unsafe fn create_children(app: *mut App) -> Result<()> {
         Some(hinst),
         None,
     )?;
+    (*app).search = CreateWindowExW(
+        WINDOW_EX_STYLE(0),
+        WC_EDITW,
+        PCWSTR::null(),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+        0,
+        0,
+        0,
+        0,
+        Some(hwnd),
+        Some(HMENU(ID_SEARCH as *mut c_void)),
+        Some(hinst),
+        None,
+    )?;
+    // wparam 1: the cue stays visible while the box has the focus and is empty.
+    SendMessageW((*app).search, EM_SETCUEBANNER, Some(WPARAM(1)), Some(LPARAM(w!("Search").as_ptr() as isize)));
+    let _ = SetWindowSubclass((*app).search, Some(source::search_subclass), 2, app as usize);
     (*app).tools = toolbar::create(
         hwnd,
         ID_TOOLS,
@@ -101,6 +118,7 @@ pub(crate) unsafe fn apply_theme(app: *mut App) {
     theme::apply_window((*app).hwnd, t);
     theme::apply_list((*app).list, t);
     theme::apply_control((*app).addr, t);
+    theme::apply_control((*app).search, t);
     tabs::set_theme((*app).strip, t);
     breadcrumb::set_theme((*app).crumbs, t);
     toolbar::set_theme((*app).nav, t);
@@ -117,7 +135,7 @@ pub(crate) unsafe fn apply_theme(app: *mut App) {
 /// (Re)creates the UI font for the window's current DPI.
 pub(crate) unsafe fn apply_font(app: *mut App) {
     let font = theme::ui_font(&(*app).theme, GetDpiForWindow((*app).hwnd));
-    for h in [(*app).list, (*app).addr, (*app).strip, (*app).crumbs, (*app).status] {
+    for h in [(*app).list, (*app).addr, (*app).search, (*app).strip, (*app).crumbs, (*app).status] {
         SendMessageW(h, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
     }
     if !(*app).font.is_invalid() {
@@ -141,13 +159,17 @@ pub(crate) unsafe fn layout(app: *mut App) {
     let _ = MoveWindow((*app).nav, pad, y, nw, nh, true);
     let _ = MoveWindow((*app).tools, (w - pad - tw).max(0), y, tw, nh, true);
     let cx = 2 * pad + nw;
-    let cw = (w - tw - 2 * pad - cx).max(0);
+    // The search box keeps 200 px right of the breadcrumb; the breadcrumb gives way first on a narrow window.
+    let sw = scale(200, dpi).min((w - tw - 3 * pad - cx).max(0));
+    let cw = (w - tw - 3 * pad - sw - cx).max(0);
     let _ = MoveWindow((*app).crumbs, cx, y, cw, nh, true);
     // A single-line Edit draws its text at the top, so size it to one line and center it in the field,
     // right of the breadcrumb's icon (8 + 16 + 4 px).
     let eh = (*app).theme.font_size * dpi as i32 / 72 * 4 / 3 + scale(4, dpi);
     let ex = scale(28, dpi);
     let _ = MoveWindow((*app).addr, cx + ex, y + (nh - eh) / 2, (cw - ex - 2 * pad).max(0), eh, true);
+    let bh = eh + scale(6, dpi);
+    let _ = MoveWindow((*app).search, cx + cw + pad, y + (nh - bh) / 2, sw, bh, true);
 
     let sh = statusbar::height(dpi);
     let _ = MoveWindow((*app).status, 0, rc.bottom - sh, w, sh, true);
@@ -164,7 +186,7 @@ pub(crate) unsafe fn set_crumbs(app: *mut App) {
     breadcrumb::set_crumbs((*app).crumbs, if editing { &[] } else { &names });
     let old = std::mem::take(&mut (*app).crumb_icon);
     let (himl, index) = tab.icon;
-    if himl != 0 && tab.listing.is_some() {
+    if himl != 0 && tab.source.is_some() {
         (*app).crumb_icon = ImageList_GetIcon(HIMAGELIST(himl as isize), index, ILD_NORMAL);
     }
     let icon = (*app).crumb_icon;
@@ -184,8 +206,8 @@ pub(crate) unsafe fn show_edit(app: *mut App) {
 
 /// On EN_KILLFOCUS: whatever was typed and not entered is dropped.
 pub(crate) unsafe fn hide_edit(app: *mut App) {
-    if let Some(l) = listing(app) {
-        set_text((*app).addr, &l.folder.editing_name);
+    if let Some(s) = source(app) {
+        set_text((*app).addr, &s.editing_name());
     }
     let _ = ShowWindow((*app).addr, SW_HIDE);
     set_crumbs(app);
@@ -193,12 +215,20 @@ pub(crate) unsafe fn hide_edit(app: *mut App) {
 
 // ---- popup menus -------------------------------------------------------------------------------
 
-/// Shows `entries` (id, text; id 0 = separator) and returns the picked id, 0 when dismissed.
-unsafe fn popup(app: *mut App, entries: &[(usize, String)], x: i32, y: i32) -> usize {
+/// Menu entry id of a greyed heading.
+const HEADING: usize = usize::MAX;
+/// More-menu ids of the Quick access entries start here.
+const QUICK: usize = 0x1000;
+
+/// Shows `entries` (id, text; id 0 = separator, HEADING = greyed text) and returns the picked id, 0 when dismissed.
+pub(crate) unsafe fn popup(app: *mut App, entries: &[(usize, String)], x: i32, y: i32) -> usize {
     let Ok(menu) = CreatePopupMenu() else { return 0 };
     for (id, text) in entries {
         if *id == 0 {
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        } else if *id == HEADING {
+            let h = HSTRING::from(text.as_str());
+            let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, PCWSTR(h.as_ptr()));
         } else {
             let h = HSTRING::from(text.as_str());
             let _ = AppendMenuW(menu, MF_STRING, *id, PCWSTR(h.as_ptr()));
@@ -212,10 +242,11 @@ unsafe fn popup(app: *mut App, entries: &[(usize, String)], x: i32, y: i32) -> u
 /// Breadcrumb chevron: the subfolders of crumb `index`, listed on the UI thread only where that is cheap.
 pub(crate) unsafe fn crumb_dropdown(app: *mut App, index: usize) {
     let Some(c) = cur(app).crumbs.get(index) else { return };
+    let Some(pidl) = &c.pidl else { return };
     if !(is_fs_path(&c.parsing) || c.parsing.eq_ignore_ascii_case(THIS_PC)) {
         return;
     }
-    let Ok(folder) = ShellFolder::from_pidl(&c.pidl) else { return };
+    let Ok(folder) = ShellFolder::from_pidl(pidl) else { return };
     let Ok(mut items) = folder.enumerate() else { return };
     items.retain(|i| i.is_folder() && !i.is_hidden());
     items.sort_by(|a, b| folder.compare(0, a, b));
@@ -237,16 +268,25 @@ pub(crate) unsafe fn more_menu(app: *mut App) {
     } else {
         (CMD_REGISTER as usize, "Register as folder handler...".to_string())
     };
-    let entries = [
+    let mut entries = vec![
         (CMD_EXPLORER as usize, "Open in Explorer\tCtrl+Shift+E".to_string()),
         reg,
         (CMD_SETTINGS as usize, "Settings folder".to_string()),
         (0, String::new()),
         (CMD_ABOUT as usize, "About rexplorer".to_string()),
     ];
+    // Quick access: profile bookmarks, then cloud-sync roots.
+    let quick: Vec<(String, String)> = (*app).profile.bookmarks.iter().chain(CLOUD.get().into_iter().flatten()).cloned().collect();
+    if !quick.is_empty() {
+        entries.push((0, String::new()));
+        entries.push((HEADING, "Quick access".to_string()));
+        entries.extend(quick.iter().enumerate().map(|(i, (label, _))| (QUICK + i, label.clone())));
+    }
     let r = toolbar::button_rect((*app).tools, CMD_MORE).unwrap_or_default();
     let picked = popup(app, &entries, r.left, r.bottom);
-    if picked != 0 {
+    if let Some((_, target)) = picked.checked_sub(QUICK).and_then(|i| quick.get(i)) {
+        go(app, Target::Name(target.clone()), nav::History::Push);
+    } else if picked != 0 {
         on_command(app, picked as u16);
     }
 }
@@ -325,10 +365,14 @@ pub(crate) unsafe fn open_terminal(app: *mut App) {
 }
 
 pub(crate) unsafe fn update_status(app: *mut App) {
-    let count = listing(app).map_or(0, |l| l.items.len());
+    let count = source(app).map_or(0, |s| s.len());
     let selected = SendMessageW((*app).list, LVM_GETSELECTEDCOUNT, None, None).0 as usize;
     // Selected bytes are omitted: the size column is shell-formatted text, not a number.
-    statusbar::set_text((*app).status, &statusbar::summary(count, selected, None), &(*app).profile.name);
+    let mut left = statusbar::summary(count, selected, None);
+    if let Some(Source::Search(s)) = source(app) {
+        left.push_str(if s.running { "  ·  searching…" } else { "  ·  search done" });
+    }
+    statusbar::set_text((*app).status, &left, &(*app).profile.name);
 }
 
 #[cfg(test)]

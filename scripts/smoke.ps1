@@ -3,11 +3,12 @@ $ErrorActionPreference = 'Stop'
 $Exe = Join-Path (Split-Path $PSScriptRoot -Parent) 'target\release\rexplorer.exe'
 Add-Type -AssemblyName System.Windows.Forms, Microsoft.VisualBasic, UIAutomationClient, UIAutomationTypes
 Add-Type @'
-using System; using System.Text; using System.Runtime.InteropServices;
+using System; using System.Text; using System.Runtime.InteropServices; using System.Collections.Generic;
 public static class W {
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowEx(IntPtr p, IntPtr a, string cls, string title);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindow(string cls, string title);
   [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode, EntryPoint="SendMessageW")] public static extern IntPtr SendText(IntPtr h, uint m, IntPtr w, string l);
   [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
@@ -34,6 +35,37 @@ public static class W {
     return found;
   }
   public static int Left(IntPtr h) { RECT r; GetWindowRect(h, out r); return r.L; }
+  // The visible direct child Edit of `parent` (the search box; the address Edit stays hidden until Ctrl+L).
+  public static IntPtr VisibleEdit(IntPtr parent) {
+    IntPtr h = IntPtr.Zero;
+    while ((h = FindWindowEx(parent, h, "Edit", null)) != IntPtr.Zero) { if (IsWindowVisible(h)) return h; }
+    return IntPtr.Zero;
+  }
+  // The RAR5 fixture of crates/core/src/archive.rs tests: one file docs/a.txt holding "hello".
+  static uint Crc32(byte[] d) {
+    uint c = 0xFFFFFFFF;
+    foreach (byte b in d) { c ^= b; for (int k = 0; k < 8; k++) c = (c & 1) != 0 ? (c >> 1) ^ 0xEDB88320 : c >> 1; }
+    return ~c;
+  }
+  static void Vint(List<byte> o, ulong v) {
+    while (true) { byte b = (byte)(v & 0x7F); v >>= 7; if (v == 0) { o.Add(b); return; } o.Add((byte)(b | 0x80)); }
+  }
+  static byte[] Header(byte[] body) {
+    var after = new List<byte>(); Vint(after, (ulong)body.Length); after.AddRange(body);
+    var h = new List<byte>(BitConverter.GetBytes(Crc32(after.ToArray()))); h.AddRange(after); return h.ToArray();
+  }
+  public static byte[] Rar5() {
+    byte[] name = Encoding.ASCII.GetBytes("docs/a.txt");
+    var f = new List<byte> { 2, 0x02 };
+    foreach (ulong v in new ulong[] { 5, 0, 5, 0x20, 0, 0, (ulong)name.Length }) Vint(f, v);
+    f.AddRange(name);
+    var rar = new List<byte> { 0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00 };
+    rar.AddRange(Header(new byte[] { 1, 0, 0 }));
+    rar.AddRange(Header(f.ToArray()));
+    rar.AddRange(Encoding.ASCII.GetBytes("hello"));
+    rar.AddRange(Header(new byte[] { 5, 0, 0 }));
+    return rar.ToArray();
+  }
   // First top-level window of process `pid` with window class `cls`.
   public static IntPtr FindOfProcess(uint pid, string cls) {
     IntPtr found = IntPtr.Zero;
@@ -112,6 +144,19 @@ function Launch-Fresh($arg) {
   try { $env:APPDATA = $script:fake; Launch $arg } finally { $env:APPDATA = $appdata }
 }
 function Remove-Fresh { Stop-App $script:cur; Start-Sleep -Milliseconds 200; Remove-Item $script:fake -Recurse -Force -ErrorAction SilentlyContinue }
+# Like Launch-Fresh, with a raw argument string (several arguments).
+function Launch-FreshArgs($argline) {
+  $script:fake = Join-Path $env:TEMP "rexplorer-smoke-appdata-$PID"
+  Remove-Item $script:fake -Recurse -Force -ErrorAction SilentlyContinue
+  New-Item -ItemType Directory -Path $script:fake -Force | Out-Null
+  $appdata = $env:APPDATA
+  try {
+    $env:APPDATA = $script:fake
+    $script:cur = Start-Process -FilePath $Exe -ArgumentList $argline -PassThru; $null = $script:cur.Handle
+    $script:main = Get-Main $script:cur
+  } finally { $env:APPDATA = $appdata }
+  $script:main -ne [IntPtr]::Zero
+}
 # Keys when the window can be activated, else the same command as WM_COMMAND. Returns how it was sent.
 function Send-KeysOrCommand($keys, $cmd) {
   if (Set-Foreground $script:main) { [System.Windows.Forms.SendKeys]::SendWait($keys); 'keys' }
@@ -204,18 +249,20 @@ Run-Check 'live-update' {
   } finally { Stop-App $script:cur; Start-Sleep -Milliseconds 200; Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
-Run-Check 'fallback' {
+Run-Check 'fallback-embedded' {
+  # A name that does not resolve: an error box and no Explorer window (folders that exist but cannot be
+  # listed open in the embedded Explorer view instead of explorer.exe).
   $before = Get-Explorers
-  $script:cur = Start-App 'shell:::{11111111-2222-3333-4444-555555555555}'
-  Start-Sleep -Seconds 3; $script:cur.Refresh()
-  $alive = -not $script:cur.HasExited
-  $after = Get-Explorers
-  $newExp = @($after.Keys | Where-Object { -not $before.ContainsKey($_) }).Count
-  $dlg = [W]::FindWindow('#32770', 'rexplorer')
-  if ($dlg -ne [IntPtr]::Zero) { $null = [W]::PostMessage($dlg, 0x10, [IntPtr]::Zero, [IntPtr]::Zero) }
-  Close-NewExplorers $before
-  $d = "explorer window appeared=$($newExp -gt 0) (new=$newExp); rexplorer dialog appeared=$($dlg -ne [IntPtr]::Zero)"
-  if ($alive) { @('PASS', "alive after 3 s; $d") } else { @('FAIL', "process exited; $d") }
+  try {
+    if (-not (Launch-Fresh 'shell:::{11111111-2222-3333-4444-555555555555}')) { return @('FAIL', 'no main window within 5 s') }
+    Start-Sleep -Seconds 3; $script:cur.Refresh()
+    $alive = -not $script:cur.HasExited
+    $newExp = @((Get-Explorers).Keys | Where-Object { -not $before.ContainsKey($_) }).Count
+    $dlg = [W]::FindOfProcess([uint32]$script:cur.Id, '#32770')
+    if ($dlg -ne [IntPtr]::Zero) { $null = [W]::PostMessage($dlg, 0x10, [IntPtr]::Zero, [IntPtr]::Zero) }
+    $d = "explorer windows new=$newExp; rexplorer dialog appeared=$($dlg -ne [IntPtr]::Zero)"
+    if ($alive -and $newExp -eq 0) { @('PASS', "alive after 3 s; $d") } else { @('FAIL', "alive=$alive; $d") }
+  } finally { Close-NewExplorers $before; Remove-Fresh }
 }
 
 Run-Check 'explorer-hotkey' {
@@ -319,7 +366,8 @@ Run-Check 'tree' {
   try {
     if (-not (Launch-Fresh 'C:\Windows')) { return @('FAIL', 'no main window within 5 s') }
     Wait-Until { (Get-Count $script:main) -ge 1 } 3000 | Out-Null
-    $found = Wait-Until { $script:nstc = [W]::FindDescendant($script:main, 'NamespaceTreeControl'); $script:nstc -ne [IntPtr]::Zero } 3000
+    # The control creates its inner SysTreeView32 a moment after itself.
+    $found = Wait-Until { $script:nstc = [W]::FindDescendant($script:main, 'NamespaceTreeControl'); $script:nstc -ne [IntPtr]::Zero -and [W]::FindDescendant($script:main, 'SysTreeView32') -ne [IntPtr]::Zero } 3000
     $tv = [W]::FindDescendant($script:main, 'SysTreeView32')
     if (-not $found -or $tv -eq [IntPtr]::Zero) { return @('FAIL', "NamespaceTreeControl found=$found SysTreeView32=$($tv -ne [IntPtr]::Zero)") }
     # Drag the splitter right of the tree 100 px with posted mouse messages (client x = screen x - tree's left).
@@ -378,6 +426,55 @@ Run-Check 'views' {
     $details = Wait-Until { (& $view) -eq 1 } 2000
     $d = "LVM_GETVIEW $v0 -> Ctrl+Shift+2 ($how) icon=$icon (profile view=icons saved=$saved) -> Ctrl+Shift+1 details=$details"
     if ($v0 -eq 1 -and $icon -and $saved -and $details) { @('PASS', $d) } else { @('FAIL', $d) }
+  } finally { Remove-Fresh }
+}
+
+Run-Check 'archive' {
+  $dir = Join-Path $env:TEMP "rexplorer-smoke-rar-$PID"
+  New-Item -ItemType Directory -Path $dir -Force | Out-Null
+  $rar = Join-Path $dir 'smoke.rar'
+  [IO.File]::WriteAllBytes($rar, [W]::Rar5())
+  try {
+    if (-not (Launch-Fresh $rar)) { return @('FAIL', 'no main window within 5 s') }
+    $ok = Wait-Until { (Get-Title $script:main) -like '*smoke.rar*' -and (Get-Count $script:main) -eq 1 } 4000
+    $t0 = Get-Title $script:main; $c0 = Get-Count $script:main
+    if (-not $ok) { return @('FAIL', "title='$t0' count=$c0") }
+    # Home + Enter opens the archive's 'docs' directory; Backspace returns to the archive root.
+    $list = Get-List $script:main
+    $null = [W]::PostMessage($list, 0x100, [IntPtr]0x24, [IntPtr]::Zero)
+    $null = [W]::PostMessage($list, 0x100, [IntPtr]0x0D, [IntPtr]::Zero)
+    $in = Wait-Until { (Get-Title $script:main) -like 'docs*' -and (Get-Count $script:main) -eq 1 } 2000
+    $t1 = Get-Title $script:main
+    $null = [W]::PostMessage($list, 0x100, [IntPtr]0x08, [IntPtr]::Zero)
+    $out = Wait-Until { (Get-Title $script:main) -like '*smoke.rar*' } 2000
+    $d = "'$t0' count=$c0; Enter -> '$t1' ($in); Backspace -> '$(Get-Title $script:main)' ($out)"
+    if ($in -and $out) { @('PASS', $d) } else { @('FAIL', $d) }
+  } finally { Remove-Fresh; Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Run-Check 'search' {
+  $bench = (Join-Path $env:TEMP 'rexplorer-bench')
+  try {
+    if (-not (Launch-Fresh $bench)) { return @('FAIL', 'no main window within 5 s') }
+    if (-not (Wait-Until { (Get-Count $script:main) -eq 100000 } 5000)) { return @('FAIL', "count=$(Get-Count $script:main)") }
+    $box = [W]::VisibleEdit($script:main)
+    if ($box -eq [IntPtr]::Zero) { return @('FAIL', 'no visible search Edit') }
+    $null = [W]::SendText($box, 0x0C, [IntPtr]::Zero, 'file00012')
+    $null = [W]::PostMessage($box, 0x100, [IntPtr]0x0D, [IntPtr]::Zero)
+    Start-Sleep -Seconds 3
+    $t = Get-Title $script:main; $c = Get-Count $script:main
+    $d = "WM_SETTEXT 'file00012' + Enter: title='$t' count=$c"
+    if ($t.StartsWith('Search') -and $c -ge 1 -and $c -le 100000) { @('PASS', $d) } else { @('FAIL', $d) }
+  } finally { Remove-Fresh }
+}
+
+Run-Check 'search-cli' {
+  $bench = (Join-Path $env:TEMP 'rexplorer-bench')
+  try {
+    if (-not (Launch-FreshArgs "--search file00012 `"$bench`"")) { return @('FAIL', 'no main window within 5 s') }
+    $ok = Wait-Until { (Get-Title $script:main).StartsWith('Search') -and (Get-Count $script:main) -ge 1 } 5000
+    $d = "--search file00012: title='$(Get-Title $script:main)' count=$(Get-Count $script:main)"
+    if ($ok) { @('PASS', $d) } else { @('FAIL', $d) }
   } finally { Remove-Fresh }
 }
 exit 0
