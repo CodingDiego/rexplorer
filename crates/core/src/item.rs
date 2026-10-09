@@ -2,7 +2,7 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
 use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::System::SystemServices::{SFGAO_FOLDER, SFGAO_HIDDEN};
-use windows::Win32::System::Variant::VariantToUInt64;
+use windows::Win32::System::Variant::{VariantToStringAlloc, VariantToUInt64};
 use windows::Win32::UI::Shell::Common::{SHELLDETAILS, STRRET};
 use windows::Win32::UI::Shell::{
     ILCombine, IShellFolder, IShellFolder2, SHFILEINFOW, SHGDN_FORPARSING, SHGDN_INFOLDER,
@@ -60,6 +60,18 @@ impl ShellItem {
         unsafe {
             let v = f2.GetDetailsEx(self.pidl.as_ptr(), &PKEY_SIZE).ok()?;
             VariantToUInt64(&v).ok()
+        }
+    }
+
+    /// A property as the shell formats it for display (`GetDetailsEx` + `PropVariantToString`); None when the
+    /// item has no value for it.
+    pub fn property_text(&self, key: &PROPERTYKEY) -> Option<String> {
+        let f2 = self.parent.cast::<IShellFolder2>().ok()?;
+        unsafe {
+            let v = f2.GetDetailsEx(self.pidl.as_ptr(), key).ok()?;
+            let p = VariantToStringAlloc(&v).ok()?;
+            let s = crate::com::take_cotaskmem_string(p);
+            (!s.is_empty()).then_some(s)
         }
     }
 

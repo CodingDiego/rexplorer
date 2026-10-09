@@ -1,8 +1,8 @@
 //! Window chrome: child controls, theme and fonts, layout, the address Edit, popup menus, palette and status.
 //!
-//! Top to bottom: the tab strip; one 44 px header bar (Back / Forward segment, Up, the path bar, the search
-//! field, the view segment, Terminal, Connect, More); the sidebar (or tree) beside the list and preview cards;
-//! the status bar. The frame, header, sidebar and status bar share `theme.background`; cards and fields are
+//! Top to bottom: the tab strip; a 44 px header bar (Back / Forward segment, Up, Refresh, the path bar, the
+//! search field, Terminal, Connect); the 44 px command bar (commands.rs); the sidebar (or tree) beside the list
+//! (or Home page) and preview cards; the status bar. The frame, header, sidebar and status bar share `theme.background`; cards and fields are
 //! `theme.surface`.
 
 use super::*;
@@ -45,7 +45,12 @@ pub(crate) unsafe fn create_children(app: *mut App) -> Result<()> {
     (*app).nav = toolbar::create(
         hwnd,
         ID_NAV,
-        &[(0xE72B, CMD_BACK, "Back (Alt+Left)"), (0xE72A, CMD_FORWARD, "Forward (Alt+Right)"), (0xE74A, CMD_UP, "Up (Alt+Up)")],
+        &[
+            (0xE72B, CMD_BACK, "Back (Alt+Left)"),
+            (0xE72A, CMD_FORWARD, "Forward (Alt+Right)"),
+            (0xE74A, CMD_UP, "Up (Alt+Up)"),
+            (0xE72C, CMD_REFRESH, "Refresh (F5)"),
+        ],
     )?;
     toolbar::set_group((*app).nav, &[CMD_BACK, CMD_FORWARD]);
     (*app).crumbs = breadcrumb::create(hwnd, ID_CRUMBS)?;
@@ -86,15 +91,10 @@ pub(crate) unsafe fn create_children(app: *mut App) -> Result<()> {
     (*app).tools = toolbar::create(
         hwnd,
         ID_TOOLS,
-        &[
-            (0xE8FD, CMD_VIEW1, "List (Ctrl+Shift+1)"),
-            (0xE80A, CMD_VIEW_GRID, "Grid: icons, again for thumbnails (Ctrl+Shift+2 / 3)"),
-            (0xE756, CMD_TERMINAL, "Open terminal here (Ctrl+`)"),
-            (0xE968, CMD_CONNECT, "Connect to server"),
-            (0xE712, CMD_MORE, "More"),
-        ],
+        &[(0xE756, CMD_TERMINAL, "Open terminal here (Ctrl+`)"), (0xE968, CMD_CONNECT, "Connect to server")],
     )?;
-    toolbar::set_group((*app).tools, &[CMD_VIEW1, CMD_VIEW_GRID]);
+    (*app).cmdbar = commands::create(hwnd)?;
+    let _ = windows::Win32::System::DataExchange::AddClipboardFormatListener(hwnd);
     (*app).sidebar = sidebar::create(hwnd, ID_SIDEBAR)?;
     if !(*app).session.show_tree && (*app).session.show_sidebar {
         let _ = ShowWindow((*app).sidebar, SW_SHOW);
@@ -120,6 +120,7 @@ pub(crate) unsafe fn create_children(app: *mut App) -> Result<()> {
     let header = HWND(SendMessageW((*app).list, LVM_GETHEADER, None, None).0 as *mut c_void);
     let _ = SetWindowSubclass(header, Some(list::header_subclass), 1, 0);
     list::register_drop(app);
+    (*app).home = home::create(hwnd, ID_HOME)?;
     panes::create_preview(app)?;
     if (*app).session.show_preview {
         let _ = ShowWindow((*app).panes.preview, SW_SHOW);
@@ -144,6 +145,8 @@ pub(crate) unsafe fn apply_theme(app: *mut App) {
     breadcrumb::set_theme((*app).crumbs, t);
     toolbar::set_theme((*app).nav, t);
     toolbar::set_theme((*app).tools, t);
+    toolbar::set_theme((*app).cmdbar, t);
+    home::set_theme((*app).home, t);
     statusbar::set_theme((*app).status, t);
     preview_pane::set_theme((*app).panes.preview, t);
     // The preview's text Edit (its scroll bar) follows the theme too.
@@ -156,7 +159,8 @@ pub(crate) unsafe fn apply_theme(app: *mut App) {
 /// (Re)creates the UI font for the window's current DPI.
 pub(crate) unsafe fn apply_font(app: *mut App) {
     let font = theme::ui_font(&(*app).theme, GetDpiForWindow((*app).hwnd));
-    for h in [(*app).list, (*app).addr, (*app).search, (*app).strip, (*app).crumbs, (*app).status, (*app).sidebar] {
+    let a = &*app;
+    for h in [a.list, a.addr, a.search, a.strip, a.crumbs, a.status, a.sidebar, a.cmdbar, a.home] {
         SendMessageW(h, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
     }
     if !(*app).font.is_invalid() {
@@ -201,9 +205,17 @@ pub(crate) unsafe fn layout(app: *mut App) {
     let gx = scale(32, dpi);
     let _ = MoveWindow((*app).search, field.left + gx, y + (nh - eh) / 2, (sw - gx - pad).max(0), eh, true);
 
+    // The command bar: a second 44 px row, its spacer pushing Preview to the right edge.
+    let _ = MoveWindow((*app).cmdbar, pad, th + hh + (hh - nh) / 2, (w - 2 * pad).max(0), nh, true);
+
     let sh = statusbar::height(dpi);
     let _ = MoveWindow((*app).status, 0, rc.bottom - sh, w, sh, true);
-    panes::layout(app, th + hh, rc.bottom - sh, w);
+    panes::layout(app, th + 2 * hh, rc.bottom - sh, w);
+}
+
+/// The window keyboard focus goes to for the active tab: the Home page when it shows, else the list.
+pub(crate) unsafe fn view_hwnd(app: *mut App) -> HWND {
+    if IsWindowVisible((*app).home).as_bool() { (*app).home } else { (*app).list }
 }
 
 /// WM_PAINT of the main window: the frame color everywhere the children leave, and the search field.
@@ -280,8 +292,9 @@ const HEADING: usize = usize::MAX;
 /// More-menu ids of the Quick access entries start here.
 const QUICK: usize = 0x1000;
 
-/// Shows `entries` (id, text; id 0 = separator, HEADING = greyed text) and returns the picked id, 0 when dismissed.
-pub(crate) unsafe fn popup(app: *mut App, entries: &[(usize, String)], x: i32, y: i32) -> usize {
+/// Shows `entries` (id, text; id 0 = separator, HEADING = greyed text), the ids in `checked` with a check mark,
+/// and returns the picked id, 0 when dismissed.
+pub(crate) unsafe fn popup(app: *mut App, entries: &[(usize, String)], checked: &[usize], x: i32, y: i32) -> usize {
     let Ok(menu) = CreatePopupMenu() else { return 0 };
     for (id, text) in entries {
         if *id == 0 {
@@ -291,7 +304,8 @@ pub(crate) unsafe fn popup(app: *mut App, entries: &[(usize, String)], x: i32, y
             let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, PCWSTR(h.as_ptr()));
         } else {
             let h = HSTRING::from(text.as_str());
-            let _ = AppendMenuW(menu, MF_STRING, *id, PCWSTR(h.as_ptr()));
+            let check = if checked.contains(id) { MF_CHECKED } else { MF_UNCHECKED };
+            let _ = AppendMenuW(menu, MF_STRING | check, *id, PCWSTR(h.as_ptr()));
         }
     }
     let picked = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, x, y, None, (*app).hwnd, None).0 as usize;
@@ -315,7 +329,7 @@ pub(crate) unsafe fn crumb_dropdown(app: *mut App, index: usize) {
     let entries: Vec<(usize, String)> = items.iter().enumerate().map(|(i, it)| (i + 1, it.display_name())).collect();
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
-    let picked = popup(app, &entries, pt.x, pt.y);
+    let picked = popup(app, &entries, &[], pt.x, pt.y);
     if let Some(item) = picked.checked_sub(1).and_then(|i| items.get(i)) {
         go(app, Target::Pidl(folder.child_pidl(item)), nav::History::Push);
     }
@@ -346,8 +360,8 @@ pub(crate) unsafe fn more_menu(app: *mut App) {
         entries.push((HEADING, "Quick access".to_string()));
         entries.extend(quick.iter().enumerate().map(|(i, (label, _))| (QUICK + i, label.clone())));
     }
-    let r = toolbar::button_rect((*app).tools, CMD_MORE).unwrap_or_default();
-    let picked = popup(app, &entries, r.left, r.bottom);
+    let r = toolbar::button_rect((*app).cmdbar, CMD_MORE).unwrap_or_default();
+    let picked = popup(app, &entries, &[], r.left, r.bottom);
     if let Some((_, target)) = picked.checked_sub(QUICK).and_then(|i| quick.get(i)) {
         go(app, Target::Name(target.clone()), nav::History::Push);
     } else if picked != 0 {
@@ -416,7 +430,7 @@ pub(crate) unsafe fn on_palette(app: *mut App, hdr: &NMHDR) {
             go(app, Target::Name(target), nav::History::Push);
         }
     }
-    let _ = SetFocus(Some((*app).list));
+    let _ = SetFocus(Some(ui::view_hwnd(app)));
 }
 
 pub(crate) unsafe fn open_terminal(app: *mut App) {
@@ -428,7 +442,9 @@ pub(crate) unsafe fn open_terminal(app: *mut App) {
     }
 }
 
+/// The status bar and the command bar's enabled states.
 pub(crate) unsafe fn update_status(app: *mut App) {
+    commands::update(app);
     if cur(app).loading.is_some() {
         return statusbar::set_text((*app).status, "Loading…", &(*app).profile.name);
     }

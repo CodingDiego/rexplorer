@@ -222,8 +222,6 @@ pub(crate) unsafe fn apply(app: *mut App) {
     let a = &mut *app;
     let list = a.list;
     let view = a.views.view;
-    toolbar::set_checked(a.tools, CMD_VIEW1, view == View::Details);
-    toolbar::set_checked(a.tools, CMD_VIEW_GRID, view != View::Details);
     if view == View::Details {
         SendMessageW(list, LVM_SETVIEW, Some(WPARAM(LV_VIEW_DETAILS as usize)), None);
     } else {

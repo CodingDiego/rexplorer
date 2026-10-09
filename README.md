@@ -30,7 +30,7 @@ Folder of 100,000 files in `%TEMP%\rexplorer-bench`, release build, warm cache, 
 
 Decision: keep pure shell enumeration for every folder type. No filesystem fast path.
 
-## Features (Phase 1 and Phase 2 through step 5)
+## Features (Phase 1 and Phase 2 through step 6)
 
 Everything shown is a shell item: names, columns, icons, sorting, context menus, file operations, rename, live
 updates and drag and drop all come from the shell. rexplorer draws; the shell does the work.
@@ -39,6 +39,7 @@ updates and drag and drop all come from the shell. rexplorer draws; the shell do
 
 ![Light theme](docs/screenshots/light.png)
 ![Dark theme](docs/screenshots/dark.png)
+![Home](docs/screenshots/home.png)
 
 In the spirit of GNOME Files and the macOS Finder: one flat header bar, a sidebar of places, pill-shaped path and
 controls, the list and the preview in rounded cards, no 1 px borders. The frame, tab strip, header, sidebar and
@@ -47,9 +48,9 @@ The system title bar takes the `background` color, so it reads as part of the he
 
 ### Window
 
-Top to bottom: a tab strip of pill-shaped tabs; a 44 px header bar (a Back / Forward segment, Up, the path bar, a
-220 px search field, a list / grid view segment, Terminal, Connect, More); the places sidebar beside the list card
-and the preview card; a status bar (centered item and selection counts, search progress; the profile on the
+Top to bottom: a tab strip of pill-shaped tabs; a 44 px header bar (a Back / Forward segment, Up, Refresh, the
+path bar, a 220 px search field, Terminal, Connect); a 44 px command bar (below); the places sidebar beside the
+list card (or the Home page) and the preview card; a status bar (centered item and selection counts, search progress; the profile on the
 right). The 8 px gaps between the left pane and the cards are splitters (drag to resize, 120 to 600 px). The window
 follows the theme (title bar color, Mica when the theme asks for it, themed list, header, Edits and fonts that follow
 the monitor DPI). Minimum size 640x400.
@@ -87,8 +88,25 @@ Path bar: click a crumb to go there (the current folder, the last crumb, refresh
 subfolders (drive paths, UNC paths and This PC), a click on the empty area turns it into an address Edit (a path,
 a `shell:` name, a `::{CLSID}` or a path inside a .rar).
 
-View segment: the list button is the details view; the grid button switches to icons (96 px), and to thumbnails
-(128 px) when already in a grid view.
+Command bar, as in Windows 11 Explorer: **New** v (Folder, which is created and then renamed in place, then the
+shell's own New submenu: shortcut, text document and so on) | **Cut**, **Copy**, **Paste**, **Rename**, **Delete**
+| **Sort** v (the listing's columns, the active one checked, then Ascending / Descending), **View** v (Details,
+Icons, Thumbnails, then Sidebar, Folder tree and Preview pane, all with checks) | **More** (...), and on the right
+a **Preview** toggle. The buttons are enabled from the current state and update on a selection change, a tab
+switch, the end of a load and a clipboard change: Cut and Rename need a shell folder (Rename exactly one item),
+Copy and Delete also work on search results, Paste needs files on the clipboard, New and Sort are off on Home.
+Delete with Shift deletes permanently, as in the list. Cut, Copy, Paste, Rename and Delete run the shell's own
+verbs. The old list / grid view segment is gone: the views are in View v and on Ctrl+Shift+1/2/3.
+
+Home page: Home and Quick Access open a page of their own in the list's place, drawn like Explorer's: a "Quick
+access" title, a responsive grid of 300x72 folder tiles (40 px icon, name, the parent folder relative to the
+profile, a pin glyph), a "Recent" pill and a table of the recent files (icon, name with its folder below, Date
+modified, Type, Size; column titles from the shell, so localized), newest access first. It scrolls (wheel and
+scroll bar) and follows the theme and the DPI. Hover, click (Ctrl+click toggles), double-click or Enter opens;
+right-click shows the shell's context menu, with **Unpin from Home** on tiles; Up / Down / Home / End move,
+Ctrl+A selects the rows, Delete deletes, F5 refreshes, F2 renames in place. The status bar, the preview pane and
+the command bar follow its selection. With no recent files the table reads "No recent files". While Home loads,
+the list's placeholder rows show as for any folder.
 
 More menu: Folder tree, Pin to Home, Open in Explorer, register / unregister as the folder handler, the settings
 folder, About, and **Quick access**: the profile's bookmarks and the cloud-sync roots.
@@ -142,7 +160,7 @@ folder, About, and **Quick access**: the profile's bookmarks and the cloud-sync 
 | Ctrl+` | Terminal (Windows Terminal, else cmd) in the current filesystem folder |
 | Ctrl+B | Show / hide the sidebar (hides the folder tree when that is showing instead) |
 | Alt+P | Show / hide the preview pane (text in a monospace Edit, preview handlers in place, else a thumbnail) |
-| Ctrl+Shift+1 / 2 / 3, view segment | Details / icons (96 px) / thumbnails (128 px) |
+| Ctrl+Shift+1 / 2 / 3, View menu | Details / icons (96 px) / thumbnails (128 px) |
 | Connect button | FTP dialog (host, port, user, password, path); the `ftp://` URL opens in a new tab |
 
 Shortcuts work while the tree, the search box or the embedded Explorer view has the focus, except Enter and
@@ -243,9 +261,14 @@ Ctrl+B hides the sidebar), Home (a first run without folders shows it, and it is
 shell-built sidebar (a Recycle Bin row in Favorites, a C:\ row under This PC), the loading state (a click on
 Network shows its name and "Loading…" within 150 ms, then the emptied list), and pins (Ctrl+D on a temp folder puts
 it in Quick Access, its sidebar row's Unpin from Home takes it out; the test always unpins, so Quick Access is left
-as found). `-Only <regex>` runs the matching checks. Checks that write settings run on a scratch `APPDATA`. The
+as found), the command bar (Cut is disabled with no selection; after Home in a temp folder Cut, Copy, Rename and
+Delete are enabled; a Copy click enables Paste; a Paste click adds the copy), the Home page (a first run shows
+RexHome with tiles and rows and the list hidden; a click on the C:\ row brings the list back) and the View menu
+(a View click opens a popup menu that Escape closes). `-Only <regex>` runs the matching checks. Checks that write settings run on a scratch `APPDATA`. The
 keyboard checks need an interactive desktop that lets the window come to the foreground; they report SKIP otherwise.
-`smoke.ps1 -Screenshots` also writes `docs\screenshots\dark.png` and `light.png`.
+`smoke.ps1 -Screenshots` also writes `docs\screenshots\dark.png`, `light.png` and `home.png` (rendered with
+`PrintWindow`, so nothing else on the screen is captured; home.png shows the machine's own Quick Access and recent
+files).
 
 ### Known gaps
 
@@ -256,8 +279,10 @@ keyboard checks need an interactive desktop that lets the window come to the for
 - Search result icons come from the extension (no per-file icons such as an exe's own).
 - Only .rar archives get the archive view (zip is the shell's); multi-volume and encrypted .rar are untested.
 - The embedded Explorer view keeps Windows' own colors, not the theme.
-- Home lists its pinned folders above its recent files (folders sort first) but without group headers: the
-  ListView is owner-data, which only groups through an undocumented callback interface.
+- Home page: no Share button in the command bar, and only the Recent pill (no Favorites or Shared pills); the
+  Recent table leaves out Explorer's Activity and location-status columns; Sort is disabled on Home (tiles keep the
+  shell's order, files are newest-accessed first); every tile shows the pin glyph (no property found that tells a
+  pinned folder from a frequent one); tile subtitles are computed from the path, not read from the shell.
 - Every Quick Access folder in the sidebar offers Unpin from Home; on a frequent (not pinned) one the shell may
   refuse the verb, and rexplorer then beeps (untested: no frequent-only folder was tried).
 - The sidebar is mouse-only (no keyboard focus). Rounded corners are drawn with GDI, so they are not antialiased.

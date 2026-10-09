@@ -62,6 +62,13 @@ pub(crate) struct Listing {
     /// Shell column index, not header position.
     pub sort_col: u32,
     pub sort_desc: bool,
+    /// Home and Quick Access: what the Home page shows, built with the listing.
+    pub home: Option<home::Content>,
+}
+
+/// Home or Quick Access: shown on the Home page instead of the list.
+pub(crate) fn is_home(l: &Listing) -> bool {
+    [HOME, QUICK_ACCESS].iter().any(|h| l.folder.parsing_name.eq_ignore_ascii_case(h))
 }
 
 pub(crate) struct Tab {
@@ -128,6 +135,7 @@ pub(crate) unsafe fn navigate(app: *mut App, t: usize, target: Target, history: 
     let Some(tab) = (&mut (*app).tabs).get_mut(t) else { return };
     tab.pending = generation;
     if history != History::Refresh {
+        (*app).new_item = None;
         let (name, parsing) = destination(&target);
         tabs::set_title((*app).strip, t, &name);
         tab.loading = Some(Loading { name, parsing, since: Instant::now() });
@@ -173,7 +181,11 @@ fn load(target: Target) -> std::result::Result<Loaded, LoadError> {
     items.retain(|i| !i.is_hidden());
     let columns = folder.columns();
     let icons = vec![ICON_UNKNOWN; items.len()];
-    Ok(Loaded { source: Source::Shell(Listing { folder, items, columns, icons, sort_col: 0, sort_desc: false }), crumbs, icon })
+    let mut l = Listing { folder, items, columns, icons, sort_col: 0, sort_desc: false, home: None };
+    if is_home(&l) {
+        l.home = Some(home::build(&l.folder, &l.items));
+    }
+    Ok(Loaded { source: Source::Shell(l), crumbs, icon })
 }
 
 fn folder_icon(pidl: &Pidl) -> (usize, i32) {
@@ -285,6 +297,7 @@ pub(crate) unsafe fn on_enum_done(app: *mut App, done: Box<EnumDone>) {
     tab.source = Some(src);
     if active {
         show(app, if refresh { Show::Restore { top, selected: keep, columns: false } } else { Show::Fresh(keep) });
+        commands::rename_new_item(app);
     } else {
         tab.top = top;
         tab.selected = keep;
@@ -320,6 +333,7 @@ unsafe fn show_source(app: *mut App, mode: Show) {
         set_text((*app).addr, &tab.name);
         set_text(hwnd, "rexplorer");
         ui::set_crumbs(app);
+        sync_home(app);
         update_chrome(app);
         return;
     };
@@ -398,7 +412,71 @@ unsafe fn show_source(app: *mut App, mode: Show) {
     if (*app).session.show_tree && (*app).panes.tree.is_none() {
         SetTimer(Some(hwnd), TIMER_TREE, 1, None);
     }
+    sync_home(app);
     update_chrome(app);
+}
+
+// ---- the Home page ----------------------------------------------------------------------------------
+
+/// Shows the Home page in the list's place when the active tab is Home or Quick Access (and not showing the
+/// skeleton), with the list's selection; otherwise the list. The hidden list keeps the items and mirrors the
+/// page's selection, so every command, the status bar and the preview work on the page as on the list.
+pub(crate) unsafe fn sync_home(app: *mut App) {
+    let shown = match source(app) {
+        Some(Source::Shell(l)) if !(*app).skeleton => l.home.as_ref().map(|c| (l, c)),
+        _ => None,
+    };
+    let Some((l, content)) = shown else { return show_home(app, false) };
+    let index: std::collections::HashMap<String, usize> = l.items.iter().enumerate().map(|(i, it)| (it.parsing_name().to_lowercase(), i)).collect();
+    let mut content = content.clone();
+    for e in content.tiles.iter_mut().chain(content.rows.iter_mut()) {
+        e.index = index.get(&e.key.to_lowercase()).copied().unwrap_or(usize::MAX);
+    }
+    let (h, list) = ((*app).home, (*app).list);
+    home::set_content(h, content);
+    let focus = SendMessageW(list, LVM_GETNEXTITEM, Some(WPARAM(usize::MAX)), Some(LPARAM(LVNI_FOCUSED as isize))).0;
+    home::set_selection(h, &list::selected_indices(list), usize::try_from(focus).ok());
+    show_home(app, true);
+}
+
+/// Swaps the Home page and the list (the embedded browser, when it shows, keeps the list hidden); the keyboard
+/// focus follows.
+unsafe fn show_home(app: *mut App, on: bool) {
+    let (h, list) = ((*app).home, (*app).list);
+    if IsWindowVisible(h).as_bool() == on {
+        return;
+    }
+    let focus = GetFocus();
+    let _ = ShowWindow(h, if on { SW_SHOW } else { SW_HIDE });
+    if (*app).browser.is_none() {
+        let _ = ShowWindow(list, if on { SW_HIDE } else { SW_SHOW });
+    }
+    if focus == h || focus == list {
+        let _ = SetFocus(Some(ui::view_hwnd(app)));
+    }
+}
+
+/// WM_NOTIFY from the Home page.
+pub(crate) unsafe fn on_home_notify(app: *mut App, nm: &home::NmHome) {
+    let list = (*app).list;
+    match nm.hdr.code {
+        home::HN_SELCHANGE => {
+            let (sel, focus) = home::selection((*app).home);
+            let none = LIST_VIEW_ITEM_STATE_FLAGS(0);
+            list::set_item_state(list, usize::MAX, none, LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0));
+            for i in sel {
+                list::set_item_state(list, i, LVIS_SELECTED, LVIS_SELECTED);
+            }
+            if let Some(f) = focus {
+                list::set_item_state(list, f, LVIS_FOCUSED, LVIS_FOCUSED);
+            }
+        }
+        home::HN_ACTIVATE => source::activate(app, nm.index),
+        home::HN_CONTEXT => list::show_menu(app, nm.index != usize::MAX),
+        home::HN_KEYDOWN => list::on_key(app, VIRTUAL_KEY(nm.index as u16)),
+        home::HN_RENAME => list::rename_item(app, nm.index, &home::rename_text((*app).home)),
+        _ => {}
+    }
 }
 
 /// Toolbar enabled states and the status bar, after anything that changes the active tab.
@@ -448,6 +526,11 @@ pub(crate) unsafe fn set_columns(app: *mut App, columns: &[Column]) {
 /// left (a change in it, a tab switch) would cancel the navigation.
 pub(crate) unsafe fn refresh(app: *mut App) {
     if cur(app).loading.is_some() {
+        return;
+    }
+    // A reload would end a rename in progress (a new item's, right after its creation): wait for it.
+    if SendMessageW((*app).list, LVM_GETEDITCONTROL, None, None).0 != 0 {
+        SetTimer(Some((*app).hwnd), TIMER_REFRESH, 500, None);
         return;
     }
     let target = match source(app) {
@@ -615,6 +698,7 @@ unsafe fn begin_skeleton(app: *mut App) {
     }
     save_view_state(app);
     (*app).skeleton = true;
+    show_home(app, false);
     let list = (*app).list;
     views::reset(app, 0);
     SendMessageW(list, LVM_SETITEMCOUNT, Some(WPARAM(0)), Some(LPARAM(0)));

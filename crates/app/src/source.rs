@@ -303,7 +303,7 @@ pub(crate) unsafe fn archive_menu(app: *mut App) {
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
     let entries = [(1, "Extract all to...".to_string()), (2, "Extract here".to_string())];
-    let dest = match ui::popup(app, &entries, pt.x, pt.y) {
+    let dest = match ui::popup(app, &entries, &[], pt.x, pt.y) {
         1 => pick_folder((*app).hwnd),
         2 => archive.parent().map(|p| p.to_path_buf()),
         _ => None,
@@ -512,7 +512,7 @@ fn usn_search(cache: &UsnCache, drive: char, needle: &str, cancel: &AtomicBool, 
 }
 
 /// A filesystem path as a shell item of its parent folder.
-fn hit_for_path(path: &Path) -> Option<Hit> {
+pub(crate) fn hit_for_path(path: &Path) -> Option<Hit> {
     unsafe {
         let wide = HSTRING::from(path.as_os_str());
         let mut abs: *mut ITEMIDLIST = std::ptr::null_mut();
@@ -603,13 +603,13 @@ pub(crate) unsafe extern "system" fn search_subclass(hwnd: HWND, msg: u32, wpara
     match msg {
         WM_KEYDOWN if wparam.0 == VK_RETURN.0 as usize => {
             let text = window_text(hwnd);
-            let _ = SetFocus(Some((*app).list));
+            let _ = SetFocus(Some(ui::view_hwnd(app)));
             start_search(app, (*app).active, &text, true);
             LRESULT(0)
         }
         WM_KEYDOWN if wparam.0 == VK_ESCAPE.0 as usize => {
             cancel_search(app);
-            let _ = SetFocus(Some((*app).list));
+            let _ = SetFocus(Some(ui::view_hwnd(app)));
             LRESULT(0)
         }
         // No beep for Enter and Escape in a single-line Edit.

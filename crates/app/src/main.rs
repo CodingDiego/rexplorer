@@ -7,7 +7,9 @@
 mod archive_view;
 #[allow(dead_code)] // parts of the API are for later steps
 mod breadcrumb;
+mod commands;
 mod connect;
+mod home;
 #[allow(dead_code)] // parts of the API are for later steps
 mod instance;
 mod list;
@@ -85,6 +87,8 @@ const ID_PALETTE: usize = 107;
 const ID_PREVIEW: usize = 108;
 const ID_SEARCH: usize = 109;
 const ID_SIDEBAR: usize = 110;
+const ID_CMDBAR: usize = 111;
+const ID_HOME: usize = 112;
 
 const CMD_BACK: u16 = 1;
 const CMD_FORWARD: u16 = 2;
@@ -111,8 +115,6 @@ const CMD_ABOUT: u16 = 22;
 const CMD_TOGGLE_SIDEBAR: u16 = 23;
 const CMD_TOGGLE_PREVIEW: u16 = 24;
 const CMD_SEARCH: u16 = 28;
-/// The grid half of the view segment: icons, or thumbnails when already in a grid view.
-const CMD_VIEW_GRID: u16 = 29;
 /// More > Folder tree: the tree instead of the sidebar.
 const CMD_FOLDER_TREE: u16 = 30;
 /// Ctrl+Shift+1..3 send CMD_VIEW1..CMD_VIEW1 + 2 (details, icons, thumbnails).
@@ -121,6 +123,15 @@ const CMD_VIEW1: u16 = 25;
 const CMD_TAB1: u16 = 31;
 /// Ctrl+D: pin the selected folders (or the current one) to Home.
 const CMD_PIN: u16 = 40;
+/// The command bar: New v, Cut, Copy, Paste, Rename, Delete, Sort v, View v.
+const CMD_NEW: u16 = 41;
+const CMD_CUT: u16 = 42;
+const CMD_COPY: u16 = 43;
+const CMD_PASTE: u16 = 44;
+const CMD_RENAME: u16 = 45;
+const CMD_DELETE: u16 = 46;
+const CMD_SORT: u16 = 47;
+const CMD_VIEW_MENU: u16 = 48;
 
 const fn accel(flags: u8, key: VIRTUAL_KEY, cmd: u16) -> ACCEL {
     ACCEL { fVirt: ACCEL_VIRT_FLAGS(FVIRTKEY.0 | flags), key: key.0, cmd }
@@ -165,6 +176,12 @@ pub(crate) struct App {
     palette: HWND,
     search: HWND,
     sidebar: HWND,
+    /// The command bar under the header.
+    cmdbar: HWND,
+    /// The Home page, shown in the list's place on Home and Quick Access.
+    home: HWND,
+    /// After New > ...: start renaming the item that appears in this folder (parsing name, names before).
+    new_item: Option<(String, std::collections::HashSet<String>)>,
     /// The rounded field the window paints behind the search Edit.
     search_field: RECT,
     /// Owned copy of the current folder's icon shown in the breadcrumb.
@@ -273,6 +290,9 @@ fn main() -> Result<()> {
             palette: HWND::default(),
             search: HWND::default(),
             sidebar: HWND::default(),
+            cmdbar: HWND::default(),
+            home: HWND::default(),
+            new_item: None,
             search_field: RECT::default(),
             crumb_icon: HICON::default(),
             font: HFONT::default(),
@@ -322,7 +342,7 @@ fn main() -> Result<()> {
             // search box's Enter / Escape keep their keys. Key messages go to the focus window, so their target
             // is the focus (and a key posted to one control is not taken for another).
             let focus = msg.hwnd;
-            let ours = focus == (*app).list || focus == (*app).addr || focus == hwnd || pane_accel(app, &msg, focus);
+            let ours = focus == (*app).list || focus == (*app).home || focus == (*app).addr || focus == hwnd || pane_accel(app, &msg, focus);
             if ours && TranslateAcceleratorW(hwnd, accel_table, &msg) != 0 {
                 continue;
             }
@@ -412,8 +432,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
         WM_SETFOCUS => {
-            let _ = SetFocus(Some(source::browser_hwnd(app).unwrap_or((*app).list)));
+            let _ = SetFocus(Some(source::browser_hwnd(app).unwrap_or_else(|| ui::view_hwnd(app))));
         }
+        WM_CLIPBOARDUPDATE => commands::update(app),
         WM_NOTIFY => return on_notify(app, lparam),
         WM_COMMAND => {
             let (id, code) = (wparam.0 & 0xFFFF, (wparam.0 >> 16) & 0xFFFF);
@@ -519,6 +540,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
             }
             (*app).browser = None;
+            let _ = windows::Win32::System::DataExchange::RemoveClipboardFormatListener(hwnd);
             rexplorer_core::dragdrop::unregister((*app).list);
             views::destroy(app);
             (*app).panes.tree = None;
@@ -534,6 +556,10 @@ unsafe fn on_notify(app: *mut App, lparam: LPARAM) -> LRESULT {
     let from = hdr.hwndFrom;
     if from == (*app).list {
         return list::on_notify(app, lparam);
+    }
+    if from == (*app).home {
+        nav::on_home_notify(app, &*(lparam.0 as *const home::NmHome));
+        return LRESULT(0);
     }
     if from == (*app).strip {
         let nm = &*(lparam.0 as *const tabs::NmTab);
@@ -605,7 +631,7 @@ unsafe fn on_command(app: *mut App, cmd: u16) {
                 } else {
                     go(app, nav::Target::Name(text.trim().to_string()), nav::History::Push);
                 }
-                let _ = SetFocus(Some(list));
+                let _ = SetFocus(Some(ui::view_hwnd(app)));
             } else {
                 let i = SendMessageW(list, LVM_GETNEXTITEM, Some(WPARAM(usize::MAX)), Some(LPARAM(LVNI_FOCUSED as isize))).0;
                 if i >= 0 {
@@ -616,7 +642,7 @@ unsafe fn on_command(app: *mut App, cmd: u16) {
         CMD_ESCAPE => {
             if GetFocus() == addr {
                 // Losing focus hides the Edit and restores its text.
-                let _ = SetFocus(Some(list));
+                let _ = SetFocus(Some(ui::view_hwnd(app)));
             } else {
                 source::cancel_search(app);
             }
@@ -635,10 +661,14 @@ unsafe fn on_command(app: *mut App, cmd: u16) {
         CMD_PALETTE => ui::open_palette(app),
         CMD_TERMINAL => ui::open_terminal(app),
         CMD_VIEW => views::set_view(app, (*app).views.view.next()),
-        CMD_VIEW_GRID => {
-            let next = if (*app).views.view == views::View::Icons { views::View::Thumbnails } else { views::View::Icons };
-            views::set_view(app, next);
-        }
+        CMD_NEW => commands::new_menu(app),
+        CMD_CUT => list::verb_on_selection(app, "cut", false),
+        CMD_COPY => list::verb_on_selection(app, "copy", false),
+        CMD_PASTE => list::verb_on_background(app, "paste"),
+        CMD_RENAME => list::begin_rename(app),
+        CMD_DELETE => list::verb_on_selection(app, "delete", GetKeyState(VK_SHIFT.0 as i32) < 0),
+        CMD_SORT => commands::sort_menu(app),
+        CMD_VIEW_MENU => commands::view_menu(app),
         CMD_VIEW1 => views::set_view(app, views::View::Details),
         c if c == CMD_VIEW1 + 1 => views::set_view(app, views::View::Icons),
         c if c == CMD_VIEW1 + 2 => views::set_view(app, views::View::Thumbnails),

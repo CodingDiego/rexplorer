@@ -1,5 +1,5 @@
 # rexplorer smoke test. Windows PowerShell 5.1. Prints one PASS/FAIL/SKIP line per check, always exits 0.
-# -Screenshots also writes docs\screenshots\dark.png and light.png (the window must be able to come to the front).
+# -Screenshots also writes docs\screenshots\dark.png, light.png and home.png (rendered with PrintWindow).
 # -Only <regex> runs just the checks whose names match.
 param([switch]$Screenshots, [string]$Only)
 $ErrorActionPreference = 'Stop'
@@ -31,6 +31,14 @@ public static class W {
   [DllImport("gdi32.dll")] public static extern bool DeleteObject(IntPtr h);
   [DllImport("user32.dll")] public static extern int GetWindowRgn(IntPtr h, IntPtr rgn);
   [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int attr, out RECT r, int size);
+  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr dc, uint flags);
+  [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
+  // The direct child of `parent` with window class `cls` that answers SendMessage(msg, w) with >= 0.
+  public static IntPtr ChildAnswering(IntPtr parent, string cls, uint msg, int w) {
+    IntPtr h = IntPtr.Zero;
+    while ((h = FindWindowEx(parent, h, cls, null)) != IntPtr.Zero) { if ((long)SendMessage(h, msg, (IntPtr)w, IntPtr.Zero) >= 0) return h; }
+    return IntPtr.Zero;
+  }
   // Region type of a window's region: 0 none (ERROR), 1 NULLREGION, 2 SIMPLEREGION, 3 COMPLEXREGION (rounded).
   public static int RegionType(IntPtr h) { IntPtr r = CreateRectRgn(0, 0, 0, 0); int t = GetWindowRgn(h, r); DeleteObject(r); return t; }
   public static int Width(IntPtr h) { RECT r; GetWindowRect(h, out r); return r.R - r.L; }
@@ -627,26 +635,98 @@ Run-Check 'pin' {
   }
 }
 
+# The command bar is the RexToolbar that has a Cut button (command 42). WM_APP+0x44 answers a button's state
+# (-1 none, 1 enabled, +2 checked), WM_APP+0x45 its center x.
+function Get-CmdBar { [W]::ChildAnswering($script:main, 'RexToolbar', 0x8044, 42) }
+function Get-ButtonState($bar, $cmd) { [int][W]::SendMessage($bar, 0x8044, [IntPtr]$cmd, [IntPtr]::Zero) }
+function Click-Button($bar, $cmd) {
+  $x = [int][W]::SendMessage($bar, 0x8045, [IntPtr]$cmd, [IntPtr]::Zero)
+  $r = New-Object W+RECT; $null = [W]::GetClientRect($bar, [ref]$r)
+  $at = [IntPtr]((([int]($r.B / 2)) -shl 16) -bor $x)
+  $null = [W]::PostMessage($bar, 0x201, [IntPtr]1, $at); $null = [W]::PostMessage($bar, 0x202, [IntPtr]0, $at)
+}
+
+Run-Check 'commandbar' {
+  $dir = Join-Path $env:TEMP "rexplorer-smoke-cmd-$PID"
+  New-Item -ItemType Directory -Path $dir -Force | Out-Null
+  Set-Content -Path (Join-Path $dir 'file000000.txt') -Value 'x'
+  try {
+    if (-not (Launch-Fresh $dir)) { return @('FAIL', 'no main window within 5 s') }
+    if (-not (Wait-Until { (Get-Count $script:main) -eq 1 } 4000)) { return @('FAIL', "count=$(Get-Count $script:main)") }
+    $bar = Get-CmdBar
+    if ($bar -eq [IntPtr]::Zero) { return @('FAIL', 'no RexToolbar with a Cut button') }
+    $cut0 = Get-ButtonState $bar 42
+    # Home selects file000000.txt; the buttons follow the selection.
+    $null = [W]::PostMessage((Get-List $script:main), 0x100, [IntPtr]0x24, [IntPtr]::Zero)
+    $on = Wait-Until { @(42, 43, 45, 46 | Where-Object { ((Get-ButtonState $bar $_) -band 1) -eq 0 }).Count -eq 0 } 2000
+    Click-Button $bar 43
+    $paste = Wait-Until { ((Get-ButtonState $bar 44) -band 1) -eq 1 } 3000
+    Click-Button $bar 44
+    $copied = Wait-Until { (Get-Count $script:main) -eq 2 } 3000
+    $d = "Cut with no selection=$cut0 (0 = disabled); after Home Cut/Copy/Rename/Delete enabled=$on; Copy click -> Paste enabled=$paste; Paste click -> count $(Get-Count $script:main) (want 2)"
+    if ($cut0 -eq 0 -and $on -and $paste -and $copied) { @('PASS', $d) } else { @('FAIL', $d) }
+  } finally { Remove-Fresh; Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Run-Check 'home-page' {
+  try {
+    if (-not (Launch-Fresh $null)) { return @('FAIL', 'no main window within 5 s') }
+    $script:homePage = [IntPtr]::Zero
+    $shown = Wait-Until { $script:homePage = [W]::FindWindowEx($script:main, [IntPtr]::Zero, 'RexHome', [NullString]::Value); $script:homePage -ne [IntPtr]::Zero -and [W]::IsWindowVisible($script:homePage) } 4000
+    if (-not $shown) { return @('FAIL', "RexHome present=$($script:homePage -ne [IntPtr]::Zero), not visible after 4 s") }
+    # WM_APP+0x52: tiles << 16 | rows.
+    $n = [int64][W]::SendMessage($script:homePage, 0x8052, [IntPtr]::Zero, [IntPtr]::Zero)
+    $tiles = $n -shr 16; $rows = $n -band 0xFFFF
+    $listHidden = -not [W]::IsWindowVisible((Get-List $script:main))
+    $sb = Get-Sidebar
+    $i = Find-Row $sb 'C:\' 5000
+    if ($i -lt 0) { return @('FAIL', "tiles=$tiles rows=$rows; no C:\ sidebar row") }
+    $null = Click-Row $sb $i
+    $back = Wait-Until { -not [W]::IsWindowVisible($script:homePage) -and [W]::IsWindowVisible((Get-List $script:main)) -and (Get-Count $script:main) -gt 0 } 4000
+    $d = "RexHome visible with tiles=$tiles rows=$rows, ListView hidden=$listHidden; C:\ row -> list back, RexHome hidden=$back"
+    if ($tiles -gt 0 -and $rows -ge 0 -and $listHidden -and $back) { @('PASS', $d) } else { @('FAIL', $d) }
+  } finally { Remove-Fresh }
+}
+
+Run-Check 'view-menu' {
+  try {
+    if (-not (Launch-Fresh 'C:\Windows')) { return @('FAIL', 'no main window within 5 s') }
+    Wait-Until { (Get-Count $script:main) -ge 1 } 3000 | Out-Null
+    $bar = Get-CmdBar
+    if ($bar -eq [IntPtr]::Zero) { return @('FAIL', 'no command bar') }
+    Click-Button $bar 48
+    $script:menu = [IntPtr]::Zero
+    $open = Wait-Until { $script:menu = [W]::FindOfProcess([uint32]$script:cur.Id, '#32768'); $script:menu -ne [IntPtr]::Zero -and [W]::IsWindowVisible($script:menu) } 2000
+    if (-not $open) { return @('FAIL', 'View click showed no popup menu') }
+    $null = [W]::PostMessage($script:menu, 0x100, [IntPtr]0x1B, [IntPtr]::Zero)
+    $closed = Wait-Until { $m = [W]::FindOfProcess([uint32]$script:cur.Id, '#32768'); $m -eq [IntPtr]::Zero -or -not [W]::IsWindowVisible($m) } 2000
+    $alive = -not $script:cur.HasExited
+    $d = "View click -> popup menu; Escape closed it=$closed; alive=$alive"
+    if ($closed -and $alive) { @('PASS', $d) } else { @('FAIL', $d) }
+  } finally { Remove-Fresh }
+}
+
 # Window screenshots for the README: dark on C:\Windows (details, a row selected), light on the wallpapers with
-# the preview pane. CopyFromScreen of the window's frame bounds, so the window has to be in front.
-function Save-Shot($theme, $folder, $preview, $file) {
+# the preview pane, dark on Home. PrintWindow renders the window itself, so nothing else on screen is captured.
+function Save-Shot($theme, $folder, $preview, $file, $place) {
   $script:fake = Join-Path $env:TEMP "rexplorer-smoke-appdata-$PID"
   Remove-Item $script:fake -Recurse -Force -ErrorAction SilentlyContinue
   New-Item -ItemType Directory -Path (Join-Path $script:fake 'rexplorer') -Force | Out-Null
   $ini = "[general]`r`nprofile=default`r`n[profile default]`r`ntheme=$theme`r`nshow_preview=$preview`r`n"
   Set-Content -Path (Join-Path $script:fake 'rexplorer\settings.ini') -Value $ini
+  if ($place) { Set-Content -Path (Join-Path $script:fake 'rexplorer\window.txt') -Value $place }
   $appdata = $env:APPDATA
   try { $env:APPDATA = $script:fake; $null = Launch $folder } finally { $env:APPDATA = $appdata }
   Wait-Until { (Get-Count $script:main) -ge 1 } 3000 | Out-Null
-  if (-not (Set-Foreground $script:main)) { return @('SKIP', 'could not activate') }
+  $null = Set-Foreground $script:main
   $list = Get-List $script:main
   foreach ($k in 0x24, 0x28, 0x28) { $null = [W]::PostMessage($list, 0x100, [IntPtr]$k, [IntPtr]::Zero) }
-  Start-Sleep -Milliseconds 1500
+  Start-Sleep -Milliseconds 2000
   $r = New-Object W+RECT
-  $null = [W]::DwmGetWindowAttribute($script:main, 9, [ref]$r, 16)  # DWMWA_EXTENDED_FRAME_BOUNDS
+  $null = [W]::GetWindowRect($script:main, [ref]$r)
   $bmp = New-Object System.Drawing.Bitmap ($r.R - $r.L), ($r.B - $r.T)
   $g = [System.Drawing.Graphics]::FromImage($bmp)
-  $g.CopyFromScreen($r.L, $r.T, 0, 0, $bmp.Size)
+  $hdc = $g.GetHdc(); $null = [W]::PrintWindow($script:main, $hdc, 2); $g.ReleaseHdc($hdc)  # PW_RENDERFULLCONTENT
   $bmp.Save($file, [System.Drawing.Imaging.ImageFormat]::Png)
   $g.Dispose(); $bmp.Dispose()
   @('PASS', "$file ($($r.R - $r.L)x$($r.B - $r.T))")
@@ -657,5 +737,6 @@ if ($Screenshots) {
   New-Item -ItemType Directory -Path $shots -Force | Out-Null
   Run-Check 'screenshot-dark' { try { Save-Shot 'dark' 'C:\Windows' 'false' (Join-Path $shots 'dark.png') } finally { Remove-Fresh } }
   Run-Check 'screenshot-light' { try { Save-Shot 'light' 'C:\Windows\Web\Wallpaper\Windows' 'true' (Join-Path $shots 'light.png') } finally { Remove-Fresh } }
+  Run-Check 'screenshot-home' { try { Save-Shot 'dark' $null 'false' (Join-Path $shots 'home.png') '1 40 40 1480 1040' } finally { Remove-Fresh } }
 }
 exit 0

@@ -175,6 +175,7 @@ pub(crate) unsafe fn toggle_preview(app: *mut App) {
         // Releases a hosted preview handler.
         preview_pane::show((*app).panes.preview, None);
     }
+    commands::update(app);
     nav::session_changed(app);
 }
 
@@ -210,6 +211,7 @@ pub(crate) unsafe fn layout(app: *mut App, top: i32, bottom: i32, w: i32) {
         left = tw + gap;
     }
     let _ = MoveWindow(a.list, left, top, (right - left).max(0), h, true);
+    let _ = MoveWindow(a.home, left, top, (right - left).max(0), h, true);
     a.panes.list_rect = RECT { left, top, right: right.max(left), bottom: top + h };
     if let Some(b) = &a.browser {
         let _ = b.set_rect(a.panes.list_rect);
@@ -305,7 +307,7 @@ pub(crate) unsafe fn sidebar_menu(app: *mut App, index: usize) {
     let target = sidebar::target((*app).sidebar, index);
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
-    if ui::popup(app, &[(1, text.to_string())], pt.x, pt.y) != 1 {
+    if ui::popup(app, &[(1, text.to_string())], &[], pt.x, pt.y) != 1 {
         return;
     }
     match kind {

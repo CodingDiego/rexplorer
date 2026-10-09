@@ -5,8 +5,9 @@ use windows::Win32::UI::Shell::{
     GCS_VERBW, IContextMenu, IContextMenu2, IContextMenu3, SEE_MASK_UNICODE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreatePopupMenu, DestroyMenu, GMDI_GOINTOPOPUPS, GetMenuDefaultItem, HMENU, InsertMenuW, MF_BYPOSITION,
-    MF_SEPARATOR, MF_STRING, SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx,
+    CreatePopupMenu, DestroyMenu, GMDI_GOINTOPOPUPS, GetMenuDefaultItem, GetMenuItemCount, GetMenuItemID,
+    GetMenuStringW, GetSubMenu, HMENU, InsertMenuW, MF_BYPOSITION, MF_SEPARATOR, MF_STRING, SW_SHOWNORMAL,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WM_INITMENUPOPUP,
 };
 use windows::core::{HSTRING, Interface, PCSTR, PCWSTR, PSTR, Result};
 
@@ -113,6 +114,50 @@ impl ContextMenu {
         }
     }
 
+    /// The entries of a background menu's "New" submenu: (command id, text) in menu order, without separators and
+    /// without the folder entry (canonical verb "NewFolder", which is how the submenu is recognized: its title is
+    /// localized). Empty when the menu has no such submenu. Run an entry with `invoke_command` on this same menu.
+    pub fn new_items(&self) -> Result<Vec<(u32, String)>> {
+        unsafe {
+            self.menu.QueryContextMenu(self.hmenu, 0, ID_FIRST, ID_LAST, CMF_NORMAL).ok()?;
+            for pos in 0..GetMenuItemCount(Some(self.hmenu)) {
+                let sub = GetSubMenu(self.hmenu, pos);
+                if sub.is_invalid() {
+                    continue;
+                }
+                // The shell fills some submenus, New among them, only when they open.
+                self.handle_message(WM_INITMENUPOPUP, WPARAM(sub.0 as usize), LPARAM(pos as isize));
+                let mut entries = Vec::new();
+                let mut found = false;
+                for i in 0..GetMenuItemCount(Some(sub)) {
+                    let id = GetMenuItemID(sub, i);
+                    if !(ID_FIRST..=ID_LAST).contains(&id) {
+                        continue; // separators and nested submenus
+                    }
+                    if self.verb_of(id - ID_FIRST).eq_ignore_ascii_case("NewFolder") {
+                        found = true;
+                        continue;
+                    }
+                    let mut buf = [0u16; 128];
+                    let n = GetMenuStringW(sub, i as u32, Some(&mut buf), MF_BYPOSITION).max(0) as usize;
+                    let text = String::from_utf16_lossy(&buf[..n]);
+                    if !text.is_empty() {
+                        entries.push((id, text));
+                    }
+                }
+                if found {
+                    return Ok(entries);
+                }
+            }
+            Ok(Vec::new())
+        }
+    }
+
+    /// Runs an entry by the id `new_items` gave it.
+    pub fn invoke_command(&self, hwnd: HWND, id: u32) -> Result<()> {
+        unsafe { self.invoke_id(hwnd, id - ID_FIRST, None, false) }
+    }
+
     unsafe fn invoke_id(&self, hwnd: HWND, id: u32, at: Option<POINT>, shift: bool) -> Result<()> {
         // MAKEINTRESOURCE: the verb pointer carries the command id in its low word.
         unsafe { self.invoke(hwnd, PCSTR(id as usize as *const u8), PCWSTR(id as usize as *const u16), at, shift) }
@@ -188,5 +233,21 @@ mod tests {
         let m = ContextMenu::for_items(&f, &first, HWND::default()).unwrap();
         unsafe { m.menu.QueryContextMenu(m.hmenu, 0, ID_FIRST, ID_LAST, CMF_NORMAL).ok().unwrap() };
         assert!(ContextMenu::for_background(&f, HWND::default()).is_ok());
+    }
+
+    #[test]
+    fn background_new_submenu_and_new_folder() {
+        let _c = ComInit::sta();
+        let dir = std::env::temp_dir().join(format!("rexplorer-newmenu-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = ShellFolder::parse(dir.to_str().unwrap()).unwrap();
+        let items = ContextMenu::for_background(&f, HWND::default()).unwrap().new_items().unwrap();
+        // NewFolder, run without a view, still creates the folder.
+        let made = ContextMenu::for_background(&f, HWND::default()).unwrap().invoke_verb(HWND::default(), "NewFolder", false);
+        let subdirs = std::fs::read_dir(&dir).unwrap().filter(|e| e.as_ref().is_ok_and(|e| e.path().is_dir())).count();
+        std::fs::remove_dir_all(&dir).unwrap();
+        println!("new items: {items:?}");
+        assert!(!items.is_empty(), "the New submenu lists file types");
+        assert!(made.is_ok() && subdirs == 1, "NewFolder made {subdirs} folders: {made:?}");
     }
 }

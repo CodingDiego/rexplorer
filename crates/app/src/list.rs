@@ -17,6 +17,8 @@ use windows::Win32::UI::Shell::{ILClone, ILFindLastID};
 
 /// Our own entry above the shell's in the list's context menu.
 const PIN_TO_HOME: &str = "Pin to Home\tCtrl+D";
+/// The same on the Home page's folders.
+const UNPIN_FROM_HOME: &str = "Unpin from Home";
 
 pub(crate) unsafe fn on_notify(app: *mut App, lparam: LPARAM) -> LRESULT {
     let hdr = &*(lparam.0 as *const NMHDR);
@@ -102,15 +104,18 @@ unsafe fn fill_dispinfo(app: *mut App, item: &mut LVITEMW) {
 }
 
 unsafe fn on_column_click(app: *mut App, sub: usize) {
+    let Some(Source::Shell(l)) = &cur(app).source else { return };
+    let Some(col) = l.columns.get(sub) else { return };
+    let desc = col.index == l.sort_col && !l.sort_desc;
+    sort_by(app, col.index, desc);
+}
+
+/// Sorts the active shell listing by shell column `col` (the header click, the command bar's Sort menu).
+pub(crate) unsafe fn sort_by(app: *mut App, col: u32, desc: bool) {
     let list = (*app).list;
     let Some(Source::Shell(l)) = &mut cur(app).source else { return };
-    let Some(col) = l.columns.get(sub) else { return };
-    if col.index == l.sort_col {
-        l.sort_desc = !l.sort_desc;
-    } else {
-        l.sort_col = col.index;
-        l.sort_desc = false;
-    }
+    l.sort_col = col;
+    l.sort_desc = desc;
     sort_listing(l);
     let _ = InvalidateRect(Some(list), None, true);
 }
@@ -165,7 +170,9 @@ pub(crate) unsafe fn register_drop(app: *mut App) {
     let _ = dragdrop::register((*app).list, Box::new(pick));
 }
 
-unsafe fn show_menu(app: *mut App, on_item: bool) {
+/// The shell context menu at the cursor for the selection (`on_item`) or the folder background. On the Home page
+/// our own entry on folders is "Unpin from Home"; elsewhere it is "Pin to Home".
+pub(crate) unsafe fn show_menu(app: *mut App, on_item: bool) {
     let hwnd = (*app).hwnd;
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
@@ -179,15 +186,25 @@ unsafe fn show_menu(app: *mut App, on_item: bool) {
         listing(app).and_then(|l| ContextMenu::for_background(&l.folder, hwnd).ok())
     };
     let Some(menu) = menu else { return };
+    let home = listing(app).is_some_and(nav::is_home);
+    let folders = listing(app).is_some_and(|l| sel.iter().filter_map(|&i| l.items.get(i)).any(|i| i.is_folder()));
     // Pinning applies to the current folder (background) or to selected folders of a shell listing.
-    let pin = listing(app).is_some_and(|l| !on_item || sel.iter().filter_map(|&i| l.items.get(i)).any(|i| i.is_folder()));
-    let own: &[&str] = if pin { &[PIN_TO_HOME] } else { &[] };
+    let own: &[&str] = match (home, on_item) {
+        (true, true) if folders => &[UNPIN_FROM_HOME],
+        (true, _) => &[],
+        (false, _) if listing(app).is_some() && (!on_item || folders) => &[PIN_TO_HOME],
+        _ => &[],
+    };
     let extended = GetKeyState(VK_SHIFT.0 as i32) < 0;
     (*app).active_menu = Some(menu);
     let picked = (*app).active_menu.as_ref().unwrap().show_with(hwnd, pt.x, pt.y, extended, own);
     (*app).active_menu = None;
     match picked {
         Ok(Picked::Rename) => begin_rename(app),
+        Ok(Picked::Own(_)) if home => {
+            verb_on_selection(app, "unpinfromhome", false);
+            panes::sidebar_changed(app);
+        }
         Ok(Picked::Own(_)) => pin_to_home(app),
         _ => {}
     }
@@ -270,7 +287,8 @@ unsafe fn draw_skeleton(app: *mut App, hdc: HDC) {
     }
 }
 
-unsafe fn on_key(app: *mut App, key: VIRTUAL_KEY) {
+/// Keys of the list, and the keys the Home page passes on.
+pub(crate) unsafe fn on_key(app: *mut App, key: VIRTUAL_KEY) {
     let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
     let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
     match key {
@@ -318,25 +336,34 @@ pub(crate) unsafe fn verb_on_background(app: *mut App, verb: &str) {
     }
 }
 
-unsafe fn begin_rename(app: *mut App) {
+/// F2: edits the focused item's name in place (in the list, or on the Home page when it shows).
+pub(crate) unsafe fn begin_rename(app: *mut App) {
     let list = (*app).list;
     let i = SendMessageW(list, LVM_GETNEXTITEM, Some(WPARAM(usize::MAX)), Some(LPARAM(LVNI_FOCUSED as isize))).0;
-    if i >= 0 {
+    if i < 0 || listing(app).is_none() {
+        return;
+    }
+    if IsWindowVisible((*app).home).as_bool() {
+        home::begin_rename((*app).home, i as usize);
+    } else {
         let _ = SetFocus(Some(list));
         SendMessageW(list, LVM_EDITLABELW, Some(WPARAM(i as usize)), None);
     }
 }
 
 unsafe fn on_end_edit(app: *mut App, item: &LVITEMW) {
-    if item.pszText.is_null() {
-        return;
+    if !item.pszText.is_null() {
+        rename_item(app, item.iItem as usize, &item.pszText.to_string().unwrap_or_default());
     }
-    let name = item.pszText.to_string().unwrap_or_default();
+}
+
+/// Renames item `index` of the active listing to `name` (the shell shows its own error UI).
+pub(crate) unsafe fn rename_item(app: *mut App, index: usize, name: &str) {
     // Work on a copy: the shell may pump messages while renaming, and a refresh could replace the listing.
-    let target = listing(app).and_then(|l| l.items.get(item.iItem as usize).cloned());
+    let target = listing(app).and_then(|l| l.items.get(index).cloned());
     if let Some(mut target) = target {
         if !name.is_empty() && name != target.display_name() {
-            let _ = target.rename((*app).hwnd, &name);
+            let _ = target.rename((*app).hwnd, name);
             SetTimer(Some((*app).hwnd), TIMER_REFRESH, 150, None);
         }
     }
