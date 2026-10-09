@@ -227,6 +227,9 @@ the pane widths; saved within 2 s of each change and on exit; a search tab is sa
 later runs from the session. A session written before the sidebar existed (no `sidebar=`) opens with the sidebar.
 
 The exe carries a Common Controls 6 manifest (`crates/app/build.rs`): icon views and the themed controls need it.
+It also carries Windows Explorer's own icon, so the taskbar and the title bar look like Explorer's: `scripts/extract-icon.py` copies the
+first icon group of `C:\Windows\explorer.exe` into `crates/app/app.ico` (Microsoft's artwork, for personal use), and `build.rs` compiles
+`app.rc` with the newest Windows SDK `rc.exe` it finds and links the result. Without the SDK the build warns and skips the icon.
 
 ### Smoke test
 
