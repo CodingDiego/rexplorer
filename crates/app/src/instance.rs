@@ -82,13 +82,22 @@ fn exec(file: PCWSTR, params: &HSTRING, dir: &HSTRING) -> bool {
     unsafe { ShellExecuteW(None, w!("open"), file, params, dir, SW_SHOWNORMAL).0 as isize > 32 }
 }
 
+/// `dir` quoted for a command line: a trailing backslash would escape the closing quote (`"C:\"` reads as `C:"`).
+fn quoted_dir(dir: &Path) -> String {
+    let d = dir.display().to_string();
+    let bs = if d.ends_with(BS) { BS } else { "" };
+    format!("\"{d}{bs}\"")
+}
+
+const BS: &str = "\\";
+
 pub fn open_terminal(dir: &Path) -> Result<()> {
     let d = HSTRING::from(dir.display().to_string());
-    let wt = HSTRING::from(format!("-d \"{}\"", dir.display()));
+    let wt = HSTRING::from(format!("-d {}", quoted_dir(dir)));
     if exec(w!("wt.exe"), &wt, &d) {
         return Ok(());
     }
-    let cmd = HSTRING::from(format!("/K cd /d \"{}\"", dir.display()));
+    let cmd = HSTRING::from(format!("/K cd /d {}", quoted_dir(dir)));
     if exec(w!("cmd.exe"), &cmd, &d) {
         Ok(())
     } else {
@@ -105,6 +114,12 @@ pub fn open_default_app(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_dirs_keep_their_closing_quote() {
+        assert_eq!(quoted_dir(Path::new("C:\\")), "\"C:\\\\\"");
+        assert_eq!(quoted_dir(Path::new("C:\\Users\\x")), "\"C:\\Users\\x\"");
+    }
 
     #[test]
     fn claim_is_exclusive() {
