@@ -954,6 +954,110 @@ Run-Check 'dnd' {
   }
 }
 
+Run-Check 'handoff' {
+  # Hand-off latency: from the second process's creation (timed by this script, so process creation is in it) to
+  # the running window's title naming the new tab.
+  $dir = Join-Path $env:TEMP "rexplorer-smoke-handoff-$PID"
+  New-Item -ItemType Directory -Path $dir -Force | Out-Null
+  $second = $null
+  try {
+    if (-not (Launch 'C:\Windows')) { return @('FAIL', 'no main window within 5 s') }
+    Wait-Until { (Get-Count $script:main) -ge 1 } 3000 | Out-Null
+    Start-Sleep -Milliseconds 300
+    $leaf = Split-Path $dir -Leaf
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $second = Start-Process -FilePath $Exe -ArgumentList ('"{0}"' -f $dir) -PassThru
+    $ms = -1
+    while ($sw.ElapsedMilliseconds -lt 3000) { if ((Get-Title $script:main) -like "*$leaf*") { $ms = $sw.ElapsedMilliseconds; break } }
+    $t = Get-Title $script:main
+    $exited = $second.WaitForExit(3000)
+    $d = "second launch to new tab title: $ms ms (title '$t'; second exited=$exited)"
+    if ($ms -ge 0 -and $ms -lt 300 -and $exited) { @('PASS', $d) } else { @('FAIL', "$d; limit 300 ms") }
+  } finally { Stop-App $second; Stop-App $script:cur; Start-Sleep -Milliseconds 200; Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+# Runs the exe with `$arg`, which ends in a message box: returns @(exit code, box text) once the box is closed.
+function Run-WithBox($arg) {
+  $script:cur = Start-Process -FilePath $Exe -ArgumentList $arg -PassThru; $null = $script:cur.Handle
+  $script:dlg = [IntPtr]::Zero
+  Wait-Until { $script:dlg = [W]::FindOfProcess([uint32]$script:cur.Id, '#32770'); $script:dlg -ne [IntPtr]::Zero } 5000 | Out-Null
+  if ($script:dlg -eq [IntPtr]::Zero) { return @(-1, 'no message box within 5 s') }
+  $text = ''
+  for ($h = [W]::FindWindowEx($script:dlg, [IntPtr]::Zero, 'Static', $null); $h -ne [IntPtr]::Zero; $h = [W]::FindWindowEx($script:dlg, $h, 'Static', $null)) { $text += (Get-Title $h) + ' ' }
+  $null = [W]::PostMessage($script:dlg, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)
+  if (-not $script:cur.WaitForExit(3000)) { return @(-2, "still running after its box closed; box: $text") }
+  @($script:cur.ExitCode, $text)
+}
+
+Run-Check 'install-scratch' {
+  # --install / --uninstall against a scratch install folder and a scratch registry base (never the real HKCU
+  # Classes, App Paths or Start menu): the undocumented REXPLORER_INSTALL_DIR / REXPLORER_REG_BASE overrides.
+  $root = Join-Path $env:TEMP "rexplorer-smoke-install-$PID"
+  $dir = Join-Path $root 'app'
+  $base = "Software\rexplorer-test\$PID"
+  $hk = "HKCU:\$base"
+  $testRootExisted = Test-Path 'HKCU:\Software\rexplorer-test'
+  $clsid = '{52205fd8-5dfb-447d-801a-d0b52f2e83e1}'
+  $keys = @('Classes\Folder\shell\open\command', 'Classes\Directory\shell\open\command', 'Classes\Drive\shell\open\command',
+    "Classes\CLSID\$clsid\shell\open\command", "Classes\CLSID\$clsid\shell\opennewwindow\command",
+    'Microsoft\Windows\CurrentVersion\App Paths\explorer.exe')
+  Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
+  $env:REXPLORER_INSTALL_DIR = $dir; $env:REXPLORER_REG_BASE = $base
+  try {
+    $r = Run-WithBox '--install'
+    $missing = @($keys | Where-Object { -not ((Get-ItemProperty -LiteralPath "$hk\$_" -ErrorAction SilentlyContinue).'(default)' -like "*$dir*") })
+    $files = (Test-Path (Join-Path $dir 'rexplorer.exe')) -and (Test-Path (Join-Path $dir 'install.txt'))
+    $u = Run-WithBox '--uninstall'
+    $left = @(@($hk, $dir) | Where-Object { Test-Path -LiteralPath $_ })
+    if (-not $testRootExisted -and (Test-Path 'HKCU:\Software\rexplorer-test')) { $left += 'HKCU:\Software\rexplorer-test' }
+    $d = "install exit=$($r[0]) files=$files missing keys=[$($missing -join ', ')]; uninstall exit=$($u[0]) left=[$($left -join ', ')]"
+    if ($r[0] -eq 0 -and $files -and $missing.Count -eq 0 -and $u[0] -eq 0 -and $left.Count -eq 0) { @('PASS', "6 keys + exe + install.txt, all gone after --uninstall; $d") }
+    else { @('FAIL', "$d; install box: $($r[1]); uninstall box: $($u[1])") }
+  } finally {
+    Remove-Item Env:REXPLORER_INSTALL_DIR, Env:REXPLORER_REG_BASE -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $hk -Recurse -Force -ErrorAction SilentlyContinue
+    if (-not $testRootExisted) { Remove-Item 'HKCU:\Software\rexplorer-test' -Recurse -Force -ErrorAction SilentlyContinue }
+    Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
+  }
+}
+
+Run-Check 'explorer-args' {
+  # explorer.exe's own argument forms, as programs pass them once rexplorer answers for explorer.exe.
+  $dir = Join-Path $env:TEMP "rexplorer-smoke-args-$PID"
+  New-Item -ItemType Directory -Path $dir -Force | Out-Null
+  $file = Join-Path $dir 'pick.txt'; Set-Content -Path $file -Value 'x'
+  $want = "$(Split-Path $dir -Leaf) - rexplorer"
+  $out = @(); $ok = $true
+  $before = $null
+  try {
+    # Start-App quotes the argument: "<dir>\" reaches the exe as <dir>" (the trailing-quote artefact).
+    foreach ($arg in @("/select,$file", "/e,$dir", "$dir\")) {
+      if (-not (Launch $arg)) { $ok = $false; $out += "'$arg': no window"; continue }
+      $titled = Wait-Until { (Get-Title $script:main) -eq $want -and (Get-Count $script:main) -eq 1 } 4000
+      if ($arg -like '/select,*') { $titled = $titled -and (Wait-Until { [int][W]::SendMessage((Get-List $script:main), 0x1032, [IntPtr]::Zero, [IntPtr]::Zero) -eq 1 } 2000) }
+      $sel = [int][W]::SendMessage((Get-List $script:main), 0x1032, [IntPtr]::Zero, [IntPtr]::Zero)
+      if (-not $titled) { $ok = $false }
+      $out += "'$arg' -> '$(Get-Title $script:main)' selected=$sel"
+      Stop-App $script:cur; Start-Sleep -Milliseconds 200
+    }
+    # Unsupported: the command line goes to the real Explorer and the process exits. Explorer itself opens no
+    # window for a malformed /idlist, so the window count is checked with an unknown switch, which Explorer
+    # answers with a window of its own.
+    $before = Get-Explorers
+    $script:cur = Start-Process -FilePath $Exe -ArgumentList '/idlist,x' -PassThru; $null = $script:cur.Handle
+    $exited = $script:cur.WaitForExit(2000)
+    $script:cur = Start-Process -FilePath $Exe -ArgumentList '/zzz' -PassThru; $null = $script:cur.Handle
+    $exited2 = $script:cur.WaitForExit(2000)
+    $rose = Wait-Until { (Get-Explorers).Count -eq $before.Count + 1 } 4000
+    $out += "'/idlist,x' exited within 2 s=$exited; '/zzz' exited=$exited2, explorer windows $($before.Count) -> $((Get-Explorers).Count)"
+    if (-not ($exited -and $exited2 -and $rose)) { $ok = $false }
+    if ($ok) { @('PASS', ($out -join '; ')) } else { @('FAIL', ($out -join '; ')) }
+  } finally {
+    if ($before) { Close-NewExplorers $before }
+    Stop-App $script:cur; Start-Sleep -Milliseconds 200; Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+  }
+}
+
 # Window screenshots for the README: dark on C:\Windows (details, a row selected), light on the wallpapers with
 # the preview pane, dark on Home. PrintWindow renders the window itself, so nothing else on screen is captured.
 # Pixelates a rect of `bmp`: down to 1/12 and back up, nearest neighbor.

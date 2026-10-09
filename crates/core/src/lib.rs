@@ -9,6 +9,7 @@ pub mod fallback;
 pub mod folder;
 pub mod fuzzy;
 pub mod icons;
+pub mod install;
 pub mod images;
 pub mod item;
 pub mod menu;

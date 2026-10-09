@@ -134,6 +134,11 @@ const CMD_SORT: u16 = 47;
 const CMD_VIEW_MENU: u16 = 48;
 /// The command bar's Share: the Windows share sheet for the selected files.
 const CMD_SHARE: u16 = 49;
+/// More > Install as default file manager... / Uninstall...
+const CMD_INSTALL: u16 = 50;
+const CMD_UNINSTALL: u16 = 51;
+/// Two crashes this close together (seconds) send the folder to Windows Explorer instead of a third start.
+const CRASH_GUARD_SECS: u64 = 60;
 
 const fn accel(flags: u8, key: VIRTUAL_KEY, cmd: u16) -> ACCEL {
     ACCEL { fVirt: ACCEL_VIRT_FLAGS(FVIRTKEY.0 | flags), key: key.0, cmd }
@@ -220,8 +225,22 @@ fn main() -> Result<()> {
         Ok(a) => a,
         Err(e) => return Ok(info_box(&format!("{e}\n\n{}", cli::usage()), MB_ICONERROR)),
     };
+    if args.forward {
+        // Explorer arguments we do not handle (/idlist, URLs, apps): the real Explorer gets them verbatim.
+        std::process::exit(if rexplorer_core::fallback::forward_command_line().is_ok() { 0 } else { 1 });
+    }
     if args.register || args.unregister {
         unsafe { ui::register_flow(None, args.unregister) };
+        return Ok(());
+    }
+    if args.install || args.uninstall {
+        std::process::exit(if unsafe { ui::install_flow(None, args.uninstall, false) } { 0 } else { 1 });
+    }
+    if args.recover && !crash::record_recovery(CRASH_GUARD_SECS) {
+        // The second crash in a row: show the folder in Windows Explorer rather than crash again.
+        let s = session::load();
+        let folder = s.tabs.get(s.active).map(|f| format!("\"{f}\"")).unwrap_or_default();
+        let _ = rexplorer_core::fallback::run_explorer(&folder);
         return Ok(());
     }
     // A recovery launch must not hand off to the instance that is crashing.
@@ -232,7 +251,11 @@ fn main() -> Result<()> {
             return Ok(());
         }
     }
-    crash::install(&["--recover".to_string()], 10);
+    if !args.recover {
+        crash::reset_recoveries();
+    }
+    std::thread::spawn(rexplorer_core::install::cleanup_old);
+    crash::install(&["--recover".to_string()]);
     // Undocumented, for the smoke test: an access violation after this many ms exercises the recovery path. A
     // recovery launch inherits the variable and ignores it.
     if let Some(ms) = std::env::var("REXPLORER_CRASH_AFTER_MS").ok().and_then(|v| v.parse::<u64>().ok()).filter(|_| !args.recover) {
@@ -463,7 +486,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_COPYDATA => {
             if let Some(text) = instance::receive(lparam) {
                 let args = cli::parse_payload(&text);
-                nav::open_args(app, &args);
+                // A launch without folders (Win+E, the taskbar icon once installed) opens a tab at the start place.
+                if !nav::open_args(app, &args) && args.search.is_none() {
+                    nav::new_tab(app, nav::Target::Name((*app).profile.start.clone()), true, None);
+                }
                 nav::apply_search(app, &args);
                 if IsIconic(hwnd).as_bool() {
                     let _ = ShowWindow(hwnd, SW_RESTORE);
@@ -698,6 +724,9 @@ unsafe fn on_command(app: *mut App, cmd: u16) {
         }
         CMD_MORE => ui::more_menu(app),
         CMD_REGISTER | CMD_UNREGISTER => ui::register_flow(Some((*app).hwnd), cmd == CMD_UNREGISTER),
+        CMD_INSTALL | CMD_UNINSTALL => {
+            ui::install_flow(Some((*app).hwnd), cmd == CMD_UNINSTALL, true);
+        }
         CMD_SETTINGS => nav::new_tab(app, nav::Target::Name(settings::dir().display().to_string()), true, None),
         CMD_ABOUT => ui::about(app),
         CMD_PIN => list::pin_to_home(app),

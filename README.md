@@ -30,7 +30,7 @@ Folder of 100,000 files in `%TEMP%\rexplorer-bench`, release build, warm cache, 
 
 Decision: keep pure shell enumeration for every folder type. No filesystem fast path.
 
-## Features (Phase 1 and Phase 2 through step 7)
+## Features (Phase 1 and Phase 2 through step 8)
 
 Everything shown is a shell item: names, columns, icons, sorting, context menus, file operations, rename, live
 updates and drag and drop all come from the shell. rexplorer draws; the shell does the work.
@@ -120,7 +120,8 @@ Ctrl+A selects the rows, Delete deletes, F5 refreshes, F2 renames in place. The 
 the command bar follow its selection. While Home loads,
 the list's placeholder rows show as for any folder.
 
-More menu: Folder tree, Pin to Home, Open in Explorer, register / unregister as the folder handler, the settings
+More menu: Folder tree, Pin to Home, Open in Explorer, register / unregister as the folder handler, **Install as
+default file manager...** and **Uninstall...** (each asks first, listing what changes; see below), the settings
 folder, About, and **Quick access**: the profile's bookmarks and the cloud-sync roots.
 
 ### What a tab can show
@@ -191,17 +192,60 @@ rexplorer [options] [folder...]
   --profile <name>    use the named settings profile
   --new-tab, -t       open in a new tab of the running window
   --search <text>     search the (first) folder opened for <text>
-  --register          open folders with rexplorer (per-user HKCU\Software\Classes keys; asks first)
+  --register          open folders and Win+E with this exe (per-user HKCU\Software\Classes keys; asks first)
   --unregister        undo --register
+  --install           copy rexplorer to %LOCALAPPDATA%\Programs and make it the default file manager
+  --uninstall         undo --install
   --recover           restore the previous session after a crash
   -h, --help          show this help
 ```
 
-Folders may be paths, `shell:` names, `::{CLSID}` strings or .rar paths. `/e`, `/n`, `/root,<path>` are accepted
-as Explorer does. A second launch hands its folders (and `--search`) to the running window and exits; one
-instance runs per settings folder, so a launch with another `%APPDATA%` (the smoke test) runs on its own. A plain
-launch restores the session; a launch with folders opens just those. After a crash the process relaunches itself
-with `--recover` (at most once per 10 s, so a crash loop stops).
+Folders may be paths, `shell:` names, `::{CLSID}` strings, UNC paths or .rar paths. Explorer's own arguments
+work too, since an installed rexplorer is started as `explorer.exe`: `/select,<path>` (also `/select,` followed by
+the path as the next argument), `/e,<path>`, `/root,<path>`, `/n`, `/separate`, chained with commas
+(`/n,/e,/select,C:\x`); a file path opens its folder with the file selected (.zip and .rar files open as folders); a
+trailing backslash, or the trailing quote some callers leave (`"C:\"` arrives as `C:"`), is dropped. Anything
+else Explorer-style (`/idlist,...`, an unknown `/` switch, URLs such as `ms-settings:display`,
+`shell:AppsFolder\<app>`) is handed verbatim to `C:\Windows\explorer.exe` (with CreateProcess, never through App
+Paths) and the process exits. A second launch hands its folders (and `--search`) to the running window and
+exits (36-78 ms measured from process creation to the new tab's title); a second launch without folders (Win+E once
+installed) opens a tab at the profile's start place. One instance runs per settings folder, so a launch with
+another `%APPDATA%` (the smoke test) runs on its own. A plain first launch restores the session; a launch with
+folders opens just those. After a crash the process relaunches itself with `--recover`; each `--recover` start
+counts itself in `%APPDATA%\rexplorer\crash-count.txt`, and the second within 60 s opens the folder in Windows
+Explorer instead of running (so a crash loop stops at Explorer). A start without `--recover` resets the count.
+Ctrl+Shift+E and the fallbacks start `%SystemRoot%\explorer.exe` by full path, so they reach Explorer even when
+rexplorer answers for `explorer.exe`.
+
+### Make it the default file manager
+
+`rexplorer --install` (or More > **Install as default file manager...**) copies the running exe to
+`%LOCALAPPDATA%\Programs\rexplorer\rexplorer.exe` and points Windows' entry points for folder windows at that copy.
+It replaces Explorer's folder windows only: the desktop, the taskbar and the Start menu stay Explorer.
+
+| Entry point | After `--install` | How |
+|---|---|---|
+| Opening a folder or drive from the desktop, a shortcut, another program's "open folder" (`ShellExecute` of a folder) | rexplorer | `HKCU\Software\Classes\{Folder, Directory, Drive}\shell\open\command` = `"<copy>" "%1"` |
+| Win+E, the taskbar's File Explorer icon, Start's "File Explorer" | rexplorer, at the start place (Home) | `HKCU\Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}\shell\{open, opennewwindow}\command` = `"<copy>"` |
+| Programs that run `explorer.exe` by bare name through `ShellExecute` (`explorer.exe /select,<file>`, `explorer.exe <folder>`) | rexplorer, with the arguments above | `HKCU\Software\Microsoft\Windows\CurrentVersion\App Paths\explorer.exe` = the copy, `Path` = its folder |
+| Start menu | a "rexplorer" shortcut | `<Start Menu>\Programs\rexplorer.lnk` |
+| Programs that start `C:\Windows\explorer.exe` with `CreateProcess`, or call `SHOpenFolderAndSelectItems` (Chrome-style "Show in folder") | still Explorer | not reachable per-user |
+| The desktop, the taskbar, Start, other programs' Open / Save dialogs, Explorer windows already open | still Explorer | untouched |
+
+Each command key also gets an empty `DelegateExecute` value, which stops Windows from using Explorer's own handler.
+`--install` refuses, changing nothing, when another program already overrides one of these keys. Everything it
+created (keys, values, the copy, the shortcut) is listed in `%LOCALAPPDATA%\Programs\rexplorer\install.txt`.
+Running it again updates the copy (a running copy is renamed to `rexplorer.old`, deleted at the next start).
+
+Escape hatch: `rexplorer --uninstall` (or More > **Uninstall...**, or `%LOCALAPPDATA%\Programs\rexplorer\rexplorer.exe
+--uninstall` from Win+R) reverts what install.txt lists: the values that still name rexplorer (a value another
+program has written since is left alone), the keys install created once they are empty, the shortcut, then the
+copy (if it is running it moves to `%TEMP%`, deleted at the next start). Both print a summary in a message box
+and exit 0, or non-zero on an error. If rexplorer keeps crashing, the crash guard above opens Explorer.
+
+Nothing touches HKLM and nothing needs elevation: all of it is per-user under HKCU and `%LOCALAPPDATA%`.
+`--register` / `--unregister` remain the registry-only subset: they point the five command keys at the exe they run
+from, without copying it, without App Paths and without a shortcut.
 
 ### Files under `%APPDATA%\rexplorer`
 
@@ -286,8 +330,14 @@ remove-bookmark (a scratch profile's bookmark row, removed through its popup, le
 share (Share is enabled with a file selected and its click brings the share sheet to the foreground; Escape
 closes it), access-denied (`C:\System Volume Information` shows "Access denied: ..." within 3 s), crash-recovery
 (`REXPLORER_CRASH_AFTER_MS`, read only for this, raises an access violation; within 6 s a `--recover` process
-shows the same folder) and dnd (a real `SendInput` drag of a file row onto a folder row moves the file; the file
-is moved back whatever happens). `-Only <regex>` runs the matching checks. The whole run uses a scratch `APPDATA`,
+shows the same folder), dnd (a real `SendInput` drag of a file row onto a folder row moves the file; the file
+is moved back whatever happens), handoff (with one instance running, a second launch with a folder, timed from the
+script's process creation to the new tab's title: under 300 ms, 36-78 ms measured), install-scratch (`--install`
+and `--uninstall` with the undocumented `REXPLORER_INSTALL_DIR` / `REXPLORER_REG_BASE` overrides pointing at a
+scratch folder and `HKCU\Software\rexplorer-test\<pid>`: the copy, install.txt, the five command keys and App Paths
+appear, then all of it is gone, the scratch key included; the real keys, App Paths and Start menu are never
+written) and explorer-args (`/select,<file>` selects it, `/e,<dir>` and `<dir>\` open it; `/idlist,x` and `/zzz`
+exit within 2 s, handed to Explorer, which opens a window for `/zzz`). `-Only <regex>` runs the matching checks. The whole run uses a scratch `APPDATA`,
 so the user's settings, window placement and open rexplorer window are never touched. The keyboard, share and dnd
 checks need an interactive desktop that lets the window come to the foreground; they report SKIP otherwise.
 `smoke.ps1 -Screenshots` also writes `docs\screenshots\dark.png`, `light.png` and `home.png` (rendered with

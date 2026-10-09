@@ -349,6 +349,8 @@ pub(crate) unsafe fn more_menu(app: *mut App) {
         (CMD_PIN as usize, "Pin to Home\tCtrl+D".to_string()),
         (CMD_EXPLORER as usize, "Open in Explorer\tCtrl+Shift+E".to_string()),
         reg,
+        (CMD_INSTALL as usize, "Install as default file manager...".to_string()),
+        (CMD_UNINSTALL as usize, "Uninstall...".to_string()),
         (CMD_SETTINGS as usize, "Settings folder".to_string()),
         (0, String::new()),
         (CMD_ABOUT as usize, "About rexplorer".to_string()),
@@ -372,13 +374,18 @@ pub(crate) unsafe fn more_menu(app: *mut App) {
 /// --register / --unregister and the More menu: confirm, change HKCU, report.
 pub(crate) unsafe fn register_flow(owner: Option<HWND>, unregister: bool) {
     let exe = std::env::current_exe().unwrap_or_default();
-    let keys = r"HKEY_CURRENT_USER\Software\Classes\{Folder, Directory, Drive}\shell\open";
+    let keys = format!(
+        "HKEY_CURRENT_USER\\Software\\Classes\\{{Folder, Directory, Drive}}\\shell\\open\\command and \
+         ...\\Classes\\CLSID\\{}\\shell\\{{open, opennewwindow}}\\command (File Explorer: Win+E, the taskbar icon)",
+        register::EXPLORER_CLSID
+    );
     let question = if unregister {
         format!("Stop opening folders with rexplorer?\n\nThis deletes {keys} (per-user). Windows Explorer opens folders again.")
     } else {
         format!(
-            "Open folders with rexplorer?\n\nThis writes {keys}\\command = \"{}\" \"%1\" (per-user only; nothing under HKLM changes). \
-             Win+E and the taskbar icon still open Explorer.\n\nUndo with rexplorer --unregister.",
+            "Open folders and Win+E with rexplorer?\n\nThis writes {keys} = \"{}\" (per-user only; nothing under HKLM \
+             changes).\n\nUndo with rexplorer --unregister. To copy rexplorer to a fixed place first, use \
+             More > Install as default file manager.",
             exe.display()
         )
     };
@@ -394,6 +401,44 @@ pub(crate) unsafe fn register_flow(owner: Option<HWND>, unregister: bool) {
     };
     let t = HSTRING::from(text);
     MessageBoxW(owner, PCWSTR(t.as_ptr()), w!("rexplorer"), MB_OK | icon);
+}
+
+/// --install / --uninstall and the More menu: optionally confirm (listing what changes), run, report. True on
+/// success.
+pub(crate) unsafe fn install_flow(owner: Option<HWND>, uninstall: bool, confirm: bool) -> bool {
+    use rexplorer_core::install;
+    let dir = install::default_dir();
+    let base = install::reg_base();
+    if confirm {
+        let question = if uninstall {
+            let record = std::fs::read_to_string(dir.join("install.txt")).unwrap_or_default();
+            let listed: Vec<String> = record
+                .lines()
+                .filter_map(|l| l.strip_prefix("value ").map(|k| format!("HKCU\\{k}")).or_else(|| l.strip_prefix("file ").map(str::to_string)))
+                .collect();
+            let listed = if listed.is_empty() { "(nothing: rexplorer is not installed)".to_string() } else { listed.join("\n") };
+            format!(
+                "Stop using rexplorer as the default file manager?\n\nThis reverts what {} lists (values another \
+                 program has changed since are left alone):\n\n{listed}",
+                dir.join("install.txt").display()
+            )
+        } else {
+            format!("Make rexplorer the default file manager?\n\n{}", install::plan(&dir, &base))
+        };
+        let q = HSTRING::from(question);
+        if MessageBoxW(owner, PCWSTR(q.as_ptr()), w!("rexplorer"), MB_YESNO | MB_ICONQUESTION) != IDYES {
+            return false;
+        }
+    }
+    let r = if uninstall { install::uninstall(&dir) } else { install::install(&dir, &base) };
+    let ok = r.is_ok();
+    let (text, icon) = match r {
+        Ok(s) => (s, MB_ICONINFORMATION),
+        Err(e) => (format!("{} failed:\n\n{}", if uninstall { "Uninstall" } else { "Install" }, e.message()), MB_ICONERROR),
+    };
+    let t = HSTRING::from(text);
+    MessageBoxW(owner, PCWSTR(t.as_ptr()), w!("rexplorer"), MB_OK | icon);
+    ok
 }
 
 pub(crate) unsafe fn about(app: *mut App) {

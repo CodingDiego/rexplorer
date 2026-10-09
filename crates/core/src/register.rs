@@ -1,32 +1,74 @@
 //! Make rexplorer the handler for opening folders, via per-user overrides only.
 //!
-//! `register` writes, for each of `Folder`, `Directory` and `Drive`, under
-//! `HKCU\<base>\<class>\shell\open\command`: the default value `"<exe>" "%1"` and an
-//! empty `DelegateExecute` string (which stops the shell from using Explorer's
-//! DelegateExecute handler). HKLM is never touched. `unregister` deletes
-//! `HKCU\<base>\<class>\shell\open` for each class.
-//!
-//! Win+E and the taskbar icon still open Explorer: they do not go through these verbs.
+//! `register` writes five command keys: for each of `Folder`, `Directory` and `Drive`,
+//! `HKCU\<base>\<class>\shell\open\command` = `"<exe>" "%1"`, and for the File Explorer CLSID (Win+E, the taskbar
+//! icon, Start's File Explorer) `HKCU\<base>\CLSID\{52205fd8-...}\shell\{open,opennewwindow}\command` = `"<exe>"`
+//! (those verbs carry no argument). Each also gets an empty `DelegateExecute` string, which stops the shell from
+//! using Explorer's DelegateExecute handler. HKLM is never touched. `unregister` deletes the command keys that
+//! still launch rexplorer, and the keys left empty above them up to `<base>`.
 use std::path::Path;
 
 use windows::Win32::Foundation::{E_FAIL, ERROR_FILE_NOT_FOUND};
 use windows::Win32::System::Registry::{
-    HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteTreeW, RegGetValueW, RegSetKeyValueW,
+    HKEY, HKEY_CURRENT_USER, KEY_READ, REG_SZ, RRF_RT_REG_SZ, RegCloseKey, RegDeleteTreeW, RegGetValueW, RegOpenKeyExW,
+    RegSetKeyValueW,
 };
-use windows::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify};
+use windows::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify, SHDeleteEmptyKeyW};
 use windows::core::{Error, HSTRING, PCWSTR, Result, w};
 
 /// Shell classes whose `open` verb is overridden.
 pub const CLASSES: [&str; 3] = ["Folder", "Directory", "Drive"];
 /// The real per-user classes key, relative to HKCU.
 pub const REAL_BASE: &str = r"Software\Classes";
+/// File Explorer: Win+E, the taskbar icon and Start's "File Explorer" open it through these verbs.
+pub const EXPLORER_CLSID: &str = "{52205fd8-5dfb-447d-801a-d0b52f2e83e1}";
+const CLSID_VERBS: [&str; 2] = ["open", "opennewwindow"];
 
 fn command_key(base: &str, class: &str) -> HSTRING {
     HSTRING::from(format!(r"{base}\{class}\shell\open\command"))
 }
 
+/// The five command keys `register` writes, each with whether its command takes the `%1` argument.
+pub fn command_keys(base: &str) -> Vec<(HSTRING, bool)> {
+    let classes = CLASSES.iter().map(|c| (command_key(base, c), true));
+    let verbs =
+        CLSID_VERBS.iter().map(|v| (HSTRING::from(format!(r"{base}\CLSID\{EXPLORER_CLSID}\shell\{v}\command")), false));
+    classes.chain(verbs).collect()
+}
+
+/// True when a command or path value names rexplorer (ours to replace or remove).
+pub(crate) fn is_ours(value: &str) -> bool {
+    value.to_lowercase().contains("rexplorer")
+}
+
+pub(crate) fn key_exists(key: &str) -> bool {
+    let mut h = HKEY::default();
+    let ok = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, &HSTRING::from(key), None, KEY_READ, &mut h) }.is_ok();
+    if ok {
+        let _ = unsafe { RegCloseKey(h) };
+    }
+    ok
+}
+
+/// Deletes `key` if it has neither values nor subkeys; false when it is not empty or missing.
+pub(crate) fn delete_empty(key: &str) -> bool {
+    unsafe { SHDeleteEmptyKeyW(HKEY_CURRENT_USER, &HSTRING::from(key)) }.is_ok()
+}
+
+/// Deletes the tree at `key` unless its default value is another program's. Ok(false) when it was left alone.
+pub(crate) fn remove_if_ours(key: &HSTRING) -> Result<bool> {
+    if read_default(key).is_some_and(|v| !is_ours(&v)) {
+        return Ok(false);
+    }
+    let err = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, key) };
+    if err != ERROR_FILE_NOT_FOUND {
+        err.ok()?;
+    }
+    Ok(true)
+}
+
 /// Default value of `HKCU\key`, or None if the key or value is missing.
-fn read_default(key: &HSTRING) -> Option<String> {
+pub(crate) fn read_default(key: &HSTRING) -> Option<String> {
     let mut cb = 0u32;
     unsafe {
         RegGetValueW(HKEY_CURRENT_USER, key, PCWSTR::null(), RRF_RT_REG_SZ, None, None, Some(&mut cb))
@@ -52,7 +94,7 @@ fn read_default(key: &HSTRING) -> Option<String> {
 }
 
 /// REG_SZ write; cbdata counts bytes including the terminating NUL.
-fn set_sz(key: &HSTRING, name: PCWSTR, value: &str) -> Result<()> {
+pub(crate) fn set_sz(key: &HSTRING, name: PCWSTR, value: &str) -> Result<()> {
     let data: Vec<u16> = value.encode_utf16().chain(Some(0)).collect();
     unsafe {
         RegSetKeyValueW(
@@ -67,24 +109,23 @@ fn set_sz(key: &HSTRING, name: PCWSTR, value: &str) -> Result<()> {
     .ok()
 }
 
-fn notify() {
+pub(crate) fn notify() {
     unsafe { SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None) };
 }
 
-/// Point the folder open verbs at `exe`. Refuses (writing nothing) if another program's
-/// override already exists.
+/// The first command key holding another program's override, if any.
+pub fn foreign_override(base: &str) -> Option<HSTRING> {
+    command_keys(base).into_iter().map(|(k, _)| k).find(|k| read_default(k).is_some_and(|v| !is_ours(&v)))
+}
+
+/// Point the folder open verbs and File Explorer's verbs at `exe`. Refuses (writing nothing) if another
+/// program's override already exists.
 pub fn register(base: &str, exe: &Path) -> Result<()> {
-    for class in CLASSES {
-        let key = command_key(base, class);
-        if let Some(cur) = read_default(&key) {
-            if !cur.to_lowercase().contains("rexplorer") {
-                return Err(Error::new(E_FAIL, format!("another override exists: {key}")));
-            }
-        }
+    if let Some(key) = foreign_override(base) {
+        return Err(Error::new(E_FAIL, format!("another override exists: {key}")));
     }
-    let cmd = format!("\"{}\" \"%1\"", exe.display());
-    for class in CLASSES {
-        let key = command_key(base, class);
+    for (key, arg) in command_keys(base) {
+        let cmd = if arg { format!("\"{}\" \"%1\"", exe.display()) } else { format!("\"{}\"", exe.display()) };
         set_sz(&key, PCWSTR::null(), &cmd)?;
         set_sz(&key, w!("DelegateExecute"), "")?;
     }
@@ -92,13 +133,18 @@ pub fn register(base: &str, exe: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Remove the overrides written by `register`.
+/// Remove the overrides written by `register`, leaving another program's in place, and the keys left empty
+/// above them (never `base` itself).
 pub fn unregister(base: &str) -> Result<()> {
-    for class in CLASSES {
-        let key = HSTRING::from(format!(r"{base}\{class}\shell\open"));
-        let err = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, &key) };
-        if err != ERROR_FILE_NOT_FOUND {
-            err.ok()?;
+    for (key, _) in command_keys(base) {
+        if remove_if_ours(&key)? {
+            let mut k = key.to_string();
+            while let Some((parent, _)) = k.rsplit_once('\\') {
+                if parent.len() <= base.len() || !delete_empty(parent) {
+                    break;
+                }
+                k = parent.to_string();
+            }
         }
     }
     notify();
@@ -134,8 +180,13 @@ mod tests {
             read_default(&command_key(&base, "Directory")).as_deref(),
             Some(r#""C:\x\rexplorer.exe" "%1""#)
         );
+        let verb = HSTRING::from(format!(r"{base}\CLSID\{EXPLORER_CLSID}\shell\opennewwindow\command"));
+        assert_eq!(read_default(&verb).as_deref(), Some(r#""C:\x\rexplorer.exe""#));
         unregister(&base).unwrap();
         assert!(!is_registered(&base, exe));
+        // The keys emptied above the commands go too; the base stays.
+        assert!(!key_exists(&format!(r"{base}\CLSID")) && !key_exists(&format!(r"{base}\Folder")));
+        assert!(key_exists(&base));
         cleanup(&root);
     }
 
@@ -145,6 +196,19 @@ mod tests {
         set_sz(&command_key(&base, "Folder"), PCWSTR::null(), r"C:\other.exe %1").unwrap();
         assert!(register(&base, Path::new(r"C:\x\rexplorer.exe")).is_err());
         assert!(read_default(&command_key(&base, "Directory")).is_none());
+        cleanup(&root);
+    }
+
+    #[test]
+    fn unregister_leaves_foreign_overrides() {
+        let (base, root) = test_base("c");
+        let exe = Path::new(r"C:\x\rexplorer.exe");
+        register(&base, exe).unwrap();
+        let drive = command_key(&base, "Drive");
+        set_sz(&drive, PCWSTR::null(), r"C:\other.exe %1").unwrap();
+        unregister(&base).unwrap();
+        assert!(!is_registered(&base, exe));
+        assert_eq!(read_default(&drive).as_deref(), Some(r"C:\other.exe %1"));
         cleanup(&root);
     }
 }
