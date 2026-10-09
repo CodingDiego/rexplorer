@@ -4,12 +4,15 @@ use windows::Win32::System::Com::{
     COINIT, COINIT_APARTMENTTHREADED, COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree,
     CoUninitialize,
 };
+use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
 use windows::Win32::UI::Shell::Common::{ITEMIDLIST, STRRET};
 use windows::Win32::UI::Shell::{ILClone, ILFree, StrRetToStrW};
 use windows::core::PWSTR;
 
 /// Initializes COM for the current thread and uninitializes it on drop.
-pub struct ComInit;
+pub struct ComInit {
+    ole: bool,
+}
 
 impl ComInit {
     /// Single-threaded apartment: the UI thread.
@@ -22,16 +25,22 @@ impl ComInit {
         Self::init(COINIT_MULTITHREADED)
     }
 
+    /// STA plus OLE (drag and drop, clipboard); needed before RegisterDragDrop or DoDragDrop.
+    pub fn ole() -> Self {
+        unsafe { OleInitialize(None).expect("OleInitialize") };
+        ComInit { ole: true }
+    }
+
     fn init(kind: COINIT) -> Self {
         // S_FALSE (already initialized) is fine; a real failure here is unrecoverable.
         unsafe { CoInitializeEx(None, kind).ok().expect("CoInitializeEx") };
-        ComInit
+        ComInit { ole: false }
     }
 }
 
 impl Drop for ComInit {
     fn drop(&mut self) {
-        unsafe { CoUninitialize() };
+        unsafe { if self.ole { OleUninitialize() } else { CoUninitialize() } };
     }
 }
 
