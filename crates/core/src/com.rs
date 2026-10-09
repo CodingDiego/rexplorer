@@ -1,17 +1,30 @@
 use std::ptr;
 
-use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize};
-use windows::Win32::UI::Shell::Common::ITEMIDLIST;
-use windows::Win32::UI::Shell::{ILClone, ILFree};
+use windows::Win32::System::Com::{
+    COINIT, COINIT_APARTMENTTHREADED, COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree,
+    CoUninitialize,
+};
+use windows::Win32::UI::Shell::Common::{ITEMIDLIST, STRRET};
+use windows::Win32::UI::Shell::{ILClone, ILFree, StrRetToStrW};
 use windows::core::PWSTR;
 
-/// Initializes COM (STA) for the current thread and uninitializes it on drop.
+/// Initializes COM for the current thread and uninitializes it on drop.
 pub struct ComInit;
 
 impl ComInit {
+    /// Single-threaded apartment: the UI thread.
     pub fn sta() -> Self {
+        Self::init(COINIT_APARTMENTTHREADED)
+    }
+
+    /// Multi-threaded apartment: worker threads.
+    pub fn mta() -> Self {
+        Self::init(COINIT_MULTITHREADED)
+    }
+
+    fn init(kind: COINIT) -> Self {
         // S_FALSE (already initialized) is fine; a real failure here is unrecoverable.
-        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().expect("CoInitializeEx") };
+        unsafe { CoInitializeEx(None, kind).ok().expect("CoInitializeEx") };
         ComInit
     }
 }
@@ -32,6 +45,15 @@ pub unsafe fn take_cotaskmem_string(pw: PWSTR) -> String {
     s
 }
 
+/// Converts a `STRRET` produced for `pidl` into a `String`.
+pub unsafe fn strret_to_string(ret: &mut STRRET, pidl: *const ITEMIDLIST) -> String {
+    let mut pw = PWSTR::null();
+    if unsafe { StrRetToStrW(ret, Some(pidl), &mut pw) }.is_err() {
+        return String::new();
+    }
+    unsafe { take_cotaskmem_string(pw) }
+}
+
 /// Owned item ID list; freed with ILFree on drop.
 pub struct Pidl(*mut ITEMIDLIST);
 
@@ -44,6 +66,15 @@ impl Pidl {
 
     pub fn as_ptr(&self) -> *const ITEMIDLIST {
         self.0
+    }
+
+    pub fn as_mut_ptr(&mut self) -> *mut ITEMIDLIST {
+        self.0
+    }
+
+    /// The empty PIDL that denotes the desktop root.
+    pub fn is_empty(&self) -> bool {
+        unsafe { (*self.0).mkid.cb == 0 }
     }
 }
 

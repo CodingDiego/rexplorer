@@ -23,6 +23,10 @@ dependencies = [
 [[package]]
 name = "rexplorer"
 version = "0.1.0"
+dependencies = [
+ "rexplorer-core",
+ "windows",
+]
 
 [[package]]
 name = "rexplorer-core"

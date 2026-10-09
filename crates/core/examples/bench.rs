@@ -23,7 +23,7 @@ fn main() {
 
     let t = Instant::now();
     let mut sorted: Vec<&_> = items.iter().collect();
-    sorted.sort_by(|a, b| folder.compare(a, b));
+    sorted.sort_by(|a, b| folder.compare(0, a, b));
     let sort_time = t.elapsed();
 
     println!("folder     : {} ({})", folder.name, folder.parsing_name);
