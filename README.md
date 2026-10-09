@@ -73,7 +73,7 @@ header, Edit and fonts that follow the monitor DPI). Minimum size 640x400.
 
 Breadcrumb: click a segment to go there; its chevron lists the subfolders (for drive paths, UNC paths and This
 PC). More menu: Open in Explorer, register / unregister as the folder handler, the settings folder, About.
-View and Connect are placeholders until steps 2 and 3.
+Connect is a placeholder until step 3.
 
 Command line (`rexplorer --help`): folders to open, `--select <path>` (or `/select,<path>`), `--profile`,
 `--new-tab`, `--register` / `--unregister` (each asks first; per-user `HKCU\Software\Classes` keys only),
@@ -87,3 +87,34 @@ folders opens just those. After a crash the process relaunches itself with `--re
 
 `scripts\smoke.ps1` also checks the tab strip and Ctrl+T, the single-instance hand-off, first-run settings files
 (in a scratch `APPDATA`), and that `--help` shows its dialog and exits.
+
+## Phase 2, step 2: panes, views, drag and drop, icon themes
+
+Layout, left to right under the nav row: the shell's folder tree (NamespaceTreeControl), the list, the preview.
+Both panes have a 4 px splitter (drag to resize, 120 to 600 px); the tree follows each navigation and picking a
+folder in it navigates the active tab.
+
+| Keys | Action |
+|---|---|
+| Ctrl+B | Show / hide the folder tree |
+| Alt+P | Show / hide the preview pane (text in a monospace Edit, preview handlers in place, else a thumbnail) |
+| Ctrl+Shift+1 / 2 / 3, View button | Details / icons (48 px) / thumbnails (128 px); the button cycles |
+
+Icon and thumbnail images render on a worker thread and land in the list as they finish (placeholder until
+then); the last 512 are cached, so switching tabs back does not render them again. Drag items out of the list
+to anywhere that accepts files, or drop files onto the list (onto a folder item, or the current folder); the
+shell performs the copy or move and the change watch refreshes the list.
+
+Pane visibility, widths and the view are saved in `session.txt`; a first run, or a launch with `--profile`,
+takes them from the profile. Changing the view also writes `view=` into the profile in `settings.ini`.
+
+Icon themes: set `icon_theme=<name>` in a theme file and drop PNGs named by extension (`rs.png`, `pdf.png`...)
+plus `folder.png` and `file.png` into `%APPDATA%\rexplorer\icons\<name>\`; the details view then draws those
+instead of the system icons. A starter set is written to `icons\default` on first run.
+
+The exe now carries a Common Controls 6 manifest (`crates/app/build.rs`): icon views and the themed controls
+need it.
+
+`scripts\smoke.ps1` also checks the tree (present, splitter drag, Ctrl+B, the list's drop target), the preview
+(Alt+P, a text file of the 100k folder previewed) and the views (Ctrl+Shift+2 gives the icon view and saves it to
+the profile, Ctrl+Shift+1 returns to details), each on a scratch `APPDATA`.

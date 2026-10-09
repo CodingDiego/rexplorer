@@ -7,6 +7,11 @@ use windows::Win32::Graphics::Gdi::{
     SetTextColor, TRANSPARENT,
 };
 use crate::nav::{activate, cur, go_up, listing, open_in_background, sort_listing};
+use rexplorer_core::dragdrop;
+use std::cell::RefCell;
+use windows::Win32::Foundation::POINTL;
+use windows::Win32::Graphics::Gdi::ScreenToClient;
+use windows::Win32::System::Ole::IDropTarget;
 
 pub(crate) unsafe fn on_notify(app: *mut App, lparam: LPARAM) -> LRESULT {
     let hdr = &*(lparam.0 as *const NMHDR);
@@ -27,7 +32,13 @@ pub(crate) unsafe fn on_notify(app: *mut App, lparam: LPARAM) -> LRESULT {
         }
         LVN_ITEMCHANGED | LVN_ODSTATECHANGED => {
             SetTimer(Some((*app).hwnd), TIMER_STATUS, 100, None);
+            panes::schedule_preview(app);
         }
+        LVN_ODCACHEHINT => {
+            let nm = &*(lparam.0 as *const NMLVCACHEHINT);
+            views::on_cache_hint(app, nm.iFrom, nm.iTo);
+        }
+        LVN_BEGINDRAG => begin_drag(app),
         NM_RCLICK => {
             let nm = &*(lparam.0 as *const NMITEMACTIVATE);
             show_menu(app, nm.iItem >= 0);
@@ -65,8 +76,12 @@ pub(crate) fn find_prefix(n: usize, start: usize, wrap: bool, needle: &str, name
 }
 
 unsafe fn fill_dispinfo(app: *mut App, item: &mut LVITEMW) {
-    let Some(l) = &mut cur(app).listing else { return };
     let i = item.iItem as usize;
+    let icon_view = (*app).views.view != views::View::Details;
+    if item.mask.contains(LVIF_IMAGE) && item.iSubItem == 0 && icon_view {
+        item.iImage = views::image(app, i);
+    }
+    let Some(l) = &mut cur(app).listing else { return };
     let Some(entry) = l.items.get(i) else { return };
     if item.mask.contains(LVIF_TEXT) {
         let text = if item.iSubItem == 0 {
@@ -76,10 +91,10 @@ unsafe fn fill_dispinfo(app: *mut App, item: &mut LVITEMW) {
         };
         copy_text(&text, item.pszText, item.cchTextMax);
     }
-    if item.mask.contains(LVIF_IMAGE) && item.iSubItem == 0 {
+    if item.mask.contains(LVIF_IMAGE) && item.iSubItem == 0 && !icon_view {
         if l.icons[i] == ICON_UNKNOWN {
             // shortcut: icon lookup runs on the UI thread, move it to a worker when a slow folder visibly stutters
-            l.icons[i] = entry.icon_index(&l.folder.pidl).1;
+            l.icons[i] = views::theme_icon(app, entry).unwrap_or_else(|| entry.icon_index(&l.folder.pidl).1);
         }
         item.iImage = l.icons[i];
     }
@@ -97,6 +112,55 @@ unsafe fn on_column_click(app: *mut App, sub: usize) {
     }
     sort_listing(l);
     let _ = InvalidateRect(Some(list), None, true);
+}
+
+/// Drags the selection with the shell's data object; the shell performs the operation and the change watch refreshes.
+unsafe fn begin_drag(app: *mut App) {
+    let data = {
+        let Some(l) = listing(app) else { return };
+        let sel = selected_indices((*app).list);
+        let items: Vec<&ShellItem> = sel.iter().filter_map(|&i| l.items.get(i)).collect();
+        if items.is_empty() {
+            return;
+        }
+        dragdrop::data_object(&l.folder, &items)
+    };
+    if let Ok(data) = data {
+        let _ = dragdrop::drag(&data);
+    }
+}
+
+/// Drops land on the folder item under the cursor, else on the current folder.
+pub(crate) unsafe fn register_drop(app: *mut App) {
+    let ptr = app as usize;
+    // The forwarder re-enters a target only when pick returns a different object, so reuse it per (listing, item).
+    let last: RefCell<Option<((usize, isize), IDropTarget)>> = RefCell::new(None);
+    let pick = move |pt: POINTL| -> Option<IDropTarget> {
+        let app = ptr as *mut App;
+        unsafe {
+            let (list, hwnd) = ((*app).list, (*app).hwnd);
+            let l = listing(app)?;
+            let mut p = POINT { x: pt.x, y: pt.y };
+            let _ = ScreenToClient(list, &mut p);
+            let mut ht = LVHITTESTINFO { pt: p, ..Default::default() };
+            let i = SendMessageW(list, LVM_HITTEST, None, Some(LPARAM(&mut ht as *mut _ as isize))).0;
+            let folder_item = usize::try_from(i).ok().and_then(|i| l.items.get(i)).filter(|it| it.is_folder());
+            let key = (l.folder.pidl.as_ptr() as usize, if folder_item.is_some() { i } else { -1 });
+            if let Some((k, t)) = &*last.borrow() {
+                if *k == key {
+                    return Some(t.clone());
+                }
+            }
+            let target = match folder_item {
+                Some(it) => dragdrop::item_drop_target(&l.folder, it, hwnd),
+                None => dragdrop::folder_drop_target(&l.folder, hwnd),
+            }
+            .ok()?;
+            *last.borrow_mut() = Some((key, target.clone()));
+            Some(target)
+        }
+    };
+    let _ = dragdrop::register((*app).list, Box::new(pick));
 }
 
 unsafe fn show_menu(app: *mut App, on_item: bool) {

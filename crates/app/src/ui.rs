@@ -84,9 +84,15 @@ pub(crate) unsafe fn create_children(app: *mut App) -> Result<()> {
     let ex = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_HEADERDRAGDROP;
     SendMessageW((*app).list, LVM_SETEXTENDEDLISTVIEWSTYLE, Some(WPARAM(0)), Some(LPARAM(ex as isize)));
     let _ = SetWindowSubclass((*app).list, Some(list::subclass), 1, app as usize);
+    list::register_drop(app);
+    panes::create_preview(app)?;
+    if (*app).session.show_preview {
+        let _ = ShowWindow((*app).panes.preview, SW_SHOW);
+    }
     (*app).status = statusbar::create(hwnd, ID_STATUS)?;
     apply_theme(app);
     apply_font(app);
+    views::init(app);
     Ok(())
 }
 
@@ -100,6 +106,12 @@ pub(crate) unsafe fn apply_theme(app: *mut App) {
     toolbar::set_theme((*app).nav, t);
     toolbar::set_theme((*app).tools, t);
     statusbar::set_theme((*app).status, t);
+    preview_pane::set_theme((*app).panes.preview, t);
+    // The preview's text Edit (its scroll bar) follows the theme too.
+    if let Ok(edit) = FindWindowExW(Some((*app).panes.preview), None, WC_EDITW, PCWSTR::null()) {
+        theme::apply_control(edit, t);
+    }
+    panes::theme_tree(app);
 }
 
 /// (Re)creates the UI font for the window's current DPI.
@@ -112,6 +124,7 @@ pub(crate) unsafe fn apply_font(app: *mut App) {
         let _ = DeleteObject((*app).font.into());
     }
     (*app).font = font;
+    panes::set_preview_fonts(app);
 }
 
 pub(crate) unsafe fn layout(app: *mut App) {
@@ -138,8 +151,7 @@ pub(crate) unsafe fn layout(app: *mut App) {
 
     let sh = statusbar::height(dpi);
     let _ = MoveWindow((*app).status, 0, rc.bottom - sh, w, sh, true);
-    let ly = y + nh + pad;
-    let _ = MoveWindow((*app).list, 0, ly, w, (rc.bottom - sh - ly).max(0), true);
+    panes::layout(app, y + nh + pad, rc.bottom - sh, w);
 }
 
 // ---- address Edit over the breadcrumb ----------------------------------------------------------

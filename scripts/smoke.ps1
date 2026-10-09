@@ -17,6 +17,23 @@ public static class W {
   public delegate bool EnumProc(IntPtr h, IntPtr l);
   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc f, IntPtr l);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+  [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr p, EnumProc f, IntPtr l);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr GetProp(IntPtr h, string name);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  // First descendant of `parent` whose window class contains `cls`.
+  public static IntPtr FindDescendant(IntPtr parent, string cls) {
+    IntPtr found = IntPtr.Zero;
+    EnumChildWindows(parent, (h, l) => {
+      var sb = new StringBuilder(128); GetClassName(h, sb, 128);
+      if (sb.ToString().Contains(cls)) { found = h; return false; }
+      return true;
+    }, IntPtr.Zero);
+    return found;
+  }
+  public static int Left(IntPtr h) { RECT r; GetWindowRect(h, out r); return r.L; }
   // First top-level window of process `pid` with window class `cls`.
   public static IntPtr FindOfProcess(uint pid, string cls) {
     IntPtr found = IntPtr.Zero;
@@ -31,6 +48,8 @@ public static class W {
 }
 '@
 
+# Window rects in physical pixels, like the app's own layout.
+$null = [W]::SetProcessDPIAware()
 function Out-Check($status, $name, $detail) { Write-Output ("{0} {1} {2}" -f $status, $name, ($detail -replace '\s+', ' ')) }
 function Start-App($arg) {
   if ($arg) { $p = Start-Process -FilePath $Exe -ArgumentList ('"{0}"' -f $arg) -PassThru } else { $p = Start-Process -FilePath $Exe -PassThru }
@@ -82,6 +101,21 @@ function Launch($arg) {
   $script:cur = Start-App $arg
   $script:main = Get-Main $script:cur
   $script:main -ne [IntPtr]::Zero
+}
+
+# Launches with APPDATA pointed at a fresh scratch folder: a first run on profile defaults, real settings untouched.
+function Launch-Fresh($arg) {
+  $script:fake = Join-Path $env:TEMP "rexplorer-smoke-appdata-$PID"
+  Remove-Item $script:fake -Recurse -Force -ErrorAction SilentlyContinue
+  New-Item -ItemType Directory -Path $script:fake -Force | Out-Null
+  $appdata = $env:APPDATA
+  try { $env:APPDATA = $script:fake; Launch $arg } finally { $env:APPDATA = $appdata }
+}
+function Remove-Fresh { Stop-App $script:cur; Start-Sleep -Milliseconds 200; Remove-Item $script:fake -Recurse -Force -ErrorAction SilentlyContinue }
+# Keys when the window can be activated, else the same command as WM_COMMAND. Returns how it was sent.
+function Send-KeysOrCommand($keys, $cmd) {
+  if (Set-Foreground $script:main) { [System.Windows.Forms.SendKeys]::SendWait($keys); 'keys' }
+  else { $null = [W]::PostMessage($script:main, 0x111, [IntPtr]$cmd, [IntPtr]::Zero); 'WM_COMMAND' }
 }
 
 if (-not (Test-Path $Exe)) { Out-Check 'FAIL' 'startup' "exe missing: $Exe"; exit 0 }
@@ -244,11 +278,11 @@ Run-Check 'theme' {
     if (-not (Launch 'C:\Windows')) { return @('FAIL', 'no main window within 5 s') }
     $env:APPDATA = $appdata
     Start-Sleep -Seconds 1
-    $missing = @('settings.ini', 'themes\dark.ini', 'themes\light.ini') | Where-Object { -not (Test-Path (Join-Path $dir $_)) }
+    $missing = @('settings.ini', 'themes\dark.ini', 'themes\light.ini', 'icons\default\folder.png') | Where-Object { -not (Test-Path (Join-Path $dir $_)) }
     $null = [W]::PostMessage($script:main, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)
     if (-not $script:cur.WaitForExit(3000)) { return @('FAIL', 'did not exit within 3 s of WM_CLOSE') }
     $win = Test-Path (Join-Path $dir 'window.txt'); $ses = Test-Path (Join-Path $dir 'session.txt')
-    if (@($missing).Count -eq 0 -and $win -and $ses) { @('PASS', 'first run wrote settings.ini, themes\dark.ini, themes\light.ini; exit wrote window.txt, session.txt') }
+    if (@($missing).Count -eq 0 -and $win -and $ses) { @('PASS', 'first run wrote settings.ini, themes\dark.ini, themes\light.ini, icons\default\*.png; exit wrote window.txt, session.txt') }
     else { @('FAIL', "missing=$($missing -join ',') window.txt=$win session.txt=$ses") }
   } finally { $env:APPDATA = $appdata; Stop-App $script:cur; Remove-Item $fake -Recurse -Force -ErrorAction SilentlyContinue }
 }
@@ -280,5 +314,70 @@ Run-Check 'placement' {
   $good = ($tok.Count -eq 5) -and (@($tok | Where-Object { $_ -notmatch '^-?\d+$' }).Count -eq 0)
   if ($code -eq 0 -and $good -and $fresh) { @('PASS', "exit=0 window.txt='$raw'") }
   else { @('FAIL', "exit=$code ints=$($tok.Count) wellformed=$good freshly written=$fresh content='$raw'") }
+}
+Run-Check 'tree' {
+  try {
+    if (-not (Launch-Fresh 'C:\Windows')) { return @('FAIL', 'no main window within 5 s') }
+    Wait-Until { (Get-Count $script:main) -ge 1 } 3000 | Out-Null
+    $found = Wait-Until { $script:nstc = [W]::FindDescendant($script:main, 'NamespaceTreeControl'); $script:nstc -ne [IntPtr]::Zero } 3000
+    $tv = [W]::FindDescendant($script:main, 'SysTreeView32')
+    if (-not $found -or $tv -eq [IntPtr]::Zero) { return @('FAIL', "NamespaceTreeControl found=$found SysTreeView32=$($tv -ne [IntPtr]::Zero)") }
+    # Drag the splitter right of the tree 100 px with posted mouse messages (client x = screen x - tree's left).
+    $list = Get-List $script:main
+    # The tree is created once the first listing is on screen, then laid out.
+    Wait-Until { ([W]::Left($list) - [W]::Left($script:nstc)) -gt 100 } 2000 | Out-Null
+    $x0 = [W]::Left($list) - [W]::Left($script:nstc); $y = 200
+    $lp = { param($x) [IntPtr](($y -shl 16) -bor ($x -band 0xFFFF)) }
+    $null = [W]::PostMessage($script:main, 0x201, [IntPtr]1, (& $lp ($x0 - 2)))
+    $null = [W]::PostMessage($script:main, 0x200, [IntPtr]1, (& $lp ($x0 + 98)))
+    $null = [W]::PostMessage($script:main, 0x202, [IntPtr]0, (& $lp ($x0 + 98)))
+    Start-Sleep -Milliseconds 300
+    $moved = ([W]::Left($list) - [W]::Left($script:nstc)) - $x0
+    $how = Send-KeysOrCommand '^b' 23
+    $hidden = Wait-Until { -not [W]::IsWindowVisible($script:nstc) } 2000
+    $drop = [W]::GetProp($list, 'OleDropTargetInterface') -ne [IntPtr]::Zero
+    $d = "tree present; splitter drag moved the list $moved px; Ctrl+B ($how) hid it=$hidden; list drop target registered=$drop"
+    if ($moved -ge 90 -and $moved -le 115 -and $hidden -and $drop) { @('PASS', $d) } else { @('FAIL', $d) }
+  } finally { Remove-Fresh }
+}
+
+Run-Check 'preview' {
+  $bench = (Join-Path $env:TEMP 'rexplorer-bench')
+  $first = Join-Path $bench 'file000000.txt'
+  # The bench files are empty; the first one gets a line so the preview has something to show.
+  if ((Get-Item $first).Length -eq 0) { Set-Content -Path $first -Value 'rexplorer preview smoke' }
+  try {
+    if (-not (Launch-Fresh $bench)) { return @('FAIL', 'no main window within 5 s') }
+    if (-not (Wait-Until { (Get-Count $script:main) -eq 100000 } 5000)) { return @('FAIL', "count=$(Get-Count $script:main)") }
+    $how = Send-KeysOrCommand '%p' 24
+    $pane = [W]::FindWindowEx($script:main, [IntPtr]::Zero, 'RexPreview', $null)
+    $shown = Wait-Until { $pane -ne [IntPtr]::Zero -and [W]::IsWindowVisible($pane) } 2000
+    if (-not $shown) { return @('FAIL', "Alt+P ($how): RexPreview present=$($pane -ne [IntPtr]::Zero) visible=$shown") }
+    # Home selects file000000.txt; the pane updates 150 ms after the selection settles.
+    $null = [W]::PostMessage((Get-List $script:main), 0x100, [IntPtr]0x24, [IntPtr]::Zero)
+    $edit = [W]::FindWindowEx($pane, [IntPtr]::Zero, 'Edit', $null)
+    $ok = Wait-Until { [int][W]::SendMessage($edit, 0x0E, [IntPtr]::Zero, [IntPtr]::Zero) -gt 0 } 3000
+    $n = [int][W]::SendMessage($edit, 0x0E, [IntPtr]::Zero, [IntPtr]::Zero)
+    if ($ok) { @('PASS', "Alt+P ($how) showed RexPreview; file000000.txt previewed, Edit holds $n chars") }
+    else { @('FAIL', "Alt+P ($how) showed RexPreview; Edit text length=$n after selecting file000000.txt") }
+  } finally { Remove-Fresh }
+}
+
+Run-Check 'views' {
+  try {
+    if (-not (Launch-Fresh 'C:\Windows')) { return @('FAIL', 'no main window within 5 s') }
+    Wait-Until { (Get-Count $script:main) -ge 1 } 3000 | Out-Null
+    $list = Get-List $script:main
+    $view = { [int][W]::SendMessage($list, 0x108F, [IntPtr]::Zero, [IntPtr]::Zero) }  # LVM_GETVIEW
+    $v0 = & $view
+    $how = Send-KeysOrCommand '^+2' 26
+    $icon = Wait-Until { (& $view) -eq 0 } 2000
+    $ini = Get-Content (Join-Path $script:fake 'rexplorer\settings.ini') -Raw
+    $saved = $ini -match '(?m)^view=icons\s*$'
+    $null = Send-KeysOrCommand '^+1' 25
+    $details = Wait-Until { (& $view) -eq 1 } 2000
+    $d = "LVM_GETVIEW $v0 -> Ctrl+Shift+2 ($how) icon=$icon (profile view=icons saved=$saved) -> Ctrl+Shift+1 details=$details"
+    if ($v0 -eq 1 -and $icon -and $saved -and $details) { @('PASS', $d) } else { @('FAIL', $d) }
+  } finally { Remove-Fresh }
 }
 exit 0

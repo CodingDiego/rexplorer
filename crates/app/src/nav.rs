@@ -240,7 +240,9 @@ unsafe fn show(app: *mut App, mode: Show) {
     let tab = cur(app);
     tab.watch = None;
     let Some(l) = &tab.listing else {
+        views::reset(app, 0);
         SendMessageW(list, LVM_SETITEMCOUNT, Some(WPARAM(0)), Some(LPARAM(0)));
+        panes::schedule_preview(app);
         set_columns(app, &[]);
         set_text((*app).addr, &tab.name);
         set_text(hwnd, "rexplorer");
@@ -267,9 +269,13 @@ unsafe fn show(app: *mut App, mode: Show) {
     tab.watch = ChangeWatch::register(hwnd, &l.folder, WM_SHELL_CHANGE);
 
     let count = l.items.len();
+    views::reset(app, count);
     // The list asks for item text synchronously from here on, so the listing must be in place first.
     SendMessageW(list, LVM_SETITEMCOUNT, Some(WPARAM(count)), Some(LPARAM(LVSICF_NOSCROLL as isize)));
     list::set_item_state(list, usize::MAX, LIST_VIEW_ITEM_STATE_FLAGS(0), LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0));
+    if !matches!(mode, Show::Restore { columns: false, .. }) {
+        panes::sync_tree(app);
+    }
     let select = |names: &[String]| -> Option<usize> {
         let mut first = None;
         if !names.is_empty() {
@@ -302,6 +308,12 @@ unsafe fn show(app: *mut App, mode: Show) {
                 SendMessageW(list, LVM_ENSUREVISIBLE, Some(WPARAM(top.max(0) as usize)), Some(LPARAM(0)));
             }
         }
+    }
+    panes::schedule_preview(app);
+    // The tree builds on this thread and can take a while (Quick Access, slow drives): only after the first
+    // listing is on screen (WM_TIMER comes after paint).
+    if (*app).session.show_tree && (*app).panes.tree.is_none() {
+        SetTimer(Some(hwnd), TIMER_TREE, 1, None);
     }
     update_chrome(app);
 }

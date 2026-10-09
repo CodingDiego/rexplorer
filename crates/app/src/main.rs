@@ -12,6 +12,7 @@ mod instance;
 mod list;
 mod nav;
 mod palette;
+mod panes;
 mod preview_pane;
 mod session;
 mod statusbar;
@@ -21,6 +22,7 @@ mod theme;
 mod thumbs;
 mod toolbar;
 mod ui;
+mod views;
 
 use std::ffi::c_void;
 use std::mem::size_of;
@@ -58,6 +60,8 @@ const WM_SHELL_CHANGE: u32 = WM_APP + 2;
 const TIMER_REFRESH: usize = 1;
 const TIMER_STATUS: usize = 2;
 const TIMER_SESSION: usize = 3;
+const TIMER_PREVIEW: usize = 4;
+const TIMER_TREE: usize = 5;
 const ICON_UNKNOWN: i32 = i32::MIN;
 
 const ID_ADDR: usize = 100;
@@ -68,6 +72,7 @@ const ID_TOOLS: usize = 104;
 const ID_CRUMBS: usize = 105;
 const ID_STATUS: usize = 106;
 const ID_PALETTE: usize = 107;
+const ID_PREVIEW: usize = 108;
 
 const CMD_BACK: u16 = 1;
 const CMD_FORWARD: u16 = 2;
@@ -91,6 +96,10 @@ const CMD_REGISTER: u16 = 19;
 const CMD_UNREGISTER: u16 = 20;
 const CMD_SETTINGS: u16 = 21;
 const CMD_ABOUT: u16 = 22;
+const CMD_TOGGLE_TREE: u16 = 23;
+const CMD_TOGGLE_PREVIEW: u16 = 24;
+/// Ctrl+Shift+1..3 send CMD_VIEW1..CMD_VIEW1 + 2 (details, icons, thumbnails).
+const CMD_VIEW1: u16 = 25;
 /// Ctrl+1..Ctrl+9 send CMD_TAB1..CMD_TAB1 + 8.
 const CMD_TAB1: u16 = 31;
 
@@ -98,7 +107,7 @@ const fn accel(flags: u8, key: VIRTUAL_KEY, cmd: u16) -> ACCEL {
     ACCEL { fVirt: ACCEL_VIRT_FLAGS(FVIRTKEY.0 | flags), key: key.0, cmd }
 }
 
-const ACCELS: [ACCEL; 17] = [
+const ACCELS: [ACCEL; 22] = [
     accel(FALT.0, VK_LEFT, CMD_BACK),
     accel(FALT.0, VK_RIGHT, CMD_FORWARD),
     accel(FALT.0, VK_UP, CMD_UP),
@@ -116,6 +125,11 @@ const ACCELS: [ACCEL; 17] = [
     accel(FCONTROL.0 | FSHIFT.0, VK_TAB, CMD_PREV_TAB),
     accel(FCONTROL.0, VK_P, CMD_PALETTE),
     accel(FCONTROL.0, VK_OEM_3, CMD_TERMINAL),
+    accel(FCONTROL.0, VK_B, CMD_TOGGLE_TREE),
+    accel(FALT.0, VK_P, CMD_TOGGLE_PREVIEW),
+    accel(FCONTROL.0 | FSHIFT.0, VK_1, CMD_VIEW1),
+    accel(FCONTROL.0 | FSHIFT.0, VK_2, CMD_VIEW1 + 1),
+    accel(FCONTROL.0 | FSHIFT.0, VK_3, CMD_VIEW1 + 2),
 ];
 
 pub(crate) struct App {
@@ -142,6 +156,8 @@ pub(crate) struct App {
     session: session::Session,
     debounce: session::Debounce,
     recent: Recent,
+    panes: panes::Panes,
+    views: views::Views,
 }
 
 fn main() -> Result<()> {
@@ -180,6 +196,8 @@ fn main() -> Result<()> {
         let theme = settings.theme(&profile.theme).clone();
         let brushes = theme::Brushes::new(&theme);
         ui::probe_cloud_roots();
+        views::ensure_starter_theme(&theme);
+        let session = startup_session(&profile, args.profile.is_some());
 
         let hinst: HINSTANCE = GetModuleHandleW(None)?.into();
         let class = w!("RexplorerMain");
@@ -214,9 +232,11 @@ fn main() -> Result<()> {
             generation: 0,
             active_menu: None,
             image_list_set: false,
-            session: session::load(),
+            views: views::Views::new(views::View::parse(&session.view)),
+            session,
             debounce: session::Debounce::new(Duration::from_secs(2)),
             recent: Recent::load(dir.join("recent.txt")),
+            panes: panes::Panes::default(),
         }));
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -243,7 +263,7 @@ fn main() -> Result<()> {
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             // Accelerators only when our own controls have focus; the ListView's label editor and the palette keep their keys.
             let focus = GetFocus();
-            let ours = focus == (*app).list || focus == (*app).addr || focus == hwnd;
+            let ours = focus == (*app).list || focus == (*app).addr || focus == hwnd || tree_accel(app, &msg, focus);
             if ours && TranslateAcceleratorW(hwnd, accel_table, &msg) != 0 {
                 continue;
             }
@@ -252,6 +272,32 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Pane and view state: the saved session, or the profile on a first run or an explicit --profile.
+fn startup_session(profile: &Profile, explicit_profile: bool) -> session::Session {
+    let mut s = session::load();
+    if explicit_profile || !session::path().exists() {
+        s.view = profile.view.clone();
+        s.show_tree = profile.show_tree;
+        s.show_preview = profile.show_preview;
+        s.tree_width = profile.tree_width;
+        s.preview_width = profile.preview_width;
+    }
+    s.tree_width = panes::clamp_width(s.tree_width);
+    s.preview_width = panes::clamp_width(s.preview_width);
+    s
+}
+
+/// The tree keeps Enter and Escape; every other shortcut works while it has the focus.
+unsafe fn tree_accel(app: *mut App, msg: &MSG, focus: HWND) -> bool {
+    if !matches!(msg.message, WM_KEYDOWN | WM_SYSKEYDOWN) || matches!(VIRTUAL_KEY(msg.wParam.0 as u16), VK_RETURN | VK_ESCAPE) {
+        return false;
+    }
+    (*app).panes.tree.as_ref().is_some_and(|t| {
+        let h = t.hwnd();
+        focus == h || IsChild(h, focus).as_bool()
+    })
 }
 
 fn accels() -> Vec<ACCEL> {
@@ -336,6 +382,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             return LRESULT(1);
         }
         WM_ENUM_DONE => nav::on_enum_done(app, Box::from_raw(lparam.0 as *mut nav::EnumDone)),
+        panes::WM_TREE_SELECT => panes::on_tree_select(app, Box::from_raw(lparam.0 as *mut Pidl)),
+        views::WM_THUMB_DONE => views::on_thumb_done(app, wparam, lparam),
+        WM_SETCURSOR => {
+            if HWND(wparam.0 as *mut c_void) == hwnd && (lparam.0 & 0xFFFF) as u32 == HTCLIENT && panes::on_set_cursor(app) {
+                return LRESULT(1);
+            }
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+        WM_LBUTTONDOWN => panes::on_button_down(app, lparam),
+        WM_MOUSEMOVE => panes::on_mouse_move(app, lparam),
+        WM_LBUTTONUP | WM_CAPTURECHANGED => panes::end_drag(app),
         WM_SHELL_CHANGE => {
             ChangeWatch::acknowledge(wparam, lparam);
             SetTimer(Some(hwnd), TIMER_REFRESH, 150, None);
@@ -346,6 +403,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 TIMER_REFRESH => nav::refresh(app),
                 TIMER_STATUS => ui::update_status(app),
                 TIMER_SESSION => nav::save_session(app),
+                TIMER_PREVIEW => panes::update_preview(app),
+                TIMER_TREE => {
+                    panes::ensure_tree(app);
+                    ui::layout(app);
+                }
                 _ => {}
             }
         }
@@ -364,6 +426,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if let Some(l) = listing(app) {
                 nav::set_columns(app, &l.columns);
             }
+            views::apply(app);
             ui::layout(app);
         }
         WM_DESTROY => {
@@ -372,6 +435,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             for t in &mut (*app).tabs {
                 t.watch = None;
             }
+            rexplorer_core::dragdrop::unregister((*app).list);
+            views::destroy(app);
+            (*app).panes.tree = None;
             PostQuitMessage(0);
         }
         _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -466,8 +532,14 @@ unsafe fn on_command(app: *mut App, cmd: u16) {
         CMD_PREV_TAB => nav::cycle_tab(app, -1),
         CMD_PALETTE => ui::open_palette(app),
         CMD_TERMINAL => ui::open_terminal(app),
-        // Real views arrive in step 2, the connect dialog in step 3.
-        CMD_VIEW | CMD_CONNECT => {}
+        CMD_VIEW => views::set_view(app, (*app).views.view.next()),
+        CMD_VIEW1 => views::set_view(app, views::View::Details),
+        c if c == CMD_VIEW1 + 1 => views::set_view(app, views::View::Icons),
+        c if c == CMD_VIEW1 + 2 => views::set_view(app, views::View::Thumbnails),
+        CMD_TOGGLE_TREE => panes::toggle_tree(app),
+        CMD_TOGGLE_PREVIEW => panes::toggle_preview(app),
+        // The connect dialog arrives in step 3.
+        CMD_CONNECT => {}
         CMD_MORE => ui::more_menu(app),
         CMD_REGISTER | CMD_UNREGISTER => ui::register_flow(Some((*app).hwnd), cmd == CMD_UNREGISTER),
         CMD_SETTINGS => nav::new_tab(app, nav::Target::Name(settings::dir().display().to_string()), true, None),
