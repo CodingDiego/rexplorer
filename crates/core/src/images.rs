@@ -1,10 +1,13 @@
 //! Thumbnails and large icons via `IShellItemImageFactory`, plus a small LRU bitmap cache.
 //!
-//! All bitmaps are 32-bit premultiplied-alpha DIBs; `ImageList_Add` accepts them as-is.
+//! All bitmaps are 32-bit DIBs; `ImageList_Add` accepts them as-is. `GetImage` returns straight alpha (edge pixels
+//! carry color above their alpha), so anything drawn with `AlphaBlend` goes through `premultiply` first.
 use std::collections::HashMap;
+use std::ffi::c_void;
+use std::mem::size_of;
 
 use windows::Win32::Foundation::SIZE;
-use windows::Win32::Graphics::Gdi::{DeleteObject, HBITMAP};
+use windows::Win32::Graphics::Gdi::{BITMAP, DeleteObject, GetObjectW, HBITMAP};
 use windows::Win32::UI::Shell::{
     IShellItemImageFactory, SHCreateItemFromIDList, SIIGBF, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
     SIIGBF_RESIZETOFIT,
@@ -13,7 +16,7 @@ use windows::core::Result;
 
 use crate::com::Pidl;
 
-/// Renders `abs` at `size` x `size`; the caller owns the returned 32-bit premultiplied-alpha DIB.
+/// Renders `abs` at `size` x `size`; the caller owns the returned 32-bit straight-alpha DIB.
 pub fn image(abs: &Pidl, size: i32, flags: SIIGBF) -> Result<HBITMAP> {
     let factory: IShellItemImageFactory = unsafe { SHCreateItemFromIDList(abs.as_ptr())? };
     unsafe { factory.GetImage(SIZE { cx: size, cy: size }, flags) }
@@ -27,6 +30,26 @@ pub fn thumbnail(abs: &Pidl, size: i32) -> Result<HBITMAP> {
 /// The item's icon only, never a content thumbnail.
 pub fn icon(abs: &Pidl, size: i32) -> Result<HBITMAP> {
     image(abs, size, SIIGBF_ICONONLY | SIIGBF_RESIZETOFIT)
+}
+
+/// Converts a 32-bit DIB section in place to premultiplied alpha, as `AlphaBlend` with `AC_SRC_ALPHA` expects.
+/// Straight-alpha edge pixels would otherwise add their full color and halo the image.
+pub fn premultiply(bmp: HBITMAP) {
+    let mut bm = BITMAP::default();
+    let n = unsafe { GetObjectW(bmp.into(), size_of::<BITMAP>() as i32, Some(&mut bm as *mut _ as *mut c_void)) };
+    if n == 0 || bm.bmBitsPixel != 32 || bm.bmBits.is_null() {
+        return;
+    }
+    let count = (bm.bmWidthBytes / 4 * bm.bmHeight.abs()) as usize;
+    let px = unsafe { std::slice::from_raw_parts_mut(bm.bmBits as *mut [u8; 4], count) };
+    for p in px {
+        let a = p[3] as u32;
+        if a < 255 {
+            for c in &mut p[..3] {
+                *c = ((*c as u32 * a + 127) / 255) as u8;
+            }
+        }
+    }
 }
 
 /// LRU cache that owns its bitmaps and deletes them on eviction, `clear` and drop.
@@ -131,6 +154,44 @@ mod tests {
     fn icon_of_folder_is_a_bitmap() {
         let _c = ComInit::sta();
         assert_bitmap(icon(&parse(&std::env::temp_dir()), 48).unwrap());
+    }
+
+    #[test]
+    fn premultiply_scales_color_by_alpha() {
+        use windows::Win32::Graphics::Gdi::{BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateDIBSection, DIB_RGB_COLORS};
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: 2,
+                biHeight: -1,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits = std::ptr::null_mut();
+        let bmp = unsafe { CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0).unwrap() };
+        let px = unsafe { std::slice::from_raw_parts_mut(bits as *mut [u8; 4], 2) };
+        px[0] = [0, 102, 102, 10];
+        px[1] = [10, 20, 30, 255];
+        premultiply(bmp);
+        assert_eq!(px[0], [0, 4, 4, 10], "straight edge pixel scaled by its alpha");
+        assert_eq!(px[1], [10, 20, 30, 255], "opaque pixels untouched");
+        delete(bmp);
+    }
+
+    #[test]
+    fn shell_icons_come_straight_and_premultiply_to_valid_pixels() {
+        let _c = ComInit::sta();
+        let bmp = icon(&parse(&std::env::temp_dir()), 48).unwrap();
+        premultiply(bmp);
+        let mut b = BITMAP::default();
+        unsafe { GetObjectW(bmp.into(), size_of::<BITMAP>() as i32, Some(&mut b as *mut _ as *mut c_void)) };
+        let px = unsafe { std::slice::from_raw_parts(b.bmBits as *const [u8; 4], (b.bmWidthBytes / 4 * b.bmHeight.abs()) as usize) };
+        assert!(px.iter().all(|p| p[0] <= p[3] && p[1] <= p[3] && p[2] <= p[3]), "no channel above alpha");
+        delete(bmp);
     }
 
     #[test]

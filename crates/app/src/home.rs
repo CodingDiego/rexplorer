@@ -435,6 +435,7 @@ pub fn set_content(hwnd: HWND, mut content: Content) {
                         return;
                     }
                     let Ok(bmp) = images::icon(&abs, size) else { continue };
+                    images::premultiply(bmp);
                     let wp = WPARAM(((generation as usize) << 32) | slot);
                     if PostMessageW(Some(HWND(target as *mut c_void)), HM_ICON, wp, LPARAM(bmp.0 as isize)).is_err() {
                         let _ = DeleteObject(bmp.into());
