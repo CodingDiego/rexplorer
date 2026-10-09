@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 # RAR has no shell namespace handler; this bundles the unrar library and builds it with cc.
 unrar = "0.5"
+windows-core = { workspace = true }
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
@@ -16,6 +17,7 @@ windows = { workspace = true, features = [
     "Win32_System_Diagnostics_Debug",
     "Win32_System_IO",
     "Win32_System_Ioctl",
+    "Win32_System_Kernel",
     "Win32_System_Ole",
     "Win32_System_Registry",
     "Win32_System_SystemServices",

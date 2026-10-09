@@ -5,6 +5,8 @@ members = ["crates/core", "crates/app"]
 [workspace.dependencies]
 # Pinned on purpose: the windows crate breaks its API across minors. Upgrade deliberately.
 windows = "=0.62.2"
+# Same version as windows: the #[implement] macro needs windows-core as a direct dependency.
+windows-core = "=0.62.2"
 
 [profile.release]
 lto = true
