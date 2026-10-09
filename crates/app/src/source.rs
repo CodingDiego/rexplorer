@@ -206,6 +206,10 @@ impl Source {
     /// Up: the containing folder; at an archive's root its folder; from a search the folder searched.
     pub fn parent(&self) -> Option<Target> {
         match self {
+            // Home and Quick Access sit on the desktop root; Up goes to This PC, as in Explorer.
+            Source::Shell(l) if [nav::HOME, nav::QUICK_ACCESS].iter().any(|h| l.folder.parsing_name.eq_ignore_ascii_case(h)) => {
+                Some(Target::Name(ui::THIS_PC.to_string()))
+            }
             Source::Shell(l) => l.folder.parent_pidl().map(Target::Pidl),
             Source::Archive(a) => archive_parent(&a.listing.archive, &a.listing.dir).map(Target::Name),
             Source::Search(s) => Some(Target::Pidl(s.root.clone())),
@@ -243,7 +247,7 @@ pub(crate) fn load_archive(archive: &Path, dir: &str) -> Result<Loaded> {
 }
 
 /// System image list and small icon index for a name, by extension only (no disk access).
-fn sys_icon(name: &str, dir: bool) -> (usize, i32) {
+pub(crate) fn sys_icon(name: &str, dir: bool) -> (usize, i32) {
     let mut fi = SHFILEINFOW::default();
     let attr = if dir { FILE_ATTRIBUTE_DIRECTORY } else { FILE_ATTRIBUTE_NORMAL };
     let h = HSTRING::from(name);
@@ -425,6 +429,7 @@ pub(crate) unsafe fn start_search(app: *mut App, t: usize, needle: &str, push: b
     let generation = (*app).generation;
     // A load still in flight for this tab no longer lands here.
     tab.pending = 0;
+    tab.loading = None;
     let old = tab.source.take();
     if let (true, Some(o)) = (push, &old) {
         tab.back.push(o.location());
@@ -452,6 +457,7 @@ pub(crate) unsafe fn start_search(app: *mut App, t: usize, needle: &str, push: b
     tab.source = Some(Source::Search(s));
     if t == (*app).active {
         nav::show(app, Show::Fresh(Vec::new()));
+        SetTimer(Some((*app).hwnd), TIMER_SKELETON, 120, None);
     }
     nav::session_changed(app);
 
@@ -567,6 +573,9 @@ pub(crate) unsafe fn on_search_batch(app: *mut App, batch: Box<SearchBatch>) {
         return;
     }
     let list = (*app).list;
+    if count > 0 || done {
+        nav::stop_skeleton(app);
+    }
     if count != before {
         SendMessageW(list, LVM_SETITEMCOUNT, Some(WPARAM(count)), Some(LPARAM((LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL) as isize)));
         if before == 0 {
@@ -615,6 +624,12 @@ pub(crate) unsafe extern "system" fn search_subclass(hwnd: HWND, msg: u32, wpara
 pub(crate) unsafe fn enter_browser(app: *mut App, place: &BrowserPlace) {
     let a = &mut *app;
     if a.browser.is_none() {
+        // Creating the view blocks this thread for a moment: the skeleton stands in for it meanwhile.
+        a.skeleton = true;
+        SendMessageW(a.list, LVM_SETITEMCOUNT, Some(WPARAM(0)), Some(LPARAM(0)));
+        let _ = InvalidateRect(Some(a.list), None, true);
+        let _ = windows::Win32::Graphics::Gdi::UpdateWindow(a.list);
+        a.skeleton = false;
         let hwnd = a.hwnd.0 as isize;
         // Runs inside the browser's own message handling: only post.
         let post = move |p: Pidl| {

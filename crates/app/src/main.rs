@@ -68,6 +68,10 @@ const TIMER_SESSION: usize = 3;
 const TIMER_PREVIEW: usize = 4;
 const TIMER_TREE: usize = 5;
 const TIMER_SIDEBAR: usize = 6;
+/// A navigation has run long enough to show the skeleton.
+const TIMER_SKELETON: usize = 7;
+/// The skeleton's shade alternates.
+const TIMER_PULSE: usize = 8;
 const ICON_UNKNOWN: i32 = i32::MIN;
 
 const ID_ADDR: usize = 100;
@@ -115,12 +119,14 @@ const CMD_FOLDER_TREE: u16 = 30;
 const CMD_VIEW1: u16 = 25;
 /// Ctrl+1..Ctrl+9 send CMD_TAB1..CMD_TAB1 + 8.
 const CMD_TAB1: u16 = 31;
+/// Ctrl+D: pin the selected folders (or the current one) to Home.
+const CMD_PIN: u16 = 40;
 
 const fn accel(flags: u8, key: VIRTUAL_KEY, cmd: u16) -> ACCEL {
     ACCEL { fVirt: ACCEL_VIRT_FLAGS(FVIRTKEY.0 | flags), key: key.0, cmd }
 }
 
-const ACCELS: [ACCEL; 23] = [
+const ACCELS: [ACCEL; 24] = [
     accel(FALT.0, VK_LEFT, CMD_BACK),
     accel(FALT.0, VK_RIGHT, CMD_FORWARD),
     accel(FALT.0, VK_UP, CMD_UP),
@@ -141,6 +147,7 @@ const ACCELS: [ACCEL; 23] = [
     accel(FCONTROL.0, VK_B, CMD_TOGGLE_SIDEBAR),
     accel(FALT.0, VK_P, CMD_TOGGLE_PREVIEW),
     accel(FCONTROL.0, VK_F, CMD_SEARCH),
+    accel(FCONTROL.0, VK_D, CMD_PIN),
     accel(FCONTROL.0 | FSHIFT.0, VK_1, CMD_VIEW1),
     accel(FCONTROL.0 | FSHIFT.0, VK_2, CMD_VIEW1 + 1),
     accel(FCONTROL.0 | FSHIFT.0, VK_3, CMD_VIEW1 + 2),
@@ -182,6 +189,10 @@ pub(crate) struct App {
     browser_at: Option<Pidl>,
     /// Volume indexes for elevated searches, built once per drive.
     usn: source::UsnCache,
+    /// The list is empty and draws placeholder rows while the active tab loads (or searches with no results yet).
+    skeleton: bool,
+    /// Which of the skeleton's two shades is showing.
+    pulse: bool,
 }
 
 fn main() -> Result<()> {
@@ -226,7 +237,11 @@ fn main() -> Result<()> {
         if let Some(p) = &args.profile {
             settings.active = p.clone();
         }
-        let profile = settings.active_profile().clone();
+        let mut profile = settings.active_profile().clone();
+        // Home needs a recent Windows; elsewhere the default start is This PC.
+        if profile.start.eq_ignore_ascii_case(settings::HOME_START) && ShellFolder::parse(&profile.start).is_err() {
+            profile.start = "shell:MyComputerFolder".into();
+        }
         let theme = settings.theme(&profile.theme).clone();
         let brushes = theme::Brushes::new(&theme);
         views::ensure_starter_theme(&theme);
@@ -277,6 +292,8 @@ fn main() -> Result<()> {
             browser: None,
             browser_at: None,
             usn: Default::default(),
+            skeleton: false,
+            pulse: false,
         }));
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -437,7 +454,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         source::WM_SEARCH_BATCH => source::on_search_batch(app, Box::from_raw(lparam.0 as *mut source::SearchBatch)),
         source::WM_BROWSER_NAV => source::on_browser_nav(app, Box::from_raw(lparam.0 as *mut Pidl)),
         source::WM_WORKER_ERROR => message(hwnd, &Box::from_raw(lparam.0 as *mut String)),
-        panes::WM_SIDEBAR_ROWS => panes::on_sidebar_rows(app, Box::from_raw(lparam.0 as *mut Vec<sidebar::Row>)),
+        panes::WM_SIDEBAR_ROWS => panes::on_sidebar_rows(app, Box::from_raw(lparam.0 as *mut panes::SidebarRows)),
         panes::WM_TREE_SELECT => panes::on_tree_select(app, Box::from_raw(lparam.0 as *mut Pidl)),
         views::WM_THUMB_DONE => views::on_thumb_done(app, wparam, lparam),
         WM_SETCURSOR => {
@@ -464,6 +481,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     panes::ensure_tree(app);
                     ui::layout(app);
                 }
+                TIMER_SKELETON => nav::on_skeleton_timer(app),
+                TIMER_PULSE => nav::on_pulse_timer(app),
                 TIMER_SIDEBAR if GetActiveWindow() == hwnd => {
                     panes::refresh_sidebar(app);
                     SetTimer(Some(hwnd), TIMER_SIDEBAR, 5000, None);
@@ -525,6 +544,10 @@ unsafe fn on_notify(app: *mut App, lparam: LPARAM) -> LRESULT {
             _ => {}
         }
     } else if from == (*app).crumbs {
+        // While a navigation is in flight the bar shows its destination, not the tab's crumbs.
+        if cur(app).loading.is_some() {
+            return LRESULT(0);
+        }
         let nm = &*(lparam.0 as *const breadcrumb::NmCrumb);
         match hdr.code {
             breadcrumb::CN_CRUMB => {
@@ -549,6 +572,8 @@ unsafe fn on_notify(app: *mut App, lparam: LPARAM) -> LRESULT {
         if !target.is_empty() {
             go(app, nav::Target::Name(target), nav::History::Push);
         }
+    } else if from == (*app).sidebar && hdr.code == sidebar::SN_CONTEXT {
+        panes::sidebar_menu(app, (*(lparam.0 as *const sidebar::NmSidebar)).index);
     } else if hdr.idFrom == ID_PALETTE && (hdr.code == palette::PN_PICK || hdr.code == palette::PN_CLOSE) {
         ui::on_palette(app, hdr);
     }
@@ -633,6 +658,7 @@ unsafe fn on_command(app: *mut App, cmd: u16) {
         CMD_REGISTER | CMD_UNREGISTER => ui::register_flow(Some((*app).hwnd), cmd == CMD_UNREGISTER),
         CMD_SETTINGS => nav::new_tab(app, nav::Target::Name(settings::dir().display().to_string()), true, None),
         CMD_ABOUT => ui::about(app),
+        CMD_PIN => list::pin_to_home(app),
         c if (CMD_TAB1..CMD_TAB1 + 9).contains(&c) => {
             // Ctrl+9 is the last tab, as in browsers.
             let n = (*app).tabs.len();

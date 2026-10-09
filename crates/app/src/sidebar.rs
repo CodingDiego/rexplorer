@@ -1,6 +1,7 @@
 //! Places sidebar, window class "RexSidebar": titled sections of rows (small icon + label), the current place
 //! marked with a pill. A click sends WM_NOTIFY SN_PICK with an `NmSidebar` to the parent, which reads the row's
-//! target with `target`. Rows (and their icons) are built by the caller, typically on a worker thread.
+//! target with `target`; a right-click sends SN_CONTEXT the same way. Rows with an empty section title have no
+//! header. Rows (and their icons) are built by the caller, typically on a worker thread.
 
 use std::ffi::c_void;
 use std::mem::size_of;
@@ -19,8 +20,12 @@ use windows::core::{PCWSTR, Result, w};
 use crate::theme;
 
 pub const SN_PICK: u32 = 0x9031;
+pub const SN_CONTEXT: u32 = 0x9032;
 /// Test hook (the smoke test clicks rows): returns the client-space top of row `wparam`, or -1.
 pub const SM_ROW_TOP: u32 = WM_APP + 0x40;
+/// Test hook: sets the window text to row `wparam`'s target (WM_GETTEXT reads it from another process) and
+/// returns its length, or -1 when there is no such row.
+pub const SM_ROW_TARGET: u32 = WM_APP + 0x41;
 
 #[repr(C)]
 pub struct NmSidebar {
@@ -57,7 +62,7 @@ pub fn layout(rows: &[Row], dpi: u32) -> Vec<RECT> {
     let mut out = Vec::with_capacity(rows.len());
     for (i, r) in rows.iter().enumerate() {
         if i == 0 || rows[i - 1].section != r.section {
-            y += if i > 0 { scale(GAP, dpi) } else { 0 } + scale(HEADER, dpi);
+            y += if i > 0 { scale(GAP, dpi) } else { 0 } + if r.section.is_empty() { 0 } else { scale(HEADER, dpi) };
         }
         out.push(RECT { left: 0, top: y, right: 0, bottom: y + scale(ROW, dpi) });
         y += scale(ROW, dpi);
@@ -261,6 +266,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             s.sync(hwnd);
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
+        SM_ROW_TARGET => {
+            let Some(r) = s.rows.get(wparam.0) else { return LRESULT(-1) };
+            let t = windows::core::HSTRING::from(r.target.as_str());
+            let _ = SetWindowTextW(hwnd, PCWSTR(t.as_ptr()));
+            return LRESULT(t.len() as isize);
+        }
         SM_ROW_TOP => {
             s.sync(hwnd);
             return LRESULT(s.rects.get(wparam.0).map_or(-1, |r| (r.top - s.scroll) as isize));
@@ -288,12 +299,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
         WM_LBUTTONDOWN => s.pressed = row_at(hwnd, s, lparam),
-        WM_LBUTTONUP => {
-            let picked = s.pressed.take().filter(|&i| row_at(hwnd, s, lparam) == Some(i));
+        WM_LBUTTONUP | WM_RBUTTONUP => {
+            let (picked, code) = if msg == WM_LBUTTONUP {
+                (s.pressed.take().filter(|&i| row_at(hwnd, s, lparam) == Some(i)), SN_PICK)
+            } else {
+                (row_at(hwnd, s, lparam), SN_CONTEXT)
+            };
             // No state reference is used after notifying: the parent may do anything, including destroying us.
             if let (Some(index), Ok(parent)) = (picked, GetParent(hwnd)) {
                 let id = GetDlgCtrlID(hwnd) as usize;
-                let nm = NmSidebar { hdr: NMHDR { hwndFrom: hwnd, idFrom: id, code: SN_PICK }, index };
+                let nm = NmSidebar { hdr: NMHDR { hwndFrom: hwnd, idFrom: id, code }, index };
                 SendMessageW(parent, WM_NOTIFY, Some(WPARAM(id)), Some(LPARAM(&nm as *const _ as isize)));
             }
         }
@@ -335,7 +350,7 @@ unsafe fn paint(hwnd: HWND, s: &mut State) {
         if bottom < 0 || top - sc(HEADER) > ch {
             continue;
         }
-        if i == 0 || s.rows[i - 1].section != row.section {
+        if (i == 0 || s.rows[i - 1].section != row.section) && !row.section.is_empty() {
             SelectObject(dc, s.header_font.into());
             SetTextColor(dc, COLORREF(t.secondary_text));
             let mut hr = RECT { left: 2 * inset, top: top - sc(HEADER), right: cw - inset, bottom: top - sc(4) };
@@ -386,6 +401,9 @@ mod tests {
         assert_eq!(hit(&r, 91), Some(1));
         assert_eq!(hit(&r, 100), None, "a section header is no row");
         assert_eq!(hit(&r, 10), None);
+        let top = [row("", "home"), row("Favorites", "a")];
+        let r = layout(&top, 96);
+        assert_eq!((r[0].top, r[1].top), (8, 36 + 8 + 28), "an untitled first row has no header");
     }
 
     #[test]
@@ -417,6 +435,11 @@ mod tests {
             let dpi = GetDpiForWindow(sb);
             assert_eq!(SendMessageW(sb, SM_ROW_TOP, Some(WPARAM(0)), None).0 as i32, layout(&state(sb).unwrap().rows, dpi)[0].top);
             assert_eq!(SendMessageW(sb, SM_ROW_TOP, Some(WPARAM(5)), None).0, -1);
+            assert_eq!(SendMessageW(sb, SM_ROW_TARGET, Some(WPARAM(1)), None).0, 3);
+            let mut buf = [0u16; 8];
+            let n = GetWindowTextW(sb, &mut buf) as usize;
+            assert_eq!(String::from_utf16_lossy(&buf[..n]), "C:\\");
+            assert_eq!(SendMessageW(sb, SM_ROW_TARGET, Some(WPARAM(5)), None).0, -1);
             set_rows(sb, vec![row("Favorites", "C:\\Users"), row("This PC", "C:\\")]);
             assert_eq!(state(sb).unwrap().rows.len(), 2);
             let _ = DestroyWindow(parent);

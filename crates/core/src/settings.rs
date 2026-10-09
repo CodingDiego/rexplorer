@@ -199,6 +199,9 @@ impl Theme {
     }
 }
 
+/// The shell's Home ("Inicio"): Quick Access pins and recent files. The default start folder.
+pub const HOME_START: &str = "shell:::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}";
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Profile {
     pub name: String,
@@ -214,17 +217,17 @@ pub struct Profile {
 
 impl Profile {
     pub fn default_profile() -> Profile {
-        let b = |l: &str, t: &str| (l.to_string(), t.to_string());
         Profile {
             name: "default".into(),
-            start: "shell:MyComputerFolder".into(),
+            start: HOME_START.into(),
             theme: "dark".into(),
             view: "details".into(),
             show_tree: false,
             show_preview: false,
             tree_width: 220,
             preview_width: 360,
-            bookmarks: vec![b("Desktop", "shell:Desktop"), b("Downloads", "shell:Downloads"), b("Documents", "shell:Personal")],
+            // The sidebar's Favorites come from Quick Access with the shell's names; bookmarks are the user's own.
+            bookmarks: Vec::new(),
         }
     }
 

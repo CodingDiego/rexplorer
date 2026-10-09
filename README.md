@@ -30,7 +30,7 @@ Folder of 100,000 files in `%TEMP%\rexplorer-bench`, release build, warm cache, 
 
 Decision: keep pure shell enumeration for every folder type. No filesystem fast path.
 
-## Features (Phase 1 and Phase 2 through step 4)
+## Features (Phase 1 and Phase 2 through step 5)
 
 Everything shown is a shell item: names, columns, icons, sorting, context menus, file operations, rename, live
 updates and drag and drop all come from the shell. rexplorer draws; the shell does the work.
@@ -54,12 +54,34 @@ right). The 8 px gaps between the left pane and the cards are splitters (drag to
 follows the theme (title bar color, Mica when the theme asks for it, themed list, header, Edits and fonts that follow
 the monitor DPI). Minimum size 640x400.
 
-Sidebar: **Favorites** (the profile's bookmarks, then Desktop, Downloads, Documents, Pictures, Music and Videos),
-**This PC** (the drives, re-read every 5 s while the window is active), **Cloud** (the cloud-sync roots found on
-this machine: OneDrive, Google Drive, Dropbox, iCloud Drive; the section is left out when there are none) and
-**Network**. Click a row to go there; the row of the current folder, or of its nearest ancestor, is highlighted.
-The rows and their icons are read on a worker thread, so the sidebar fills in after the first listing. More >
-**Folder tree** shows the shell's folder tree in the sidebar's place (choose it again for the sidebar).
+Sidebar, every row read from the shell with its localized name and icon:
+
+- **Home** ("Inicio" on a Spanish Windows) on top, without a section title.
+- **Favorites**: the profile's bookmarks, then the folders of Quick Access in the shell's order: the pinned known
+  folders, the Recycle Bin, your own pins and the frequent folders. A place is listed once.
+- **This PC**: the drives, connected MTP phones and other devices This PC shows (not the user folders it also
+  lists).
+- **Devices**: what the desktop root adds that is neither a file on the desktop nor a place shown elsewhere: Phone
+  Link phones (`%USERPROFILE%\CrossDevice\...`) and Linux (WSL). Left out when empty.
+- **Cloud**: the cloud-sync roots found on this machine (OneDrive, Google Drive, Dropbox, iCloud Drive); left out
+  when there are none.
+- **Network**.
+
+Click a row to go there; the row of the current folder, or of its nearest ancestor, is highlighted. Right-click a
+Quick Access folder for **Unpin from Home**, a bookmark for **Remove bookmark** (its `bookmark.<label>` line leaves
+settings.ini). The rows are built on a worker thread, rebuilt every 5 s while the window is active and right after
+a pin or unpin from rexplorer, so the sidebar fills in after the first listing. More > **Folder tree** shows the
+shell's folder tree in the sidebar's place (choose it again for the sidebar).
+
+Pins: **Ctrl+D**, **Pin to Home** at the top of the list's context menu, or More > **Pin to Home** run the shell's
+own "pin to Home" verb on the selected folders, or on the current folder when nothing is selected. The pin lands
+in Explorer's Quick Access too, and unpinning from either side shows in both.
+
+Loading: a navigation shows where it goes at once. The title, tab, path bar and sidebar take the destination's
+name, the status bar reads "Loading…", and when the folder takes longer than 120 ms the list shows eight pulsing
+placeholder rows until it arrives (a slow Network folder, a sleeping drive). Fast folders never flash. A refresh
+keeps the current items on screen. If the place cannot be opened, the previous one comes back with the error. A
+search shows the same placeholders, with "Searching…", until its first result.
 
 Path bar: click a crumb to go there (the current folder, the last crumb, refreshes), its chevron lists the
 subfolders (drive paths, UNC paths and This PC), a click on the empty area turns it into an address Edit (a path,
@@ -68,13 +90,16 @@ a `shell:` name, a `::{CLSID}` or a path inside a .rar).
 View segment: the list button is the details view; the grid button switches to icons (96 px), and to thumbnails
 (128 px) when already in a grid view.
 
-More menu: Folder tree, Open in Explorer, register / unregister as the folder handler, the settings folder, About,
-and **Quick access**: the profile's bookmarks and the cloud-sync roots.
+More menu: Folder tree, Pin to Home, Open in Explorer, register / unregister as the folder handler, the settings
+folder, About, and **Quick access**: the profile's bookmarks and the cloud-sync roots.
 
 ### What a tab can show
 
 - **A shell folder**: filesystem, virtual (This PC, Recycle Bin, Control Panel...), zip files (the shell browses
   them as folders), network shares, `ftp://` URLs where the shell supports them.
+- **Home**, where a first run starts: the shell's own Home folder, so the pinned folders (above, as folders sort
+  first) and the recent files, with the shell's columns. Enter on a recent file opens it with its default verb; Up
+  goes to This PC.
 - **A .rar archive**: Enter on a .rar file, or type a path to it or inside it (`C:\x\a.rar\docs`). Columns
   Name, Date modified, Type, Size; directories first. Enter on a directory enters it, Backspace / Alt+Up goes up
   (at the archive's root: back to its folder), Enter on a file extracts it to
@@ -112,6 +137,8 @@ and **Quick access**: the profile's bookmarks and the cloud-sync roots.
 | Ctrl+Tab, Ctrl+Shift+Tab, Ctrl+1..8, Ctrl+9 | Next, previous, nth, last tab |
 | Middle-click a folder | Open it in a background tab (middle-click a tab closes it) |
 | Ctrl+P | Palette: recent places, bookmarks, cloud roots and the current subfolders, fuzzy matched |
+| Ctrl+D | Pin the selected folders (or the current folder) to Home |
+| Right-click a sidebar row | Unpin from Home (Quick Access folders), Remove bookmark (bookmarks) |
 | Ctrl+` | Terminal (Windows Terminal, else cmd) in the current filesystem folder |
 | Ctrl+B | Show / hide the sidebar (hides the folder tree when that is showing instead) |
 | Alt+P | Show / hide the preview pane (text in a monospace Edit, preview handlers in place, else a thumbnail) |
@@ -145,23 +172,24 @@ with `--recover` (at most once per 10 s, so a crash loop stops).
 
 ### Files under `%APPDATA%\rexplorer`
 
-`settings.ini` and `themes\*.ini` are written with defaults on first run, then yours to edit. Lines starting
-with `;` or `#` are comments.
+`settings.ini` and `themes\*.ini` are written with defaults on first run, then yours to edit. A new profile has
+no bookmarks (Quick Access already brings the known folders); one written by an earlier version keeps its start
+folder and its Desktop / Downloads / Documents bookmarks (right-click them in the sidebar to remove them). Where
+Home does not exist (older Windows), the default start is This PC. Lines starting with `;` or `#` are comments.
 
 ```ini
 [general]
 profile=default                  ; the active profile
 
 [profile default]
-start=shell:MyComputerFolder     ; where a first run (or a launch without a session) starts
+start=shell:::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}   ; where a first run (or a launch without a session) starts: Home
 theme=dark                       ; a file name in themes\ without .ini
 view=details                     ; details | icons | thumbnails (the view segment writes it back here)
 show_tree=false                  ; the folder tree instead of the sidebar
 show_preview=false
 tree_width=220                   ; sidebar (or tree) width, 96-DPI pixels
 preview_width=360
-bookmark.Desktop=shell:Desktop   ; bookmark.<label>=<target>: palette and More > Quick access
-bookmark.Downloads=shell:Downloads
+bookmark.Repos=C:\src           ; bookmark.<label>=<target>: sidebar Favorites, palette, More > Quick access
 ```
 
 `themes\<name>.ini` holds one `[theme]` section; missing keys fall back to the built-in dark or light theme
@@ -207,9 +235,13 @@ in about 300 ms from process start), columns, keyboard navigation, live update, 
 no Explorer window), the Explorer hotkey, tabs, the single-instance hand-off, first-run settings, `--help`,
 placement, the tree (opened from More > Folder tree), the preview, the views, a RAR5 archive (open, enter a
 directory, go back up), a search in the 100k folder (typed into the search box), `--search` from the command line,
-and the look (the sidebar is there, the list card has a rounded window region, a click on a Favorites row
-navigates, Ctrl+B hides the sidebar). Checks that write settings run on a scratch `APPDATA`. The keyboard checks
-need an interactive desktop that lets the window come to the foreground; they report SKIP otherwise.
+the look (the sidebar is there, the list card has a rounded window region, a click on the Downloads row navigates,
+Ctrl+B hides the sidebar), Home (a first run without folders shows it, and it is the sidebar's first row), the
+shell-built sidebar (a Recycle Bin row in Favorites, a C:\ row under This PC), the loading state (a click on
+Network shows its name and "Loading…" within 150 ms, then the emptied list), and pins (Ctrl+D on a temp folder puts
+it in Quick Access, its sidebar row's Unpin from Home takes it out; the test always unpins, so Quick Access is left
+as found). `-Only <regex>` runs the matching checks. Checks that write settings run on a scratch `APPDATA`. The
+keyboard checks need an interactive desktop that lets the window come to the foreground; they report SKIP otherwise.
 `smoke.ps1 -Screenshots` also writes `docs\screenshots\dark.png` and `light.png`.
 
 ### Known gaps
@@ -221,6 +253,10 @@ need an interactive desktop that lets the window come to the foreground; they re
 - Search result icons come from the extension (no per-file icons such as an exe's own).
 - Only .rar archives get the archive view (zip is the shell's); multi-volume and encrypted .rar are untested.
 - The embedded Explorer view keeps Windows' own colors, not the theme.
+- Home lists its pinned folders above its recent files (folders sort first) but without group headers: the
+  ListView is owner-data, which only groups through an undocumented callback interface.
+- Every Quick Access folder in the sidebar offers Unpin from Home; on a frequent (not pinned) one the shell may
+  refuse the verb, and rexplorer then beeps (untested: no frequent-only folder was tried).
 - The sidebar is mouse-only (no keyboard focus). Rounded corners are drawn with GDI, so they are not antialiased.
 - `ftp://` browsing goes through the shell's FTP folder (present on Windows 11 25H2, untested against a live
   server); where it is missing the URL shows the not-found error.

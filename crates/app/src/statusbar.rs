@@ -106,6 +106,9 @@ pub fn set_text(hwnd: HWND, left: &str, right: &str) {
         if !st.is_null() && ((*st).left != left || (*st).right != right) {
             (*st).left = left.to_string();
             (*st).right = right.to_string();
+            // The window text carries the left text too: screen readers and UI Automation read it.
+            let t = windows::core::HSTRING::from(left);
+            let _ = SetWindowTextW(hwnd, windows::core::PCWSTR(t.as_ptr()));
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
     }
@@ -247,6 +250,9 @@ mod tests {
             let _ = UpdateWindow(sb);
             pump();
             assert_eq!((*state(sb)).left, "3 items");
+            let mut buf = [0u16; 16];
+            let n = GetWindowTextW(sb, &mut buf) as usize;
+            assert_eq!(String::from_utf16_lossy(&buf[..n]), "3 items", "the window text carries the left text");
             let _ = DestroyWindow(parent);
             pump();
         }

@@ -10,14 +10,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::{
-    FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Music, FOLDERID_Pictures, FOLDERID_Videos, ILIsEqual,
-    IShellFolder, IShellFolder2, KF_FLAG_DEFAULT, SHGFI_ICON, SHGetKnownFolderPath,
+    FOLDERID_Desktop, FOLDERID_Profile, FOLDERID_PublicDesktop, ILIsEqual, IShellFolder, IShellFolder2, KF_FLAG_DEFAULT,
+    SHGFI_ICON, SHGetKnownFolderPath,
 };
 use windows::core::{GUID, Interface};
 
 /// lparam = Box<Pidl> picked in the tree.
 pub(crate) const WM_TREE_SELECT: u32 = WM_APP + 3;
-/// lparam = Box<Vec<sidebar::Row>> built by the sidebar worker.
+/// lparam = Box<SidebarRows> built by the sidebar worker.
 pub(crate) const WM_SIDEBAR_ROWS: u32 = WM_APP + 8;
 /// Gap between the side panes and the cards, and the cards' margin from the window edges; it is the splitter.
 const SPLIT: i32 = 8;
@@ -43,6 +43,8 @@ pub(crate) struct Panes {
     split_preview: RECT,
     /// Where the list (or the embedded browser in its place) goes, in client coordinates.
     pub list_rect: RECT,
+    /// Index for index with the sidebar's rows.
+    pub sidebar_kinds: Vec<Kind>,
 }
 
 fn scale(px: i32, dpi: u32) -> i32 {
@@ -219,11 +221,42 @@ pub(crate) unsafe fn layout(app: *mut App, top: i32, bottom: i32, w: i32) {
 
 /// One sidebar worker at a time (the 5 s refresh must not pile up behind a slow drive).
 static SIDEBAR_BUSY: AtomicBool = AtomicBool::new(false);
+/// A refresh was asked for while the worker ran (a pin right after the timer's refresh): run once more.
+static SIDEBAR_AGAIN: AtomicBool = AtomicBool::new(false);
 
-/// Builds the sidebar rows on a worker: Favorites (bookmarks, then the known folders), This PC (drives),
-/// Cloud and Network. Icons are loaded there too; the rows arrive as WM_SIDEBAR_ROWS.
+/// What a sidebar row is, for its right-click menu.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Kind {
+    Place,
+    /// A profile bookmark, by its label.
+    Bookmark(String),
+    /// A folder of Quick Access (pinned or frequent).
+    Pinned,
+}
+
+/// WM_SIDEBAR_ROWS payload: the rows and, index for index, their kinds.
+#[derive(Default)]
+pub(crate) struct SidebarRows {
+    pub rows: Vec<Row>,
+    pub kinds: Vec<Kind>,
+}
+
+impl SidebarRows {
+    /// Adds a row (loading its icon) unless its label is empty or, with `dedupe`, its target is already listed.
+    fn add(&mut self, section: &'static str, label: String, target: String, pidl: &Pidl, kind: Kind, dedupe: bool) {
+        if label.is_empty() || (dedupe && self.rows.iter().any(|r| r.target.eq_ignore_ascii_case(&target))) {
+            return;
+        }
+        self.rows.push(Row { section, label, target, icon: small_icon(pidl) });
+        self.kinds.push(kind);
+    }
+}
+
+/// Builds the sidebar rows on a worker: Home, Favorites (bookmarks, then Quick Access), This PC, Devices, Cloud
+/// and Network. Icons are loaded there too; the rows arrive as WM_SIDEBAR_ROWS.
 pub(crate) unsafe fn refresh_sidebar(app: *mut App) {
     if SIDEBAR_BUSY.swap(true, Ordering::SeqCst) {
+        SIDEBAR_AGAIN.store(true, Ordering::SeqCst);
         return;
     }
     let bookmarks = (*app).profile.bookmarks.clone();
@@ -235,18 +268,70 @@ pub(crate) unsafe fn refresh_sidebar(app: *mut App) {
         let p = Box::into_raw(rows);
         if unsafe { PostMessageW(Some(HWND(hwnd as *mut c_void)), WM_SIDEBAR_ROWS, WPARAM(0), LPARAM(p as isize)) }.is_err() {
             let rows = unsafe { Box::from_raw(p) };
-            for i in rows.iter().filter_map(|r| r.icon) {
+            for i in rows.rows.iter().filter_map(|r| r.icon) {
                 let _ = unsafe { DestroyIcon(i) };
             }
         }
     });
 }
 
-pub(crate) unsafe fn on_sidebar_rows(app: *mut App, rows: Box<Vec<Row>>) {
-    sidebar::set_rows((*app).sidebar, *rows);
+/// After our own pin or unpin: rebuild now, and once more a second later in case the shell updates late.
+pub(crate) unsafe fn sidebar_changed(app: *mut App) {
+    refresh_sidebar(app);
+    SetTimer(Some((*app).hwnd), TIMER_SIDEBAR, 1000, None);
+}
+
+pub(crate) unsafe fn on_sidebar_rows(app: *mut App, rows: Box<SidebarRows>) {
+    let SidebarRows { rows, kinds } = *rows;
+    (*app).panes.sidebar_kinds = kinds;
+    sidebar::set_rows((*app).sidebar, rows);
     let a = &*app;
     if let Some(t) = a.tabs.get(a.active) {
-        sidebar::select(a.sidebar, &t.name);
+        sidebar::select(a.sidebar, t.loading.as_ref().map_or(&t.name, |l| &l.parsing));
+    }
+    if SIDEBAR_AGAIN.swap(false, Ordering::SeqCst) {
+        refresh_sidebar(app);
+    }
+}
+
+/// Right-click on a sidebar row: "Unpin from Home" on a Quick Access folder, "Remove bookmark" on a bookmark.
+pub(crate) unsafe fn sidebar_menu(app: *mut App, index: usize) {
+    let kind = (&(*app).panes.sidebar_kinds).get(index).cloned();
+    let text = match &kind {
+        Some(Kind::Pinned) => "Unpin from Home",
+        Some(Kind::Bookmark(_)) => "Remove bookmark",
+        _ => return,
+    };
+    let target = sidebar::target((*app).sidebar, index);
+    let mut pt = POINT::default();
+    let _ = GetCursorPos(&mut pt);
+    if ui::popup(app, &[(1, text.to_string())], pt.x, pt.y) != 1 {
+        return;
+    }
+    match kind {
+        Some(Kind::Pinned) => unpin_from_home(app, &target),
+        Some(Kind::Bookmark(label)) => {
+            views::remove_profile_key(&(*app).profile.name, &format!("bookmark.{label}"));
+            (*app).profile.bookmarks.retain(|(l, _)| *l != label);
+            sidebar_changed(app);
+        }
+        _ => {}
+    }
+}
+
+/// The shell's canonical "unpinfromhome" verb on the Quick Access item for `target`; beeps when it is not pinned.
+unsafe fn unpin_from_home(app: *mut App, target: &str) {
+    let hwnd = (*app).hwnd;
+    let done = (|| {
+        let qa = ShellFolder::parse(&format!("shell:{}", nav::QUICK_ACCESS)).ok()?;
+        let items = qa.enumerate().ok()?;
+        let item = items.iter().find(|i| i.parsing_name().eq_ignore_ascii_case(target))?;
+        ContextMenu::for_items(&qa, &[item], hwnd).ok()?.invoke_verb(hwnd, "unpinfromhome", false).ok()
+    })();
+    if done.is_some() {
+        sidebar_changed(app);
+    } else {
+        let _ = MessageBeep(MB_OK);
     }
 }
 
@@ -266,46 +351,78 @@ fn known_folder(id: &GUID) -> Option<String> {
     }
 }
 
-fn sidebar_rows(bookmarks: &[(String, String)]) -> Vec<Row> {
-    let mut rows: Vec<Row> = Vec::new();
-    // A place is listed once, under its first section (a bookmark to Downloads hides the known folder).
-    let mut add = |section: &'static str, label: Option<&str>, name: &str| {
-        let Ok(f) = ShellFolder::parse(name) else { return };
-        if rows.iter().any(|r| r.target.eq_ignore_ascii_case(&f.parsing_name)) {
-            return;
-        }
-        let label = label.map_or_else(|| f.name.clone(), str::to_string);
-        rows.push(Row { section, label, target: f.parsing_name.clone(), icon: small_icon(&f.pidl) });
-    };
+/// SFGAO_FILESYSTEM (the app does not pull in System_SystemServices for one constant).
+const SFGAO_FILESYSTEM: u32 = 0x4000_0000;
+
+/// Places on the desktop root that are neither devices nor shown elsewhere in the sidebar: This PC, Network,
+/// Control Panel, Libraries, Gallery (the root also lists Home and the Recycle Bin, which are rows already).
+const NOT_DEVICES: [&str; 5] = [
+    ui::THIS_PC,
+    "::{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}",
+    "::{26EE0668-A00A-44D7-9371-BEB064C98683}",
+    "::{031E4825-7B94-4DC3-B131-E946B44C8DD5}",
+    "::{E88865EA-0E1C-4E20-9AA6-EDCD0212C87C}",
+];
+
+/// `path` is `dir` or inside it (case-insensitive).
+fn is_under(path: &str, dir: &str) -> bool {
+    let (p, d) = (path.to_lowercase(), dir.to_lowercase().trim_end_matches('\\').to_string());
+    p == d || p.starts_with(&format!("{d}\\"))
+}
+
+fn sidebar_rows(bookmarks: &[(String, String)]) -> SidebarRows {
+    let mut b = SidebarRows::default();
+    if let Ok(home) = ShellFolder::parse(settings::HOME_START) {
+        b.add("", home.name.clone(), home.parsing_name.clone(), &home.pidl, Kind::Place, false);
+    }
     for (label, target) in bookmarks {
-        add("Favorites", Some(label.as_str()), target);
-    }
-    let known = [FOLDERID_Desktop, FOLDERID_Downloads, FOLDERID_Documents, FOLDERID_Pictures, FOLDERID_Music, FOLDERID_Videos];
-    for path in known.iter().filter_map(known_folder) {
-        add("Favorites", None, &path);
-    }
-    if let Ok(pc) = ShellFolder::parse("shell:MyComputerFolder") {
-        let mut drives: Vec<ShellItem> = pc.enumerate().unwrap_or_default();
-        drives.retain(|i| {
-            let p = i.parsing_name();
-            p.len() == 3 && p.ends_with(":\\")
-        });
-        drives.sort_by_key(|i| i.parsing_name());
-        for d in drives {
-            let pidl = pc.child_pidl(&d);
-            rows.push(Row { section: "This PC", label: d.display_name(), target: d.parsing_name(), icon: small_icon(&pidl) });
+        if let Ok(f) = ShellFolder::parse(target) {
+            b.add("Favorites", label.clone(), f.parsing_name.clone(), &f.pidl, Kind::Bookmark(label.clone()), true);
         }
     }
-    let mut add = |section: &'static str, label: Option<&str>, name: &str| {
-        let Ok(f) = ShellFolder::parse(name) else { return };
-        let label = label.map_or_else(|| f.name.clone(), str::to_string);
-        rows.push(Row { section, label, target: f.parsing_name.clone(), icon: small_icon(&f.pidl) });
-    };
-    for (label, path) in ui::cloud_roots() {
-        add("Cloud", Some(label.as_str()), path);
+    // Quick Access in the shell's order and names: the pinned known folders, the Recycle Bin, the user's pins.
+    if let Ok(qa) = ShellFolder::parse(&format!("shell:{}", nav::QUICK_ACCESS)) {
+        for item in qa.enumerate().unwrap_or_default().iter().filter(|i| i.is_folder()) {
+            b.add("Favorites", item.display_name(), item.parsing_name(), &qa.child_pidl(item), Kind::Pinned, true);
+        }
     }
-    add("Network", None, "shell:NetworkPlacesFolder");
-    rows
+    let cloud = ui::cloud_roots();
+    if let Ok(pc) = ShellFolder::parse("shell:MyComputerFolder") {
+        // Drives, phones and other devices; not the user folders This PC shows too.
+        let mut items: Vec<ShellItem> = pc.enumerate().unwrap_or_default();
+        items.retain(|i| {
+            let p = i.parsing_name();
+            i.attributes(SFGAO_FILESYSTEM) == 0 || (p.len() == 3 && p.ends_with(":\\"))
+        });
+        items.sort_by_key(|i| i.parsing_name());
+        for d in &items {
+            b.add("This PC", d.display_name(), d.parsing_name(), &pc.child_pidl(d), Kind::Place, false);
+        }
+        // Devices: what the desktop root adds besides files and the shell's own places (Phone Link phones, Linux).
+        if let Some(root) = pc.parent() {
+            let desktops: Vec<String> = [FOLDERID_Desktop, FOLDERID_PublicDesktop].iter().filter_map(known_folder).collect();
+            let profile = known_folder(&FOLDERID_Profile).unwrap_or_default();
+            for item in root.enumerate().unwrap_or_default().iter().filter(|i| i.is_folder() && !i.is_hidden()) {
+                let (p, label) = (item.parsing_name(), item.display_name());
+                let skip = NOT_DEVICES.iter().any(|n| p.eq_ignore_ascii_case(n))
+                    || desktops.iter().any(|d| is_under(&p, d))
+                    || p.eq_ignore_ascii_case(&profile)
+                    || cloud.iter().any(|(l, _)| l.eq_ignore_ascii_case(&label));
+                if !skip {
+                    b.add("Devices", label, p, &root.child_pidl(item), Kind::Place, true);
+                }
+            }
+        }
+    }
+    for (label, path) in cloud {
+        if let Ok(f) = ShellFolder::parse(path) {
+            b.add("Cloud", label.clone(), f.parsing_name.clone(), &f.pidl, Kind::Place, false);
+        }
+    }
+    if let Ok(f) = ShellFolder::parse("shell:NetworkPlacesFolder") {
+        b.add("Network", f.name.clone(), f.parsing_name.clone(), &f.pidl, Kind::Place, false);
+    }
+    b
 }
 
 fn hit(r: &RECT, x: i32, y: i32) -> bool {
@@ -446,15 +563,32 @@ mod tests {
     #[test]
     fn sidebar_rows_of_this_machine() {
         let _com = ComInit::mta();
-        let rows = sidebar_rows(&[("Downloads".to_string(), "shell:Downloads".to_string())]);
-        assert_eq!(rows[0].label, "Downloads", "bookmarks come first, under their own label");
-        assert_eq!(rows.iter().filter(|r| r.section == "Favorites").count(), 6, "the known Downloads is not repeated");
-        assert!(rows.iter().any(|r| r.section == "This PC" && r.target.len() == 3), "drives");
+        let SidebarRows { rows, kinds } = sidebar_rows(&[("My downloads".to_string(), "shell:Downloads".to_string())]);
+        let names: Vec<(&str, &str)> = rows.iter().map(|r| (r.section, r.target.as_str())).collect();
+        assert_eq!(rows.len(), kinds.len());
+        assert_eq!((rows[0].section, rows[0].target.as_str()), ("", nav::HOME), "Home first, without a header: {names:?}");
+        assert_eq!((rows[1].label.as_str(), &kinds[1]), ("My downloads", &Kind::Bookmark("My downloads".into())), "then bookmarks");
+        let downloads = rows[1].target.to_lowercase();
+        assert_eq!(rows.iter().filter(|r| r.target.to_lowercase() == downloads).count(), 1, "Quick Access does not repeat it");
+        let recycle = "::{645FF040-5081-101B-9F08-00AA002F954E}";
+        let bin = rows.iter().position(|r| r.target.eq_ignore_ascii_case(recycle)).expect("Recycle Bin from Quick Access");
+        assert_eq!((rows[bin].section, &kinds[bin]), ("Favorites", &Kind::Pinned));
+        assert!(rows.iter().any(|r| r.section == "This PC" && r.target == "C:\\"), "drives: {names:?}");
+        assert!(!rows.iter().any(|r| r.section == "This PC" && r.target.len() > 3 && ui::is_fs_path(&r.target)), "no user folders under This PC");
+        assert!(rows.iter().filter(|r| r.section == "Devices").all(|r| !NOT_DEVICES.contains(&r.target.as_str())));
         assert_eq!(rows.last().map(|r| r.section), Some("Network"));
         assert!(rows.iter().all(|r| r.icon.is_some()));
         for i in rows.iter().filter_map(|r| r.icon) {
             let _ = unsafe { DestroyIcon(i) };
         }
+    }
+
+    #[test]
+    fn under_a_directory() {
+        assert!(is_under(r"C:\Users\v\Desktop\x", r"c:\users\v\desktop"));
+        assert!(is_under(r"C:\Users\v\Desktop", r"C:\Users\v\Desktop\"));
+        assert!(!is_under(r"C:\Users\v\Desktop2", r"C:\Users\v\Desktop"));
+        assert!(!is_under("::{B2B4A4D1-2754-4140-A2EB-9A76D9D7CDC6}", r"C:\Users\v\Desktop"));
     }
 
     #[test]

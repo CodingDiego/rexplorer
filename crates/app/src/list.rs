@@ -13,6 +13,10 @@ use std::cell::RefCell;
 use windows::Win32::Foundation::POINTL;
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::System::Ole::IDropTarget;
+use windows::Win32::UI::Shell::{ILClone, ILFindLastID};
+
+/// Our own entry above the shell's in the list's context menu.
+const PIN_TO_HOME: &str = "Pin to Home\tCtrl+D";
 
 pub(crate) unsafe fn on_notify(app: *mut App, lparam: LPARAM) -> LRESULT {
     let hdr = &*(lparam.0 as *const NMHDR);
@@ -168,18 +172,101 @@ unsafe fn show_menu(app: *mut App, on_item: bool) {
     if let Some(Source::Archive(_)) = source(app) {
         return source::archive_menu(app);
     }
+    let sel = selected_indices((*app).list);
     let menu = if on_item {
-        selection_menu(app, &selected_indices((*app).list))
+        selection_menu(app, &sel)
     } else {
         listing(app).and_then(|l| ContextMenu::for_background(&l.folder, hwnd).ok())
     };
     let Some(menu) = menu else { return };
+    // Pinning applies to the current folder (background) or to selected folders of a shell listing.
+    let pin = listing(app).is_some_and(|l| !on_item || sel.iter().filter_map(|&i| l.items.get(i)).any(|i| i.is_folder()));
+    let own: &[&str] = if pin { &[PIN_TO_HOME] } else { &[] };
     let extended = GetKeyState(VK_SHIFT.0 as i32) < 0;
     (*app).active_menu = Some(menu);
-    let picked = (*app).active_menu.as_ref().unwrap().show(hwnd, pt.x, pt.y, extended);
+    let picked = (*app).active_menu.as_ref().unwrap().show_with(hwnd, pt.x, pt.y, extended, own);
     (*app).active_menu = None;
-    if let Ok(Picked::Rename) = picked {
-        begin_rename(app);
+    match picked {
+        Ok(Picked::Rename) => begin_rename(app),
+        Ok(Picked::Own(_)) => pin_to_home(app),
+        _ => {}
+    }
+}
+
+/// Ctrl+D and the menus' "Pin to Home": the shell's canonical "pintohome" verb on the selected folders, or on the
+/// current folder when nothing is selected. Beeps when there is nothing to pin or the shell refuses.
+pub(crate) unsafe fn pin_to_home(app: *mut App) {
+    let hwnd = (*app).hwnd;
+    let menu = (|| {
+        // While a navigation is in flight the listing is the place being left.
+        if cur(app).loading.is_some() {
+            return None;
+        }
+        let l = listing(app)?;
+        let sel = selected_indices((*app).list);
+        if sel.is_empty() {
+            let parent = ShellFolder::from_pidl(&l.folder.parent_pidl()?).ok()?;
+            let last = ILClone(ILFindLastID(l.folder.pidl.as_ptr()));
+            if last.is_null() {
+                return None;
+            }
+            let item = ShellItem { parent: parent.folder.clone(), pidl: Pidl::from_raw(last) };
+            return ContextMenu::for_items(&parent, &[&item], hwnd).ok();
+        }
+        let folders: Vec<&ShellItem> = sel.iter().filter_map(|&i| l.items.get(i)).filter(|i| i.is_folder()).collect();
+        if folders.is_empty() {
+            return None;
+        }
+        ContextMenu::for_items(&l.folder, &folders, hwnd).ok()
+    })();
+    match menu.map(|m| m.invoke_verb(hwnd, "pintohome", false)) {
+        Some(Ok(())) => panes::sidebar_changed(app),
+        _ => {
+            let _ = MessageBeep(MB_OK);
+        }
+    }
+}
+
+/// While the active tab loads: eight placeholder rows (an icon square, a name bar, two detail bars under the
+/// second and third columns) in the selection color washed toward the surface, alternating between two shades.
+unsafe fn draw_skeleton(app: *mut App, hdc: HDC) {
+    let (list, t) = ((*app).list, &(*app).theme);
+    let dpi = GetDpiForWindow(list) as i32;
+    let sc = |v: i32| v * dpi / 96;
+    let mut client = RECT::default();
+    let _ = GetClientRect(list, &mut client);
+    let w = client.right;
+    let header = HWND(SendMessageW(list, LVM_GETHEADER, None, None).0 as *mut c_void);
+    let mut top = client.top + sc(4);
+    let mut cols = Vec::new();
+    if !header.is_invalid() && IsWindowVisible(header).as_bool() {
+        let mut hr = RECT::default();
+        let _ = GetWindowRect(header, &mut hr);
+        top += hr.bottom - hr.top;
+        let n = SendMessageW(header, HDM_GETITEMCOUNT, None, None).0.max(0) as usize;
+        for i in 0..n.min(3) {
+            let mut r = RECT::default();
+            SendMessageW(header, HDM_GETITEMRECT, Some(WPARAM(i)), Some(LPARAM(&mut r as *mut _ as isize)));
+            cols.push(r);
+        }
+    }
+    let color = theme::blend(t.selection, t.surface, if (*app).pulse { 0.75 } else { 0.5 });
+    let (row, pad) = (sc(28), sc(12));
+    // Name bar up to the second column; detail bars at the second and third (or at 55% / 75% without a header).
+    let name_right = cols.get(1).map_or(w, |c| c.left - pad);
+    let details: Vec<(i32, i32)> = match (cols.get(1), cols.get(2)) {
+        (Some(a), Some(b)) => vec![(a.left + pad, a.right - pad), (b.left + pad, b.right - pad)],
+        _ => vec![(w * 55 / 100, w), (w * 75 / 100, w)],
+    };
+    for r in 0..8 {
+        let cy = top + r * row + row / 2;
+        let bar = |left: i32, right: i32, h: i32| RECT { left, top: cy - h / 2, right: right.max(left), bottom: cy + h / 2 };
+        theme::fill_round(hdc, &bar(pad, pad + sc(16), sc(16)), color, sc(4));
+        let x = pad + sc(28);
+        theme::fill_round(hdc, &bar(x, (x + w * 40 / 100).min(name_right), sc(10)), color, sc(10));
+        for &(left, right) in &details {
+            theme::fill_round(hdc, &bar(left, (left + w * 15 / 100).min(right), sc(10)), color, sc(10));
+        }
     }
 }
 
@@ -265,6 +352,9 @@ unsafe fn draw_item(app: *mut App, cd: &mut NMLVCUSTOMDRAW) -> u32 {
             let b = CreateSolidBrush(COLORREF((*app).theme.surface));
             FillRect(cd.nmcd.hdc, &cd.nmcd.rc, b);
             let _ = DeleteObject(b.into());
+            if (*app).skeleton {
+                draw_skeleton(app, cd.nmcd.hdc);
+            }
             CDRF_NOTIFYITEMDRAW
         }
         CDDS_ITEMPREPAINT => {

@@ -461,6 +461,30 @@ fn set_ini_key(text: &str, section: &str, key: &str, value: &str) -> String {
     out.join("\n") + "\n"
 }
 
+/// Drops `key=...` lines from `[section]` of ini text, keeping every other line.
+fn remove_ini_key(text: &str, section: &str, key: &str) -> String {
+    let header = |l: &str| l.trim().strip_prefix('[').and_then(|l| l.strip_suffix(']')).map(|n| n.trim().to_string());
+    let norm = |n: &str| n.strip_prefix("profile ").map_or_else(|| n.to_string(), |p| format!("profile {}", p.trim()));
+    let mut inside = false;
+    let mut out: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        if let Some(name) = header(line) {
+            inside = norm(&name) == norm(section);
+        } else if inside && line.split_once('=').is_some_and(|(k, _)| k.trim() == key) {
+            continue;
+        }
+        out.push(line);
+    }
+    out.join("\n") + "\n"
+}
+
+/// Removes a key of the profile's section in settings.ini (a sidebar bookmark), comments and order kept.
+pub(crate) fn remove_profile_key(profile: &str, key: &str) {
+    let path = settings::dir().join("settings.ini");
+    let Ok(text) = std::fs::read_to_string(&path) else { return };
+    let _ = std::fs::write(&path, remove_ini_key(&text, &format!("profile {profile}"), key));
+}
+
 unsafe fn save_profile_key(profile: &str, key: &str, value: &str) {
     let path = settings::dir().join("settings.ini");
     let text = std::fs::read_to_string(&path).unwrap_or_default();
@@ -527,6 +551,14 @@ mod tests {
         }
         assert_eq!(View::parse("bogus"), View::Details);
         assert_eq!(View::Thumbnails.next(), View::Details);
+    }
+
+    #[test]
+    fn ini_key_removed_from_its_section_only() {
+        let text = "[profile a]\n; mine\nbookmark.X=C:\\x\nview=icons\n[profile b]\nbookmark.X=C:\\y\n";
+        let out = remove_ini_key(text, "profile a", "bookmark.X");
+        assert_eq!(out, "[profile a]\n; mine\nview=icons\n[profile b]\nbookmark.X=C:\\y\n");
+        assert_eq!(remove_ini_key(text, "profile c", "bookmark.X"), text);
     }
 
     #[test]

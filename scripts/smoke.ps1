@@ -1,6 +1,7 @@
 # rexplorer smoke test. Windows PowerShell 5.1. Prints one PASS/FAIL/SKIP line per check, always exits 0.
 # -Screenshots also writes docs\screenshots\dark.png and light.png (the window must be able to come to the front).
-param([switch]$Screenshots)
+# -Only <regex> runs just the checks whose names match.
+param([switch]$Screenshots, [string]$Only)
 $ErrorActionPreference = 'Stop'
 $Exe = Join-Path (Split-Path $PSScriptRoot -Parent) 'target\release\rexplorer.exe'
 Add-Type -AssemblyName System.Windows.Forms, Microsoft.VisualBasic, UIAutomationClient, UIAutomationTypes
@@ -133,6 +134,7 @@ function Close-NewExplorers($before) { foreach ($k in (Get-Explorers).GetEnumera
 
 # Runs one check: $body returns @(status, detail). Process in $script:cur is always killed.
 function Run-Check($name, [scriptblock]$body) {
+  if ($Only -and $name -notmatch $Only) { return }
   $script:cur = $null
   try { $r = & $body; Out-Check $r[0] $name $r[1] }
   catch { Out-Check 'FAIL' $name ("exception: " + $_.Exception.Message) }
@@ -166,6 +168,33 @@ function Launch-FreshArgs($argline) {
   } finally { $env:APPDATA = $appdata }
   $script:main -ne [IntPtr]::Zero
 }
+# Sidebar rows: WM_APP+0x41 puts row i's target in the sidebar's window text (-1 past the last row), WM_APP+0x40
+# answers row i's client top. Rows fill in from a worker thread.
+# [NullString]: PowerShell passes $null to a string parameter as "", which only matches windows without text.
+function Get-Sidebar { [W]::FindWindowEx($script:main, [IntPtr]::Zero, 'RexSidebar', [NullString]::Value) }
+function Get-RowTargets($sb) {
+  $out = @()
+  for ($i = 0; $i -lt 200; $i++) { if ([int][W]::SendMessage($sb, 0x8041, [IntPtr]$i, [IntPtr]::Zero) -lt 0) { break }; $out += (Get-Title $sb) }
+  , $out
+}
+# Index of the first row whose target is $target (case-insensitive), waiting up to $ms for it; -1 if none.
+function Find-Row($sb, $target, $ms) {
+  $script:rowIndex = -1
+  $null = Wait-Until { $t = Get-RowTargets $sb; for ($i = 0; $i -lt $t.Count; $i++) { if ($t[$i] -eq $target) { $script:rowIndex = $i; return $true } }; $false } $ms
+  $script:rowIndex
+}
+# Posts a click (or, with -Right, a right-click) in the middle of sidebar row $i.
+function Click-Row($sb, $i, [switch]$Right) {
+  $top = [int][W]::SendMessage($sb, 0x8040, [IntPtr]$i, [IntPtr]::Zero)
+  $at = [IntPtr]((($top + 10) -shl 16) -bor [int]([W]::Width($sb) / 2))
+  if ($Right) { $null = [W]::PostMessage($sb, 0x205, [IntPtr]::Zero, $at) }
+  else { $null = [W]::PostMessage($sb, 0x201, [IntPtr]1, $at); $null = [W]::PostMessage($sb, 0x202, [IntPtr]0, $at) }
+  $top
+}
+function Get-Status { Get-Title ([W]::FindWindowEx($script:main, [IntPtr]::Zero, 'RexStatus', [NullString]::Value)) }
+$QuickAccess = 'shell:::{679f85cb-0220-4080-b29b-5540cc05aab6}'
+function Get-QuickAccess { @((New-Object -ComObject Shell.Application).NameSpace($QuickAccess).Items() | ForEach-Object { $_.Path }) }
+
 # Keys when the window can be activated, else the same command as WM_COMMAND. Returns how it was sent.
 function Send-KeysOrCommand($keys, $cmd) {
   if (Set-Foreground $script:main) { [System.Windows.Forms.SendKeys]::SendWait($keys); 'keys' }
@@ -314,8 +343,8 @@ Run-Check 'single-instance' {
   try {
     $exited = $second.WaitForExit(3000)
     $script:cur.Refresh(); $alive = -not $script:cur.HasExited
-    # 'rexplorer' alone is the new tab while it loads.
-    $changed = Wait-Until { $n = Get-Title $script:main; $n -ne $orig -and $n -ne 'rexplorer' } 3000
+    # While the new tab loads its title is the typed path; once loaded, the shell's name for it.
+    $changed = Wait-Until { $n = Get-Title $script:main; $n -ne $orig -and $n -ne 'C:\Users - rexplorer' -and $n -ne 'rexplorer' } 3000
     $t = Get-Title $script:main
     if ($exited -and $alive -and $changed) { @('PASS', "second exited, first alive, title '$orig' -> '$t' (new tab)") }
     else { @('FAIL', "second exited=$exited first alive=$alive title '$orig' -> '$t'") }
@@ -496,22 +525,106 @@ Run-Check 'look' {
     $sb = [W]::FindWindowEx($script:main, [IntPtr]::Zero, 'RexSidebar', $null)
     if ($sb -eq [IntPtr]::Zero -or -not [W]::IsWindowVisible($sb)) { return @('FAIL', "RexSidebar present=$($sb -ne [IntPtr]::Zero), visible=false") }
     $rgn = [W]::RegionType((Get-List $script:main))
-    # Rows fill in from a worker; WM_APP+0x40 answers the client top of row i (-1 until it exists).
-    # Favorites on a first run: the bookmarks Desktop, Downloads, Documents, then the known folders not listed yet.
-    $script:top = -1
-    Wait-Until { $script:top = [int][W]::SendMessage($sb, 0x8040, [IntPtr]1, [IntPtr]::Zero); $script:top -ge 0 } 5000 | Out-Null
-    if ($script:top -lt 0) { return @('FAIL', "list region type=$rgn; the sidebar has no second row after 5 s") }
-    $want = (New-Object -ComObject Shell.Application).NameSpace('shell:Downloads').Self.Name
-    $at = [IntPtr]((($script:top + 10) -shl 16) -bor [int]([W]::Width($sb) / 2))
-    $null = [W]::PostMessage($sb, 0x201, [IntPtr]1, $at)
-    $null = [W]::PostMessage($sb, 0x202, [IntPtr]0, $at)
+    # Favorites come from Quick Access, which pins Downloads by default.
+    $dl = (New-Object -ComObject Shell.Application).NameSpace('shell:Downloads').Self
+    $i = Find-Row $sb $dl.Path 5000
+    if ($i -lt 0) { return @('FAIL', "list region type=$rgn; no sidebar row for $($dl.Path) after 5 s") }
+    $want = $dl.Name
+    $top = Click-Row $sb $i
     $went = Wait-Until { (Get-Title $script:main) -eq "$want - rexplorer" } 3000
     $t = Get-Title $script:main
     $how = Send-KeysOrCommand '^b' 23
     $hidden = Wait-Until { -not [W]::IsWindowVisible($sb) } 2000
-    $d = "RexSidebar shown; list region type=$rgn (3 = rounded); click on Favorites row 2 (y=$($script:top)) -> '$t' (want '$want'); Ctrl+B ($how) hid the sidebar=$hidden"
+    $d = "RexSidebar shown; list region type=$rgn (3 = rounded); click on Downloads row $i (y=$top) -> '$t' (want '$want'); Ctrl+B ($how) hid the sidebar=$hidden"
     if ($rgn -eq 3 -and $went -and $hidden) { @('PASS', $d) } else { @('FAIL', $d) }
   } finally { Remove-Fresh }
+}
+
+Run-Check 'home' {
+  $homeId = '::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}'
+  try {
+    # A first run without folders starts at Home (its name is localized: ask the shell).
+    if (-not (Launch-Fresh $null)) { return @('FAIL', 'no main window within 5 s') }
+    $want = (New-Object -ComObject Shell.Application).NameSpace("shell:$homeId").Self.Name
+    $ok = Wait-Until { (Get-Title $script:main) -eq "$want - rexplorer" -and (Get-Count $script:main) -gt 0 } 3000
+    $t = Get-Title $script:main; $c = Get-Count $script:main
+    $sb = Get-Sidebar
+    $null = Wait-Until { [int][W]::SendMessage($sb, 0x8041, [IntPtr]0, [IntPtr]::Zero) -ge 0 } 5000
+    $first = Get-Title $sb
+    $d = "title='$t' (want '$want - rexplorer') count=$c; first sidebar row target='$first'"
+    if ($ok -and $first -eq $homeId) { @('PASS', $d) } else { @('FAIL', $d) }
+  } finally { Remove-Fresh }
+}
+
+Run-Check 'sidebar-shell' {
+  $bin = '::{645FF040-5081-101B-9F08-00AA002F954E}'
+  try {
+    if (-not (Launch-Fresh 'C:\Windows')) { return @('FAIL', 'no main window within 5 s') }
+    $sb = Get-Sidebar
+    $c = Find-Row $sb 'C:\' 5000
+    $t = Get-RowTargets $sb
+    $b = [array]::IndexOf([string[]]$t, $bin)
+    # Favorites (Quick Access) come before This PC.
+    $d = "Recycle Bin row=$b, This PC C:\ row=$c, $($t.Count) rows"
+    if ($b -gt 0 -and $c -gt $b) { @('PASS', $d) } else { @('FAIL', "$d; targets: $($t -join ' | ')") }
+  } finally { Remove-Fresh }
+}
+
+Run-Check 'loading' {
+  $red = '::{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}'
+  try {
+    if (-not (Launch-Fresh 'C:\Windows')) { return @('FAIL', 'no main window within 5 s') }
+    Wait-Until { (Get-Count $script:main) -ge 1 } 3000 | Out-Null
+    $sb = Get-Sidebar
+    $i = Find-Row $sb $red 5000
+    if ($i -lt 0) { return @('FAIL', 'no Network row in the sidebar after 5 s') }
+    $want = (New-Object -ComObject Shell.Application).NameSpace("shell:$red").Self.Name
+    $null = Click-Row $sb $i
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $seen = $false; $t = ''; $st = ''
+    while ($sw.ElapsedMilliseconds -lt 150) {
+      $t = Get-Title $script:main; $st = Get-Status
+      if ($t -eq "$want - rexplorer" -and $st -like '*Loading*') { $seen = $true; break }
+      Start-Sleep -Milliseconds 5
+    }
+    $ms = $sw.ElapsedMilliseconds
+    # Past 120 ms the list is emptied for the skeleton while the status still says Loading.
+    $skeleton = Wait-Until { (Get-Count $script:main) -eq 0 -and (Get-Status) -like '*Loading*' } 600
+    $d = "click on Network row $i -> title='$t' status='$st' after $ms ms; list emptied for the skeleton=$skeleton"
+    if ($seen) { @('PASS', $d) }
+    elseif ($t -eq "$want - rexplorer") { @('SKIP', "enumeration finished first: $d") }
+    else { @('FAIL', $d) }
+  } finally { Remove-Fresh }
+}
+
+Run-Check 'pin' {
+  $dir = Join-Path $env:TEMP "rexplorer-smoke-pin-$PID"
+  New-Item -ItemType Directory -Path $dir -Force | Out-Null
+  try {
+    if (-not (Launch-FreshArgs "--select `"$dir`"")) { return @('FAIL', 'no main window within 5 s') }
+    $selected = Wait-Until { [int][W]::SendMessage((Get-List $script:main), 0x1032, [IntPtr]::Zero, [IntPtr]::Zero) -ge 1 } 4000
+    if (-not $selected) { return @('FAIL', "--select did not select $dir") }
+    $how = Send-KeysOrCommand '^d' 40
+    $pinned = Wait-Until { (Get-QuickAccess) -contains $dir } 4000
+    if (-not $pinned) { return @('FAIL', "Ctrl+D ($how): $dir not in Quick Access") }
+    # Unpin through the sidebar: right-click the folder's Favorites row, pick the popup's only entry.
+    $sb = Get-Sidebar
+    $i = Find-Row $sb $dir 4000
+    if ($i -lt 0) { return @('FAIL', "Ctrl+D ($how) pinned it, but no sidebar row for it after 4 s") }
+    $null = Click-Row $sb $i -Right
+    $script:menu = [IntPtr]::Zero
+    $null = Wait-Until { $script:menu = [W]::FindOfProcess([uint32]$script:cur.Id, '#32768'); $script:menu -ne [IntPtr]::Zero } 2000
+    if ($script:menu -eq [IntPtr]::Zero) { return @('FAIL', "pinned; right-click on row $i showed no popup menu") }
+    $null = [W]::PostMessage($script:menu, 0x100, [IntPtr]0x28, [IntPtr]::Zero)
+    $null = [W]::PostMessage($script:menu, 0x100, [IntPtr]0x0D, [IntPtr]::Zero)
+    $gone = Wait-Until { -not ((Get-QuickAccess) -contains $dir) } 4000
+    $d = "Ctrl+D ($how) pinned $dir (in Quick Access, sidebar row $i); its Unpin from Home removed it=$gone"
+    if ($gone) { @('PASS', $d) } else { @('FAIL', $d) }
+  } finally {
+    # Leave Quick Access as found, whatever happened above.
+    foreach ($it in (New-Object -ComObject Shell.Application).NameSpace($QuickAccess).Items()) { if ($it.Path -eq $dir) { try { $it.InvokeVerb('unpinfromhome') } catch {} } }
+    Remove-Fresh; Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+  }
 }
 
 # Window screenshots for the README: dark on C:\Windows (details, a row selected), light on the wallpapers with
@@ -520,8 +633,7 @@ function Save-Shot($theme, $folder, $preview, $file) {
   $script:fake = Join-Path $env:TEMP "rexplorer-smoke-appdata-$PID"
   Remove-Item $script:fake -Recurse -Force -ErrorAction SilentlyContinue
   New-Item -ItemType Directory -Path (Join-Path $script:fake 'rexplorer') -Force | Out-Null
-  $ini = "[general]`r`nprofile=default`r`n[profile default]`r`ntheme=$theme`r`nshow_preview=$preview`r`n" +
-    "bookmark.Desktop=shell:Desktop`r`nbookmark.Downloads=shell:Downloads`r`nbookmark.Documents=shell:Personal`r`n"
+  $ini = "[general]`r`nprofile=default`r`n[profile default]`r`ntheme=$theme`r`nshow_preview=$preview`r`n"
   Set-Content -Path (Join-Path $script:fake 'rexplorer\settings.ini') -Value $ini
   $appdata = $env:APPDATA
   try { $env:APPDATA = $script:fake; $null = Launch $folder } finally { $env:APPDATA = $appdata }

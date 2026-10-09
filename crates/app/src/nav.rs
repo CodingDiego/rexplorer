@@ -3,6 +3,15 @@
 
 use super::*;
 use crate::source::Source;
+use std::time::Instant;
+use windows::Win32::UI::Shell::{SHGetNameFromIDList, SHParseDisplayName, SIGDN, SIGDN_DESKTOPABSOLUTEPARSING, SIGDN_NORMALDISPLAY};
+
+/// The shell's Home ("Inicio") and Quick Access, as parsing names.
+pub(crate) const HOME: &str = "::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}";
+pub(crate) const QUICK_ACCESS: &str = "::{679F85CB-0220-4080-B29B-5540CC05AAB6}";
+/// A load that takes longer than this shows the skeleton; faster ones never flash it.
+const SKELETON_DELAY: Duration = Duration::from_millis(120);
+const PULSE_MS: u32 = 400;
 
 #[derive(Clone)]
 pub(crate) enum Target {
@@ -74,6 +83,14 @@ pub(crate) struct Tab {
     pub crumbs: Vec<Crumb>,
     /// System image list and index of the folder's small icon, for the breadcrumb.
     pub icon: (usize, i32),
+    /// Where a navigation in flight is going; the chrome shows it until the load lands.
+    pub loading: Option<Loading>,
+}
+
+pub(crate) struct Loading {
+    pub name: String,
+    pub parsing: String,
+    since: Instant,
 }
 
 /// How the active tab's source is put into the ListView.
@@ -110,6 +127,15 @@ pub(crate) unsafe fn navigate(app: *mut App, t: usize, target: Target, history: 
     let generation = (*app).generation;
     let Some(tab) = (&mut (*app).tabs).get_mut(t) else { return };
     tab.pending = generation;
+    if history != History::Refresh {
+        let (name, parsing) = destination(&target);
+        tabs::set_title((*app).strip, t, &name);
+        tab.loading = Some(Loading { name, parsing, since: Instant::now() });
+        if t == (*app).active {
+            present_loading(app);
+        }
+    }
+    let tab = &mut (&mut (*app).tabs)[t];
     // A new navigation stops a search still running in this tab; its results stay until the load lands.
     if let Some(Source::Search(s)) = &mut tab.source {
         s.stop();
@@ -178,6 +204,7 @@ pub(crate) fn crumbs_of(folder: &ShellFolder) -> Vec<Crumb> {
 pub(crate) unsafe fn on_enum_done(app: *mut App, done: Box<EnumDone>) {
     let Some(t) = (*app).tabs.iter().position(|x| x.pending == done.generation) else { return };
     (&mut (*app).tabs)[t].pending = 0;
+    let was_loading = (&mut (*app).tabs)[t].loading.take().is_some();
     let hwnd = (*app).hwnd;
     let list = (*app).list;
     let active = t == (*app).active;
@@ -186,6 +213,17 @@ pub(crate) unsafe fn on_enum_done(app: *mut App, done: Box<EnumDone>) {
             // Decide about the tab before the message box: it pumps messages and other loads may land meanwhile.
             if (&mut (*app).tabs)[t].source.is_none() && (*app).tabs.len() > 1 {
                 close_tab(app, t);
+            } else if was_loading {
+                // The old place comes back: its items, title and crumbs.
+                if let Some(s) = &(&(*app).tabs)[t].source {
+                    tabs::set_title((*app).strip, t, &s.title());
+                }
+                if active {
+                    save_view_state(app);
+                    let tab = cur(app);
+                    let (top, selected) = (tab.top, std::mem::take(&mut tab.selected));
+                    show(app, Show::Restore { top, selected, columns: true });
+                }
             } else if let Some(s) = source(app) {
                 set_text((*app).addr, &s.editing_name());
             }
@@ -258,8 +296,17 @@ pub(crate) unsafe fn on_enum_done(app: *mut App, done: Box<EnumDone>) {
     session_changed(app);
 }
 
-/// Puts the active tab into the list (or the embedded browser), address bar, breadcrumb, title and toolbar.
+/// Puts the active tab into the list (or the embedded browser), address bar, breadcrumb, title and toolbar; a
+/// navigation still in flight then shows its destination over it.
 pub(crate) unsafe fn show(app: *mut App, mode: Show) {
+    stop_skeleton(app);
+    show_source(app, mode);
+    if cur(app).loading.is_some() {
+        present_loading(app);
+    }
+}
+
+unsafe fn show_source(app: *mut App, mode: Show) {
     let hwnd = (*app).hwnd;
     let list = (*app).list;
     let tab = cur(app);
@@ -397,8 +444,12 @@ pub(crate) unsafe fn set_columns(app: *mut App, columns: &[Column]) {
     }
 }
 
-/// Reloads the active tab; a search runs again.
+/// Reloads the active tab; a search runs again. Nothing while a navigation is in flight: reloading the place being
+/// left (a change in it, a tab switch) would cancel the navigation.
 pub(crate) unsafe fn refresh(app: *mut App) {
+    if cur(app).loading.is_some() {
+        return;
+    }
     let target = match source(app) {
         Some(Source::Search(s)) => {
             let needle = s.needle.clone();
@@ -451,6 +502,7 @@ pub(crate) unsafe fn new_tab(app: *mut App, target: Target, activate: bool, sele
         search_after: None,
         crumbs: Vec::new(),
         icon: (0, 0),
+        loading: None,
     });
     let t = (*app).tabs.len() - 1;
     tabs::add((*app).strip, &title);
@@ -477,17 +529,114 @@ pub(crate) unsafe fn switch_tab(app: *mut App, t: usize) {
     if t >= (*app).tabs.len() || t == old {
         return;
     }
-    {
-        let list = (*app).list;
-        let tab = &mut (&mut (*app).tabs)[old];
-        tab.watch = None;
-        tab.top = SendMessageW(list, LVM_GETTOPINDEX, None, None).0 as i32;
-        tab.selected = match &tab.source {
-            Some(Source::Shell(l)) => list::selected_indices(list).iter().filter_map(|&i| l.items.get(i)).map(|i| i.parsing_name()).collect(),
-            _ => Vec::new(),
-        };
-    }
+    cur(app).watch = None;
+    save_view_state(app);
     show_tab(app, t, true);
+}
+
+/// Keeps the active tab's scroll position and selection in the tab, unless the skeleton already replaced them.
+unsafe fn save_view_state(app: *mut App) {
+    if (*app).skeleton {
+        return;
+    }
+    let list = (*app).list;
+    let tab = cur(app);
+    tab.top = SendMessageW(list, LVM_GETTOPINDEX, None, None).0 as i32;
+    tab.selected = match &tab.source {
+        Some(Source::Shell(l)) => list::selected_indices(list).iter().filter_map(|&i| l.items.get(i)).map(|i| i.parsing_name()).collect(),
+        _ => Vec::new(),
+    };
+}
+
+// ---- loading state ------------------------------------------------------------------------------
+
+/// Display and parsing name of where a navigation goes, without loading it: PIDLs and `shell:` / `::{CLSID}`
+/// names resolve in the namespace (no disk access); anything else shows as typed.
+fn destination(target: &Target) -> (String, String) {
+    let names = |p: *const windows::Win32::UI::Shell::Common::ITEMIDLIST| unsafe {
+        let get = |k: SIGDN| SHGetNameFromIDList(p, k).map(|s| rexplorer_core::com::take_cotaskmem_string(s)).unwrap_or_default();
+        (get(SIGDN_NORMALDISPLAY), get(SIGDN_DESKTOPABSOLUTEPARSING))
+    };
+    match target {
+        Target::Pidl(p) => names(p.as_ptr()),
+        Target::Name(n) => {
+            let lower = n.to_ascii_lowercase();
+            if lower.starts_with("shell:") || lower.starts_with("::") {
+                let wide = HSTRING::from(n.as_str());
+                let mut abs = std::ptr::null_mut();
+                if unsafe { SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut abs, 0, None) }.is_ok() && !abs.is_null() {
+                    let p = unsafe { Pidl::from_raw(abs) };
+                    let (name, parsing) = names(p.as_ptr());
+                    if !name.is_empty() {
+                        return (name, parsing);
+                    }
+                }
+            }
+            (n.clone(), n.clone())
+        }
+    }
+}
+
+/// The active tab is loading: its destination in the title, tab, breadcrumb, address and sidebar; "Loading..."
+/// in the status bar; the skeleton once the load has taken longer than SKELETON_DELAY.
+unsafe fn present_loading(app: *mut App) {
+    let hwnd = (*app).hwnd;
+    let tab = cur(app);
+    let Some(l) = &tab.loading else { return };
+    set_text(hwnd, &format!("{} - rexplorer", l.name));
+    if !IsWindowVisible((*app).addr).as_bool() {
+        set_text((*app).addr, &l.parsing);
+    }
+    sidebar::select((*app).sidebar, &l.parsing);
+    let waited = l.since.elapsed();
+    ui::set_crumbs(app);
+    if waited >= SKELETON_DELAY {
+        begin_skeleton(app);
+    } else {
+        SetTimer(Some(hwnd), TIMER_SKELETON, (SKELETON_DELAY - waited).as_millis() as u32 + 1, None);
+    }
+    ui::update_status(app);
+}
+
+/// TIMER_SKELETON: a load (or a search with nothing found yet) is still running in the active tab.
+pub(crate) unsafe fn on_skeleton_timer(app: *mut App) {
+    let tab = cur(app);
+    if tab.loading.is_some() {
+        present_loading(app);
+    } else if matches!(&tab.source, Some(Source::Search(s)) if s.running && s.rows.is_empty()) {
+        begin_skeleton(app);
+    }
+}
+
+/// Empties the list (the old items stay in the tab) and lets it draw placeholder rows that pulse.
+unsafe fn begin_skeleton(app: *mut App) {
+    if (*app).skeleton {
+        return;
+    }
+    save_view_state(app);
+    (*app).skeleton = true;
+    let list = (*app).list;
+    views::reset(app, 0);
+    SendMessageW(list, LVM_SETITEMCOUNT, Some(WPARAM(0)), Some(LPARAM(0)));
+    panes::schedule_preview(app);
+    SetTimer(Some((*app).hwnd), TIMER_PULSE, PULSE_MS, None);
+    let _ = InvalidateRect(Some(list), None, true);
+}
+
+/// TIMER_PULSE: the skeleton alternates between two shades.
+pub(crate) unsafe fn on_pulse_timer(app: *mut App) {
+    if (*app).skeleton {
+        (*app).pulse = !(*app).pulse;
+        let _ = InvalidateRect(Some((*app).list), None, false);
+        SetTimer(Some((*app).hwnd), TIMER_PULSE, PULSE_MS, None);
+    }
+}
+
+pub(crate) unsafe fn stop_skeleton(app: *mut App) {
+    if std::mem::take(&mut (*app).skeleton) {
+        let _ = KillTimer(Some((*app).hwnd), TIMER_PULSE);
+        let _ = InvalidateRect(Some((*app).list), None, true);
+    }
 }
 
 /// Makes `t` the active tab without saving the previous one's view state.
@@ -587,4 +736,23 @@ pub(crate) unsafe fn save_session(app: *mut App) {
     a.session.active = named.iter().position(|(i, _)| *i == a.active).unwrap_or(0);
     a.session.tabs = named.iter().map(|(_, t)| t.name.clone()).collect();
     session::save(&a.session);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn destinations_resolve_namespace_names_and_keep_typed_paths() {
+        let _com = ComInit::sta();
+        let (name, parsing) = destination(&Target::Name(format!("shell:{HOME}")));
+        assert_eq!(parsing, HOME);
+        assert!(!name.is_empty() && !name.starts_with("shell:"), "the shell's (localized) name: {name:?}");
+        let pc = ShellFolder::parse("shell:MyComputerFolder").unwrap();
+        assert_eq!(destination(&Target::Pidl(pc.pidl.clone())), (pc.name.clone(), pc.parsing_name.clone()));
+        let typed = r"C:\x\a.rar\docs".to_string();
+        assert_eq!(destination(&Target::Name(typed.clone())), (typed.clone(), typed));
+        let bad = "shell:NoSuchFolder".to_string();
+        assert_eq!(destination(&Target::Name(bad.clone())), (bad.clone(), bad));
+    }
 }

@@ -13,7 +13,7 @@ use windows::Win32::Graphics::Gdi::{
     SetBkMode, SetTextColor, TRANSPARENT,
 };
 
-const THIS_PC: &str = "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}";
+pub(crate) const THIS_PC: &str = "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}";
 const HEADER_H: i32 = 44;
 const CONTROL_H: i32 = 32;
 const SEARCH_W: i32 = 220;
@@ -235,12 +235,16 @@ pub(crate) unsafe fn paint(app: *mut App) {
 /// Crumb names and folder icon of the active tab.
 pub(crate) unsafe fn set_crumbs(app: *mut App) {
     let tab = cur(app);
-    let names: Vec<String> = tab.crumbs.iter().map(|c| c.name.clone()).collect();
+    let names: Vec<String> = match &tab.loading {
+        Some(l) => vec![l.name.clone()],
+        None => tab.crumbs.iter().map(|c| c.name.clone()).collect(),
+    };
     let editing = IsWindowVisible((*app).addr).as_bool();
     breadcrumb::set_crumbs((*app).crumbs, if editing { &[] } else { &names });
     let old = std::mem::take(&mut (*app).crumb_icon);
-    let (himl, index) = tab.icon;
-    if himl != 0 && tab.source.is_some() {
+    // While loading, a plain folder icon: the destination's own may need disk or network access.
+    let (himl, index) = if tab.loading.is_some() { source::sys_icon("folder", true) } else { tab.icon };
+    if himl != 0 && (tab.source.is_some() || tab.loading.is_some()) {
         (*app).crumb_icon = ImageList_GetIcon(HIMAGELIST(himl as isize), index, ILD_NORMAL);
     }
     let icon = (*app).crumb_icon;
@@ -260,7 +264,9 @@ pub(crate) unsafe fn show_edit(app: *mut App) {
 
 /// On EN_KILLFOCUS: whatever was typed and not entered is dropped.
 pub(crate) unsafe fn hide_edit(app: *mut App) {
-    if let Some(s) = source(app) {
+    if let Some(l) = &cur(app).loading {
+        set_text((*app).addr, &l.parsing);
+    } else if let Some(s) = source(app) {
         set_text((*app).addr, &s.editing_name());
     }
     let _ = ShowWindow((*app).addr, SW_HIDE);
@@ -326,6 +332,7 @@ pub(crate) unsafe fn more_menu(app: *mut App) {
     let mut entries = vec![
         (CMD_FOLDER_TREE as usize, tree.to_string()),
         (0, String::new()),
+        (CMD_PIN as usize, "Pin to Home\tCtrl+D".to_string()),
         (CMD_EXPLORER as usize, "Open in Explorer\tCtrl+Shift+E".to_string()),
         reg,
         (CMD_SETTINGS as usize, "Settings folder".to_string()),
@@ -422,12 +429,19 @@ pub(crate) unsafe fn open_terminal(app: *mut App) {
 }
 
 pub(crate) unsafe fn update_status(app: *mut App) {
+    if cur(app).loading.is_some() {
+        return statusbar::set_text((*app).status, "Loading…", &(*app).profile.name);
+    }
     let count = source(app).map_or(0, |s| s.len());
     let selected = SendMessageW((*app).list, LVM_GETSELECTEDCOUNT, None, None).0 as usize;
     // Selected bytes are omitted: the size column is shell-formatted text, not a number.
     let mut left = statusbar::summary(count, selected, None);
     if let Some(Source::Search(s)) = source(app) {
-        left.push_str(if s.running { "  Â·  searchingâ€¦" } else { "  Â·  search done" });
+        if s.running && s.rows.is_empty() {
+            left = "Searching…".to_string();
+        } else {
+            left.push_str(if s.running { "  ·  searching…" } else { "  ·  search done" });
+        }
     }
     statusbar::set_text((*app).status, &left, &(*app).profile.name);
 }
