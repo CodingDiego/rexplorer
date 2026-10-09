@@ -239,6 +239,7 @@ fn main() -> Result<()> {
             lpfnWndProc: Some(wndproc),
             hInstance: hinst,
             hCursor: LoadCursorW(None, IDC_ARROW)?,
+            hIcon: LoadIconW(Some(hinst), PCWSTR(1 as *const u16)).unwrap_or_default(),
             hbrBackground: brushes.background,
             lpszClassName: class,
             ..Default::default()
