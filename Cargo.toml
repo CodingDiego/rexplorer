@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/app"]
+
+[workspace.dependencies]
+# Pinned on purpose: the windows crate breaks its API across minors. Upgrade deliberately.
+windows = "=0.62.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
