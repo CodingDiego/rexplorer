@@ -1,4 +1,4 @@
-//! Custom-drawn browser-style tab strip, window class "RexTabs".
+//! Custom-drawn tab strip of pill-shaped tabs, window class "RexTabs".
 //! The parent receives WM_NOTIFY with an `NmTab` (TN_SELECT / TN_CLOSE / TN_NEW); it owns adding and removing tabs.
 
 use std::ffi::c_void;
@@ -14,6 +14,8 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, Result, w};
+
+use crate::theme;
 
 pub const TN_SELECT: u32 = 0x9001;
 pub const TN_CLOSE: u32 = 0x9002;
@@ -97,15 +99,6 @@ impl TabLayout {
             Hit::Tab(i)
         }
     }
-}
-
-/// Mix `a` toward `b` by `pct` percent, per 0x00BBGGRR channel.
-fn blend(a: u32, b: u32, pct: u32) -> u32 {
-    let ch = |s: u32| {
-        let (x, y) = ((a >> s) & 0xFF, (b >> s) & 0xFF);
-        ((x * (100 - pct) + y * pct) / 100) << s
-    };
-    ch(0) | ch(8) | ch(16)
 }
 
 // ---- window ---------------------------------------------------------------------------------
@@ -353,15 +346,15 @@ unsafe fn fill(dc: HDC, r: &RECT, color: u32) {
 
 unsafe fn draw(dc: HDC, s: &State, lay: &TabLayout, dpi: u32, cw: i32, ch: i32) {
     let t = &s.theme;
-    let strip = blend(t.background, t.text, 6);
-    let hover_fill = blend(strip, t.text, 10);
-    fill(dc, &RECT { left: 0, top: 0, right: cw, bottom: ch }, strip);
+    fill(dc, &RECT { left: 0, top: 0, right: cw, bottom: ch }, t.background);
     SetBkMode(dc, TRANSPARENT);
     let font = if s.font.is_invalid() { HFONT(GetStockObject(DEFAULT_GUI_FONT).0) } else { s.font };
     let glyphs = icon_font(dc, scale(12, dpi));
-    let pad = scale(10, dpi);
+    let pad = scale(12, dpi);
     let radius = scale(8, dpi);
-    let top = scale(4, dpi);
+    let m = scale(4, dpi);
+    // Each tab is a pill inset in its slot: active = surface, hovered = the hover fill, others transparent.
+    let pill = |r: &RECT| RECT { left: r.left + m / 2, top: r.top + m, right: r.right - m / 2, bottom: r.bottom - m };
     let fmt = DT_END_ELLIPSIS | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
     let glyph_fmt = DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
 
@@ -370,17 +363,9 @@ unsafe fn draw(dc: HDC, s: &State, lay: &TabLayout, dpi: u32, cw: i32, ch: i32) 
         let is_active = i == s.active;
         let hovered = matches!(s.hover, Hit::Tab(j) | Hit::Close(j) if j == i);
         if is_active {
-            // Bottom corners fall below the client area so only the top is rounded.
-            let pen = CreatePen(PS_SOLID, 1, COLORREF(t.border));
-            let brush = CreateSolidBrush(COLORREF(t.background));
-            let (op, ob) = (SelectObject(dc, pen.into()), SelectObject(dc, brush.into()));
-            let _ = RoundRect(dc, r.left, r.top + top, r.right, r.bottom + radius, radius, radius);
-            SelectObject(dc, op);
-            SelectObject(dc, ob);
-            let _ = DeleteObject(pen.into());
-            let _ = DeleteObject(brush.into());
+            theme::fill_round(dc, &pill(&r), t.surface, radius);
         } else if hovered {
-            fill(dc, &RECT { top: r.top + top, ..r }, hover_fill);
+            theme::fill_round(dc, &pill(&r), theme::hover(t), radius);
         }
         SetTextColor(dc, COLORREF(if is_active { t.text } else { t.secondary_text }));
         let c = lay.close_rect(i);
@@ -397,8 +382,7 @@ unsafe fn draw(dc: HDC, s: &State, lay: &TabLayout, dpi: u32, cw: i32, ch: i32) 
 
     let n = lay.new_rect();
     if s.hover == Hit::New {
-        let m = scale(6, dpi);
-        fill(dc, &RECT { left: n.left + scale(4, dpi), top: n.top + m, right: n.right - scale(4, dpi), bottom: n.bottom - m }, hover_fill);
+        theme::fill_round(dc, &RECT { left: n.left + m, top: n.top + m, right: n.right - m, bottom: n.bottom - m }, theme::hover(t), radius);
     }
     let old = SelectObject(dc, glyphs.into());
     SetTextColor(dc, COLORREF(t.secondary_text));
@@ -449,12 +433,6 @@ mod tests {
         assert_eq!(l.hit(n.left + 2, 5), Hit::New);
         assert_eq!(l.hit(n.right + 50, 5), Hit::None);
         assert_eq!(layout(0, 1000, 96).hit(100, 5), Hit::None);
-    }
-
-    #[test]
-    fn blend_mixes_channels() {
-        assert_eq!(blend(0x000000, 0xFFFFFF, 50), 0x7F7F7F);
-        assert_eq!(blend(0x102030, 0x102030, 40), 0x102030);
     }
 
     #[test]

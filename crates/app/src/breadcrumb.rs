@@ -1,4 +1,4 @@
-//! Explorer-style breadcrumb address bar, window class "RexCrumbs".
+//! Breadcrumb path bar, window class "RexCrumbs": a borderless rounded field of pill-shaped crumbs.
 //!
 //! The parent owns the text Edit and overlays it when it receives `CN_EDIT`.
 
@@ -15,6 +15,8 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Result, w};
+
+use crate::theme::fill_round;
 
 /// The user clicked crumb `index`.
 pub const CN_CRUMB: u32 = 0x9011;
@@ -97,9 +99,14 @@ fn blend(a: u32, b: u32, t: f32) -> u32 {
 }
 
 struct State {
+    /// Behind the field's rounded corners (the header).
     background: u32,
+    /// The field itself.
+    surface: u32,
     text: u32,
-    border: u32,
+    secondary: u32,
+    selection: u32,
+    hover_fill: u32,
     accent: u32,
     font: HFONT,
     icon: Option<HICON>,
@@ -136,8 +143,11 @@ pub fn create(parent: HWND, id: usize) -> Result<HWND> {
         let t = Theme::light();
         let st = Box::into_raw(Box::new(State {
             background: t.background,
+            surface: t.surface,
             text: t.text,
-            border: t.border,
+            secondary: t.secondary_text,
+            selection: t.selection,
+            hover_fill: crate::theme::hover(&t),
             accent: t.accent,
             font: HFONT::default(),
             icon: None,
@@ -168,8 +178,11 @@ pub fn set_theme(hwnd: HWND, t: &Theme) {
     unsafe {
         if let Some(s) = state(hwnd) {
             s.background = t.background;
+            s.surface = t.surface;
             s.text = t.text;
-            s.border = t.border;
+            s.secondary = t.secondary_text;
+            s.selection = t.selection;
+            s.hover_fill = crate::theme::hover(t);
             s.accent = t.accent;
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
@@ -307,14 +320,10 @@ unsafe fn paint(hwnd: HWND, st: &mut State) {
         let bmp = CreateCompatibleBitmap(hdc, cw.max(1), ch.max(1));
         let old_bmp = SelectObject(mem, bmp.into());
 
+        // The field: a borderless surface pill on the header.
         let bg = CreateSolidBrush(COLORREF(st.background));
         FillRect(mem, &rc, bg);
-        let pen = CreatePen(PS_SOLID, 1, COLORREF(st.border));
-        let (old_pen, old_br) = (SelectObject(mem, pen.into()), SelectObject(mem, bg.into()));
-        let _ = RoundRect(mem, 0, 0, cw, ch, s(6), s(6));
-        SelectObject(mem, old_pen);
-        SelectObject(mem, old_br);
-        let _ = DeleteObject(pen.into());
+        fill_round(mem, &rc, st.surface, s(8));
 
         let text_font = if st.font.is_invalid() { HFONT(GetStockObject(DEFAULT_GUI_FONT).0) } else { st.font };
         let glyph = glyph_font(mem, s(12));
@@ -337,40 +346,44 @@ unsafe fn paint(hwnd: HWND, st: &mut State) {
         let widths: Vec<i32> = st.crumbs.iter().map(|c| text_width(mem, &wide(c))).collect();
         SelectObject(mem, glyph.into());
         let chevron_w = text_width(mem, &wide("\u{E76C}"));
-        st.layout = layout(&widths, chevron_w, s(6), cw - st.origin - s(4));
+        st.layout = layout(&widths, chevron_w, s(8), cw - st.origin - s(4));
 
-        let (top, bottom, origin) = (s(4), ch - s(4), st.origin);
+        // Each crumb is its own 28 px pill: hover fill, the current folder (last crumb) in the selection color.
+        let top = (ch - s(28)) / 2;
+        let (bottom, origin) = (top + s(28), st.origin);
         let at = |r: &RECT| RECT { left: r.left + origin, top, right: r.right + origin, bottom };
         let first = st.layout.first_visible;
+        let last = st.crumbs.len().checked_sub(1);
+        if let Some((c, _)) = st.layout.items.last() {
+            fill_round(mem, &at(c), st.selection, s(6));
+        }
         let hover_rect = match st.hover {
-            Hit::Crumb(i) if i >= first => st.layout.items.get(i - first).map(|(c, _)| at(c)),
+            Hit::Crumb(i) if i >= first && Some(i) != last => st.layout.items.get(i - first).map(|(c, _)| at(c)),
             Hit::Chevron(i) if i >= first => st.layout.items.get(i - first).map(|(_, k)| at(k)),
             Hit::Overflow => st.layout.items.first().map(|(c, _)| at(&RECT { left: 0, top: 0, right: c.left, bottom: 0 })),
             _ => None,
         };
         if let Some(r) = hover_rect {
-            let hb = CreateSolidBrush(COLORREF(blend(st.background, st.text, 0.08)));
-            let (op, ob) = (SelectObject(mem, GetStockObject(NULL_PEN)), SelectObject(mem, hb.into()));
-            let _ = RoundRect(mem, r.left, r.top, r.right, r.bottom, s(4), s(4));
-            SelectObject(mem, op);
-            SelectObject(mem, ob);
-            let _ = DeleteObject(hb.into());
+            fill_round(mem, &r, st.hover_fill, s(6));
         }
 
-        SetTextColor(mem, COLORREF(st.text));
         let flags = DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX;
+        let chevron_color = blend(st.secondary, st.background, 0.6);
         if first > 0 {
             if let Some((c, _)) = st.layout.items.first() {
                 let mut r = at(&RECT { left: 0, top: 0, right: c.left, bottom: 0 });
                 SelectObject(mem, text_font.into());
+                SetTextColor(mem, COLORREF(st.text));
                 DrawTextW(mem, &mut wide("\u{2026}"), &mut r, flags);
             }
         }
         for (k, (c, chev)) in st.layout.items.iter().enumerate() {
             let (mut cr, mut kr) = (at(c), at(chev));
             SelectObject(mem, text_font.into());
+            SetTextColor(mem, COLORREF(st.text));
             DrawTextW(mem, &mut wide(&st.crumbs[first + k]), &mut cr, flags);
             SelectObject(mem, glyph.into());
+            SetTextColor(mem, COLORREF(chevron_color));
             DrawTextW(mem, &mut wide("\u{E76C}"), &mut kr, flags);
         }
 

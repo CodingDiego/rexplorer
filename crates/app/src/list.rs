@@ -40,6 +40,7 @@ pub(crate) unsafe fn on_notify(app: *mut App, lparam: LPARAM) -> LRESULT {
             views::on_cache_hint(app, nm.iFrom, nm.iTo);
         }
         LVN_BEGINDRAG => begin_drag(app),
+        NM_CUSTOMDRAW => return LRESULT(draw_item(app, &mut *(lparam.0 as *mut NMLVCUSTOMDRAW)) as isize),
         NM_RCLICK => {
             let nm = &*(lparam.0 as *const NMITEMACTIVATE);
             show_menu(app, nm.iItem >= 0);
@@ -92,7 +93,7 @@ unsafe fn fill_dispinfo(app: *mut App, item: &mut LVITEMW) {
         copy_text(&s.text(i, item.iSubItem as usize), item.pszText, item.cchTextMax);
     }
     if item.mask.contains(LVIF_IMAGE) && item.iSubItem == 0 && !icon_view {
-        item.iImage = source::small_icon(app, i);
+        item.iImage = views::tall_icon(app, source::small_icon(app, i));
     }
 }
 
@@ -254,10 +255,66 @@ unsafe fn on_end_edit(app: *mut App, item: &LVITEMW) {
     }
 }
 
-/// Middle-click support (the ListView ignores the middle button) and the dark header.
+/// Selected and hot rows (and icon tiles) as rounded pills: the pill is painted first, then the control draws the
+/// item as unselected over it with a transparent text background.
+unsafe fn draw_item(app: *mut App, cd: &mut NMLVCUSTOMDRAW) -> u32 {
+    match cd.nmcd.dwDrawStage {
+        CDDS_PREPAINT => {
+            // The Explorer style draws faint vertical lines between details columns (LVP_COLUMNDETAIL) before the
+            // items; painting the whole client over them leaves a clean card.
+            let b = CreateSolidBrush(COLORREF((*app).theme.surface));
+            FillRect(cd.nmcd.hdc, &cd.nmcd.rc, b);
+            let _ = DeleteObject(b.into());
+            CDRF_NOTIFYITEMDRAW
+        }
+        CDDS_ITEMPREPAINT => {
+            let (list, t) = ((*app).list, &(*app).theme);
+            let i = cd.nmcd.dwItemSpec;
+            let selected = SendMessageW(list, LVM_GETITEMSTATE, Some(WPARAM(i)), Some(LPARAM(LVIS_SELECTED.0 as isize))).0 != 0;
+            let hot = cd.nmcd.uItemState.0 & CDIS_HOT.0 != 0;
+            if selected || hot {
+                // nmcd.rc is the item's rect; asking the list for it here (LVM_GETITEMRECT) stops it drawing the item.
+                let r = cd.nmcd.rc;
+                let mut client = RECT::default();
+                let _ = GetClientRect(list, &mut client);
+                let dpi = GetDpiForWindow(list) as i32;
+                let (m, v) = (4 * dpi / 96, dpi / 96);
+                // A details row spans the visible width, whatever the columns add up to.
+                let details = (*app).views.view == views::View::Details;
+                let (left, right) = if details { (client.left, client.right) } else { (r.left, r.right) };
+                let pill = RECT { left: left + m, top: r.top + v, right: right - m, bottom: r.bottom - v };
+                theme::fill_round(cd.nmcd.hdc, &pill, if selected { t.selection } else { theme::hover(t) }, 6 * dpi / 96);
+            }
+            cd.nmcd.uItemState.0 &= !(CDIS_SELECTED.0 | CDIS_HOT.0 | CDIS_FOCUS.0);
+            cd.clrText = COLORREF(t.text);
+            cd.clrTextBk = COLORREF(CLR_NONE as u32);
+            CDRF_NEWFONT
+        }
+        _ => CDRF_DODEFAULT,
+    }
+}
+
+/// The header is 32 px high (96 DPI) whatever the font asks for.
+pub(crate) unsafe extern "system" fn header_subclass(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM, _id: usize, _data: usize) -> LRESULT {
+    let r = DefSubclassProc(hwnd, msg, wparam, lparam);
+    if msg == HDM_LAYOUT {
+        let l = &*(lparam.0 as *const HDLAYOUT);
+        let h = 32 * GetDpiForWindow(hwnd) as i32 / 96;
+        (*l.pwpos).cy = h;
+        (*l.prc).top = (*l.pwpos).y + h;
+    }
+    r
+}
+
+/// Middle-click support (the ListView ignores the middle button), the flat header and the card's rounded corners.
 pub(crate) unsafe extern "system" fn subclass(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM, _id: usize, data: usize) -> LRESULT {
-    if msg == WM_NOTIFY && (*(lparam.0 as *const NMHDR)).code == NM_CUSTOMDRAW && (*(data as *mut App)).theme.dark {
+    if msg == WM_NOTIFY && (*(lparam.0 as *const NMHDR)).code == NM_CUSTOMDRAW {
         return LRESULT(draw_header(&(*(data as *mut App)).theme, &*(lparam.0 as *const NMCUSTOMDRAW)) as isize);
+    }
+    if msg == WM_SIZE {
+        let r = DefSubclassProc(hwnd, msg, wparam, lparam);
+        theme::round_corners(hwnd, 10 * GetDpiForWindow(hwnd) as i32 / 96);
+        return r;
     }
     if msg == WM_MBUTTONUP {
         let mut ht = LVHITTESTINFO { pt: POINT { x: lparam.0 as i16 as i32, y: (lparam.0 >> 16) as i16 as i32 }, ..Default::default() };
@@ -270,7 +327,8 @@ pub(crate) unsafe extern "system" fn subclass(hwnd: HWND, msg: u32, wparam: WPAR
     DefSubclassProc(hwnd, msg, wparam, lparam)
 }
 
-/// The header ignores DarkMode themes on this Windows build, so dark themes draw it themselves.
+/// A flat header in both themes (the DarkMode header themes are ignored on this Windows build): surface fill,
+/// secondary-text labels, no dividers or bottom line; a hovered column gets a rounded hover fill.
 unsafe fn draw_header(t: &Theme, nm: &NMCUSTOMDRAW) -> u32 {
     let fill = |r: &RECT, c: u32| {
         let b = CreateSolidBrush(COLORREF(c));
@@ -278,24 +336,27 @@ unsafe fn draw_header(t: &Theme, nm: &NMCUSTOMDRAW) -> u32 {
         let _ = DeleteObject(b.into());
     };
     let header = nm.hdr.hwndFrom;
-    let bottom_line = |r: &RECT| fill(&RECT { top: r.bottom - 1, ..*r }, t.border);
+    let dpi = GetDpiForWindow(header) as i32;
     match nm.dwDrawStage {
         CDDS_PREPAINT => {
-            fill(&nm.rc, t.background);
+            fill(&nm.rc, t.surface);
             CDRF_NOTIFYITEMDRAW | CDRF_NOTIFYPOSTPAINT
         }
         CDDS_ITEMPREPAINT => {
             let r = nm.rc;
-            fill(&r, if nm.uItemState.0 & CDIS_HOT.0 != 0 { theme::hover(t) } else { t.background });
-            fill(&RECT { left: r.right - 1, top: r.top + 4, right: r.right, bottom: r.bottom - 4 }, t.border);
-            bottom_line(&r);
+            fill(&r, t.surface);
+            if nm.uItemState.0 & CDIS_HOT.0 != 0 {
+                let m = 4 * dpi / 96;
+                theme::fill_round(nm.hdc, &RECT { left: r.left + m, top: r.top + m, right: r.right - m, bottom: r.bottom - m }, theme::hover(t), 6 * dpi / 96);
+            }
             let mut buf = [0u16; 260];
             let mut hi = HDITEMW { mask: HDI_TEXT | HDI_FORMAT, pszText: PWSTR(buf.as_mut_ptr()), cchTextMax: buf.len() as i32, ..Default::default() };
             SendMessageW(header, HDM_GETITEMW, Some(WPARAM(nm.dwItemSpec)), Some(LPARAM(&mut hi as *mut _ as isize)));
             let len = buf.iter().position(|&c| c == 0).unwrap_or(0);
             SetBkMode(nm.hdc, TRANSPARENT);
-            SetTextColor(nm.hdc, COLORREF(t.text));
-            let mut tr = RECT { left: r.left + 6, right: r.right - 6, ..r };
+            SetTextColor(nm.hdc, COLORREF(t.secondary_text));
+            let p = 8 * dpi / 96;
+            let mut tr = RECT { left: r.left + p, right: r.right - p, ..r };
             let align = if hi.fmt.0 & HDF_RIGHT.0 != 0 { DT_RIGHT } else { Default::default() };
             DrawTextW(nm.hdc, &mut buf[..len], &mut tr, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX | align);
             CDRF_SKIPDEFAULT
@@ -309,9 +370,7 @@ unsafe fn draw_header(t: &Theme, nm: &NMCUSTOMDRAW) -> u32 {
                 SendMessageW(header, HDM_GETITEMRECT, Some(WPARAM(i)), Some(LPARAM(&mut r as *mut _ as isize)));
                 right = right.max(r.right);
             }
-            let rest = RECT { left: right, ..nm.rc };
-            fill(&rest, t.background);
-            bottom_line(&rest);
+            fill(&RECT { left: right, ..nm.rc }, t.surface);
             CDRF_DODEFAULT
         }
         _ => CDRF_DODEFAULT,

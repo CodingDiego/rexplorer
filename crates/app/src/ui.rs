@@ -1,17 +1,31 @@
 //! Window chrome: child controls, theme and fonts, layout, the address Edit, popup menus, palette and status.
+//!
+//! Top to bottom: the tab strip; one 44 px header bar (Back / Forward segment, Up, the path bar, the search
+//! field, the view segment, Terminal, Connect, More); the sidebar (or tree) beside the list and preview cards;
+//! the status bar. The frame, header, sidebar and status bar share `theme.background`; cards and fields are
+//! `theme.surface`.
 
 use super::*;
 use crate::nav::{Target, cur, go, listing, source};
+use windows::Win32::Foundation::COLORREF;
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DrawTextW, EndPaint, FillRect, PAINTSTRUCT, SelectObject,
+    SetBkMode, SetTextColor, TRANSPARENT,
+};
 
 const THIS_PC: &str = "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}";
+const HEADER_H: i32 = 44;
+const CONTROL_H: i32 = 32;
+const SEARCH_W: i32 = 220;
+const PAD: i32 = 8;
 
-/// Cloud-sync roots for the palette, probed once on a worker (volume probing can stall on dead drives).
+/// Cloud-sync roots for the sidebar, the palette and the More menu, probed once by the sidebar worker (volume
+/// probing can stall on dead drives, so the UI thread only reads what is there).
 static CLOUD: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
 
-pub(crate) fn probe_cloud_roots() {
-    std::thread::spawn(|| {
-        let _ = CLOUD.set(connect::cloud_roots());
-    });
+/// Probes on first use: call on a worker thread.
+pub(crate) fn cloud_roots() -> &'static [(String, String)] {
+    CLOUD.get_or_init(connect::cloud_roots)
 }
 
 fn scale(px: i32, dpi: u32) -> i32 {
@@ -31,13 +45,9 @@ pub(crate) unsafe fn create_children(app: *mut App) -> Result<()> {
     (*app).nav = toolbar::create(
         hwnd,
         ID_NAV,
-        &[
-            (0xE72B, CMD_BACK, "Back (Alt+Left)"),
-            (0xE72A, CMD_FORWARD, "Forward (Alt+Right)"),
-            (0xE74A, CMD_UP, "Up (Alt+Up)"),
-            (0xE72C, CMD_REFRESH, "Refresh (F5)"),
-        ],
+        &[(0xE72B, CMD_BACK, "Back (Alt+Left)"), (0xE72A, CMD_FORWARD, "Forward (Alt+Right)"), (0xE74A, CMD_UP, "Up (Alt+Up)")],
     )?;
+    toolbar::set_group((*app).nav, &[CMD_BACK, CMD_FORWARD]);
     (*app).crumbs = breadcrumb::create(hwnd, ID_CRUMBS)?;
     // The address Edit sits on top of the breadcrumb while editing; keep the breadcrumb from painting over it.
     let style = GetWindowLongPtrW((*app).crumbs, GWL_STYLE);
@@ -60,7 +70,7 @@ pub(crate) unsafe fn create_children(app: *mut App) -> Result<()> {
         WINDOW_EX_STYLE(0),
         WC_EDITW,
         PCWSTR::null(),
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
         0,
         0,
         0,
@@ -77,12 +87,18 @@ pub(crate) unsafe fn create_children(app: *mut App) -> Result<()> {
         hwnd,
         ID_TOOLS,
         &[
+            (0xE8FD, CMD_VIEW1, "List (Ctrl+Shift+1)"),
+            (0xE80A, CMD_VIEW_GRID, "Grid: icons, again for thumbnails (Ctrl+Shift+2 / 3)"),
             (0xE756, CMD_TERMINAL, "Open terminal here (Ctrl+`)"),
-            (0xE8A9, CMD_VIEW, "View"),
             (0xE968, CMD_CONNECT, "Connect to server"),
             (0xE712, CMD_MORE, "More"),
         ],
     )?;
+    toolbar::set_group((*app).tools, &[CMD_VIEW1, CMD_VIEW_GRID]);
+    (*app).sidebar = sidebar::create(hwnd, ID_SIDEBAR)?;
+    if !(*app).session.show_tree && (*app).session.show_sidebar {
+        let _ = ShowWindow((*app).sidebar, SW_SHOW);
+    }
     let list_style = LVS_REPORT | LVS_OWNERDATA | LVS_SHOWSELALWAYS | LVS_EDITLABELS | LVS_SHAREIMAGELISTS;
     (*app).list = CreateWindowExW(
         WINDOW_EX_STYLE(0),
@@ -101,6 +117,8 @@ pub(crate) unsafe fn create_children(app: *mut App) -> Result<()> {
     let ex = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_HEADERDRAGDROP;
     SendMessageW((*app).list, LVM_SETEXTENDEDLISTVIEWSTYLE, Some(WPARAM(0)), Some(LPARAM(ex as isize)));
     let _ = SetWindowSubclass((*app).list, Some(list::subclass), 1, app as usize);
+    let header = HWND(SendMessageW((*app).list, LVM_GETHEADER, None, None).0 as *mut c_void);
+    let _ = SetWindowSubclass(header, Some(list::header_subclass), 1, 0);
     list::register_drop(app);
     panes::create_preview(app)?;
     if (*app).session.show_preview {
@@ -110,8 +128,10 @@ pub(crate) unsafe fn create_children(app: *mut App) -> Result<()> {
     apply_theme(app);
     apply_font(app);
     views::init(app);
+    panes::refresh_sidebar(app);
     Ok(())
 }
+
 
 pub(crate) unsafe fn apply_theme(app: *mut App) {
     let t = &(*app).theme;
@@ -120,6 +140,7 @@ pub(crate) unsafe fn apply_theme(app: *mut App) {
     theme::apply_control((*app).addr, t);
     theme::apply_control((*app).search, t);
     tabs::set_theme((*app).strip, t);
+    sidebar::set_theme((*app).sidebar, t);
     breadcrumb::set_theme((*app).crumbs, t);
     toolbar::set_theme((*app).nav, t);
     toolbar::set_theme((*app).tools, t);
@@ -135,7 +156,7 @@ pub(crate) unsafe fn apply_theme(app: *mut App) {
 /// (Re)creates the UI font for the window's current DPI.
 pub(crate) unsafe fn apply_font(app: *mut App) {
     let font = theme::ui_font(&(*app).theme, GetDpiForWindow((*app).hwnd));
-    for h in [(*app).list, (*app).addr, (*app).search, (*app).strip, (*app).crumbs, (*app).status] {
+    for h in [(*app).list, (*app).addr, (*app).search, (*app).strip, (*app).crumbs, (*app).status, (*app).sidebar] {
         SendMessageW(h, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
     }
     if !(*app).font.is_invalid() {
@@ -149,18 +170,20 @@ pub(crate) unsafe fn layout(app: *mut App) {
     let mut rc = RECT::default();
     let _ = GetClientRect((*app).hwnd, &mut rc);
     let dpi = GetDpiForWindow((*app).hwnd);
-    let (w, pad) = (rc.right, scale(4, dpi));
+    let (w, pad) = (rc.right, scale(PAD, dpi));
     let th = tabs::height(dpi);
     let _ = MoveWindow((*app).strip, 0, 0, w, th, true);
 
-    let (y, nh) = (th + pad, scale(32, dpi));
+    // The header bar: 32 px controls centered in 44 px.
+    let (hh, nh) = (scale(HEADER_H, dpi), scale(CONTROL_H, dpi));
+    let y = th + (hh - nh) / 2;
     let nw = toolbar::width((*app).nav);
     let tw = toolbar::width((*app).tools);
     let _ = MoveWindow((*app).nav, pad, y, nw, nh, true);
     let _ = MoveWindow((*app).tools, (w - pad - tw).max(0), y, tw, nh, true);
     let cx = 2 * pad + nw;
-    // The search box keeps 200 px right of the breadcrumb; the breadcrumb gives way first on a narrow window.
-    let sw = scale(200, dpi).min((w - tw - 3 * pad - cx).max(0));
+    // The search field keeps 220 px right of the path bar; the path bar gives way first on a narrow window.
+    let sw = scale(SEARCH_W, dpi).min((w - tw - 3 * pad - cx).max(0));
     let cw = (w - tw - 3 * pad - sw - cx).max(0);
     let _ = MoveWindow((*app).crumbs, cx, y, cw, nh, true);
     // A single-line Edit draws its text at the top, so size it to one line and center it in the field,
@@ -168,12 +191,43 @@ pub(crate) unsafe fn layout(app: *mut App) {
     let eh = (*app).theme.font_size * dpi as i32 / 72 * 4 / 3 + scale(4, dpi);
     let ex = scale(28, dpi);
     let _ = MoveWindow((*app).addr, cx + ex, y + (nh - eh) / 2, (cw - ex - 2 * pad).max(0), eh, true);
-    let bh = eh + scale(6, dpi);
-    let _ = MoveWindow((*app).search, cx + cw + pad, y + (nh - bh) / 2, sw, bh, true);
+    // The search Edit sits in a rounded field the window paints, right of a magnifier glyph.
+    let field = RECT { left: cx + cw + pad, top: y, right: cx + cw + pad + sw, bottom: y + nh };
+    if field != (*app).search_field {
+        let _ = InvalidateRect(Some((*app).hwnd), Some(&(*app).search_field as *const RECT), true);
+        let _ = InvalidateRect(Some((*app).hwnd), Some(&field as *const RECT), true);
+        (*app).search_field = field;
+    }
+    let gx = scale(32, dpi);
+    let _ = MoveWindow((*app).search, field.left + gx, y + (nh - eh) / 2, (sw - gx - pad).max(0), eh, true);
 
     let sh = statusbar::height(dpi);
     let _ = MoveWindow((*app).status, 0, rc.bottom - sh, w, sh, true);
-    panes::layout(app, y + nh + pad, rc.bottom - sh, w);
+    panes::layout(app, th + hh, rc.bottom - sh, w);
+}
+
+/// WM_PAINT of the main window: the frame color everywhere the children leave, and the search field.
+pub(crate) unsafe fn paint(app: *mut App) {
+    let hwnd = (*app).hwnd;
+    let mut ps = PAINTSTRUCT::default();
+    let dc = BeginPaint(hwnd, &mut ps);
+    let t = &(*app).theme;
+    FillRect(dc, &ps.rcPaint, (*app).brushes.background);
+    let f = (*app).search_field;
+    if f.right > f.left {
+        let dpi = GetDpiForWindow(hwnd);
+        theme::fill_round(dc, &f, t.surface, scale(8, dpi));
+        let glyphs = theme::icon_font(dpi, 16);
+        let old = SelectObject(dc, glyphs.into());
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, COLORREF(t.secondary_text));
+        let mut r = RECT { left: f.left + scale(8, dpi), right: f.left + scale(28, dpi), ..f };
+        let mut g: Vec<u16> = "\u{E721}".encode_utf16().collect();
+        DrawTextW(dc, &mut g, &mut r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(dc, old);
+        let _ = DeleteObject(glyphs.into());
+    }
+    let _ = EndPaint(hwnd, &ps);
 }
 
 // ---- address Edit over the breadcrumb ----------------------------------------------------------
@@ -268,7 +322,10 @@ pub(crate) unsafe fn more_menu(app: *mut App) {
     } else {
         (CMD_REGISTER as usize, "Register as folder handler...".to_string())
     };
+    let tree = if (*app).session.show_tree { "Places sidebar" } else { "Folder tree" };
     let mut entries = vec![
+        (CMD_FOLDER_TREE as usize, tree.to_string()),
+        (0, String::new()),
         (CMD_EXPLORER as usize, "Open in Explorer\tCtrl+Shift+E".to_string()),
         reg,
         (CMD_SETTINGS as usize, "Settings folder".to_string()),
@@ -370,7 +427,7 @@ pub(crate) unsafe fn update_status(app: *mut App) {
     // Selected bytes are omitted: the size column is shell-formatted text, not a number.
     let mut left = statusbar::summary(count, selected, None);
     if let Some(Source::Search(s)) = source(app) {
-        left.push_str(if s.running { "  ·  searching…" } else { "  ·  search done" });
+        left.push_str(if s.running { "  Â·  searchingâ€¦" } else { "  Â·  search done" });
     }
     statusbar::set_text((*app).status, &left, &(*app).profile.name);
 }

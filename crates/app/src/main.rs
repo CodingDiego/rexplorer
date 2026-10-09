@@ -1,4 +1,5 @@
-//! The window: tabs, a nav row (buttons, breadcrumb address bar, search box) over a virtual ListView, and a status bar.
+//! The window: tabs, a header bar (buttons, breadcrumb path bar, search field), the places sidebar beside a virtual
+//! ListView card, and a status bar.
 //! All shell logic lives in rexplorer-core; this crate is plumbing and drawing.
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 #![allow(unsafe_op_in_unsafe_fn)]
@@ -15,6 +16,7 @@ mod palette;
 mod panes;
 mod preview_pane;
 mod session;
+mod sidebar;
 mod source;
 mod statusbar;
 #[allow(dead_code)] // parts of the API are for later steps
@@ -42,14 +44,15 @@ use rexplorer_core::settings::{self, Profile, Settings, Theme};
 use rexplorer_core::{Column, ShellFolder, ShellItem};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{DeleteObject, HDC, HFONT, InvalidateRect};
-use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
+use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_FLAGS_AND_ATTRIBUTES};
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::*;
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Shell::{
-    DefSubclassProc, SHFILEINFOW, SHGFI_PIDL, SHGFI_SMALLICON, SHGFI_SYSICONINDEX, SHGetFileInfoW, SetWindowSubclass,
+    DefSubclassProc, SHFILEINFOW, SHGFI_PIDL, SHGFI_SMALLICON, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW,
+    SetWindowSubclass,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Error, HSTRING, PCWSTR, PWSTR, Result, w};
@@ -64,6 +67,7 @@ const TIMER_STATUS: usize = 2;
 const TIMER_SESSION: usize = 3;
 const TIMER_PREVIEW: usize = 4;
 const TIMER_TREE: usize = 5;
+const TIMER_SIDEBAR: usize = 6;
 const ICON_UNKNOWN: i32 = i32::MIN;
 
 const ID_ADDR: usize = 100;
@@ -76,6 +80,7 @@ const ID_STATUS: usize = 106;
 const ID_PALETTE: usize = 107;
 const ID_PREVIEW: usize = 108;
 const ID_SEARCH: usize = 109;
+const ID_SIDEBAR: usize = 110;
 
 const CMD_BACK: u16 = 1;
 const CMD_FORWARD: u16 = 2;
@@ -99,9 +104,13 @@ const CMD_REGISTER: u16 = 19;
 const CMD_UNREGISTER: u16 = 20;
 const CMD_SETTINGS: u16 = 21;
 const CMD_ABOUT: u16 = 22;
-const CMD_TOGGLE_TREE: u16 = 23;
+const CMD_TOGGLE_SIDEBAR: u16 = 23;
 const CMD_TOGGLE_PREVIEW: u16 = 24;
 const CMD_SEARCH: u16 = 28;
+/// The grid half of the view segment: icons, or thumbnails when already in a grid view.
+const CMD_VIEW_GRID: u16 = 29;
+/// More > Folder tree: the tree instead of the sidebar.
+const CMD_FOLDER_TREE: u16 = 30;
 /// Ctrl+Shift+1..3 send CMD_VIEW1..CMD_VIEW1 + 2 (details, icons, thumbnails).
 const CMD_VIEW1: u16 = 25;
 /// Ctrl+1..Ctrl+9 send CMD_TAB1..CMD_TAB1 + 8.
@@ -129,7 +138,7 @@ const ACCELS: [ACCEL; 23] = [
     accel(FCONTROL.0 | FSHIFT.0, VK_TAB, CMD_PREV_TAB),
     accel(FCONTROL.0, VK_P, CMD_PALETTE),
     accel(FCONTROL.0, VK_OEM_3, CMD_TERMINAL),
-    accel(FCONTROL.0, VK_B, CMD_TOGGLE_TREE),
+    accel(FCONTROL.0, VK_B, CMD_TOGGLE_SIDEBAR),
     accel(FALT.0, VK_P, CMD_TOGGLE_PREVIEW),
     accel(FCONTROL.0, VK_F, CMD_SEARCH),
     accel(FCONTROL.0 | FSHIFT.0, VK_1, CMD_VIEW1),
@@ -148,6 +157,9 @@ pub(crate) struct App {
     status: HWND,
     palette: HWND,
     search: HWND,
+    sidebar: HWND,
+    /// The rounded field the window paints behind the search Edit.
+    search_field: RECT,
     /// Owned copy of the current folder's icon shown in the breadcrumb.
     crumb_icon: HICON,
     font: HFONT,
@@ -197,6 +209,16 @@ fn main() -> Result<()> {
         let _com = ComInit::ole();
         let icc = INITCOMMONCONTROLSEX { dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_LISTVIEW_CLASSES };
         let _ = InitCommonControlsEx(&icc);
+        // Creates the system image list here, before the workers ask it for folder icons: a worker's first
+        // SHGFI_SYSICONINDEX call racing the UI thread's own first use comes back empty.
+        let mut fi = SHFILEINFOW::default();
+        SHGetFileInfoW(
+            w!("folder"),
+            FILE_ATTRIBUTE_DIRECTORY,
+            Some(&mut fi),
+            size_of::<SHFILEINFOW>() as u32,
+            SHGFI_USEFILEATTRIBUTES | SHGFI_SYSICONINDEX | SHGFI_SMALLICON,
+        );
 
         let dir = settings::dir();
         Settings::ensure_files(&dir);
@@ -207,7 +229,6 @@ fn main() -> Result<()> {
         let profile = settings.active_profile().clone();
         let theme = settings.theme(&profile.theme).clone();
         let brushes = theme::Brushes::new(&theme);
-        ui::probe_cloud_roots();
         views::ensure_starter_theme(&theme);
         let session = startup_session(&profile, args.profile.is_some());
 
@@ -235,6 +256,8 @@ fn main() -> Result<()> {
             status: HWND::default(),
             palette: HWND::default(),
             search: HWND::default(),
+            sidebar: HWND::default(),
+            search_field: RECT::default(),
             crumb_icon: HICON::default(),
             font: HFONT::default(),
             theme,
@@ -258,7 +281,7 @@ fn main() -> Result<()> {
             WINDOW_EX_STYLE(0),
             class,
             w!("rexplorer"),
-            WS_OVERLAPPEDWINDOW,
+            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             1000,
@@ -362,6 +385,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     }
     match msg {
         WM_SIZE => ui::layout(app),
+        WM_PAINT => ui::paint(app),
+        WM_ACTIVATE => {
+            // Drives come and go: the sidebar re-reads them every 5 s, only while the window is active.
+            if (wparam.0 & 0xFFFF) as u32 != WA_INACTIVE {
+                SetTimer(Some(hwnd), TIMER_SIDEBAR, 5000, None);
+            }
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
         WM_SETFOCUS => {
             let _ = SetFocus(Some(source::browser_hwnd(app).unwrap_or((*app).list)));
         }
@@ -405,6 +436,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         source::WM_SEARCH_BATCH => source::on_search_batch(app, Box::from_raw(lparam.0 as *mut source::SearchBatch)),
         source::WM_BROWSER_NAV => source::on_browser_nav(app, Box::from_raw(lparam.0 as *mut Pidl)),
         source::WM_WORKER_ERROR => message(hwnd, &Box::from_raw(lparam.0 as *mut String)),
+        panes::WM_SIDEBAR_ROWS => panes::on_sidebar_rows(app, Box::from_raw(lparam.0 as *mut Vec<sidebar::Row>)),
         panes::WM_TREE_SELECT => panes::on_tree_select(app, Box::from_raw(lparam.0 as *mut Pidl)),
         views::WM_THUMB_DONE => views::on_thumb_done(app, wparam, lparam),
         WM_SETCURSOR => {
@@ -431,6 +463,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     panes::ensure_tree(app);
                     ui::layout(app);
                 }
+                TIMER_SIDEBAR if GetActiveWindow() == hwnd => {
+                    panes::refresh_sidebar(app);
+                    SetTimer(Some(hwnd), TIMER_SIDEBAR, 5000, None);
+                }
                 _ => {}
             }
         }
@@ -446,6 +482,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let r = &*(lparam.0 as *const RECT);
             let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
             ui::apply_font(app);
+            views::rebuild_tall(app);
             if let Some(s) = nav::source(app) {
                 nav::set_columns(app, &s.columns());
             }
@@ -504,6 +541,12 @@ unsafe fn on_notify(app: *mut App, lparam: LPARAM) -> LRESULT {
             breadcrumb::CN_EDIT => ui::show_edit(app),
             breadcrumb::CN_DROPDOWN => ui::crumb_dropdown(app, nm.index),
             _ => {}
+        }
+    } else if from == (*app).sidebar && hdr.code == sidebar::SN_PICK {
+        let nm = &*(lparam.0 as *const sidebar::NmSidebar);
+        let target = sidebar::target(from, nm.index);
+        if !target.is_empty() {
+            go(app, nav::Target::Name(target), nav::History::Push);
         }
     } else if hdr.idFrom == ID_PALETTE && (hdr.code == palette::PN_PICK || hdr.code == palette::PN_CLOSE) {
         ui::on_palette(app, hdr);
@@ -566,10 +609,15 @@ unsafe fn on_command(app: *mut App, cmd: u16) {
         CMD_PALETTE => ui::open_palette(app),
         CMD_TERMINAL => ui::open_terminal(app),
         CMD_VIEW => views::set_view(app, (*app).views.view.next()),
+        CMD_VIEW_GRID => {
+            let next = if (*app).views.view == views::View::Icons { views::View::Thumbnails } else { views::View::Icons };
+            views::set_view(app, next);
+        }
         CMD_VIEW1 => views::set_view(app, views::View::Details),
         c if c == CMD_VIEW1 + 1 => views::set_view(app, views::View::Icons),
         c if c == CMD_VIEW1 + 2 => views::set_view(app, views::View::Thumbnails),
-        CMD_TOGGLE_TREE => panes::toggle_tree(app),
+        CMD_TOGGLE_SIDEBAR => panes::toggle_sidebar(app),
+        CMD_FOLDER_TREE => panes::toggle_tree(app),
         CMD_TOGGLE_PREVIEW => panes::toggle_preview(app),
         CMD_CONNECT => {
             if let Some(url) = connect::dialog((*app).hwnd, &(*app).theme, (*app).font) {

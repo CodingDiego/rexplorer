@@ -30,26 +30,46 @@ Folder of 100,000 files in `%TEMP%\rexplorer-bench`, release build, warm cache, 
 
 Decision: keep pure shell enumeration for every folder type. No filesystem fast path.
 
-## Features (Phase 1 and Phase 2 through step 3)
+## Features (Phase 1 and Phase 2 through step 4)
 
 Everything shown is a shell item: names, columns, icons, sorting, context menus, file operations, rename, live
 updates and drag and drop all come from the shell. rexplorer draws; the shell does the work.
 
+### Look
+
+![Light theme](docs/screenshots/light.png)
+![Dark theme](docs/screenshots/dark.png)
+
+In the spirit of GNOME Files and the macOS Finder: one flat header bar, a sidebar of places, pill-shaped path and
+controls, the list and the preview in rounded cards, no 1 px borders. The frame, tab strip, header, sidebar and
+status bar share the theme's `background`; cards and fields use its `surface`; selections are `selection` pills.
+The system title bar takes the `background` color, so it reads as part of the header.
+
 ### Window
 
-Top to bottom: a tab strip; a nav row (Back / Forward / Up / Refresh, the breadcrumb address bar, a 200 px
-search box, Terminal / View / Connect / More); the folder tree, the list and the preview side by side; a status
-bar (item and selection counts, search progress, profile). Both side panes have a 4 px splitter (drag to resize,
-120 to 600 px). The window follows the theme (dark title bar, Mica when the theme asks for it, themed list,
-header, Edits and fonts that follow the monitor DPI). Minimum size 640x400.
+Top to bottom: a tab strip of pill-shaped tabs; a 44 px header bar (a Back / Forward segment, Up, the path bar, a
+220 px search field, a list / grid view segment, Terminal, Connect, More); the places sidebar beside the list card
+and the preview card; a status bar (centered item and selection counts, search progress; the profile on the
+right). The 8 px gaps between the left pane and the cards are splitters (drag to resize, 120 to 600 px). The window
+follows the theme (title bar color, Mica when the theme asks for it, themed list, header, Edits and fonts that follow
+the monitor DPI). Minimum size 640x400.
 
-Breadcrumb: click a segment to go there, its chevron lists the subfolders (drive paths, UNC paths and This PC),
-a click on the empty area turns it into an address Edit (a path, a `shell:` name, a `::{CLSID}` or a path inside
-a .rar).
+Sidebar: **Favorites** (the profile's bookmarks, then Desktop, Downloads, Documents, Pictures, Music and Videos),
+**This PC** (the drives, re-read every 5 s while the window is active), **Cloud** (the cloud-sync roots found on
+this machine: OneDrive, Google Drive, Dropbox, iCloud Drive; the section is left out when there are none) and
+**Network**. Click a row to go there; the row of the current folder, or of its nearest ancestor, is highlighted.
+The rows and their icons are read on a worker thread, so the sidebar fills in after the first listing. More >
+**Folder tree** shows the shell's folder tree in the sidebar's place (choose it again for the sidebar).
 
-More menu: Open in Explorer, register / unregister as the folder handler, the settings folder, About, and
-**Quick access**: the profile's bookmarks and the cloud-sync roots found on this machine (OneDrive, Google Drive,
-Dropbox, iCloud Drive).
+Path bar: click a crumb to go there (the current folder, the last crumb, refreshes), its chevron lists the
+subfolders (drive paths, UNC paths and This PC), a click on the empty area turns it into an address Edit (a path,
+a `shell:` name, a `::{CLSID}` or a path inside a .rar).
+
+View segment: the list button is the details view; the grid button switches to icons (96 px), and to thumbnails
+(128 px) when already in a grid view.
+
+More menu: Folder tree, Open in Explorer, register / unregister as the folder handler, the settings folder, About,
+and **Quick access**: the profile's bookmarks and the cloud-sync roots.
 
 ### What a tab can show
 
@@ -93,9 +113,9 @@ Dropbox, iCloud Drive).
 | Middle-click a folder | Open it in a background tab (middle-click a tab closes it) |
 | Ctrl+P | Palette: recent places, bookmarks, cloud roots and the current subfolders, fuzzy matched |
 | Ctrl+` | Terminal (Windows Terminal, else cmd) in the current filesystem folder |
-| Ctrl+B | Show / hide the folder tree |
+| Ctrl+B | Show / hide the sidebar (hides the folder tree when that is showing instead) |
 | Alt+P | Show / hide the preview pane (text in a monospace Edit, preview handlers in place, else a thumbnail) |
-| Ctrl+Shift+1 / 2 / 3, View button | Details / icons (48 px) / thumbnails (128 px); the button cycles |
+| Ctrl+Shift+1 / 2 / 3, view segment | Details / icons (96 px) / thumbnails (128 px) |
 | Connect button | FTP dialog (host, port, user, password, path); the `ftp://` URL opens in a new tab |
 
 Shortcuts work while the tree, the search box or the embedded Explorer view has the focus, except Enter and
@@ -135,42 +155,48 @@ profile=default                  ; the active profile
 [profile default]
 start=shell:MyComputerFolder     ; where a first run (or a launch without a session) starts
 theme=dark                       ; a file name in themes\ without .ini
-view=details                     ; details | icons | thumbnails (the View button writes it back here)
-show_tree=true
+view=details                     ; details | icons | thumbnails (the view segment writes it back here)
+show_tree=false                  ; the folder tree instead of the sidebar
 show_preview=false
-tree_width=240                   ; 96-DPI pixels
+tree_width=220                   ; sidebar (or tree) width, 96-DPI pixels
 preview_width=360
 bookmark.Desktop=shell:Desktop   ; bookmark.<label>=<target>: palette and More > Quick access
 bookmark.Downloads=shell:Downloads
 ```
 
 `themes\<name>.ini` holds one `[theme]` section; missing keys fall back to the built-in dark or light theme
-chosen by `dark`:
+chosen by `dark` (the built-in dark theme shown):
 
 ```ini
 [theme]
 dark=true
-mica=true
-background=#202020               ; colors are #RRGGBB
-text=#FFFFFF
-secondary_text=#A0A0A0
-accent=#4CC2FF
-selection=#3A3A3A
-border=#333333
+mica=true                        ; Mica backdrop where Windows supports it
+background=#1E1E1E               ; colors are #RRGGBB; the frame: tabs, header, sidebar, status bar, title bar
+surface=#262626                  ; cards and fields: the list, the preview, the path bar, the search field
+text=#F2F2F7
+secondary_text=#98989D           ; section titles, column titles, the status bar, chevrons
+accent=#0A84FF
+selection=#21374D                ; selection pills (the built-ins mix 18% accent into the surface)
+border=#2F2F2F                   ; kept for themes; nothing draws border lines any more
 icon_theme=default               ; optional: a folder under icons\
 font=Segoe UI Variable Text
-font_size=9                      ; points
+font_size=10                     ; points
 ```
+
+The built-in light theme is `background=#F5F5F7`, `surface=#FFFFFF`, `text=#1D1D1F`, `secondary_text=#6E6E73`,
+`accent=#0A84FF`, `selection=#D3E9FF`. A theme file without `surface` but with `background` uses the background for
+the cards (flat, as before). A `light.ini` / `dark.ini` still holding an earlier version's unedited defaults is
+rewritten with the current ones at startup; edited files are left alone.
 
 Icon themes: `icons\<name>\` holds PNGs named by extension (`rs.png`, `pdf.png`...) plus `folder.png` and
 `file.png` (the fallback for unknown extensions); the details view draws them, at the small-icon size, instead of
 the system icons, for folders, archive members and search results alike. A starter set is written to
 `icons\default` on first run.
 
-Written by the app: `session.txt` (`tab=` lines, `active=`, `view=`, `tree=` / `preview=` as 0 or 1, the pane
-widths; saved within 2 s of each change and on exit; a search tab is saved as its folder), `recent.txt` (palette
-history), `window.txt` (placement). A first run, or `--profile`, takes view and panes from the profile; later
-runs from the session.
+Written by the app: `session.txt` (`tab=` lines, `active=`, `view=`, `tree=` / `sidebar=` / `preview=` as 0 or 1,
+the pane widths; saved within 2 s of each change and on exit; a search tab is saved as its folder), `recent.txt`
+(palette history), `window.txt` (placement). A first run, or `--profile`, takes view and panes from the profile;
+later runs from the session. A session written before the sidebar existed (no `sidebar=`) opens with the sidebar.
 
 The exe carries a Common Controls 6 manifest (`crates/app/build.rs`): icon views and the themed controls need it.
 
@@ -179,10 +205,12 @@ The exe carries a Common Controls 6 manifest (`crates/app/build.rs`): icon views
 `scripts\smoke.ps1` drives the release exe: startup, the 100k-file folder (`%TEMP%\rexplorer-bench`, populated
 in about 300 ms from process start), columns, keyboard navigation, live update, the not-found fallback (error,
 no Explorer window), the Explorer hotkey, tabs, the single-instance hand-off, first-run settings, `--help`,
-placement, the tree, the preview, the views, a RAR5 archive (open, enter a directory, go back up), a search in
-the 100k folder (typed into the search box) and `--search` from the command line. Checks that write settings
-run on a scratch `APPDATA`. The keyboard checks need an interactive desktop that lets the window come to the
-foreground; they report SKIP otherwise.
+placement, the tree (opened from More > Folder tree), the preview, the views, a RAR5 archive (open, enter a
+directory, go back up), a search in the 100k folder (typed into the search box), `--search` from the command line,
+and the look (the sidebar is there, the list card has a rounded window region, a click on a Favorites row
+navigates, Ctrl+B hides the sidebar). Checks that write settings run on a scratch `APPDATA`. The keyboard checks
+need an interactive desktop that lets the window come to the foreground; they report SKIP otherwise.
+`smoke.ps1 -Screenshots` also writes `docs\screenshots\dark.png` and `light.png`.
 
 ### Known gaps
 
@@ -193,6 +221,7 @@ foreground; they report SKIP otherwise.
 - Search result icons come from the extension (no per-file icons such as an exe's own).
 - Only .rar archives get the archive view (zip is the shell's); multi-volume and encrypted .rar are untested.
 - The embedded Explorer view keeps Windows' own colors, not the theme.
+- The sidebar is mouse-only (no keyboard focus). Rounded corners are drawn with GDI, so they are not antialiased.
 - `ftp://` browsing depends on the shell's FTP folder, which recent Windows builds no longer ship; without it the
   URL shows the not-found error.
 - No keyboard context menu; small icons of shell folders resolve on the UI thread.

@@ -9,7 +9,10 @@ pub struct Session {
     pub tabs: Vec<String>,
     pub active: usize,
     pub view: String,
+    /// The folder tree, shown instead of the sidebar.
     pub show_tree: bool,
+    /// The places sidebar (when the tree is not shown).
+    pub show_sidebar: bool,
     pub show_preview: bool,
     pub tree_width: i32,
     pub preview_width: i32,
@@ -21,9 +24,10 @@ impl Default for Session {
             tabs: Vec::new(),
             active: 0,
             view: "details".to_string(),
-            show_tree: true,
+            show_tree: false,
+            show_sidebar: true,
             show_preview: false,
-            tree_width: 240,
+            tree_width: 220,
             preview_width: 360,
         }
     }
@@ -31,6 +35,7 @@ impl Default for Session {
 
 pub fn parse(text: &str) -> Session {
     let mut s = Session::default();
+    let mut has_sidebar = false;
     for line in text.lines() {
         let Some((k, v)) = line.trim_end_matches('\r').split_once('=') else { continue };
         match k {
@@ -38,11 +43,19 @@ pub fn parse(text: &str) -> Session {
             "active" => s.active = v.trim().parse().unwrap_or(0),
             "view" if !v.is_empty() => s.view = v.to_string(),
             "tree" => s.show_tree = v.trim() != "0",
+            "sidebar" => {
+                s.show_sidebar = v.trim() != "0";
+                has_sidebar = true;
+            }
             "preview" => s.show_preview = v.trim() != "0",
             "tree_width" => s.tree_width = v.trim().parse().unwrap_or(s.tree_width),
             "preview_width" => s.preview_width = v.trim().parse().unwrap_or(s.preview_width),
             _ => {}
         }
+    }
+    // A session from before the sidebar had the tree on by default: it gets the sidebar instead.
+    if !has_sidebar {
+        s.show_tree = false;
     }
     s.active = s.active.min(s.tabs.len().saturating_sub(1));
     s.tree_width = s.tree_width.clamp(120, 1200);
@@ -56,8 +69,8 @@ pub fn format(s: &Session) -> String {
         out.push_str(&format!("tab={t}\n"));
     }
     out.push_str(&format!(
-        "active={}\nview={}\ntree={}\npreview={}\ntree_width={}\npreview_width={}\n",
-        s.active, s.view, s.show_tree as u8, s.show_preview as u8, s.tree_width, s.preview_width
+        "active={}\nview={}\ntree={}\nsidebar={}\npreview={}\ntree_width={}\npreview_width={}\n",
+        s.active, s.view, s.show_tree as u8, s.show_sidebar as u8, s.show_preview as u8, s.tree_width, s.preview_width
     ));
     out
 }
@@ -116,7 +129,8 @@ mod tests {
             tabs: vec!["C:/a".into(), "::{GUID}/x=y".into()],
             active: 1,
             view: "icons".into(),
-            show_tree: false,
+            show_tree: true,
+            show_sidebar: false,
             show_preview: true,
             tree_width: 300,
             preview_width: 500,
@@ -136,6 +150,15 @@ mod tests {
         assert_eq!(s.tree_width, 120);
         assert_eq!(s.preview_width, 1200);
         assert_eq!(parse("active=4").active, 0);
+    }
+
+    #[test]
+    fn sessions_before_the_sidebar_get_it() {
+        let old = parse("tab=C:\\Windows\nactive=0\nview=details\ntree=1\npreview=0\ntree_width=240\n");
+        assert!(!old.show_tree && old.show_sidebar);
+        assert_eq!(old.tree_width, 240);
+        let new = parse("tree=1\nsidebar=0\n");
+        assert!(new.show_tree && !new.show_sidebar);
     }
 
     #[test]

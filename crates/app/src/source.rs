@@ -259,8 +259,7 @@ unsafe fn name_icon(app: *mut App, name: &str, dir: bool) -> i32 {
     }
     let (himl, index) = sys_icon(name, dir);
     if himl != 0 && !(*app).image_list_set {
-        SendMessageW((*app).list, LVM_SETIMAGELIST, Some(WPARAM(LVSIL_SMALL as usize)), Some(LPARAM(himl as isize)));
-        (*app).image_list_set = true;
+        views::set_small_source(app, HIMAGELIST(himl as isize));
     }
     index
 }

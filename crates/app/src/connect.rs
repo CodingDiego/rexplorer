@@ -7,15 +7,17 @@ use std::sync::Once;
 
 use rexplorer_core::settings::Theme;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
+use windows::Win32::Graphics::Dwm::{DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Storage::FileSystem::{GetLogicalDrives, GetVolumeInformationW};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Controls::SetWindowTheme;
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_FOCUS, ODS_SELECTED};
+use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{HSTRING, PCWSTR, w};
+
+use crate::theme;
 
 /// Everything outside [A-Za-z0-9-._~] becomes %XX (UTF-8 bytes).
 fn percent_encode(s: &str) -> String {
@@ -108,7 +110,9 @@ const DC_HASDEFID: isize = 0x534B;
 struct State {
     theme: Theme,
     font: HFONT,
+    /// The dialog is one surface card; fields are rounded wells in the background color.
     bg: HBRUSH,
+    field: HBRUSH,
     labels: [HWND; 5],
     edits: [HWND; 5],
     ok: HWND,
@@ -127,9 +131,13 @@ struct Layout {
     cancel: Rc4,
 }
 
+/// Client size the dialog is laid out for, in 96-DPI pixels.
+const CLIENT: (i32, i32) = (440, 280);
+
+/// Edit rects are the rounded fields; the Edit itself sits inset in its field.
 fn layout(cw: i32, ch: i32, dpi: i32) -> Layout {
     let s = |v: i32| v * dpi / 96;
-    let (pad, label_w, row_h, gap, btn_w, btn_h) = (s(12), s(100), s(24), s(8), s(88), s(26));
+    let (pad, label_w, row_h, gap, btn_w, btn_h) = (s(16), s(112), s(32), s(8), s(96), s(32));
     let mut l = Layout { labels: Default::default(), edits: Default::default(), connect: (0, 0, 0, 0), cancel: (0, 0, 0, 0) };
     for i in 0..5 {
         let y = pad + i as i32 * (row_h + gap);
@@ -195,33 +203,61 @@ unsafe fn create_children(hwnd: HWND, st: &mut State) {
         st.labels[i] = mk(w!("STATIC"), LABELS[i], 0x200 /* SS_CENTERIMAGE */, WINDOW_EX_STYLE(0), -1);
         let pw = if i == 3 { ES_PASSWORD as u32 } else { 0 };
         let style = WS_TABSTOP.0 | ES_AUTOHSCROLL as u32 | pw;
-        st.edits[i] = mk(w!("EDIT"), PCWSTR::null(), style, WS_EX_CLIENTEDGE, ID_HOST + i as i32);
+        st.edits[i] = mk(w!("EDIT"), PCWSTR::null(), style, WINDOW_EX_STYLE(0), ID_HOST + i as i32);
     }
-    st.ok = mk(w!("BUTTON"), w!("Connect"), WS_TABSTOP.0 | BS_DEFPUSHBUTTON as u32, WINDOW_EX_STYLE(0), IDOK.0);
-    st.cancel = mk(w!("BUTTON"), w!("Cancel"), WS_TABSTOP.0 | BS_PUSHBUTTON as u32, WINDOW_EX_STYLE(0), IDCANCEL.0);
-    if st.theme.dark {
-        for h in [st.ok, st.cancel] {
-            let _ = SetWindowTheme(h, w!("DarkMode_Explorer"), PCWSTR::null());
-        }
-        for h in st.edits {
-            let _ = SetWindowTheme(h, w!("DarkMode_CFD"), PCWSTR::null());
-        }
-    }
+    // Pills drawn on WM_DRAWITEM; Enter still means Connect through DM_GETDEFID.
+    st.ok = mk(w!("BUTTON"), w!("Connect"), WS_TABSTOP.0 | BS_OWNERDRAW as u32, WINDOW_EX_STYLE(0), IDOK.0);
+    st.cancel = mk(w!("BUTTON"), w!("Cancel"), WS_TABSTOP.0 | BS_OWNERDRAW as u32, WINDOW_EX_STYLE(0), IDCANCEL.0);
+}
+
+unsafe fn layout_of(hwnd: HWND) -> Layout {
+    let mut rc = RECT::default();
+    let _ = GetClientRect(hwnd, &mut rc);
+    layout(rc.right, rc.bottom, GetDpiForWindow(hwnd) as i32)
 }
 
 unsafe fn place(hwnd: HWND, st: &State) {
-    let mut rc = RECT::default();
-    let _ = GetClientRect(hwnd, &mut rc);
-    let l = layout(rc.right, rc.bottom, GetDpiForWindow(hwnd) as i32);
+    let l = layout_of(hwnd);
+    let dpi = GetDpiForWindow(hwnd) as i32;
+    // A single-line Edit draws its text at the top: one line high, centered in its field.
+    let eh = st.theme.font_size * dpi / 72 * 4 / 3 + 4 * dpi / 96;
+    let inset = 8 * dpi / 96;
     let mv = |h: HWND, r: Rc4| {
         let _ = MoveWindow(h, r.0, r.1, r.2, r.3, true);
     };
     for i in 0..5 {
         mv(st.labels[i], l.labels[i]);
-        mv(st.edits[i], l.edits[i]);
+        let (x, y, w, h) = l.edits[i];
+        mv(st.edits[i], (x + inset, y + (h - eh) / 2, w - 2 * inset, eh));
     }
     mv(st.ok, l.connect);
     mv(st.cancel, l.cancel);
+}
+
+/// Connect is an accent pill with white text, Cancel a background-colored one; pressed or focused buttons darken.
+unsafe fn draw_button(st: &State, di: &DRAWITEMSTRUCT) {
+    let t = &st.theme;
+    let ok = di.CtlID as i32 == IDOK.0;
+    let base = if ok { t.accent } else { t.background };
+    let fill = if di.itemState.0 & ODS_SELECTED.0 != 0 {
+        theme::blend(base, 0, 0.2)
+    } else if di.itemState.0 & ODS_FOCUS.0 != 0 {
+        theme::blend(base, t.text, 0.1)
+    } else {
+        base
+    };
+    let dc = di.hDC;
+    let surface = CreateSolidBrush(COLORREF(t.surface));
+    FillRect(dc, &di.rcItem, surface);
+    let _ = DeleteObject(surface.into());
+    theme::fill_round(dc, &di.rcItem, fill, 8 * GetDpiForWindow(di.hwndItem) as i32 / 96);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, COLORREF(if ok { 0x00FF_FFFF } else { t.text }));
+    let old = SelectObject(dc, st.font.into());
+    let mut r = di.rcItem;
+    let mut text: Vec<u16> = if ok { "Connect" } else { "Cancel" }.encode_utf16().collect();
+    DrawTextW(dc, &mut text, &mut r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(dc, old);
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -243,16 +279,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_ERASEBKGND => {
+            let dc = HDC(wparam.0 as *mut c_void);
             let mut rc = RECT::default();
             let _ = GetClientRect(hwnd, &mut rc);
-            FillRect(HDC(wparam.0 as *mut c_void), &rc, st.bg);
+            FillRect(dc, &rc, st.bg);
+            let radius = 8 * GetDpiForWindow(hwnd) as i32 / 96;
+            for (x, y, w, h) in layout_of(hwnd).edits {
+                theme::fill_round(dc, &RECT { left: x, top: y, right: x + w, bottom: y + h }, st.theme.background, radius);
+            }
             LRESULT(1)
         }
         WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT => {
             let hdc = HDC(wparam.0 as *mut c_void);
-            SetTextColor(hdc, COLORREF(st.theme.text));
-            SetBkColor(hdc, COLORREF(st.theme.background));
-            LRESULT(st.bg.0 as isize)
+            let in_field = st.edits.contains(&HWND(lparam.0 as *mut c_void));
+            SetTextColor(hdc, COLORREF(if in_field { st.theme.text } else { st.theme.secondary_text }));
+            SetBkColor(hdc, COLORREF(if in_field { st.theme.background } else { st.theme.surface }));
+            LRESULT(if in_field { st.field.0 } else { st.bg.0 } as isize)
+        }
+        WM_DRAWITEM => {
+            draw_button(st, &*(lparam.0 as *const DRAWITEMSTRUCT));
+            LRESULT(1)
         }
         // IsDialogMessageW asks this to find the Enter button; without it Enter does nothing in a plain window.
         DM_GETDEFID => LRESULT((DC_HASDEFID << 16) | IDOK.0 as isize),
@@ -286,7 +332,8 @@ pub fn dialog(parent: HWND, t: &Theme, font: HFONT) -> Option<String> {
         let mut st = Box::new(State {
             theme: t.clone(),
             font,
-            bg: CreateSolidBrush(COLORREF(t.background)),
+            bg: CreateSolidBrush(COLORREF(t.surface)),
+            field: CreateSolidBrush(COLORREF(t.background)),
             labels: [HWND::default(); 5],
             edits: [HWND::default(); 5],
             ok: HWND::default(),
@@ -296,7 +343,10 @@ pub fn dialog(parent: HWND, t: &Theme, font: HFONT) -> Option<String> {
         });
         let has_parent = !parent.0.is_null();
         let dpi = if has_parent { GetDpiForWindow(parent) as i32 } else { 96 };
-        let (w, h) = (420 * dpi / 96, 260 * dpi / 96);
+        // The window size that gives a CLIENT-sized client area under a caption.
+        let mut wr = RECT { left: 0, top: 0, right: CLIENT.0 * dpi / 96, bottom: CLIENT.1 * dpi / 96 };
+        let _ = AdjustWindowRectExForDpi(&mut wr, WS_POPUP | WS_CAPTION | WS_SYSMENU, false, WINDOW_EX_STYLE(0), dpi as u32);
+        let (w, h) = (wr.right - wr.left, wr.bottom - wr.top);
         let mut pr = RECT::default();
         if !has_parent || GetWindowRect(parent, &mut pr).is_err() {
             pr = RECT { left: 0, top: 0, right: GetSystemMetrics(SM_CXSCREEN), bottom: GetSystemMetrics(SM_CYSCREEN) };
@@ -322,6 +372,10 @@ pub fn dialog(parent: HWND, t: &Theme, font: HFONT) -> Option<String> {
             Ok(hwnd) => {
                 let dark = t.dark as i32;
                 let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const i32 as *const c_void, 4);
+                // The title bar and frame merge into the card.
+                for attr in [DWMWA_CAPTION_COLOR, DWMWA_BORDER_COLOR] {
+                    let _ = DwmSetWindowAttribute(hwnd, attr, &t.surface as *const u32 as *const c_void, 4);
+                }
                 create_children(hwnd, &mut st);
                 place(hwnd, &st);
                 if has_parent {
@@ -345,6 +399,7 @@ pub fn dialog(parent: HWND, t: &Theme, font: HFONT) -> Option<String> {
             Err(_) => None,
         };
         let _ = DeleteObject(st.bg.into());
+        let _ = DeleteObject(st.field.into());
         result
     }
 }
@@ -382,7 +437,7 @@ mod tests {
     #[test]
     fn layout_rows_do_not_overlap() {
         for dpi in [96, 144, 192] {
-            let l = layout(400 * dpi / 96, 220 * dpi / 96, dpi);
+            let l = layout(CLIENT.0 * dpi / 96, CLIENT.1 * dpi / 96, dpi);
             for i in 1..5 {
                 assert!(l.edits[i].1 >= l.edits[i - 1].1 + l.edits[i - 1].3);
             }

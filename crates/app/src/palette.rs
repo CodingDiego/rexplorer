@@ -1,4 +1,4 @@
-//! Ctrl+P fuzzy folder palette: a borderless popup with an Edit on top and up to 10 self-drawn result rows.
+//! Ctrl+P fuzzy folder palette: a borderless rounded popup with an Edit on top and up to 10 self-drawn result rows.
 #![allow(dead_code)] // until main.rs wires it in
 
 use std::ffi::c_void;
@@ -8,7 +8,6 @@ use std::sync::Once;
 use rexplorer_core::fuzzy::{Candidate, rank};
 use rexplorer_core::settings::Theme;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Dwm::{DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DWM_WINDOW_CORNER_PREFERENCE, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{NMHDR, WM_MOUSELEAVE};
@@ -17,6 +16,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, Result, w};
+
+use crate::theme;
 
 pub const PN_PICK: u32 = 0x9021;
 pub const PN_CLOSE: u32 = 0x9022;
@@ -33,6 +34,9 @@ const EDIT_AREA: i32 = 44;
 const EDIT_H: i32 = 28;
 const ROW_H: i32 = 32;
 const PAD: i32 = 12;
+const RADIUS: i32 = 12;
+/// Left edge of the typed text and of the result names.
+const TEXT_X: i32 = 20;
 
 const WM_APP_KEY: u32 = WM_APP + 1;
 const WM_APP_BLUR: u32 = WM_APP + 2;
@@ -109,7 +113,7 @@ struct State {
     model: Model,
     edit: HWND,
     font: HFONT,
-    colors: [u32; 5], // background, text, secondary, selection, border
+    colors: [u32; 4], // surface, text, secondary, selection
     brush: HBRUSH,
     id: usize,
     dpi: u32,
@@ -149,8 +153,8 @@ pub fn open(parent: HWND, id: usize, candidates: Vec<Candidate>, t: &Theme, font
             model,
             edit: HWND::default(),
             font,
-            colors: [t.background, t.text, t.secondary_text, t.selection, t.border],
-            brush: CreateSolidBrush(COLORREF(t.background)),
+            colors: [t.surface, t.text, t.secondary_text, t.selection],
+            brush: CreateSolidBrush(COLORREF(t.surface)),
             id,
             dpi,
             picked: None,
@@ -171,13 +175,7 @@ pub fn open(parent: HWND, id: usize, candidates: Vec<Candidate>, t: &Theme, font
             Some(hinst),
             Some(st as *const c_void),
         )?;
-        let pref = DWMWCP_ROUND;
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_WINDOW_CORNER_PREFERENCE,
-            &pref as *const _ as *const c_void,
-            size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
-        );
+        theme::round_corners(hwnd, sc(RADIUS, dpi));
         let _ = ShowWindow(hwnd, SW_SHOWNA);
         let _ = SetFocus(Some((*st).edit));
         Ok(hwnd)
@@ -240,12 +238,13 @@ unsafe fn confirm(hwnd: HWND, st: *mut State) {
 unsafe fn refresh(hwnd: HWND, st: *mut State) {
     let h = height_for((*st).model.results().len(), (*st).dpi);
     let _ = SetWindowPos(hwnd, None, 0, 0, sc(WIDTH, (*st).dpi), h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    theme::round_corners(hwnd, sc(RADIUS, (*st).dpi));
     let _ = InvalidateRect(Some(hwnd), None, false);
 }
 
 unsafe fn on_create(hwnd: HWND, st: *mut State) -> bool {
     let dpi = (*st).dpi;
-    let pad = sc(PAD, dpi);
+    let pad = sc(TEXT_X, dpi);
     let Ok(edit) = CreateWindowExW(
         WINDOW_EX_STYLE(0),
         w!("EDIT"),
@@ -394,18 +393,19 @@ unsafe fn paint(hwnd: HWND, st: *mut State) {
     let bmp = CreateCompatibleBitmap(hdc, cw, ch);
     let old_bmp = SelectObject(mem, bmp.into());
     let s = &*st;
-    let [bg, text, secondary, sel, border] = s.colors;
+    let [bg, text, secondary, sel] = s.colors;
     let font = if s.font.is_invalid() { GetStockObject(DEFAULT_GUI_FONT) } else { s.font.into() };
     let old_font = SelectObject(mem, font);
     SetBkMode(mem, TRANSPARENT);
 
     fill(mem, &rc, bg);
-    let (pad, row_h) = (sc(PAD, s.dpi), sc(ROW_H, s.dpi));
+    // Rows are pills inset like the Edit's text, so names line up with what is typed.
+    let (pad, row_h, m) = (sc(TEXT_X, s.dpi), sc(ROW_H, s.dpi), sc(PAD - 4, s.dpi));
     for (i, &ci) in s.model.results().iter().enumerate() {
         let top = sc(EDIT_AREA, s.dpi) + i as i32 * row_h;
-        let row = RECT { left: sc(4, s.dpi), top, right: cw - sc(4, s.dpi), bottom: top + row_h };
+        let row = RECT { left: m, top, right: cw - m, bottom: top + row_h };
         if i == s.model.selected() {
-            fill(mem, &row, sel);
+            theme::fill_round(mem, &row, sel, sc(6, s.dpi));
         }
         let c = &s.model.cands[ci];
         let flags = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
@@ -421,10 +421,6 @@ unsafe fn paint(hwnd: HWND, st: *mut State) {
             draw_text(mem, &c.target, &mut tr, flags | DT_RIGHT | DT_PATH_ELLIPSIS);
         }
     }
-    let bb = CreateSolidBrush(COLORREF(border));
-    FrameRect(mem, &rc, bb);
-    let _ = DeleteObject(bb.into());
-
     let _ = BitBlt(hdc, 0, 0, cw, ch, Some(mem), 0, 0, SRCCOPY);
     SelectObject(mem, old_font);
     SelectObject(mem, old_bmp);

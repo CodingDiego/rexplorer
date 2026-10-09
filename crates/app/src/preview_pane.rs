@@ -35,7 +35,6 @@ struct State {
     bg: u32,
     text: u32,
     secondary: u32,
-    border: u32,
     brush: HBRUSH,
     ui_font: HFONT,
     edit: HWND,
@@ -117,7 +116,6 @@ pub fn create(parent: HWND, id: usize) -> Result<HWND> {
             bg: 0x00FF_FFFF,
             text: 0,
             secondary: 0x0080_8080,
-            border: 0x00C0_C0C0,
             brush: CreateSolidBrush(COLORREF(0x00FF_FFFF)),
             ui_font: HFONT::default(),
             edit: HWND::default(),
@@ -211,10 +209,11 @@ unsafe fn clear_bitmap(s: *mut State) {
     }
 }
 
+/// The client area inside the card's 12 px padding.
 unsafe fn content_rect(hwnd: HWND) -> RECT {
-    let mut rc = client(hwnd);
-    rc.left += scale(hwnd, 1);
-    rc
+    let rc = client(hwnd);
+    let p = scale(hwnd, 12);
+    RECT { left: p, top: p, right: (rc.right - p).max(p), bottom: (rc.bottom - p).max(p) }
 }
 
 unsafe fn relayout(hwnd: HWND) {
@@ -242,16 +241,16 @@ unsafe fn paint(hwnd: HWND, s: *mut State) {
         let bmp = CreateCompatibleBitmap(hdc, w, h);
         let old = SelectObject(mem, bmp.into());
         FillRect(mem, &rc, (*s).brush);
-        let line = CreateSolidBrush(COLORREF((*s).border));
-        let b = RECT { left: 0, top: 0, right: scale(hwnd, 1), bottom: h };
-        FillRect(mem, &b, line);
-        let _ = DeleteObject(line.into());
 
         if let Some((hb, bw, bh)) = (*s).bitmap {
+            let c = content_rect(hwnd);
             let cap = caption_height(hwnd);
-            let area_h = (h - cap).max(1);
-            let x = ((w - bw) / 2).max(0);
-            let y = ((area_h - bh) / 2).max(0);
+            let area_h = (c.bottom - c.top - cap).max(1);
+            // The shell may hand back a larger thumbnail than asked for: shrink it into the card.
+            let fit = ((c.right - c.left) as f64 / bw.max(1) as f64).min(area_h as f64 / bh.max(1) as f64).min(1.0);
+            let (dw, dh) = (((bw as f64 * fit) as i32).max(1), ((bh as f64 * fit) as i32).max(1));
+            let x = c.left + ((c.right - c.left - dw) / 2).max(0);
+            let y = c.top + ((area_h - dh) / 2).max(0);
             let src = CreateCompatibleDC(Some(hdc));
             let prev = SelectObject(src, hb.into());
             let bf = BLENDFUNCTION {
@@ -260,7 +259,7 @@ unsafe fn paint(hwnd: HWND, s: *mut State) {
                 SourceConstantAlpha: 255,
                 AlphaFormat: AC_SRC_ALPHA as u8,
             };
-            let _ = AlphaBlend(mem, x, y, bw, bh, src, 0, 0, bw, bh, bf);
+            let _ = AlphaBlend(mem, x, y, dw, dh, src, 0, 0, bw, bh, bf);
             SelectObject(src, prev);
             let _ = DeleteDC(src);
 
@@ -271,14 +270,14 @@ unsafe fn paint(hwnd: HWND, s: *mut State) {
             };
             let of = SelectObject(mem, font);
             SetBkMode(mem, TRANSPARENT);
-            let pad = scale(hwnd, 8);
             let half = cap / 2;
             let fmt = DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX;
-            let mut r1 = RECT { left: pad, top: area_h, right: w - pad, bottom: area_h + half };
+            let top = c.top + area_h;
+            let mut r1 = RECT { left: c.left, top, right: c.right, bottom: top + half };
             SetTextColor(mem, COLORREF((*s).text));
             let mut t: Vec<u16> = (*s).name.encode_utf16().collect();
             DrawTextW(mem, &mut t, &mut r1, fmt);
-            let mut r2 = RECT { left: pad, top: area_h + half, right: w - pad, bottom: area_h + cap };
+            let mut r2 = RECT { left: c.left, top: top + half, right: c.right, bottom: top + cap };
             SetTextColor(mem, COLORREF((*s).secondary));
             let mut t: Vec<u16> = (*s).detail.encode_utf16().collect();
             DrawTextW(mem, &mut t, &mut r2, fmt);
@@ -300,11 +299,11 @@ pub fn set_theme(hwnd: HWND, t: &Theme) {
             return;
         }
         let _ = DeleteObject((*s).brush.into());
-        (*s).brush = CreateSolidBrush(COLORREF(t.background));
-        (*s).bg = t.background;
+        // A card: surface colored, like the list.
+        (*s).brush = CreateSolidBrush(COLORREF(t.surface));
+        (*s).bg = t.surface;
         (*s).text = t.text;
         (*s).secondary = t.secondary_text;
-        (*s).border = t.border;
         let _ = InvalidateRect(Some(hwnd), None, true);
         let _ = InvalidateRect(Some((*s).edit), None, true);
     }
@@ -364,7 +363,7 @@ unsafe fn present(hwnd: HWND, s: *mut State, sub: &Subject) {
         }
     }
     // Image, None, and every failure above: thumbnail plus caption.
-    let rc = client(hwnd);
+    let rc = content_rect(hwnd);
     let size = thumb_size(rc.right - rc.left, rc.bottom - rc.top, caption_height(hwnd));
     if let Ok(b) = images::thumbnail(&sub.abs_pidl, size) {
         let mut bm = BITMAP::default();

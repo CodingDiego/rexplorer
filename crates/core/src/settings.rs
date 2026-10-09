@@ -78,6 +78,8 @@ pub struct Theme {
     pub dark: bool,
     pub mica: bool,
     pub background: u32,
+    /// Content cards (list, preview, fields); the window frame, sidebar and header use `background`.
+    pub surface: u32,
     pub text: u32,
     pub secondary_text: u32,
     pub accent: u32,
@@ -88,38 +90,53 @@ pub struct Theme {
     pub font_size: i32,
 }
 
+/// Mix `a` toward `b` by `t` (0..1), per 0x00BBGGRR channel.
+fn mix(a: u32, b: u32, t: f32) -> u32 {
+    (0..3).fold(0, |acc, i| {
+        let (x, y) = (((a >> (8 * i)) & 0xFF) as f32, ((b >> (8 * i)) & 0xFF) as f32);
+        acc | (((x + (y - x) * t).round() as u32) << (8 * i))
+    })
+}
+
 impl Theme {
-    pub fn light() -> Theme {
+    /// Selection is the accent at 18% over the surface; border is the background 8% toward the text.
+    fn palette(name: &str, dark: bool, [background, surface, text, secondary_text, accent]: [&str; 5]) -> Theme {
         let c = |s| parse_color(s).unwrap();
+        let (background, surface, text, accent) = (c(background), c(surface), c(text), c(accent));
         Theme {
-            name: "light".into(),
-            dark: false,
+            name: name.into(),
+            dark,
             mica: true,
-            background: c("#FFFFFF"),
-            text: c("#1B1B1B"),
-            secondary_text: c("#6B6B6B"),
-            accent: c("#0067C0"),
-            selection: c("#CCE4F7"),
-            border: c("#E5E5E5"),
+            background,
+            surface,
+            text,
+            secondary_text: c(secondary_text),
+            accent,
+            selection: mix(surface, accent, 0.18),
+            border: mix(background, text, 0.08),
             icon_theme: None,
             font: "Segoe UI Variable Text".into(),
-            font_size: 9,
+            font_size: 10,
         }
     }
 
+    pub fn light() -> Theme {
+        Theme::palette("light", false, ["#F5F5F7", "#FFFFFF", "#1D1D1F", "#6E6E73", "#0A84FF"])
+    }
+
     pub fn dark() -> Theme {
-        let c = |s| parse_color(s).unwrap();
-        Theme {
-            name: "dark".into(),
-            dark: true,
-            background: c("#202020"),
-            text: c("#FFFFFF"),
-            secondary_text: c("#A0A0A0"),
-            accent: c("#4CC2FF"),
-            selection: c("#3A3A3A"),
-            border: c("#333333"),
-            ..Theme::light()
-        }
+        Theme::palette("dark", true, ["#1E1E1E", "#262626", "#F2F2F7", "#98989D", "#0A84FF"])
+    }
+
+    /// A theme file written by an earlier version with its built-in values unchanged (no `surface` key).
+    fn is_legacy_default(text: &str) -> bool {
+        let t = Theme::from_ini("", text);
+        let colors = [t.background, t.text, t.secondary_text, t.accent, t.selection, t.border].map(format_color);
+        let old = [
+            ["#FFFFFF", "#1B1B1B", "#6B6B6B", "#0067C0", "#CCE4F7", "#E5E5E5"],
+            ["#202020", "#FFFFFF", "#A0A0A0", "#4CC2FF", "#3A3A3A", "#333333"],
+        ];
+        !text.contains("surface") && t.icon_theme.is_none() && t.font_size == 9 && old.iter().any(|o| colors == *o)
     }
 
     /// Starts from the dark or light builtin per the `dark` key, then applies present keys.
@@ -142,6 +159,8 @@ impl Theme {
             t.mica = b;
         }
         color("background", &mut t.background);
+        // A file from before `surface` existed keeps its look: cards in its background color.
+        t.surface = get("surface").or(get("background")).and_then(parse_color).unwrap_or(t.surface);
         color("text", &mut t.text);
         color("secondary_text", &mut t.secondary_text);
         color("accent", &mut t.accent);
@@ -164,6 +183,7 @@ impl Theme {
             ("dark".to_string(), self.dark.to_string()),
             ("mica".to_string(), self.mica.to_string()),
             ("background".to_string(), format_color(self.background)),
+            ("surface".to_string(), format_color(self.surface)),
             ("text".to_string(), format_color(self.text)),
             ("secondary_text".to_string(), format_color(self.secondary_text)),
             ("accent".to_string(), format_color(self.accent)),
@@ -200,9 +220,9 @@ impl Profile {
             start: "shell:MyComputerFolder".into(),
             theme: "dark".into(),
             view: "details".into(),
-            show_tree: true,
+            show_tree: false,
             show_preview: false,
-            tree_width: 240,
+            tree_width: 220,
             preview_width: 360,
             bookmarks: vec![b("Desktop", "shell:Desktop"), b("Downloads", "shell:Downloads"), b("Documents", "shell:Personal")],
         }
@@ -339,7 +359,8 @@ impl Settings {
         find(name).or_else(|| find("dark")).unwrap_or(&self.themes[0])
     }
 
-    /// Writes the default files only where missing, so the user can edit them.
+    /// Writes the default files only where missing, so the user can edit them. A built-in theme file still
+    /// holding an earlier version's unedited defaults gets the current defaults.
     pub fn ensure_files(dir: &Path) {
         let d = Settings::default();
         let _ = std::fs::create_dir_all(dir.join("themes"));
@@ -352,7 +373,11 @@ impl Settings {
         };
         write_new(dir.join("settings.ini"), d.settings_text());
         for t in &d.themes {
-            write_new(theme_path(dir, &t.name), t.to_ini());
+            let p = theme_path(dir, &t.name);
+            if std::fs::read_to_string(&p).is_ok_and(|text| Theme::is_legacy_default(&text)) {
+                let _ = std::fs::write(&p, t.to_ini());
+            }
+            write_new(p, t.to_ini());
         }
     }
 }
@@ -424,6 +449,40 @@ mod tests {
         assert_eq!(back.active_profile().name, "work");
         assert_eq!(back.theme("nope").name, "dark");
         cleanup("save");
+    }
+
+    #[test]
+    fn palettes() {
+        let (l, d) = (Theme::light(), Theme::dark());
+        assert_eq!(format_color(l.background), "#F5F5F7");
+        assert_eq!(format_color(l.surface), "#FFFFFF");
+        assert_eq!(format_color(d.surface), "#262626");
+        assert_eq!(format_color(d.text), "#F2F2F7");
+        // #0A84FF at 18% over #FFFFFF and over #262626; borders 8% toward the text.
+        assert_eq!(format_color(l.selection), "#D3E9FF");
+        assert_eq!(format_color(d.selection), "#21374D");
+        assert_eq!(format_color(l.border), "#E4E4E6");
+        assert_eq!(l.font_size, 10);
+        // A partial file keeps the built-in surface; one that sets only a background uses it for the surface.
+        assert_eq!(Theme::from_ini("x", "[theme]\ndark=false\naccent=#010203\n").surface, l.surface);
+        assert_eq!(Theme::from_ini("x", "[theme]\nbackground=#101010\n").surface, 0x101010);
+        assert_eq!(Theme::from_ini("x", "[theme]\nsurface=#123456\n").surface, 0x563412);
+        assert_eq!(Theme::from_ini("dark", &d.to_ini()), d);
+    }
+
+    #[test]
+    fn legacy_default_themes_are_replaced() {
+        let d = tmp("legacy");
+        std::fs::create_dir_all(d.join("themes")).unwrap();
+        let old = "[theme]\ndark=true\nmica=true\nbackground=#202020\ntext=#FFFFFF\nsecondary_text=#A0A0A0\naccent=#4CC2FF\n\
+                   selection=#3A3A3A\nborder=#333333\nfont=Segoe UI Variable Text\nfont_size=9\n";
+        let edited = old.replace("#4CC2FF", "#FF0000");
+        std::fs::write(d.join("themes/dark.ini"), old).unwrap();
+        std::fs::write(d.join("themes/light.ini"), &edited).unwrap();
+        Settings::ensure_files(&d);
+        assert_eq!(Settings::load_from(&d).theme("dark"), &Theme::dark());
+        assert_eq!(std::fs::read_to_string(d.join("themes/light.ini")).unwrap(), edited);
+        cleanup("legacy");
     }
 
     #[test]

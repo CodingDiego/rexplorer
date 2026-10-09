@@ -1,4 +1,6 @@
 # rexplorer smoke test. Windows PowerShell 5.1. Prints one PASS/FAIL/SKIP line per check, always exits 0.
+# -Screenshots also writes docs\screenshots\dark.png and light.png (the window must be able to come to the front).
+param([switch]$Screenshots)
 $ErrorActionPreference = 'Stop'
 $Exe = Join-Path (Split-Path $PSScriptRoot -Parent) 'target\release\rexplorer.exe'
 Add-Type -AssemblyName System.Windows.Forms, Microsoft.VisualBasic, UIAutomationClient, UIAutomationTypes
@@ -24,6 +26,13 @@ public static class W {
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [DllImport("gdi32.dll")] public static extern IntPtr CreateRectRgn(int l, int t, int r, int b);
+  [DllImport("gdi32.dll")] public static extern bool DeleteObject(IntPtr h);
+  [DllImport("user32.dll")] public static extern int GetWindowRgn(IntPtr h, IntPtr rgn);
+  [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int attr, out RECT r, int size);
+  // Region type of a window's region: 0 none (ERROR), 1 NULLREGION, 2 SIMPLEREGION, 3 COMPLEXREGION (rounded).
+  public static int RegionType(IntPtr h) { IntPtr r = CreateRectRgn(0, 0, 0, 0); int t = GetWindowRgn(h, r); DeleteObject(r); return t; }
+  public static int Width(IntPtr h) { RECT r; GetWindowRect(h, out r); return r.R - r.L; }
   // First descendant of `parent` whose window class contains `cls`.
   public static IntPtr FindDescendant(IntPtr parent, string cls) {
     IntPtr found = IntPtr.Zero;
@@ -366,6 +375,8 @@ Run-Check 'tree' {
   try {
     if (-not (Launch-Fresh 'C:\Windows')) { return @('FAIL', 'no main window within 5 s') }
     Wait-Until { (Get-Count $script:main) -ge 1 } 3000 | Out-Null
+    # More > Folder tree (command 30) shows the tree instead of the sidebar.
+    $null = [W]::PostMessage($script:main, 0x111, [IntPtr]30, [IntPtr]::Zero)
     # The control creates its inner SysTreeView32 a moment after itself.
     $found = Wait-Until { $script:nstc = [W]::FindDescendant($script:main, 'NamespaceTreeControl'); $script:nstc -ne [IntPtr]::Zero -and [W]::FindDescendant($script:main, 'SysTreeView32') -ne [IntPtr]::Zero } 3000
     $tv = [W]::FindDescendant($script:main, 'SysTreeView32')
@@ -384,7 +395,7 @@ Run-Check 'tree' {
     $how = Send-KeysOrCommand '^b' 23
     $hidden = Wait-Until { -not [W]::IsWindowVisible($script:nstc) } 2000
     $drop = [W]::GetProp($list, 'OleDropTargetInterface') -ne [IntPtr]::Zero
-    $d = "tree present; splitter drag moved the list $moved px; Ctrl+B ($how) hid it=$hidden; list drop target registered=$drop"
+    $d = "More > Folder tree showed it; splitter drag moved the list $moved px; Ctrl+B ($how) hid it=$hidden; list drop target registered=$drop"
     if ($moved -ge 90 -and $moved -le 115 -and $hidden -and $drop) { @('PASS', $d) } else { @('FAIL', $d) }
   } finally { Remove-Fresh }
 }
@@ -476,5 +487,63 @@ Run-Check 'search-cli' {
     $d = "--search file00012: title='$(Get-Title $script:main)' count=$(Get-Count $script:main)"
     if ($ok) { @('PASS', $d) } else { @('FAIL', $d) }
   } finally { Remove-Fresh }
+}
+
+Run-Check 'look' {
+  try {
+    if (-not (Launch-Fresh 'C:\Windows')) { return @('FAIL', 'no main window within 5 s') }
+    Wait-Until { (Get-Count $script:main) -ge 1 } 3000 | Out-Null
+    $sb = [W]::FindWindowEx($script:main, [IntPtr]::Zero, 'RexSidebar', $null)
+    if ($sb -eq [IntPtr]::Zero -or -not [W]::IsWindowVisible($sb)) { return @('FAIL', "RexSidebar present=$($sb -ne [IntPtr]::Zero), visible=false") }
+    $rgn = [W]::RegionType((Get-List $script:main))
+    # Rows fill in from a worker; WM_APP+0x40 answers the client top of row i (-1 until it exists).
+    # Favorites on a first run: the bookmarks Desktop, Downloads, Documents, then the known folders not listed yet.
+    $script:top = -1
+    Wait-Until { $script:top = [int][W]::SendMessage($sb, 0x8040, [IntPtr]1, [IntPtr]::Zero); $script:top -ge 0 } 5000 | Out-Null
+    if ($script:top -lt 0) { return @('FAIL', "list region type=$rgn; the sidebar has no second row after 5 s") }
+    $want = (New-Object -ComObject Shell.Application).NameSpace('shell:Downloads').Self.Name
+    $at = [IntPtr]((($script:top + 10) -shl 16) -bor [int]([W]::Width($sb) / 2))
+    $null = [W]::PostMessage($sb, 0x201, [IntPtr]1, $at)
+    $null = [W]::PostMessage($sb, 0x202, [IntPtr]0, $at)
+    $went = Wait-Until { (Get-Title $script:main) -eq "$want - rexplorer" } 3000
+    $t = Get-Title $script:main
+    $how = Send-KeysOrCommand '^b' 23
+    $hidden = Wait-Until { -not [W]::IsWindowVisible($sb) } 2000
+    $d = "RexSidebar shown; list region type=$rgn (3 = rounded); click on Favorites row 2 (y=$($script:top)) -> '$t' (want '$want'); Ctrl+B ($how) hid the sidebar=$hidden"
+    if ($rgn -eq 3 -and $went -and $hidden) { @('PASS', $d) } else { @('FAIL', $d) }
+  } finally { Remove-Fresh }
+}
+
+# Window screenshots for the README: dark on C:\Windows (details, a row selected), light on the wallpapers with
+# the preview pane. CopyFromScreen of the window's frame bounds, so the window has to be in front.
+function Save-Shot($theme, $folder, $preview, $file) {
+  $script:fake = Join-Path $env:TEMP "rexplorer-smoke-appdata-$PID"
+  Remove-Item $script:fake -Recurse -Force -ErrorAction SilentlyContinue
+  New-Item -ItemType Directory -Path (Join-Path $script:fake 'rexplorer') -Force | Out-Null
+  $ini = "[general]`r`nprofile=default`r`n[profile default]`r`ntheme=$theme`r`nshow_preview=$preview`r`n" +
+    "bookmark.Desktop=shell:Desktop`r`nbookmark.Downloads=shell:Downloads`r`nbookmark.Documents=shell:Personal`r`n"
+  Set-Content -Path (Join-Path $script:fake 'rexplorer\settings.ini') -Value $ini
+  $appdata = $env:APPDATA
+  try { $env:APPDATA = $script:fake; $null = Launch $folder } finally { $env:APPDATA = $appdata }
+  Wait-Until { (Get-Count $script:main) -ge 1 } 3000 | Out-Null
+  if (-not (Set-Foreground $script:main)) { return @('SKIP', 'could not activate') }
+  $list = Get-List $script:main
+  foreach ($k in 0x24, 0x28, 0x28) { $null = [W]::PostMessage($list, 0x100, [IntPtr]$k, [IntPtr]::Zero) }
+  Start-Sleep -Milliseconds 1500
+  $r = New-Object W+RECT
+  $null = [W]::DwmGetWindowAttribute($script:main, 9, [ref]$r, 16)  # DWMWA_EXTENDED_FRAME_BOUNDS
+  $bmp = New-Object System.Drawing.Bitmap ($r.R - $r.L), ($r.B - $r.T)
+  $g = [System.Drawing.Graphics]::FromImage($bmp)
+  $g.CopyFromScreen($r.L, $r.T, 0, 0, $bmp.Size)
+  $bmp.Save($file, [System.Drawing.Imaging.ImageFormat]::Png)
+  $g.Dispose(); $bmp.Dispose()
+  @('PASS', "$file ($($r.R - $r.L)x$($r.B - $r.T))")
+}
+if ($Screenshots) {
+  Add-Type -AssemblyName System.Drawing
+  $shots = Join-Path (Split-Path $PSScriptRoot -Parent) 'docs\screenshots'
+  New-Item -ItemType Directory -Path $shots -Force | Out-Null
+  Run-Check 'screenshot-dark' { try { Save-Shot 'dark' 'C:\Windows' 'false' (Join-Path $shots 'dark.png') } finally { Remove-Fresh } }
+  Run-Check 'screenshot-light' { try { Save-Shot 'light' 'C:\Windows\Web\Wallpaper\Windows' 'true' (Join-Path $shots 'light.png') } finally { Remove-Fresh } }
 }
 exit 0

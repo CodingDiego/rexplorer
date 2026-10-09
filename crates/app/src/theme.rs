@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 
 use rexplorer_core::settings::Theme;
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::Controls::*;
@@ -11,8 +11,8 @@ use windows::core::{BOOL, HSTRING, PCWSTR, w};
 
 pub struct Brushes {
     pub background: HBRUSH,
+    pub surface: HBRUSH,
     pub selection: HBRUSH,
-    pub border: HBRUSH,
     pub accent: HBRUSH,
 }
 
@@ -21,8 +21,8 @@ impl Brushes {
         unsafe {
             Brushes {
                 background: CreateSolidBrush(COLORREF(t.background)),
+                surface: CreateSolidBrush(COLORREF(t.surface)),
                 selection: CreateSolidBrush(COLORREF(t.selection)),
-                border: CreateSolidBrush(COLORREF(t.border)),
                 accent: CreateSolidBrush(COLORREF(t.accent)),
             }
         }
@@ -32,7 +32,7 @@ impl Brushes {
 impl Drop for Brushes {
     fn drop(&mut self) {
         unsafe {
-            for b in [self.background, self.selection, self.border, self.accent] {
+            for b in [self.background, self.surface, self.selection, self.accent] {
                 let _ = DeleteObject(b.into());
             }
         }
@@ -48,8 +48,9 @@ pub fn apply_window(hwnd: HWND, t: &Theme) {
     dwm_set(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &BOOL::from(t.dark));
     let backdrop = if t.mica { DWMSBT_MAINWINDOW } else { DWMSBT_AUTO };
     dwm_set(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop);
+    // The system title bar and frame take the header's color, so they read as one bar.
     dwm_set(hwnd, DWMWA_CAPTION_COLOR, &COLORREF(t.background));
-    dwm_set(hwnd, DWMWA_BORDER_COLOR, &COLORREF(t.border));
+    dwm_set(hwnd, DWMWA_BORDER_COLOR, &COLORREF(t.background));
     let _ = unsafe {
         SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED)
     };
@@ -63,7 +64,9 @@ pub fn apply_control(hwnd: HWND, t: &Theme) {
 pub fn apply_list(list: HWND, t: &Theme) {
     apply_control(list, t);
     unsafe {
-        for (msg, c) in [(LVM_SETBKCOLOR, t.background), (LVM_SETTEXTBKCOLOR, t.background), (LVM_SETTEXTCOLOR, t.text)] {
+        // No background of its own: the list's custom draw paints the card, and icons then draw transparently
+        // (with a color, the icon views paint it behind each icon, over the selection pill).
+        for (msg, c) in [(LVM_SETBKCOLOR, CLR_NONE as u32), (LVM_SETTEXTBKCOLOR, CLR_NONE as u32), (LVM_SETTEXTCOLOR, t.text)] {
             SendMessageW(list, msg, Some(WPARAM(0)), Some(LPARAM(c as isize)));
         }
         let header = HWND(SendMessageW(list, LVM_GETHEADER, None, None).0 as *mut _);
@@ -75,12 +78,49 @@ pub fn apply_list(list: HWND, t: &Theme) {
     }
 }
 
+/// The main window's Edits (address, search) sit on surface-colored fields.
 pub fn ctl_color(hdc: HDC, t: &Theme, b: &Brushes) -> HBRUSH {
     unsafe {
         SetTextColor(hdc, COLORREF(t.text));
-        SetBkColor(hdc, COLORREF(t.background));
+        SetBkColor(hdc, COLORREF(t.surface));
     }
-    b.background
+    b.surface
+}
+
+/// Fills `r` with `color`, corners rounded by `radius` pixels (no outline).
+pub unsafe fn fill_round(dc: HDC, r: &RECT, color: u32, radius: i32) {
+    unsafe {
+        let brush = CreateSolidBrush(COLORREF(color));
+        let (ob, op) = (SelectObject(dc, brush.into()), SelectObject(dc, GetStockObject(NULL_PEN)));
+        // With a null pen RoundRect leaves the right and bottom edge out.
+        let _ = RoundRect(dc, r.left, r.top, r.right + 1, r.bottom + 1, 2 * radius, 2 * radius);
+        SelectObject(dc, ob);
+        SelectObject(dc, op);
+        let _ = DeleteObject(brush.into());
+    }
+}
+
+/// Clips a child window to a rounded rectangle of its current size (a "card"); call again after each resize.
+pub fn round_corners(hwnd: HWND, radius: i32) {
+    unsafe {
+        let mut r = RECT::default();
+        if GetWindowRect(hwnd, &mut r).is_ok() {
+            // The region belongs to the window from here on.
+            let rgn = CreateRoundRectRgn(0, 0, r.right - r.left + 1, r.bottom - r.top + 1, 2 * radius, 2 * radius);
+            SetWindowRgn(hwnd, Some(rgn), true);
+        }
+    }
+}
+
+/// Section headers: the theme's face, semibold.
+pub fn header_font(t: &Theme, dpi: u32, pt: i32) -> HFONT {
+    let f = HSTRING::from(t.font.as_str());
+    unsafe {
+        CreateFontW(
+            -muldiv(pt, dpi as i32, 72), 0, 0, 0, FW_SEMIBOLD.0 as i32, 0, 0, 0, DEFAULT_CHARSET,
+            FONT_OUTPUT_PRECISION(0), FONT_CLIP_PRECISION(0), CLEARTYPE_QUALITY, 0, PCWSTR(f.as_ptr()),
+        )
+    }
 }
 
 /// Rounded `a * b / c` (what MulDiv does; its feature is not enabled here).
@@ -222,7 +262,7 @@ mod tests {
                 apply_control(list, &t);
                 let b = Brushes::new(&t);
                 let dc = GetDC(Some(parent));
-                assert_eq!(ctl_color(dc, &t, &b), b.background);
+                assert_eq!(ctl_color(dc, &t, &b), b.surface);
                 ReleaseDC(Some(parent), dc);
                 pump();
             }

@@ -1,4 +1,4 @@
-//! Themed status bar: left text (item counts), right text (view/profile hints), 1px top border.
+//! Themed status bar: centered text (item counts, Finder style), right text (view/profile hints), no border.
 #![allow(dead_code)]
 
 use std::ffi::c_void;
@@ -12,7 +12,7 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Result, w};
 
-const BASE_HEIGHT: i32 = 24;
+const BASE_HEIGHT: i32 = 28;
 const PAD: i32 = 8;
 
 struct State {
@@ -128,9 +128,6 @@ unsafe fn paint(hwnd: HWND, st: &State) {
     let bg = CreateSolidBrush(COLORREF(st.theme.background));
     FillRect(mem, &rc, bg);
     let _ = DeleteObject(bg.into());
-    let line = CreateSolidBrush(COLORREF(st.theme.border));
-    FillRect(mem, &RECT { left: 0, top: 0, right: w, bottom: scale(1, dpi).max(1) }, line);
-    let _ = DeleteObject(line.into());
 
     SetBkMode(mem, TRANSPARENT);
     SetTextColor(mem, COLORREF(st.theme.secondary_text));
@@ -142,9 +139,11 @@ unsafe fn paint(hwnd: HWND, st: &State) {
     let rw = rr.right - rr.left;
     let mut rr = RECT { left: (w - pad - rw).max(pad), top: 0, right: w - pad, bottom: h };
     DrawTextW(mem, &mut right, &mut rr, flags | DT_RIGHT);
+    // Centered in the width the right text leaves free on both sides.
     let mut left: Vec<u16> = st.left.encode_utf16().collect();
-    let mut lr = RECT { left: pad, top: 0, right: (rr.left - pad).max(pad), bottom: h };
-    DrawTextW(mem, &mut left, &mut lr, flags);
+    let side = pad + rw + pad;
+    let mut lr = RECT { left: side.min(w / 2), top: 0, right: (w - side).max(w / 2), bottom: h };
+    DrawTextW(mem, &mut left, &mut lr, flags | DT_CENTER);
 
     let _ = BitBlt(hdc, 0, 0, w, h, Some(mem), 0, 0, SRCCOPY);
     SelectObject(mem, old_font);
@@ -239,8 +238,8 @@ mod tests {
         unsafe {
             let parent = CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR::null(), WS_OVERLAPPEDWINDOW, 0, 0, 800, 600, None, None, None, None).unwrap();
             let sb = create(parent, 7).unwrap();
-            assert_eq!(height(96), 24);
-            assert_eq!(height(192), 48);
+            assert_eq!(height(96), 28);
+            assert_eq!(height(192), 56);
             set_theme(sb, &Theme::dark());
             set_text(sb, "3 items", "Details");
             set_text(sb, "3 items", "Details");

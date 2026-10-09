@@ -50,7 +50,7 @@ impl View {
     fn px(self) -> i32 {
         match self {
             View::Details => 0,
-            View::Icons => 48,
+            View::Icons => 96,
             View::Thumbnails => 128,
         }
     }
@@ -81,6 +81,13 @@ pub(crate) struct Views {
     thumbs: Option<thumbs::Thumbs>,
     cache: ImageCache,
     icon_theme: Option<ThemeIcons>,
+    /// The list small-icon indices refer to: the system image list, or the icon theme's.
+    small: HIMAGELIST,
+    /// What LVSIL_SMALL really holds: each small icon centered in a row-high cell, so details rows get the
+    /// height of these images (28 px at 96 DPI) instead of the icons' 16 px.
+    tall: HIMAGELIST,
+    /// Small-icon index to `tall` index, filled on first use.
+    tall_index: HashMap<i32, i32>,
 }
 
 impl Views {
@@ -94,8 +101,64 @@ impl Views {
             thumbs: None,
             cache: ImageCache::new(512),
             icon_theme: None,
+            small: HIMAGELIST::default(),
+            tall: HIMAGELIST::default(),
+            tall_index: HashMap::new(),
         }
     }
+}
+
+/// Details row height in 96-DPI pixels.
+const ROW: i32 = 28;
+/// What the list adds to its image height for a row, in pixels.
+const ROW_PAD: i32 = 1;
+
+/// Makes `src` the list small-icon indices refer to, shown through the row-high list.
+pub(crate) unsafe fn set_small_source(app: *mut App, src: HIMAGELIST) {
+    (*app).views.small = src;
+    (*app).image_list_set = true;
+    rebuild_tall(app);
+}
+
+/// (Re)creates the row-high list for the window's DPI; its images are made again as rows ask for them.
+pub(crate) unsafe fn rebuild_tall(app: *mut App) {
+    let a = &mut *app;
+    if a.views.small.is_invalid() {
+        return;
+    }
+    let (mut w, mut h) = (0, 0);
+    let _ = ImageList_GetIconSize(a.views.small, Some(&mut w), Some(&mut h));
+    let tall = ImageList_Create(w, (ROW * GetDpiForWindow(a.hwnd) as i32 / 96 - ROW_PAD).max(h), ILC_COLOR32, 64, 64);
+    let old = std::mem::replace(&mut a.views.tall, tall);
+    a.views.tall_index.clear();
+    SendMessageW(a.list, LVM_SETIMAGELIST, Some(WPARAM(LVSIL_SMALL as usize)), Some(LPARAM(tall.0)));
+    if !old.is_invalid() {
+        let _ = ImageList_Destroy(Some(old));
+    }
+}
+
+/// The row-high image showing small icon `index`.
+pub(crate) unsafe fn tall_icon(app: *mut App, index: i32) -> i32 {
+    let v = &mut (*app).views;
+    if v.tall.is_invalid() || index < 0 {
+        return index;
+    }
+    if let Some(&t) = v.tall_index.get(&index) {
+        return t;
+    }
+    let (mut w, mut h, mut sw, mut sh) = (0, 0, 0, 0);
+    let _ = ImageList_GetIconSize(v.tall, Some(&mut w), Some(&mut h));
+    let _ = ImageList_GetIconSize(v.small, Some(&mut sw), Some(&mut sh));
+    let Some((bmp, _)) = dib(w, h) else { return 0 };
+    let dc = CreateCompatibleDC(None);
+    let old = SelectObject(dc, bmp.into());
+    let _ = ImageList_Draw(v.small, index, dc, 0, (h - sh) / 2, ILD_TRANSPARENT | ILD_PRESERVEALPHA);
+    SelectObject(dc, old);
+    let _ = DeleteDC(dc);
+    let t = ImageList_Add(v.tall, bmp, None).max(0);
+    let _ = DeleteObject(bmp.into());
+    v.tall_index.insert(index, t);
+    t
 }
 
 /// After the list exists: starts the worker, loads the icon theme and applies the saved view.
@@ -105,9 +168,8 @@ pub(crate) unsafe fn init(app: *mut App) {
     if let Some(name) = a.theme.icon_theme.clone() {
         let dpi = GetDpiForWindow(a.hwnd) as i32;
         a.views.icon_theme = load_icon_theme(&settings::dir().join("icons").join(name), 16 * dpi / 96);
-        if let Some(t) = &a.views.icon_theme {
-            SendMessageW(a.list, LVM_SETIMAGELIST, Some(WPARAM(LVSIL_SMALL as usize)), Some(LPARAM(t.list.0)));
-            a.image_list_set = true;
+        if let Some(list) = a.views.icon_theme.as_ref().map(|t| t.list) {
+            set_small_source(app, list);
         }
     }
     apply(app);
@@ -160,6 +222,8 @@ pub(crate) unsafe fn apply(app: *mut App) {
     let a = &mut *app;
     let list = a.list;
     let view = a.views.view;
+    toolbar::set_checked(a.tools, CMD_VIEW1, view == View::Details);
+    toolbar::set_checked(a.tools, CMD_VIEW_GRID, view != View::Details);
     if view == View::Details {
         SendMessageW(list, LVM_SETVIEW, Some(WPARAM(LV_VIEW_DETAILS as usize)), None);
     } else {
@@ -194,7 +258,7 @@ pub(crate) unsafe fn reset(app: *mut App, count: usize) {
     v.slots = vec![UNKNOWN; count];
     if !v.normal.is_invalid() {
         let _ = ImageList_Remove(v.normal, -1);
-        if let Some((bmp, bits)) = dib(v.size) {
+        if let Some((bmp, bits)) = dib(v.size, v.size) {
             // An image whose alpha is all zero is drawn opaque (black); one barely-there pixel keeps it transparent.
             *bits.add(3) = 1;
             ImageList_Add(v.normal, bmp, None);
@@ -295,18 +359,22 @@ pub(crate) unsafe fn destroy(app: *mut App) {
     if let Some(t) = a.views.icon_theme.take() {
         let _ = ImageList_Destroy(Some(t.list));
     }
+    if !a.views.tall.is_invalid() {
+        let _ = ImageList_Destroy(Some(a.views.tall));
+        a.views.tall = HIMAGELIST::default();
+    }
 }
 
 /// A zeroed (fully transparent) top-down 32-bit DIB and its pixels.
-unsafe fn dib(size: i32) -> Option<(HBITMAP, *mut u8)> {
-    if size <= 0 {
+unsafe fn dib(w: i32, h: i32) -> Option<(HBITMAP, *mut u8)> {
+    if w <= 0 || h <= 0 {
         return None;
     }
     let bmi = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: size,
-            biHeight: -size,
+            biWidth: w,
+            biHeight: -h,
             biPlanes: 1,
             biBitCount: 32,
             biCompression: BI_RGB.0,
@@ -316,7 +384,7 @@ unsafe fn dib(size: i32) -> Option<(HBITMAP, *mut u8)> {
     };
     let mut bits = std::ptr::null_mut();
     let bmp = CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
-    std::ptr::write_bytes(bits as *mut u8, 0, (size * size * 4) as usize);
+    std::ptr::write_bytes(bits as *mut u8, 0, (w * h * 4) as usize);
     Some((bmp, bits as *mut u8))
 }
 
@@ -330,7 +398,7 @@ unsafe fn fit(src: HBITMAP, size: i32) -> Option<HBITMAP> {
     if w <= 0 || h <= 0 {
         return None;
     }
-    let (dst, bits) = dib(size)?;
+    let (dst, bits) = dib(size, size)?;
     let scale = (size as f64 / w.max(h) as f64).min(1.0);
     let (dw, dh) = (((w as f64 * scale).round() as i32).max(1), ((h as f64 * scale).round() as i32).max(1));
     let (x, y) = ((size - dw) / 2, (size - dh) / 2);

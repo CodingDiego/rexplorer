@@ -286,8 +286,7 @@ pub(crate) unsafe fn show(app: *mut App, mode: Show) {
             if let Some(first) = l.items.first() {
                 let (himl, _) = first.icon_index(&l.folder.pidl);
                 if himl != 0 {
-                    SendMessageW(list, LVM_SETIMAGELIST, Some(WPARAM(LVSIL_SMALL as usize)), Some(LPARAM(himl as isize)));
-                    (*app).image_list_set = true;
+                    views::set_small_source(app, HIMAGELIST(himl as isize));
                 }
             }
         }
@@ -299,6 +298,7 @@ pub(crate) unsafe fn show(app: *mut App, mode: Show) {
     set_text(hwnd, &format!("{} - rexplorer", src.title()));
     set_text((*app).search, if let Source::Search(s) = src { &s.needle } else { "" });
     ui::set_crumbs(app);
+    sidebar::select((*app).sidebar, &tab.name);
     if let Source::Shell(l) = src {
         tab.watch = ChangeWatch::register(hwnd, &l.folder, WM_SHELL_CHANGE);
     }
