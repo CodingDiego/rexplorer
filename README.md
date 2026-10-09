@@ -222,6 +222,6 @@ need an interactive desktop that lets the window come to the foreground; they re
 - Only .rar archives get the archive view (zip is the shell's); multi-volume and encrypted .rar are untested.
 - The embedded Explorer view keeps Windows' own colors, not the theme.
 - The sidebar is mouse-only (no keyboard focus). Rounded corners are drawn with GDI, so they are not antialiased.
-- `ftp://` browsing depends on the shell's FTP folder, which recent Windows builds no longer ship; without it the
-  URL shows the not-found error.
+- `ftp://` browsing goes through the shell's FTP folder (present on Windows 11 25H2, untested against a live
+  server); where it is missing the URL shows the not-found error.
 - No keyboard context menu; small icons of shell folders resolve on the UI thread.

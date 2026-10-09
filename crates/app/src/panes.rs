@@ -400,13 +400,13 @@ pub(crate) unsafe fn update_preview(app: *mut App) {
         }
         let item = l.items.get(usize::try_from(i).ok()?)?;
         let parsing = item.parsing_name();
-        let (size_col, type_col) = size_and_type_columns(&l.folder.folder);
+        let (_, type_col) = size_and_type_columns(&l.folder.folder);
         Some(preview_pane::Subject {
             path: ui::is_fs_path(&parsing).then(|| PathBuf::from(&parsing)),
             abs_pidl: l.folder.child_pidl(item),
             name: item.display_name(),
             is_folder: item.is_folder(),
-            size: size_col.and_then(|c| parse_size(&item.detail(c))),
+            size: if item.is_folder() { None } else { item.size() },
             type_text: type_col.map(|c| item.detail(c)).unwrap_or_default(),
         })
     })();
@@ -439,38 +439,9 @@ pub(crate) fn size_and_type_columns(folder: &IShellFolder) -> (Option<u32>, Opti
 
 /// "12 KB", "12.345 KB", "1,024 bytes" -> bytes. Separators are dropped whatever the locale.
 // shortcut: a decimal size ("1,5 MB") reads as 15 MB; Explorer's Size column shows whole KB for files
-fn parse_size(text: &str) -> Option<u64> {
-    let text = text.trim_start_matches(|c: char| !c.is_ascii_digit());
-    let digits: String = text
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || matches!(c, '.' | ',' | ' ' | '\u{a0}' | '\u{202f}' | '\''))
-        .filter(char::is_ascii_digit)
-        .collect();
-    let n: u64 = digits.parse().ok()?;
-    let shift = match text.chars().find(|c| c.is_alphabetic()).map(|c| c.to_ascii_uppercase()) {
-        Some('K') => 10,
-        Some('M') => 20,
-        Some('G') => 30,
-        Some('T') => 40,
-        _ => 0,
-    };
-    n.checked_mul(1 << shift)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn sizes_parse_leniently() {
-        assert_eq!(parse_size("12 KB"), Some(12 * 1024));
-        assert_eq!(parse_size("12.345 KB"), Some(12345 * 1024));
-        assert_eq!(parse_size("\u{200e}1,024 bytes"), Some(1024));
-        assert_eq!(parse_size("0 bytes"), Some(0));
-        assert_eq!(parse_size("3 MB"), Some(3 << 20));
-        assert_eq!(parse_size(""), None);
-        assert_eq!(parse_size("Carpeta"), None);
-    }
 
     #[test]
     fn sidebar_rows_of_this_machine() {

@@ -1,12 +1,14 @@
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
+use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::System::SystemServices::{SFGAO_FOLDER, SFGAO_HIDDEN};
+use windows::Win32::System::Variant::VariantToUInt64;
 use windows::Win32::UI::Shell::Common::{SHELLDETAILS, STRRET};
 use windows::Win32::UI::Shell::{
     ILCombine, IShellFolder, IShellFolder2, SHFILEINFOW, SHGDN_FORPARSING, SHGDN_INFOLDER,
     SHGDN_NORMAL, SHGDNF, SHGFI_PIDL, SHGFI_SMALLICON, SHGFI_SYSICONINDEX, SHGetFileInfoW,
 };
-use windows::core::{HSTRING, Interface, PCWSTR, Result};
+use windows::core::{GUID, HSTRING, Interface, PCWSTR, Result};
 
 use crate::com::{Pidl, strret_to_string};
 
@@ -48,6 +50,16 @@ impl ShellItem {
             // SHELLDETAILS is packed: copy the STRRET out before taking a reference.
             let mut ret = { sd.str };
             strret_to_string(&mut ret, self.pidl.as_ptr())
+        }
+    }
+
+    /// Size in bytes from PKEY_Size (0 for folders); None when the folder has no such property.
+    pub fn size(&self) -> Option<u64> {
+        const PKEY_SIZE: PROPERTYKEY = PROPERTYKEY { fmtid: GUID::from_u128(0xB725F130_47EF_101A_A5F1_02608C9EEBAC), pid: 12 };
+        let f2 = self.parent.cast::<IShellFolder2>().ok()?;
+        unsafe {
+            let v = f2.GetDetailsEx(self.pidl.as_ptr(), &PKEY_SIZE).ok()?;
+            VariantToUInt64(&v).ok()
         }
     }
 

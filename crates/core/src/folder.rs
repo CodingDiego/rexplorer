@@ -219,7 +219,9 @@ mod tests {
         // Column titles are localized; filesystem folders always expose Name, Size, Type, Date modified.
         let cols = f.columns();
         assert!(cols.len() >= 4, "{} columns", cols.len());
-        let size_of_a = items.iter().find(|i| i.display_name() == "a.txt").unwrap().detail(cols[1].index);
+        let a = items.iter().find(|i| i.display_name() == "a.txt").unwrap();
+        let size_of_a = a.detail(cols[1].index);
+        let sizes = (a.size(), items.iter().find(|i| i.is_folder()).unwrap().size());
         std::fs::remove_dir_all(&dir).unwrap();
         // Folders sort first.
         assert_eq!(
@@ -232,6 +234,7 @@ mod tests {
             ]
         );
         assert!(size_of_a.starts_with("1 "), "size text: {size_of_a:?}");
+        assert_eq!(sizes, (Some(1), Some(0)), "the shell reports 0 for folders");
     }
 
     #[test]
