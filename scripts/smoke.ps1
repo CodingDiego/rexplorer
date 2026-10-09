@@ -13,6 +13,21 @@ public static class W {
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll")] public static extern int GetWindowTextLength(IntPtr h);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  public delegate bool EnumProc(IntPtr h, IntPtr l);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc f, IntPtr l);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+  // First top-level window of process `pid` with window class `cls`.
+  public static IntPtr FindOfProcess(uint pid, string cls) {
+    IntPtr found = IntPtr.Zero;
+    EnumWindows((h, l) => {
+      uint p; GetWindowThreadProcessId(h, out p);
+      var sb = new StringBuilder(64); GetClassName(h, sb, 64);
+      if (p == pid && sb.ToString() == cls) { found = h; return false; }
+      return true;
+    }, IntPtr.Zero);
+    return found;
+  }
 }
 '@
 
@@ -122,6 +137,8 @@ Run-Check 'address-nav' {
   Wait-Until { (Get-Count $script:main) -ge 1 } 3000 | Out-Null
   $orig = Get-Title $script:main
   if (-not (Set-Foreground $script:main)) { return @('SKIP', 'could not activate') }
+  # The address Edit stays hidden behind the breadcrumb until Ctrl+L.
+  [System.Windows.Forms.SendKeys]::SendWait('^l'); Start-Sleep -Milliseconds 300
   $root = [Windows.Automation.AutomationElement]::FromHandle($script:main)
   # rexplorer's Edit is exposed to UIA as ControlType.Pane, so match by class name instead
   $cond = New-Object Windows.Automation.PropertyCondition ([Windows.Automation.AutomationElement]::ClassNameProperty), 'Edit'
@@ -180,6 +197,72 @@ Run-Check 'explorer-hotkey' {
   if ($ok) { @('PASS', "explorer windows $($before.Count) -> $n") }
   elseif ([W]::GetForegroundWindow() -ne $script:main) { @('SKIP', 'could not activate (focus lost)') }
   else { @('FAIL', "explorer windows stayed at $($before.Count)") }
+}
+
+Run-Check 'tabs' {
+  if (-not (Launch 'C:\Windows')) { return @('FAIL', 'no main window within 5 s') }
+  Wait-Until { (Get-Count $script:main) -ge 1 } 3000 | Out-Null
+  $orig = Get-Title $script:main; $c0 = Get-Count $script:main
+  $strip = [W]::FindWindowEx($script:main, [IntPtr]::Zero, 'RexTabs', $null)
+  if ($strip -eq [IntPtr]::Zero) { return @('FAIL', 'no RexTabs child window') }
+  if (-not (Set-Foreground $script:main)) { return @('SKIP', 'could not activate') }
+  [System.Windows.Forms.SendKeys]::SendWait('^t')
+  Start-Sleep -Milliseconds 300
+  $ok = Wait-Until { (Get-Count $script:main) -eq $c0 } 2000
+  $t = Get-Title $script:main; $c = Get-Count $script:main
+  $alive = -not $script:cur.HasExited
+  if ($alive -and $ok -and $t -eq $orig) { @('PASS', "RexTabs present; after Ctrl+T title='$t' count=$c") }
+  elseif ([W]::GetForegroundWindow() -ne $script:main) { @('SKIP', 'could not activate (focus lost)') }
+  else { @('FAIL', "alive=$alive title '$orig' -> '$t' count $c0 -> $c") }
+}
+
+Run-Check 'single-instance' {
+  if (-not (Launch 'C:\Windows')) { return @('FAIL', 'no main window within 5 s') }
+  Wait-Until { (Get-Count $script:main) -ge 1 } 3000 | Out-Null
+  $orig = Get-Title $script:main
+  $second = Start-App 'C:\Users'
+  try {
+    $exited = $second.WaitForExit(3000)
+    $script:cur.Refresh(); $alive = -not $script:cur.HasExited
+    # 'rexplorer' alone is the new tab while it loads.
+    $changed = Wait-Until { $n = Get-Title $script:main; $n -ne $orig -and $n -ne 'rexplorer' } 3000
+    $t = Get-Title $script:main
+    if ($exited -and $alive -and $changed) { @('PASS', "second exited, first alive, title '$orig' -> '$t' (new tab)") }
+    else { @('FAIL', "second exited=$exited first alive=$alive title '$orig' -> '$t'") }
+  } finally { Stop-App $second }
+}
+
+Run-Check 'theme' {
+  # A first run: point APPDATA at an empty folder so the real settings are untouched.
+  $appdata = $env:APPDATA
+  $fake = Join-Path $env:TEMP "rexplorer-smoke-appdata-$PID"
+  Remove-Item $fake -Recurse -Force -ErrorAction SilentlyContinue
+  New-Item -ItemType Directory -Path $fake -Force | Out-Null
+  $dir = Join-Path $fake 'rexplorer'
+  try {
+    $env:APPDATA = $fake
+    if (-not (Launch 'C:\Windows')) { return @('FAIL', 'no main window within 5 s') }
+    $env:APPDATA = $appdata
+    Start-Sleep -Seconds 1
+    $missing = @('settings.ini', 'themes\dark.ini', 'themes\light.ini') | Where-Object { -not (Test-Path (Join-Path $dir $_)) }
+    $null = [W]::PostMessage($script:main, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)
+    if (-not $script:cur.WaitForExit(3000)) { return @('FAIL', 'did not exit within 3 s of WM_CLOSE') }
+    $win = Test-Path (Join-Path $dir 'window.txt'); $ses = Test-Path (Join-Path $dir 'session.txt')
+    if (@($missing).Count -eq 0 -and $win -and $ses) { @('PASS', 'first run wrote settings.ini, themes\dark.ini, themes\light.ini; exit wrote window.txt, session.txt') }
+    else { @('FAIL', "missing=$($missing -join ',') window.txt=$win session.txt=$ses") }
+  } finally { $env:APPDATA = $appdata; Stop-App $script:cur; Remove-Item $fake -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Run-Check 'cli-help' {
+  $script:cur = Start-Process -FilePath $Exe -ArgumentList '--help' -PassThru
+  $null = $script:cur.Handle
+  $script:dlg = [IntPtr]::Zero
+  Wait-Until { $script:dlg = [W]::FindOfProcess([uint32]$script:cur.Id, '#32770'); $script:dlg -ne [IntPtr]::Zero } 3000 | Out-Null
+  if ($script:dlg -eq [IntPtr]::Zero) { return @('FAIL', 'no #32770 dialog within 3 s') }
+  $title = Get-Title $script:dlg
+  $null = [W]::PostMessage($script:dlg, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)
+  if ($script:cur.WaitForExit(3000)) { @('PASS', "dialog '$title' shown; process exited after it closed") }
+  else { @('FAIL', "dialog '$title' shown; process still running 3 s after closing it") }
 }
 
 Run-Check 'placement' {

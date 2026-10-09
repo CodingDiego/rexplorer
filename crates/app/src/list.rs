@@ -1,0 +1,305 @@
+//! The ListView: virtual items, sorting, shell context menus, keys, rename and middle-click.
+
+use super::*;
+use windows::Win32::Foundation::COLORREF;
+use windows::Win32::Graphics::Gdi::{
+    CreateSolidBrush, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DrawTextW, FillRect, SetBkMode,
+    SetTextColor, TRANSPARENT,
+};
+use crate::nav::{activate, cur, go_up, listing, open_in_background, sort_listing};
+
+pub(crate) unsafe fn on_notify(app: *mut App, lparam: LPARAM) -> LRESULT {
+    let hdr = &*(lparam.0 as *const NMHDR);
+    match hdr.code {
+        LVN_GETDISPINFOW => {
+            let di = &mut *(lparam.0 as *mut NMLVDISPINFOW);
+            fill_dispinfo(app, &mut di.item);
+        }
+        LVN_COLUMNCLICK => {
+            let nm = &*(lparam.0 as *const NMLISTVIEW);
+            on_column_click(app, nm.iSubItem as usize);
+        }
+        LVN_ITEMACTIVATE => {
+            let nm = &*(lparam.0 as *const NMITEMACTIVATE);
+            if nm.iItem >= 0 {
+                activate(app, nm.iItem as usize);
+            }
+        }
+        LVN_ITEMCHANGED | LVN_ODSTATECHANGED => {
+            SetTimer(Some((*app).hwnd), TIMER_STATUS, 100, None);
+        }
+        NM_RCLICK => {
+            let nm = &*(lparam.0 as *const NMITEMACTIVATE);
+            show_menu(app, nm.iItem >= 0);
+            return LRESULT(1);
+        }
+        LVN_KEYDOWN => {
+            let nm = &*(lparam.0 as *const NMLVKEYDOWN);
+            on_key(app, VIRTUAL_KEY(nm.wVKey));
+        }
+        LVN_ENDLABELEDITW => {
+            let di = &*(lparam.0 as *const NMLVDISPINFOW);
+            on_end_edit(app, &di.item);
+        }
+        LVN_ODFINDITEMW => {
+            // Type-to-select: a virtual list holds no text, so it asks us. 0 would mean "item 0 matches".
+            let nm = &*(lparam.0 as *const NMLVFINDITEMW);
+            let Some(l) = listing(app) else { return LRESULT(-1) };
+            if !nm.lvfi.flags.contains(LVFI_STRING) || nm.lvfi.psz.is_null() {
+                return LRESULT(-1);
+            }
+            let needle = nm.lvfi.psz.to_string().unwrap_or_default();
+            let wrap = nm.lvfi.flags.contains(LVFI_WRAP);
+            let found = find_prefix(l.items.len(), nm.iStart.max(0) as usize, wrap, &needle, |i| l.items[i].display_name());
+            return LRESULT(found.map_or(-1, |i| i as isize));
+        }
+        _ => {}
+    }
+    LRESULT(0)
+}
+
+pub(crate) fn find_prefix(n: usize, start: usize, wrap: bool, needle: &str, name: impl Fn(usize) -> String) -> Option<usize> {
+    let start = start.min(n);
+    let needle = needle.to_lowercase();
+    (start..n).chain(if wrap { 0..start } else { 0..0 }).find(|&i| name(i).to_lowercase().starts_with(&needle))
+}
+
+unsafe fn fill_dispinfo(app: *mut App, item: &mut LVITEMW) {
+    let Some(l) = &mut cur(app).listing else { return };
+    let i = item.iItem as usize;
+    let Some(entry) = l.items.get(i) else { return };
+    if item.mask.contains(LVIF_TEXT) {
+        let text = if item.iSubItem == 0 {
+            entry.display_name()
+        } else {
+            l.columns.get(item.iSubItem as usize).map(|c| entry.detail(c.index)).unwrap_or_default()
+        };
+        copy_text(&text, item.pszText, item.cchTextMax);
+    }
+    if item.mask.contains(LVIF_IMAGE) && item.iSubItem == 0 {
+        if l.icons[i] == ICON_UNKNOWN {
+            // shortcut: icon lookup runs on the UI thread, move it to a worker when a slow folder visibly stutters
+            l.icons[i] = entry.icon_index(&l.folder.pidl).1;
+        }
+        item.iImage = l.icons[i];
+    }
+}
+
+unsafe fn on_column_click(app: *mut App, sub: usize) {
+    let list = (*app).list;
+    let Some(l) = &mut cur(app).listing else { return };
+    let Some(col) = l.columns.get(sub) else { return };
+    if col.index == l.sort_col {
+        l.sort_desc = !l.sort_desc;
+    } else {
+        l.sort_col = col.index;
+        l.sort_desc = false;
+    }
+    sort_listing(l);
+    let _ = InvalidateRect(Some(list), None, true);
+}
+
+unsafe fn show_menu(app: *mut App, on_item: bool) {
+    let hwnd = (*app).hwnd;
+    let mut pt = POINT::default();
+    let _ = GetCursorPos(&mut pt);
+    let menu = {
+        let Some(l) = listing(app) else { return };
+        if on_item {
+            let sel = selected_indices((*app).list);
+            let items: Vec<&ShellItem> = sel.iter().filter_map(|&i| l.items.get(i)).collect();
+            if items.is_empty() {
+                return;
+            }
+            ContextMenu::for_items(&l.folder, &items, hwnd)
+        } else {
+            ContextMenu::for_background(&l.folder, hwnd)
+        }
+    };
+    let Ok(menu) = menu else { return };
+    let extended = GetKeyState(VK_SHIFT.0 as i32) < 0;
+    (*app).active_menu = Some(menu);
+    let picked = (*app).active_menu.as_ref().unwrap().show(hwnd, pt.x, pt.y, extended);
+    (*app).active_menu = None;
+    if let Ok(Picked::Rename) = picked {
+        begin_rename(app);
+    }
+}
+
+unsafe fn on_key(app: *mut App, key: VIRTUAL_KEY) {
+    let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
+    let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
+    match key {
+        VK_BACK => go_up(app),
+        VK_F2 => begin_rename(app),
+        VK_DELETE => verb_on_selection(app, "delete", shift),
+        VK_C if ctrl => verb_on_selection(app, "copy", false),
+        VK_X if ctrl => verb_on_selection(app, "cut", false),
+        VK_V if ctrl => verb_on_background(app, "paste"),
+        VK_A if ctrl => set_item_state((*app).list, usize::MAX, LVIS_SELECTED, LVIS_SELECTED),
+        _ => {}
+    }
+}
+
+pub(crate) unsafe fn verb_on_selection(app: *mut App, verb: &str, shift: bool) {
+    let hwnd = (*app).hwnd;
+    let menu = {
+        let Some(l) = listing(app) else { return };
+        let sel = selected_indices((*app).list);
+        let items: Vec<&ShellItem> = sel.iter().filter_map(|&i| l.items.get(i)).collect();
+        if items.is_empty() {
+            return;
+        }
+        ContextMenu::for_items(&l.folder, &items, hwnd)
+    };
+    if let Ok(menu) = menu {
+        let _ = menu.invoke_verb(hwnd, verb, shift);
+    }
+}
+
+pub(crate) unsafe fn verb_on_background(app: *mut App, verb: &str) {
+    let hwnd = (*app).hwnd;
+    let menu = {
+        let Some(l) = listing(app) else { return };
+        ContextMenu::for_background(&l.folder, hwnd)
+    };
+    if let Ok(menu) = menu {
+        let _ = menu.invoke_verb(hwnd, verb, false);
+    }
+}
+
+unsafe fn begin_rename(app: *mut App) {
+    let list = (*app).list;
+    let i = SendMessageW(list, LVM_GETNEXTITEM, Some(WPARAM(usize::MAX)), Some(LPARAM(LVNI_FOCUSED as isize))).0;
+    if i >= 0 {
+        let _ = SetFocus(Some(list));
+        SendMessageW(list, LVM_EDITLABELW, Some(WPARAM(i as usize)), None);
+    }
+}
+
+unsafe fn on_end_edit(app: *mut App, item: &LVITEMW) {
+    if item.pszText.is_null() {
+        return;
+    }
+    let name = item.pszText.to_string().unwrap_or_default();
+    // Work on a copy: the shell may pump messages while renaming, and a refresh could replace the listing.
+    let target = listing(app).and_then(|l| l.items.get(item.iItem as usize).cloned());
+    if let Some(mut target) = target {
+        if !name.is_empty() && name != target.display_name() {
+            let _ = target.rename((*app).hwnd, &name);
+            SetTimer(Some((*app).hwnd), TIMER_REFRESH, 150, None);
+        }
+    }
+}
+
+/// Middle-click support (the ListView ignores the middle button) and the dark header.
+pub(crate) unsafe extern "system" fn subclass(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM, _id: usize, data: usize) -> LRESULT {
+    if msg == WM_NOTIFY && (*(lparam.0 as *const NMHDR)).code == NM_CUSTOMDRAW && (*(data as *mut App)).theme.dark {
+        return LRESULT(draw_header(&(*(data as *mut App)).theme, &*(lparam.0 as *const NMCUSTOMDRAW)) as isize);
+    }
+    if msg == WM_MBUTTONUP {
+        let mut ht = LVHITTESTINFO { pt: POINT { x: lparam.0 as i16 as i32, y: (lparam.0 >> 16) as i16 as i32 }, ..Default::default() };
+        let i = SendMessageW(hwnd, LVM_HITTEST, None, Some(LPARAM(&mut ht as *mut _ as isize))).0;
+        if i >= 0 {
+            open_in_background(data as *mut App, i as usize);
+        }
+        return LRESULT(0);
+    }
+    DefSubclassProc(hwnd, msg, wparam, lparam)
+}
+
+/// The header ignores DarkMode themes on this Windows build, so dark themes draw it themselves.
+unsafe fn draw_header(t: &Theme, nm: &NMCUSTOMDRAW) -> u32 {
+    let fill = |r: &RECT, c: u32| {
+        let b = CreateSolidBrush(COLORREF(c));
+        FillRect(nm.hdc, r, b);
+        let _ = DeleteObject(b.into());
+    };
+    let header = nm.hdr.hwndFrom;
+    let bottom_line = |r: &RECT| fill(&RECT { top: r.bottom - 1, ..*r }, t.border);
+    match nm.dwDrawStage {
+        CDDS_PREPAINT => {
+            fill(&nm.rc, t.background);
+            CDRF_NOTIFYITEMDRAW | CDRF_NOTIFYPOSTPAINT
+        }
+        CDDS_ITEMPREPAINT => {
+            let r = nm.rc;
+            fill(&r, if nm.uItemState.0 & CDIS_HOT.0 != 0 { theme::hover(t) } else { t.background });
+            fill(&RECT { left: r.right - 1, top: r.top + 4, right: r.right, bottom: r.bottom - 4 }, t.border);
+            bottom_line(&r);
+            let mut buf = [0u16; 260];
+            let mut hi = HDITEMW { mask: HDI_TEXT | HDI_FORMAT, pszText: PWSTR(buf.as_mut_ptr()), cchTextMax: buf.len() as i32, ..Default::default() };
+            SendMessageW(header, HDM_GETITEMW, Some(WPARAM(nm.dwItemSpec)), Some(LPARAM(&mut hi as *mut _ as isize)));
+            let len = buf.iter().position(|&c| c == 0).unwrap_or(0);
+            SetBkMode(nm.hdc, TRANSPARENT);
+            SetTextColor(nm.hdc, COLORREF(t.text));
+            let mut tr = RECT { left: r.left + 6, right: r.right - 6, ..r };
+            let align = if hi.fmt.0 & HDF_RIGHT.0 != 0 { DT_RIGHT } else { Default::default() };
+            DrawTextW(nm.hdc, &mut buf[..len], &mut tr, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX | align);
+            CDRF_SKIPDEFAULT
+        }
+        CDDS_POSTPAINT => {
+            // The area right of the last column.
+            let n = SendMessageW(header, HDM_GETITEMCOUNT, None, None).0.max(0) as usize;
+            let mut right = 0;
+            for i in 0..n {
+                let mut r = RECT::default();
+                SendMessageW(header, HDM_GETITEMRECT, Some(WPARAM(i)), Some(LPARAM(&mut r as *mut _ as isize)));
+                right = right.max(r.right);
+            }
+            let rest = RECT { left: right, ..nm.rc };
+            fill(&rest, t.background);
+            bottom_line(&rest);
+            CDRF_DODEFAULT
+        }
+        _ => CDRF_DODEFAULT,
+    }
+}
+
+pub(crate) unsafe fn selected_indices(list: HWND) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut i: isize = -1;
+    loop {
+        i = SendMessageW(list, LVM_GETNEXTITEM, Some(WPARAM(i as usize)), Some(LPARAM(LVNI_SELECTED as isize))).0;
+        if i < 0 {
+            break;
+        }
+        out.push(i as usize);
+    }
+    out
+}
+
+/// `index == usize::MAX` applies to every item.
+pub(crate) unsafe fn set_item_state(list: HWND, index: usize, state: LIST_VIEW_ITEM_STATE_FLAGS, mask: LIST_VIEW_ITEM_STATE_FLAGS) {
+    let lvi = LVITEMW { state, stateMask: mask, ..Default::default() };
+    SendMessageW(list, LVM_SETITEMSTATE, Some(WPARAM(index)), Some(LPARAM(&lvi as *const _ as isize)));
+}
+
+unsafe fn copy_text(text: &str, dst: PWSTR, max: i32) {
+    if dst.is_null() || max <= 0 {
+        return;
+    }
+    let buf = std::slice::from_raw_parts_mut(dst.0, max as usize);
+    let mut n = 0;
+    for (d, c) in buf[..max as usize - 1].iter_mut().zip(text.encode_utf16()) {
+        *d = c;
+        n += 1;
+    }
+    buf[n] = 0;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_prefix;
+
+    #[test]
+    fn type_to_select_searches_forward_then_wraps() {
+        let names = ["sub", "Alpha", "beta", "c"];
+        let name = |i: usize| names[i].to_string();
+        assert_eq!(find_prefix(4, 2, true, "a", name), Some(1));
+        assert_eq!(find_prefix(4, 2, false, "a", name), None);
+        assert_eq!(find_prefix(4, 0, false, "BE", name), Some(2));
+        assert_eq!(find_prefix(4, 4, true, "s", name), Some(0));
+        assert_eq!(find_prefix(0, 0, true, "s", name), None);
+    }
+}
