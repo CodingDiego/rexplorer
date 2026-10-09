@@ -123,7 +123,7 @@ const CMD_VIEW1: u16 = 25;
 const CMD_TAB1: u16 = 31;
 /// Ctrl+D: pin the selected folders (or the current one) to Home.
 const CMD_PIN: u16 = 40;
-/// The command bar: New v, Cut, Copy, Paste, Rename, Delete, Sort v, View v.
+/// The command bar: New v, Cut, Copy, Paste, Rename, Share, Delete, Sort v, View v.
 const CMD_NEW: u16 = 41;
 const CMD_CUT: u16 = 42;
 const CMD_COPY: u16 = 43;
@@ -132,6 +132,8 @@ const CMD_RENAME: u16 = 45;
 const CMD_DELETE: u16 = 46;
 const CMD_SORT: u16 = 47;
 const CMD_VIEW_MENU: u16 = 48;
+/// The command bar's Share: the Windows share sheet for the selected files.
+const CMD_SHARE: u16 = 49;
 
 const fn accel(flags: u8, key: VIRTUAL_KEY, cmd: u16) -> ACCEL {
     ACCEL { fVirt: ACCEL_VIRT_FLAGS(FVIRTKEY.0 | flags), key: key.0, cmd }
@@ -231,6 +233,14 @@ fn main() -> Result<()> {
         }
     }
     crash::install(&["--recover".to_string()], 10);
+    // Undocumented, for the smoke test: an access violation after this many ms exercises the recovery path. A
+    // recovery launch inherits the variable and ignores it.
+    if let Some(ms) = std::env::var("REXPLORER_CRASH_AFTER_MS").ok().and_then(|v| v.parse::<u64>().ok()).filter(|_| !args.recover) {
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(ms));
+            unsafe { windows::Win32::System::Diagnostics::Debug::RaiseException(0xC000_0005, 0, None) };
+        });
+    }
 
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -329,6 +339,7 @@ fn main() -> Result<()> {
             Some(hinst),
             Some(app as *const c_void),
         )?;
+        instance::mark(hwnd);
         if !restore_placement(hwnd) {
             let _ = ShowWindow(hwnd, SW_SHOWDEFAULT);
         }
@@ -666,6 +677,7 @@ unsafe fn on_command(app: *mut App, cmd: u16) {
         CMD_COPY => list::verb_on_selection(app, "copy", false),
         CMD_PASTE => list::verb_on_background(app, "paste"),
         CMD_RENAME => list::begin_rename(app),
+        CMD_SHARE => commands::share(app),
         CMD_DELETE => list::verb_on_selection(app, "delete", GetKeyState(VK_SHIFT.0 as i32) < 0),
         CMD_SORT => commands::sort_menu(app),
         CMD_VIEW_MENU => commands::view_menu(app),

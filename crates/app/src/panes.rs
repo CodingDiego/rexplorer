@@ -21,8 +21,6 @@ pub(crate) const WM_TREE_SELECT: u32 = WM_APP + 3;
 pub(crate) const WM_SIDEBAR_ROWS: u32 = WM_APP + 8;
 /// Gap between the side panes and the cards, and the cards' margin from the window edges; it is the splitter.
 const SPLIT: i32 = 8;
-/// Corner radius of the content cards.
-const CARD_RADIUS: i32 = 10;
 const MIN_WIDTH: i32 = 120;
 const MAX_WIDTH: i32 = 600;
 
@@ -193,7 +191,6 @@ pub(crate) unsafe fn layout(app: *mut App, top: i32, bottom: i32, w: i32) {
         let pw = scale(s.preview_width, dpi).min((right - min_list - gap).max(0));
         right -= pw;
         let _ = MoveWindow(a.panes.preview, right, top, pw, h, true);
-        theme::round_corners(a.panes.preview, scale(CARD_RADIUS, dpi));
         a.panes.split_preview = RECT { left: right - gap, top, right, bottom };
         right -= gap;
     }
@@ -215,7 +212,8 @@ pub(crate) unsafe fn layout(app: *mut App, top: i32, bottom: i32, w: i32) {
     a.panes.list_rect = RECT { left, top, right: right.max(left), bottom: top + h };
     if let Some(b) = &a.browser {
         let _ = b.set_rect(a.panes.list_rect);
-        theme::round_corners(b.hwnd(), scale(CARD_RADIUS, dpi));
+        // Explorer's own window paints itself: a (jagged) region is the only way to round it.
+        theme::round_corners(b.hwnd(), theme::card_radius(dpi));
     }
 }
 
@@ -232,8 +230,10 @@ pub(crate) enum Kind {
     Place,
     /// A profile bookmark, by its label.
     Bookmark(String),
-    /// A folder of Quick Access (pinned or frequent).
+    /// A folder pinned to Quick Access.
     Pinned,
+    /// A frequent folder of Quick Access (not pinned).
+    Frequent,
 }
 
 /// WM_SIDEBAR_ROWS payload: the rows and, index for index, their kinds.
@@ -296,11 +296,13 @@ pub(crate) unsafe fn on_sidebar_rows(app: *mut App, rows: Box<SidebarRows>) {
     }
 }
 
-/// Right-click on a sidebar row: "Unpin from Home" on a Quick Access folder, "Remove bookmark" on a bookmark.
+/// Right-click on a sidebar row: "Unpin from Home" on a pinned Quick Access folder, "Pin to Home" on a frequent one,
+/// "Remove bookmark" on a bookmark.
 pub(crate) unsafe fn sidebar_menu(app: *mut App, index: usize) {
     let kind = (&(*app).panes.sidebar_kinds).get(index).cloned();
     let text = match &kind {
         Some(Kind::Pinned) => "Unpin from Home",
+        Some(Kind::Frequent) => "Pin to Home",
         Some(Kind::Bookmark(_)) => "Remove bookmark",
         _ => return,
     };
@@ -311,7 +313,8 @@ pub(crate) unsafe fn sidebar_menu(app: *mut App, index: usize) {
         return;
     }
     match kind {
-        Some(Kind::Pinned) => unpin_from_home(app, &target),
+        Some(Kind::Pinned) => quick_access_verb(app, &target, "unpinfromhome"),
+        Some(Kind::Frequent) => quick_access_verb(app, &target, "pintohome"),
         Some(Kind::Bookmark(label)) => {
             views::remove_profile_key(&(*app).profile.name, &format!("bookmark.{label}"));
             (*app).profile.bookmarks.retain(|(l, _)| *l != label);
@@ -321,14 +324,15 @@ pub(crate) unsafe fn sidebar_menu(app: *mut App, index: usize) {
     }
 }
 
-/// The shell's canonical "unpinfromhome" verb on the Quick Access item for `target`; beeps when it is not pinned.
-unsafe fn unpin_from_home(app: *mut App, target: &str) {
+/// A canonical verb ("unpinfromhome", "pintohome") on the Quick Access item for `target`; beeps when the shell
+/// refuses it (the item left Quick Access meanwhile).
+unsafe fn quick_access_verb(app: *mut App, target: &str, verb: &str) {
     let hwnd = (*app).hwnd;
     let done = (|| {
         let qa = ShellFolder::parse(&format!("shell:{}", nav::QUICK_ACCESS)).ok()?;
         let items = qa.enumerate().ok()?;
         let item = items.iter().find(|i| i.parsing_name().eq_ignore_ascii_case(target))?;
-        ContextMenu::for_items(&qa, &[item], hwnd).ok()?.invoke_verb(hwnd, "unpinfromhome", false).ok()
+        ContextMenu::for_items(&qa, &[item], hwnd).ok()?.invoke_verb(hwnd, verb, false).ok()
     })();
     if done.is_some() {
         sidebar_changed(app);
@@ -385,7 +389,8 @@ fn sidebar_rows(bookmarks: &[(String, String)]) -> SidebarRows {
     // Quick Access in the shell's order and names: the pinned known folders, the Recycle Bin, the user's pins.
     if let Ok(qa) = ShellFolder::parse(&format!("shell:{}", nav::QUICK_ACCESS)) {
         for item in qa.enumerate().unwrap_or_default().iter().filter(|i| i.is_folder()) {
-            b.add("Favorites", item.display_name(), item.parsing_name(), &qa.child_pidl(item), Kind::Pinned, true);
+            let kind = if item.property_bool(&home::IS_PINNED) == Some(false) { Kind::Frequent } else { Kind::Pinned };
+            b.add("Favorites", item.display_name(), item.parsing_name(), &qa.child_pidl(item), kind, true);
         }
     }
     let cloud = ui::cloud_roots();

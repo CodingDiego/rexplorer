@@ -64,6 +64,8 @@ pub(crate) struct Listing {
     pub sort_desc: bool,
     /// Home and Quick Access: what the Home page shows, built with the listing.
     pub home: Option<home::Content>,
+    /// A filesystem folder the file system refuses to read (listed empty): why (the status bar says it).
+    pub denied: Option<String>,
 }
 
 /// Home or Quick Access: shown on the Home page instead of the list.
@@ -92,6 +94,8 @@ pub(crate) struct Tab {
     pub icon: (usize, i32),
     /// Where a navigation in flight is going; the chrome shows it until the load lands.
     pub loading: Option<Loading>,
+    /// The Home page's pill in this tab (not saved).
+    pub home_filter: home::Filter,
 }
 
 pub(crate) struct Loading {
@@ -173,15 +177,24 @@ fn load(target: Target) -> std::result::Result<Loaded, LoadError> {
     };
     let crumbs = crumbs_of(&folder);
     let icon = folder_icon(&folder.pidl);
-    let mut items = match folder.enumerate() {
-        Ok(items) => items,
-        // The folder exists but we cannot list it (a phone, an odd namespace extension): the embedded Explorer view.
-        Err(_) => return Ok(Loaded { source: Source::Browser(source::BrowserPlace::of(&folder)), crumbs, icon }),
+    // A filesystem folder Windows refuses to read (C:\System Volume Information): why, for the status bar.
+    let why = || ui::is_fs_path(&folder.parsing_name).then(|| std::fs::read_dir(&folder.parsing_name).err()).flatten().filter(|e| e.kind() == std::io::ErrorKind::PermissionDenied).map(|e| e.to_string());
+    let (mut items, mut denied) = match folder.enumerate() {
+        Ok(items) => (items, None),
+        Err(_) => match why() {
+            // An empty listing that says why: the embedded Explorer view could not read it either.
+            Some(e) => (Vec::new(), Some(e)),
+            // The folder exists but we cannot list it (a phone, an odd namespace extension): the embedded Explorer view.
+            None => return Ok(Loaded { source: Source::Browser(source::BrowserPlace::of(&folder)), crumbs, icon }),
+        },
     };
     items.retain(|i| !i.is_hidden());
+    if items.is_empty() && denied.is_none() {
+        denied = why();
+    }
     let columns = folder.columns();
     let icons = vec![ICON_UNKNOWN; items.len()];
-    let mut l = Listing { folder, items, columns, icons, sort_col: 0, sort_desc: false, home: None };
+    let mut l = Listing { folder, items, columns, icons, sort_col: 0, sort_desc: false, home: None, denied };
     if is_home(&l) {
         l.home = Some(home::build(&l.folder, &l.items));
     }
@@ -433,6 +446,7 @@ pub(crate) unsafe fn sync_home(app: *mut App) {
         e.index = index.get(&e.key.to_lowercase()).copied().unwrap_or(usize::MAX);
     }
     let (h, list) = ((*app).home, (*app).list);
+    home::set_filter(h, cur(app).home_filter);
     home::set_content(h, content);
     let focus = SendMessageW(list, LVM_GETNEXTITEM, Some(WPARAM(usize::MAX)), Some(LPARAM(LVNI_FOCUSED as isize))).0;
     home::set_selection(h, &list::selected_indices(list), usize::try_from(focus).ok());
@@ -475,6 +489,7 @@ pub(crate) unsafe fn on_home_notify(app: *mut App, nm: &home::NmHome) {
         home::HN_CONTEXT => list::show_menu(app, nm.index != usize::MAX),
         home::HN_KEYDOWN => list::on_key(app, VIRTUAL_KEY(nm.index as u16)),
         home::HN_RENAME => list::rename_item(app, nm.index, &home::rename_text((*app).home)),
+        home::HN_FILTER => cur(app).home_filter = home::filter((*app).home),
         _ => {}
     }
 }
@@ -586,6 +601,7 @@ pub(crate) unsafe fn new_tab(app: *mut App, target: Target, activate: bool, sele
         crumbs: Vec::new(),
         icon: (0, 0),
         loading: None,
+        home_filter: home::Filter::Recent,
     });
     let t = (*app).tabs.len() - 1;
     tabs::add((*app).strip, &title);

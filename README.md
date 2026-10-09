@@ -30,7 +30,7 @@ Folder of 100,000 files in `%TEMP%\rexplorer-bench`, release build, warm cache, 
 
 Decision: keep pure shell enumeration for every folder type. No filesystem fast path.
 
-## Features (Phase 1 and Phase 2 through step 6)
+## Features (Phase 1 and Phase 2 through step 7)
 
 Everything shown is a shell item: names, columns, icons, sorting, context menus, file operations, rename, live
 updates and drag and drop all come from the shell. rexplorer draws; the shell does the work.
@@ -45,6 +45,9 @@ In the spirit of GNOME Files and the macOS Finder: one flat header bar, a sideba
 controls, the list and the preview in rounded cards, no 1 px borders. The frame, tab strip, header, sidebar and
 status bar share the theme's `background`; cards and fields use its `surface`; selections are `selection` pills.
 The system title bar takes the `background` color, so it reads as part of the header.
+The cards' corners (the list, the Home page, the preview) are painted antialiased in the frame color, with 4x4
+samples per pixel, at 10 px scaled to the DPI; the scroll bars' corners too. The embedded Explorer view and the
+command palette keep a plain GDI window region.
 
 ### Window
 
@@ -69,8 +72,9 @@ Sidebar, every row read from the shell with its localized name and icon:
 - **Network**.
 
 Click a row to go there; the row of the current folder, or of its nearest ancestor, is highlighted. Right-click a
-Quick Access folder for **Unpin from Home**, a bookmark for **Remove bookmark** (its `bookmark.<label>` line leaves
-settings.ini). The rows are built on a worker thread, rebuilt every 5 s while the window is active and right after
+pinned Quick Access folder for **Unpin from Home**, a frequent (not pinned) one for **Pin to Home**, a bookmark for
+**Remove bookmark** (its `bookmark.<label>` line leaves settings.ini). Pinned and frequent are told apart by the
+shell's `System.Home.IsPinned` property. The rows are built on a worker thread, rebuilt every 5 s while the window is active and right after
 a pin or unpin from rexplorer, so the sidebar fills in after the first listing. More > **Folder tree** shows the
 shell's folder tree in the sidebar's place (choose it again for the sidebar).
 
@@ -89,23 +93,31 @@ subfolders (drive paths, UNC paths and This PC), a click on the empty area turns
 a `shell:` name, a `::{CLSID}` or a path inside a .rar).
 
 Command bar, as in Windows 11 Explorer: **New** v (Folder, which is created and then renamed in place, then the
-shell's own New submenu: shortcut, text document and so on) | **Cut**, **Copy**, **Paste**, **Rename**, **Delete**
+shell's own New submenu: shortcut, text document and so on) | **Cut**, **Copy**, **Paste**, **Rename**, **Share**, **Delete**
 | **Sort** v (the listing's columns, the active one checked, then Ascending / Descending), **View** v (Details,
 Icons, Thumbnails, then Sidebar, Folder tree and Preview pane, all with checks) | **More** (...), and on the right
 a **Preview** toggle. The buttons are enabled from the current state and update on a selection change, a tab
 switch, the end of a load and a clipboard change: Cut and Rename need a shell folder (Rename exactly one item),
-Copy and Delete also work on search results, Paste needs files on the clipboard, New and Sort are off on Home.
+Copy and Delete also work on search results, Paste needs files on the clipboard, New and Sort are off on Home,
+Share needs a selection in a shell folder or on Home. Share opens the Windows share sheet over the window for the
+selected files (through `IDataTransferManagerInterop`; the shell's own "Windows.ModernShare" verb refuses a
+desktop window); folders cannot be shared, as in Explorer, and a selection without files beeps.
 Delete with Shift deletes permanently, as in the list. Cut, Copy, Paste, Rename and Delete run the shell's own
 verbs. The old list / grid view segment is gone: the views are in View v and on Ctrl+Shift+1/2/3.
 
 Home page: Home and Quick Access open a page of their own in the list's place, drawn like Explorer's: a "Quick
 access" title, a responsive grid of 300x72 folder tiles (40 px icon, name, the parent folder relative to the
-profile, a pin glyph), a "Recent" pill and a table of the recent files (icon, name with its folder below, Date
-modified, Type, Size; column titles from the shell, so localized), newest access first. It scrolls (wheel and
+profile, a pin glyph on pinned folders only), three pills and a table of files (icon, name with its folder
+below, Date modified, Type, Size, and Activity when the shell has any, e.g. "X edited this" on cloud files; column
+titles from the shell, so localized), newest access first. The pills filter the table: **Recent** (the recent
+files), **Favorites** (files added to Favorites) and **Shared** (files shared with you, the shell's "shared"
+group); each tab keeps its own pill (not saved). Empty tables read "No recent files", "No favorites yet" or
+"Nothing shared with you". A file the shell lists in two groups (recent and a favorite) is one row with both. It scrolls (wheel and
 scroll bar) and follows the theme and the DPI. Hover, click (Ctrl+click toggles), double-click or Enter opens;
-right-click shows the shell's context menu, with **Unpin from Home** on tiles; Up / Down / Home / End move,
+right-click shows the shell's context menu, with **Unpin from Home** on pinned tiles and **Pin to Home** on
+frequent ones (the shell's own entries, such as add to or remove from Favorites, refresh the page); Up / Down / Home / End move,
 Ctrl+A selects the rows, Delete deletes, F5 refreshes, F2 renames in place. The status bar, the preview pane and
-the command bar follow its selection. With no recent files the table reads "No recent files". While Home loads,
+the command bar follow its selection. While Home loads,
 the list's placeholder rows show as for any folder.
 
 More menu: Folder tree, Pin to Home, Open in Explorer, register / unregister as the folder handler, the settings
@@ -114,7 +126,9 @@ folder, About, and **Quick access**: the profile's bookmarks and the cloud-sync 
 ### What a tab can show
 
 - **A shell folder**: filesystem, virtual (This PC, Recycle Bin, Control Panel...), zip files (the shell browses
-  them as folders), network shares, `ftp://` URLs where the shell supports them.
+  them as folders), network shares, `ftp://` URLs where the shell supports them. A filesystem folder the shell
+  lists as empty but Windows refuses to read (`C:\System Volume Information`) says so in the status bar: "Access
+  denied: <the error> (Ctrl+Shift+E opens it in Explorer)".
 - **Home**, where a first run starts: the shell's own Home folder, so the pinned folders (above, as folders sort
   first) and the recent files, with the shell's columns. Enter on a recent file opens it with its default verb; Up
   goes to This PC.
@@ -184,7 +198,8 @@ rexplorer [options] [folder...]
 ```
 
 Folders may be paths, `shell:` names, `::{CLSID}` strings or .rar paths. `/e`, `/n`, `/root,<path>` are accepted
-as Explorer does. A second launch hands its folders (and `--search`) to the running window and exits. A plain
+as Explorer does. A second launch hands its folders (and `--search`) to the running window and exits; one
+instance runs per settings folder, so a launch with another `%APPDATA%` (the smoke test) runs on its own. A plain
 launch restores the session; a launch with folders opens just those. After a crash the process relaunches itself
 with `--recover` (at most once per 10 s, so a crash loop stops).
 
@@ -256,19 +271,29 @@ in about 300 ms from process start), columns, keyboard navigation, live update, 
 no Explorer window), the Explorer hotkey, tabs, the single-instance hand-off, first-run settings, `--help`,
 placement, the tree (opened from More > Folder tree), the preview, the views, a RAR5 archive (open, enter a
 directory, go back up), a search in the 100k folder (typed into the search box), `--search` from the command line,
-the look (the sidebar is there, the list card has a rounded window region, a click on the Downloads row navigates,
-Ctrl+B hides the sidebar), Home (a first run without folders shows it, and it is the sidebar's first row), the
+the look (the sidebar is there, the list card's corner pixels are the frame color and its inside is not, a click
+on the Downloads row navigates, Ctrl+B hides the sidebar), Home (a first run without folders shows it, and it is the sidebar's first row), the
 shell-built sidebar (a Recycle Bin row in Favorites, a C:\ row under This PC), the loading state (a click on
 Network shows its name and "Loading…" within 150 ms, then the emptied list), and pins (Ctrl+D on a temp folder puts
 it in Quick Access, its sidebar row's Unpin from Home takes it out; the test always unpins, so Quick Access is left
 as found), the command bar (Cut is disabled with no selection; after Home in a temp folder Cut, Copy, Rename and
 Delete are enabled; a Copy click enables Paste; a Paste click adds the copy), the Home page (a first run shows
 RexHome with tiles and rows and the list hidden; a click on the C:\ row brings the list back) and the View menu
-(a View click opens a popup menu that Escape closes). `-Only <regex>` runs the matching checks. Checks that write settings run on a scratch `APPDATA`. The
-keyboard checks need an interactive desktop that lets the window come to the foreground; they report SKIP otherwise.
+(a View click opens a popup menu that Escape closes), home-open (a file added to Recent with `SHAddToRecentDocs`
+under `%LOCALAPPDATA%\rexplorer-smoke`, with an extension registered in HKCU for the check only, is found on Home
+and Enter opens it; afterwards it is removed from Home, the Recent shortcut, the keys and the files are deleted),
+remove-bookmark (a scratch profile's bookmark row, removed through its popup, leaves the sidebar and settings.ini),
+share (Share is enabled with a file selected and its click brings the share sheet to the foreground; Escape
+closes it), access-denied (`C:\System Volume Information` shows "Access denied: ..." within 3 s), crash-recovery
+(`REXPLORER_CRASH_AFTER_MS`, read only for this, raises an access violation; within 6 s a `--recover` process
+shows the same folder) and dnd (a real `SendInput` drag of a file row onto a folder row moves the file; the file
+is moved back whatever happens). `-Only <regex>` runs the matching checks. The whole run uses a scratch `APPDATA`,
+so the user's settings, window placement and open rexplorer window are never touched. The keyboard, share and dnd
+checks need an interactive desktop that lets the window come to the foreground; they report SKIP otherwise.
 `smoke.ps1 -Screenshots` also writes `docs\screenshots\dark.png`, `light.png` and `home.png` (rendered with
-`PrintWindow`, so nothing else on the screen is captured; home.png shows the machine's own Quick Access and recent
-files).
+`PrintWindow`, so nothing else on the screen is captured). home.png shows the machine's own Quick Access; the file
+rows and the tile subtitles that are paths are pixelated (1/12 and back, nearest neighbor), at rects Home reports
+through WM_APP+0x54.
 
 ### Known gaps
 
@@ -279,13 +304,17 @@ files).
 - Search result icons come from the extension (no per-file icons such as an exe's own).
 - Only .rar archives get the archive view (zip is the shell's); multi-volume and encrypted .rar are untested.
 - The embedded Explorer view keeps Windows' own colors, not the theme.
-- Home page: no Share button in the command bar, and only the Recent pill (no Favorites or Shared pills); the
-  Recent table leaves out Explorer's Activity and location-status columns; Sort is disabled on Home (tiles keep the
-  shell's order, files are newest-accessed first); every tile shows the pin glyph (no property found that tells a
-  pinned folder from a frequent one); tile subtitles are computed from the path, not read from the shell.
-- Every Quick Access folder in the sidebar offers Unpin from Home; on a frequent (not pinned) one the shell may
-  refuse the verb, and rexplorer then beeps (untested: no frequent-only folder was tried).
-- The sidebar is mouse-only (no keyboard focus). Rounded corners are drawn with GDI, so they are not antialiased.
+- Home page: no location-status column; Sort is disabled on Home (tiles keep the shell's order, files are
+  newest-accessed first); tile subtitles are computed from the path, not read from the shell. The Shared pill
+  relies on the shell's undocumented `System.Home.Grouping` value 5. Home keeps listing a recent file for a while
+  after the file and its Recent shortcut are deleted (the shell caches it).
+- Pin to Home on a frequent folder and the pinned / frequent split were tried on one machine only; a folder that
+  is both frequent and pinned through another tool shows as pinned.
+- The sidebar is mouse-only (no keyboard focus). The embedded Explorer view and the command palette keep GDI
+  window regions, so their corners are not antialiased. A scroll bar redrawn by the system on hover can show a
+  square corner until the next paint.
+- Share skips selected rows without a local file (on Home, files shared with you live only in the cloud); with
+  none left it beeps.
 - `ftp://` browsing goes through the shell's FTP folder (present on Windows 11 25H2, untested against a live
   server); where it is missing the URL shows the not-found error.
 - No keyboard context menu; small icons of shell folders resolve on the UI thread.

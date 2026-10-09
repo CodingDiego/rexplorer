@@ -452,6 +452,11 @@ pub(crate) unsafe fn update_status(app: *mut App) {
     let selected = SendMessageW((*app).list, LVM_GETSELECTEDCOUNT, None, None).0 as usize;
     // Selected bytes are omitted: the size column is shell-formatted text, not a number.
     let mut left = statusbar::summary(count, selected, None);
+    if let Some(Source::Shell(l)) = source(app) {
+        if let Some(e) = &l.denied {
+            left = format!("Access denied: {e} (Ctrl+Shift+E opens it in Explorer)");
+        }
+    }
     if let Some(Source::Search(s)) = source(app) {
         if s.running && s.rows.is_empty() {
             left = "Searching…".to_string();

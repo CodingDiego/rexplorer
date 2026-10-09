@@ -98,6 +98,7 @@ version = "0.1.0"
 dependencies = [
  "rexplorer-core",
  "windows",
+ "windows-collections",
 ]
 
 [[package]]

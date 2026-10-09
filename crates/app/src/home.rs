@@ -41,8 +41,17 @@ pub const HN_ACTIVATE: u32 = 0x9052;
 pub const HN_CONTEXT: u32 = 0x9053;
 pub const HN_KEYDOWN: u32 = 0x9054;
 pub const HN_RENAME: u32 = 0x9055;
-/// Test hook: returns tiles << 16 | rows.
+/// A pill was clicked; read the new filter with `filter`.
+pub const HN_FILTER: u32 = 0x9056;
+/// Test hook: returns tiles << 16 | rows shown.
 pub const HM_COUNTS: u32 = WM_APP + 0x52;
+/// Test hook (the smoke test opens a recent file): selects and focuses the entry whose name or parsing name is
+/// the page's window text (set it with WM_SETTEXT first), as a click would; returns its position or -1.
+pub const HM_SELECT_NAMED: u32 = WM_APP + 0x53;
+/// Test hook (the README screenshot hides personal names): wparam i < tiles: tile i's subtitle rectangle, 0 when
+/// it is empty or "Stored locally"; wparam 0xFFFF: the table below its header; -1 past the last tile. Client
+/// coordinates packed as four i16: left | top << 16 | right << 32 | bottom << 48.
+pub const HM_RECT: u32 = WM_APP + 0x54;
 /// wparam = generation << 32 | slot, lparam = HBITMAP (ours once received).
 const HM_ICON: u32 = WM_APP + 0x50;
 /// wparam: 0 cancels the rename edit, 1 commits it (a key), 2 commits it (the edit lost the focus).
@@ -68,6 +77,38 @@ pub struct Entry {
     /// Rows: the text of `Content::columns[1..]`.
     pub cells: Vec<String>,
     pub abs: Pidl,
+    /// Tiles: pinned (else frequent). Rows: a favorite (pinned file).
+    pub pinned: bool,
+    /// Rows: listed among the recent files.
+    pub recent: bool,
+    /// Rows: shared with you.
+    pub shared: bool,
+}
+
+/// Which rows the table shows: the pills over it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Filter {
+    #[default]
+    Recent,
+    Favorites,
+    Shared,
+}
+
+/// The pills, left to right: filter, label, the table's text when nothing matches.
+const PILLS: [(Filter, &str, &str); 3] = [
+    (Filter::Recent, "Recent", "No recent files"),
+    (Filter::Favorites, "Favorites", "No favorites yet"),
+    (Filter::Shared, "Shared", "Nothing shared with you"),
+];
+
+impl Filter {
+    fn shows(self, e: &Entry) -> bool {
+        match self {
+            Filter::Recent => e.recent,
+            Filter::Favorites => e.pinned,
+            Filter::Shared => e.shared,
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -88,10 +129,18 @@ const MODIFIED: PROPERTYKEY = pkey(STORAGE, 14);
 const ACCESSED: PROPERTYKEY = pkey(STORAGE, 16);
 const TYPE_KEY: PROPERTYKEY = pkey(0x28636AA6_953D_11D2_B5D6_00C04FD918D0, 11);
 const NARROW: PROPERTYKEY = pkey(0xDABD30ED_0043_4789_A7F8_D013A4736622, 100);
+const HOME_KEYS: u128 = 0x30C8EEF4_A832_41E2_AB32_E3C3CA28FD29;
+/// System.Home.IsPinned: true for a pinned folder or a favorite file, false for a frequent folder or a recent file.
+pub const IS_PINNED: PROPERTYKEY = pkey(HOME_KEYS, 4);
+/// System.Home.Grouping: which part of Home lists the item; 5 is "shared with you" (OneDrive files of others).
+const GROUPING: PROPERTYKEY = pkey(HOME_KEYS, 2);
+const SHARED_GROUP: &str = "5";
+/// System.ActivityInfo, Home's Activity column ("Ana edited this"): text only for cloud files.
+const ACTIVITY: PROPERTYKEY = pkey(HOME_KEYS, 17);
 /// The table: Name, then these. Home's own first columns (Size, Type, Date modified, Account, Activity) hold
 /// text only for cloud files, so local files take theirs from their own folder.
-const CELLS: [PROPERTYKEY; 3] = [MODIFIED, TYPE_KEY, SIZE_KEY];
-const FALLBACK: [&str; 4] = ["Name", "Date modified", "Type", "Size"];
+const CELLS: [PROPERTYKEY; 4] = [MODIFIED, TYPE_KEY, SIZE_KEY, ACTIVITY];
+const FALLBACK: [&str; 5] = ["Name", "Date modified", "Type", "Size", "Activity"];
 /// SFGAO_FOLDER and SFGAO_STREAM (a .zip is both: a file, not a tile).
 const SFGAO_FOLDER: u32 = 0x2000_0000;
 const SFGAO_STREAM: u32 = 0x0040_0000;
@@ -120,6 +169,9 @@ fn columns_by_key(folder: &IShellFolder) -> Vec<(PROPERTYKEY, u32, String)> {
     out
 }
 
+/// A tile's subtitle for the profile's own folders, as Explorer labels them.
+const STORED_LOCALLY: &str = "Stored locally";
+
 fn is_fs_path(p: &str) -> bool {
     let b = p.as_bytes();
     (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':') || p.starts_with("\\\\")
@@ -138,7 +190,7 @@ fn parent_label(path: &str, profile: &str) -> String {
         return parent.to_string();
     }
     if parent.eq_ignore_ascii_case(p) {
-        return "Stored locally".to_string();
+        return STORED_LOCALLY.to_string();
     }
     match (parent.get(..p.len()), parent.get(p.len()..)) {
         (Some(head), Some(rest)) if head.eq_ignore_ascii_case(p) && rest.starts_with('\\') => rest[1..].to_string(),
@@ -160,13 +212,32 @@ pub fn build(folder: &ShellFolder, items: &[ShellItem]) -> Content {
         let key = item.parsing_name();
         let attrs = item.attributes(SFGAO_FOLDER | SFGAO_STREAM);
         let subtitle = item.property_text(&NARROW).unwrap_or_else(|| parent_label(&key, &profile));
-        let mut e = Entry { index: usize::MAX, name: item.display_name(), subtitle, cells: Vec::new(), abs: folder.child_pidl(item), key };
+        // Without the property (an older Home) every folder counts as pinned, as before.
+        let pinned = item.property_bool(&IS_PINNED);
+        let mut e = Entry {
+            index: usize::MAX,
+            name: item.display_name(),
+            subtitle,
+            cells: Vec::new(),
+            abs: folder.child_pidl(item),
+            key,
+            pinned: pinned.unwrap_or(true),
+            recent: false,
+            shared: false,
+        };
         if attrs & SFGAO_FOLDER != 0 && attrs & SFGAO_STREAM == 0 {
             tiles.push(e);
             continue;
         }
-        if rows.iter().any(|(_, r)| r.key.eq_ignore_ascii_case(&e.key)) {
-            continue; // Home lists some cloud files twice
+        e.pinned = pinned == Some(true);
+        e.shared = item.property_text(&GROUPING).as_deref() == Some(SHARED_GROUP);
+        e.recent = !e.pinned && !e.shared;
+        // Home lists a file once per group it is in (a favorite that is also recent, a shared file opened lately).
+        if let Some((_, r)) = rows.iter_mut().find(|(_, r)| r.key.eq_ignore_ascii_case(&e.key)) {
+            r.pinned |= e.pinned;
+            r.recent |= e.recent;
+            r.shared |= e.shared;
+            continue;
         }
         // Home fills its columns for cloud files; a local file's own folder knows its details.
         let mut own: Option<Option<(Vec<(PROPERTYKEY, u32, String)>, ShellItem)>> = None;
@@ -209,7 +280,8 @@ fn scale(px: i32, dpi: u32) -> i32 {
 pub struct Layout {
     pub title: RECT,
     pub tiles: Vec<RECT>,
-    pub pill: RECT,
+    /// The filter pills, in `PILLS` order.
+    pub pills: Vec<RECT>,
     pub header: RECT,
     pub rows: Vec<RECT>,
     /// The "No recent files" line when there are no rows.
@@ -217,7 +289,7 @@ pub struct Layout {
     pub height: i32,
 }
 
-pub fn layout(width: i32, tiles: usize, rows: usize, pill_w: i32, dpi: u32) -> Layout {
+pub fn layout(width: i32, tiles: usize, rows: usize, pill_ws: &[i32], dpi: u32) -> Layout {
     let s = |v: i32| scale(v, dpi);
     let (left, right) = (s(PAD), (width - s(PAD)).max(s(PAD) + 1));
     let mut y = s(PAD);
@@ -232,14 +304,22 @@ pub fn layout(width: i32, tiles: usize, rows: usize, pill_w: i32, dpi: u32) -> L
         })
         .collect();
     y = tile_rects.last().map_or(y, |r| r.bottom) + s(SECTION_GAP);
-    let pill = RECT { left, top: y, right: left + pill_w, bottom: y + s(PILL_H) };
-    y = pill.bottom + s(8);
+    let mut x = left;
+    let pills: Vec<RECT> = pill_ws
+        .iter()
+        .map(|&w| {
+            let r = RECT { left: x, top: y, right: x + w, bottom: y + s(PILL_H) };
+            x = r.right + s(GAP);
+            r
+        })
+        .collect();
+    y += s(PILL_H) + s(8);
     let header = RECT { left, top: y, right, bottom: y + s(HEADER_H) };
     y = header.bottom;
     let row_rects: Vec<RECT> = (0..rows as i32).map(|i| RECT { left, top: y + i * s(ROW_H), right, bottom: y + (i + 1) * s(ROW_H) }).collect();
     let empty = RECT { left, top: y, right, bottom: y + if rows == 0 { s(ROW_H) } else { 0 } };
     y = row_rects.last().map_or(empty.bottom, |r| r.bottom);
-    Layout { title, tiles: tile_rects, pill, header, rows: row_rects, empty, height: y + s(PAD) }
+    Layout { title, tiles: tile_rects, pills, header, rows: row_rects, empty, height: y + s(PAD) }
 }
 
 /// Left edge of each table column in `left..right`: the name takes 45%, the others share the rest.
@@ -288,8 +368,12 @@ impl Fonts {
 
 struct State {
     content: Content,
-    /// Per entry (tiles, then rows); owned.
+    filter: Filter,
+    /// The rows the filter shows, as indices into `content.rows`. Entries are the tiles, then these rows.
+    shown: Vec<usize>,
+    /// Per slot (the tiles, then every row, shown or not); owned.
     icons: Vec<Option<HBITMAP>>,
+    /// Per entry.
     selected: Vec<bool>,
     focus: Option<usize>,
     hover: Option<usize>,
@@ -309,12 +393,35 @@ struct State {
 
 impl State {
     fn count(&self) -> usize {
-        self.content.tiles.len() + self.content.rows.len()
+        self.content.tiles.len() + self.shown.len()
     }
 
     fn entry(&self, e: usize) -> Option<&Entry> {
+        self.slot_entry(self.slot(e)?)
+    }
+
+    /// Icon slot of entry `e`.
+    fn slot(&self, e: usize) -> Option<usize> {
         let n = self.content.tiles.len();
-        if e < n { self.content.tiles.get(e) } else { self.content.rows.get(e - n) }
+        if e < n { Some(e) } else { self.shown.get(e - n).map(|r| n + r) }
+    }
+
+    fn slot_entry(&self, slot: usize) -> Option<&Entry> {
+        let n = self.content.tiles.len();
+        if slot < n { self.content.tiles.get(slot) } else { self.content.rows.get(slot - n) }
+    }
+
+    fn icon(&self, e: usize) -> Option<HBITMAP> {
+        self.slot(e).and_then(|i| self.icons.get(i).copied().flatten())
+    }
+
+    /// Applies the filter: the rows it shows, nothing selected.
+    fn refilter(&mut self) {
+        let f = self.filter;
+        self.shown = (0..self.content.rows.len()).filter(|&r| f.shows(&self.content.rows[r])).collect();
+        self.selected = vec![false; self.count()];
+        self.focus = None;
+        self.hover = None;
     }
 
     fn by_index(&self, index: usize) -> Option<usize> {
@@ -344,6 +451,8 @@ pub fn create(parent: HWND, id: usize) -> Result<HWND> {
         // Freed by WM_NCDESTROY.
         let st = Box::into_raw(Box::new(State {
             content: Content::default(),
+            filter: Filter::Recent,
+            shown: Vec::new(),
             icons: Vec::new(),
             selected: Vec::new(),
             focus: None,
@@ -401,30 +510,29 @@ pub fn set_content(hwnd: HWND, mut content: Content) {
         end_edit(hwnd, s, 0);
         let mut old: HashMap<(bool, String), HBITMAP> = HashMap::new();
         let n_old = s.content.tiles.len();
-        for (e, icon) in std::mem::take(&mut s.icons).into_iter().enumerate() {
-            if let (Some(bmp), Some(entry)) = (icon, s.entry(e)) {
-                if let Some(prev) = old.insert((e < n_old, entry.key.clone()), bmp) {
+        for (slot, icon) in std::mem::take(&mut s.icons).into_iter().enumerate() {
+            if let (Some(bmp), Some(entry)) = (icon, s.slot_entry(slot)) {
+                if let Some(prev) = old.insert((slot < n_old, entry.key.clone()), bmp) {
                     let _ = DeleteObject(prev.into());
                 }
             }
         }
         s.content = content;
         let n_tiles = s.content.tiles.len();
-        s.icons = (0..s.count()).map(|e| s.entry(e).and_then(|x| old.remove(&(e < n_tiles, x.key.clone())))).collect();
+        let slots = n_tiles + s.content.rows.len();
+        s.icons = (0..slots).map(|slot| s.slot_entry(slot).and_then(|x| old.remove(&(slot < n_tiles, x.key.clone())))).collect();
         for bmp in old.into_values() {
             let _ = DeleteObject(bmp.into());
         }
-        s.selected = vec![false; s.count()];
-        s.focus = None;
-        s.hover = None;
+        s.refilter();
         if !IsWindowVisible(hwnd).as_bool() {
             s.scroll = 0;
         }
         let generation = s.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let dpi = GetDpiForWindow(hwnd);
-        let wanted: Vec<(usize, Pidl, i32)> = (0..s.count())
-            .filter(|&e| s.icons[e].is_none())
-            .filter_map(|e| s.entry(e).map(|x| (e, x.abs.clone(), scale(if e < n_tiles { 40 } else { 20 }, dpi))))
+        let wanted: Vec<(usize, Pidl, i32)> = (0..slots)
+            .filter(|&slot| s.icons[slot].is_none())
+            .filter_map(|slot| s.slot_entry(slot).map(|x| (slot, x.abs.clone(), scale(if slot < n_tiles { 40 } else { 20 }, dpi))))
             .collect();
         if !wanted.is_empty() {
             let (latest, target) = (s.generation.clone(), hwnd.0 as isize);
@@ -458,6 +566,23 @@ pub fn set_selection(hwnd: HWND, indices: &[usize], focus: Option<usize>) {
         s.focus = focus.and_then(|i| s.by_index(i));
         let _ = InvalidateRect(Some(hwnd), None, false);
     }
+}
+
+/// Shows the rows `f` picks (the tab's pill); clears the selection, no notification.
+pub fn set_filter(hwnd: HWND, f: Filter) {
+    unsafe {
+        let Some(s) = state(hwnd) else { return };
+        if s.filter != f {
+            s.filter = f;
+            s.refilter();
+            sync_scroll(hwnd, s);
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+}
+
+pub fn filter(hwnd: HWND) -> Filter {
+    unsafe { state(hwnd).map(|s| s.filter).unwrap_or_default() }
 }
 
 /// The selected entries as listing indices, and the focused one.
@@ -573,16 +698,23 @@ unsafe fn ensure_fonts(s: &mut State, dpi: u32) {
     };
 }
 
-/// Width of the "Recent" pill for the current font.
-unsafe fn pill_width(hwnd: HWND, s: &State) -> i32 {
+/// Width of each pill for the current font.
+unsafe fn pill_widths(hwnd: HWND, s: &State) -> Vec<i32> {
     let dc = GetDC(Some(hwnd));
     let old = SelectObject(dc, ui_font(s).into());
-    let mut size = windows::Win32::Foundation::SIZE::default();
-    let text: Vec<u16> = "Recent".encode_utf16().collect();
-    let _ = GetTextExtentPoint32W(dc, &text, &mut size);
+    let pad = scale(32, GetDpiForWindow(hwnd));
+    let widths = PILLS
+        .iter()
+        .map(|(_, label, _)| {
+            let mut size = windows::Win32::Foundation::SIZE::default();
+            let text: Vec<u16> = label.encode_utf16().collect();
+            let _ = GetTextExtentPoint32W(dc, &text, &mut size);
+            size.cx + pad
+        })
+        .collect();
     SelectObject(dc, old);
     ReleaseDC(Some(hwnd), dc);
-    size.cx + scale(32, GetDpiForWindow(hwnd))
+    widths
 }
 
 unsafe fn current_layout(hwnd: HWND, s: &State) -> Layout {
@@ -592,7 +724,7 @@ unsafe fn current_layout(hwnd: HWND, s: &State) -> Layout {
     let mut wr = RECT::default();
     let _ = GetWindowRect(hwnd, &mut wr);
     let width = wr.right - wr.left - GetSystemMetricsForDpi(SM_CXVSCROLL, dpi);
-    layout(width, s.content.tiles.len(), s.content.rows.len(), pill_width(hwnd, s), dpi)
+    layout(width, s.content.tiles.len(), s.shown.len(), &pill_widths(hwnd, s), dpi)
 }
 
 /// Content rectangle of entry `e`.
@@ -646,7 +778,7 @@ unsafe fn ensure_visible(hwnd: HWND, s: &mut State, e: usize) {
     let r = entry_rect(&l, s.content.tiles.len(), e);
     let page = client(hwnd).bottom;
     // The rows sit under the table header: keep it in view above the first row.
-    let top = if e == s.content.tiles.len() { l.pill.top } else { r.top };
+    let top = if e == s.content.tiles.len() { l.pills.first().map_or(r.top, |p| p.top) } else { r.top };
     if top < s.scroll {
         scroll_to(hwnd, s, top - scale(8, GetDpiForWindow(hwnd)));
     } else if r.bottom > s.scroll + page {
@@ -692,6 +824,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         return DefWindowProcW(hwnd, msg, wparam, lparam);
     }
     let Some(s) = state(hwnd) else { return DefWindowProcW(hwnd, msg, wparam, lparam) };
+    // Read now: a notification below may destroy the page.
+    let outer = s.theme.background;
     match msg {
         WM_ERASEBKGND => return LRESULT(1),
         WM_SETFONT => {
@@ -699,12 +833,39 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
         WM_PAINT => paint(hwnd, s),
-        WM_SIZE => {
-            theme::round_corners(hwnd, scale(10, GetDpiForWindow(hwnd)));
-            sync_scroll(hwnd, s);
+        WM_SIZE => sync_scroll(hwnd, s),
+        HM_COUNTS => return LRESULT(((s.content.tiles.len() << 16) | s.shown.len()) as isize),
+        HM_SELECT_NAMED => {
+            let mut buf = [0u16; 1024];
+            let n = GetWindowTextW(hwnd, &mut buf) as usize;
+            let want = String::from_utf16_lossy(&buf[..n]);
+            let Some(e) = (0..s.count()).find(|&e| s.entry(e).is_some_and(|x| x.name == want || x.key.eq_ignore_ascii_case(&want))) else {
+                return LRESULT(-1);
+            };
+            select_only(s, Some(e));
+            s.focus = Some(e);
+            ensure_visible(hwnd, s, e);
             let _ = InvalidateRect(Some(hwnd), None, false);
+            notify(hwnd, HN_SELCHANGE, 0);
+            return LRESULT(e as isize);
         }
-        HM_COUNTS => return LRESULT(((s.content.tiles.len() << 16) | s.content.rows.len()) as isize),
+        HM_RECT => {
+            let l = current_layout(hwnd, s);
+            let dpi = GetDpiForWindow(hwnd);
+            let r = if wparam.0 == 0xFFFF {
+                RECT { top: l.header.bottom, bottom: client(hwnd).bottom + s.scroll, ..l.header }
+            } else if let Some(t) = l.tiles.get(wparam.0) {
+                let sub = &s.content.tiles[wparam.0].subtitle;
+                if sub.is_empty() || sub == STORED_LOCALLY {
+                    return LRESULT(0);
+                }
+                RECT { left: t.left + scale(62, dpi), top: t.top + scale(30, dpi), right: t.right - scale(8, dpi), bottom: t.top + scale(50, dpi) }
+            } else {
+                return LRESULT(-1);
+            };
+            let p = |v: i32| (v as i16 as u16) as u64;
+            return LRESULT((p(r.left) | p(r.top - s.scroll) << 16 | p(r.right) << 32 | p(r.bottom - s.scroll) << 48) as isize);
+        }
         HM_ICON => {
             let bmp = HBITMAP(lparam.0 as *mut c_void);
             let (generation, slot) = (wparam.0 >> 32, wparam.0 & 0xFFFF_FFFF);
@@ -767,6 +928,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_LBUTTONDOWN | WM_RBUTTONDOWN => {
             let _ = SetFocus(Some(hwnd));
+            if msg == WM_LBUTTONDOWN {
+                let (x, y) = (lparam.0 as i16 as i32, (lparam.0 >> 16) as i16 as i32 + s.scroll);
+                let l = current_layout(hwnd, s);
+                if let Some(i) = l.pills.iter().position(|p| x >= p.left && x < p.right && y >= p.top && y < p.bottom) {
+                    s.filter = PILLS[i].0;
+                    s.refilter();
+                    sync_scroll(hwnd, s);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                    notify(hwnd, HN_FILTER, i);
+                    notify(hwnd, HN_SELCHANGE, 0);
+                    return LRESULT(0);
+                }
+            }
             let hit = entry_at(hwnd, s, lparam);
             let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
             match hit {
@@ -823,8 +997,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_SETFOCUS | WM_KILLFOCUS => {
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
-        _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
+        _ => {
+            let r = DefWindowProcW(hwnd, msg, wparam, lparam);
+            theme::card_message(hwnd, msg, outer);
+            return r;
+        }
     }
+    theme::card_message(hwnd, msg, outer);
     LRESULT(0)
 }
 
@@ -904,7 +1083,7 @@ unsafe fn paint(hwnd: HWND, s: &mut State) {
             theme::fill_round(dc, &r, c, sc(8));
         }
         let (icon, x) = (sc(40), r.left + sc(12));
-        match s.icons.get(i).copied().flatten() {
+        match s.icon(i) {
             Some(b) => draw_bitmap(dc, b, x, r.top + (r.bottom - r.top - icon) / 2, icon),
             None => theme::fill_round(dc, &RECT { left: x, top: r.top + sc(16), right: x + icon, bottom: r.top + sc(56) }, theme::hover(t), sc(6)),
         }
@@ -915,16 +1094,22 @@ unsafe fn paint(hwnd: HWND, s: &mut State) {
         SelectObject(dc, ui.into());
         SetTextColor(dc, COLORREF(t.secondary_text));
         text(dc, &e.subtitle, RECT { left: tx, top: r.top + sc(30), right: r.right - sc(8), bottom: r.top + sc(50) }, one);
-        SelectObject(dc, s.fonts.small_glyph.into());
-        text(dc, "\u{E718}", RECT { left: tx, top: r.top + sc(50), right: tx + sc(14), bottom: r.top + sc(64) }, one);
+        if e.pinned {
+            SelectObject(dc, s.fonts.small_glyph.into());
+            text(dc, "\u{E718}", RECT { left: tx, top: r.top + sc(50), right: tx + sc(14), bottom: r.top + sc(64) }, one);
+        }
     }
 
-    // Recent: the pill, the header, the rows.
-    let pill = dy(l.pill);
-    theme::fill_round(dc, &pill, t.selection, (pill.bottom - pill.top) / 2);
+    // The pills (the active one filled), the header, the rows.
     SelectObject(dc, ui.into());
-    SetTextColor(dc, COLORREF(t.text));
-    text(dc, "Recent", pill, one | DT_CENTER);
+    for (p, (f, label, _)) in l.pills.iter().zip(PILLS) {
+        let p = dy(*p);
+        if f == s.filter {
+            theme::fill_round(dc, &p, t.selection, (p.bottom - p.top) / 2);
+        }
+        SetTextColor(dc, COLORREF(if f == s.filter { t.text } else { t.secondary_text }));
+        text(dc, label, p, one | DT_CENTER);
+    }
     let header = dy(l.header);
     let cols = column_lefts(header.left, header.right, s.content.columns.len().max(1));
     let col_right = |c: usize| cols.get(c + 1).copied().unwrap_or(header.right) - sc(8);
@@ -933,10 +1118,11 @@ unsafe fn paint(hwnd: HWND, s: &mut State) {
         let left = cols[c] + if c == 0 { sc(12) } else { 0 };
         text(dc, title, RECT { left, right: col_right(c), ..header }, one);
     }
-    if s.content.rows.is_empty() {
-        text(dc, "No recent files", RECT { left: header.left + sc(12), ..dy(l.empty) }, one);
+    if s.shown.is_empty() {
+        let empty = PILLS.iter().find(|p| p.0 == s.filter).map_or("", |p| p.2);
+        text(dc, empty, RECT { left: header.left + sc(12), ..dy(l.empty) }, one);
     }
-    for (i, e) in s.content.rows.iter().enumerate() {
+    for (i, e) in s.shown.iter().map(|&r| &s.content.rows[r]).enumerate() {
         let r = dy(l.rows[i]);
         if r.bottom < 0 || r.top > ch {
             continue;
@@ -945,7 +1131,7 @@ unsafe fn paint(hwnd: HWND, s: &mut State) {
             theme::fill_round(dc, &RECT { top: r.top + sc(1), bottom: r.bottom - sc(1), ..r }, c, sc(6));
         }
         let (icon, x) = (sc(20), r.left + sc(12));
-        if let Some(b) = s.icons.get(n + i).copied().flatten() {
+        if let Some(b) = s.icon(n + i) {
             draw_bitmap(dc, b, x, r.top + (r.bottom - r.top - icon) / 2, icon);
         }
         let tx = r.left + sc(42);
@@ -959,6 +1145,7 @@ unsafe fn paint(hwnd: HWND, s: &mut State) {
         }
     }
 
+    theme::paint_card_corners(hwnd, hwnd, dc, t.background);
     let _ = BitBlt(wdc, 0, 0, cw, ch, Some(dc), 0, 0, SRCCOPY);
     SelectObject(dc, old_bmp);
     let _ = DeleteObject(bmp.into());
@@ -986,19 +1173,19 @@ mod tests {
     #[test]
     fn layout_wraps_tiles_and_stacks_sections() {
         // 2 * 20 padding + 3 tiles of 300 with gaps of 8: 956 px hold three per row.
-        let l = layout(956, 4, 2, 80, 96);
+        let l = layout(956, 4, 2, &[80, 90, 70], 96);
         assert_eq!((l.tiles[0].left, l.tiles[2].left, l.tiles[3].left), (20, 636, 20));
         assert_eq!(l.tiles[3].top, l.tiles[0].bottom + 8);
-        assert_eq!(l.pill.top, l.tiles[3].bottom + 20);
-        assert_eq!(l.pill.right - l.pill.left, 80);
+        assert_eq!(l.pills[0].top, l.tiles[3].bottom + 20);
+        assert_eq!((l.pills[0].right - l.pills[0].left, l.pills[1].left, l.pills[2].left), (80, 108, 206), "side by side, 8 apart");
         assert_eq!(l.rows[0].top, l.header.bottom);
         assert_eq!(l.rows[1].bottom - l.rows[1].top, 48);
         assert_eq!(l.height, l.rows[1].bottom + 20);
         // Too narrow for one: still one per row.
-        let l = layout(200, 2, 0, 80, 96);
+        let l = layout(200, 2, 0, &[80], 96);
         assert_eq!((l.tiles[1].left, l.tiles[1].top), (20, l.tiles[0].bottom + 8));
         assert_eq!(l.empty.bottom - l.empty.top, 48, "the empty line takes a row");
-        assert_eq!(layout(956, 4, 2, 80, 192).tiles[0].right - layout(956, 4, 2, 80, 192).tiles[0].left, 600);
+        assert_eq!(layout(956, 4, 2, &[80], 192).tiles[0].right - layout(956, 4, 2, &[80], 192).tiles[0].left, 600);
     }
 
     #[test]
@@ -1031,14 +1218,19 @@ mod tests {
         // The real Home folder: its pinned folders become tiles (on any machine: Quick Access pins some).
         let home = ShellFolder::parse("shell:::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}").unwrap();
         let items = home.enumerate().unwrap();
+        // ShellItem::property_bool reads System.Home.IsPinned, a VT_BOOL, on every folder of Home.
+        assert!(items.iter().filter(|i| i.is_folder()).all(|i| i.property_bool(&IS_PINNED).is_some()));
         let mut c = build(&home, &items);
         assert!(!c.tiles.is_empty(), "Home has pinned folders");
-        assert_eq!(c.columns.len(), 4);
-        assert!(c.rows.iter().all(|r| r.cells.len() == 3));
+        assert_eq!(c.columns.len(), 5, "Name, Date modified, Type, Size, Activity");
+        assert!(c.rows.iter().all(|r| r.cells.len() == 4));
         for (i, e) in c.tiles.iter_mut().chain(c.rows.iter_mut()).enumerate() {
             e.index = 100 + i;
         }
-        let (nt, nr) = (c.tiles.len(), c.rows.len());
+        let nt = c.tiles.len();
+        // The Recent pill shows the recent rows.
+        let recent: Vec<usize> = c.rows.iter().filter(|r| r.recent).map(|r| r.index).collect();
+        let favorites = c.rows.iter().filter(|r| r.pinned).count();
         unsafe {
             let hinst = GetModuleHandleW(None).unwrap().into();
             let wc = WNDCLASSW { lpfnWndProc: Some(parent_proc), hInstance: hinst, lpszClassName: w!("RexHomeTestParent"), ..Default::default() };
@@ -1048,7 +1240,7 @@ mod tests {
             let _ = MoveWindow(h, 0, 0, 956, 600, false);
             set_theme(h, &Theme::dark());
             set_content(h, c);
-            assert_eq!(SendMessageW(h, HM_COUNTS, None, None).0 as usize, (nt << 16) | nr);
+            assert_eq!(SendMessageW(h, HM_COUNTS, None, None).0 as usize, (nt << 16) | recent.len());
             set_selection(h, &[100], Some(100));
             assert_eq!(selection(h), (vec![100], Some(100)));
             // A click on the second tile selects it and tells the parent; a double-click activates it.
@@ -1063,7 +1255,7 @@ mod tests {
             assert_eq!(*LAST.lock().unwrap(), vec![(HN_SELCHANGE, 0), (HN_ACTIVATE, want)]);
             // Keys: End goes to the last entry, Ctrl+A is not pressed here so other keys go to the parent.
             SendMessageW(h, WM_KEYDOWN, Some(WPARAM(VK_END.0 as usize)), None);
-            assert_eq!(selection(h).1, Some(100 + nt + nr - 1));
+            assert_eq!(selection(h).1, Some(recent.last().copied().unwrap_or(100 + nt - 1)));
             LAST.lock().unwrap().clear();
             SendMessageW(h, WM_KEYDOWN, Some(WPARAM(0x2E)), None);
             assert_eq!(*LAST.lock().unwrap(), vec![(HN_KEYDOWN, 0x2E)]);
@@ -1075,6 +1267,20 @@ mod tests {
             assert!(state(h).unwrap().edit.is_invalid());
             assert!(LAST.lock().unwrap().is_empty());
             assert!(!begin_rename(h, 7), "no such item");
+            // A click on the Favorites pill shows the favorite files.
+            let s = state(h).unwrap();
+            let p = current_layout(h, s).pills[1];
+            let at = LPARAM((((p.top - s.scroll + 5) as isize) << 16) | (p.left + 5) as isize);
+            LAST.lock().unwrap().clear();
+            SendMessageW(h, WM_LBUTTONDOWN, Some(WPARAM(1)), Some(at));
+            assert_eq!(filter(h), Filter::Favorites);
+            assert_eq!(LAST.lock().unwrap().first(), Some(&(HN_FILTER, 1)));
+            assert_eq!(SendMessageW(h, HM_COUNTS, None, None).0 as usize & 0xFFFF, favorites);
+            // The test hook selects an entry by its name.
+            let name = HSTRING::from(state(h).unwrap().content.tiles[0].name.as_str());
+            let _ = SetWindowTextW(h, PCWSTR(name.as_ptr()));
+            assert_eq!(SendMessageW(h, HM_SELECT_NAMED, None, None).0, 0);
+            assert_eq!(selection(h).0, vec![100]);
             DestroyWindow(parent).unwrap();
         }
     }

@@ -2,10 +2,11 @@
 #![allow(dead_code)]
 
 use rexplorer_core::settings::Theme;
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::Controls::*;
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, HSTRING, PCWSTR, w};
 
@@ -100,7 +101,129 @@ pub unsafe fn fill_round(dc: HDC, r: &RECT, color: u32, radius: i32) {
     }
 }
 
+/// Share of pixel (x, y) of a corner square `r` px wide that lies inside the quarter circle of radius `r` centered
+/// at (r, r), the square's inner corner: 1 inside the card, 0 in the frame. 4x4 samples per pixel.
+pub fn coverage(x: i32, y: i32, r: i32) -> f32 {
+    let r = r as f32;
+    let mut inside = 0;
+    for i in 0..4 {
+        for j in 0..4 {
+            let (sx, sy) = (x as f32 + (i as f32 + 0.5) / 4.0, y as f32 + (j as f32 + 0.5) / 4.0);
+            if (r - sx).powi(2) + (r - sy).powi(2) <= r * r {
+                inside += 1;
+            }
+        }
+    }
+    inside as f32 / 16.0
+}
+
+/// Rounds the corners of the card `rect` (in `dc`'s coordinates) by painting what lies outside a `radius` arc in
+/// `outer`, the frame color, antialiased: an arc pixel blends `outer` with the color at its corner's innermost pixel
+/// (r - 1, r - 1), which this never writes, so painting again gives the same result. A corner whose innermost pixel
+/// is clipped out of `dc` (another window or DC owns that corner) is left alone.
+pub unsafe fn paint_corners(dc: HDC, rect: &RECT, radius: i32, outer: u32) {
+    let r = radius.min((rect.right - rect.left) / 2).min((rect.bottom - rect.top) / 2);
+    if r <= 0 {
+        return;
+    }
+    // Each corner square goes through a 32-bit DIB (BitBlt out, blend, BitBlt back): GetPixel on a memory DC
+    // returned other pixels' colors on the development machine.
+    unsafe {
+        let mem = CreateCompatibleDC(Some(dc));
+        let header = BITMAPINFOHEADER { biSize: size_of::<BITMAPINFOHEADER>() as u32, biWidth: r, biHeight: -r, biPlanes: 1, biBitCount: 32, biCompression: BI_RGB.0, ..Default::default() };
+        let mut bits = std::ptr::null_mut();
+        let Ok(bmp) = CreateDIBSection(Some(mem), &BITMAPINFO { bmiHeader: header, ..Default::default() }, DIB_RGB_COLORS, &mut bits, None, 0) else {
+            let _ = DeleteDC(mem);
+            return;
+        };
+        let old = SelectObject(mem, bmp.into());
+        let px = std::slice::from_raw_parts_mut(bits as *mut u32, (r * r) as usize);
+        // DIB pixels are 0x00RRGGBB, a COLORREF 0x00BBGGRR; `blend` works on either as long as both match.
+        let outer = (outer & 0x00FF00) | (outer & 0xFF) << 16 | (outer >> 16) & 0xFF;
+        for (right, bottom) in [(false, false), (true, false), (false, true), (true, true)] {
+            let (left, top) = (if right { rect.right - r } else { rect.left }, if bottom { rect.bottom - r } else { rect.top });
+            // Corner-local (x, y), (0, 0) the outermost pixel, to an index into the square.
+            let at = |x: i32, y: i32| ((if bottom { r - 1 - y } else { y }) * r + if right { r - 1 - x } else { x }) as usize;
+            let inner_at = (left + if right { 0 } else { r - 1 }, top + if bottom { 0 } else { r - 1 });
+            if !PtVisible(dc, inner_at.0, inner_at.1).as_bool() {
+                continue;
+            }
+            let _ = BitBlt(mem, 0, 0, r, r, Some(dc), left, top, SRCCOPY);
+            let _ = GdiFlush();
+            let inner = px[at(r - 1, r - 1)] & 0xFF_FFFF;
+            for y in 0..r {
+                for x in 0..r {
+                    let c = coverage(x, y, r);
+                    if c < 1.0 {
+                        px[at(x, y)] = blend(outer, inner, c);
+                    }
+                }
+            }
+            let _ = BitBlt(dc, left, top, r, r, Some(mem), 0, 0, SRCCOPY);
+        }
+        SelectObject(mem, old);
+        let _ = DeleteObject(bmp.into());
+        let _ = DeleteDC(mem);
+    }
+}
+
+/// Corner radius of the content cards (the list, the Home page, the preview) at `dpi`.
+pub fn card_radius(dpi: u32) -> i32 {
+    10 * dpi as i32 / 96
+}
+
+/// Paints the corners of the card window `card` on `dc`, a DC of `owner` (the card itself, or a child of it such as
+/// the list's header) in `owner`'s client coordinates. Call at the end of the owner's painting.
+pub unsafe fn paint_card_corners(card: HWND, owner: HWND, dc: HDC, outer: u32) {
+    unsafe {
+        let mut wr = RECT::default();
+        if GetWindowRect(card, &mut wr).is_err() {
+            return;
+        }
+        let mut o = POINT::default();
+        let _ = ClientToScreen(owner, &mut o);
+        let rect = RECT { left: wr.left - o.x, top: wr.top - o.y, right: wr.right - o.x, bottom: wr.bottom - o.y };
+        paint_corners(dc, &rect, card_radius(GetDpiForWindow(card)), outer);
+    }
+}
+
+/// After a card's own handling of `msg`: its scroll bars (non-client) may have been redrawn, square, so their
+/// corners are painted again. A resize repaints the whole card, frame included, as the corners moved.
+pub unsafe fn card_message(card: HWND, msg: u32, outer: u32) {
+    unsafe {
+        match msg {
+            WM_SIZE => {
+                let _ = RedrawWindow(Some(card), None, None, RDW_INVALIDATE | RDW_FRAME);
+            }
+            WM_NCPAINT | WM_VSCROLL | WM_HSCROLL | WM_MOUSEWHEEL | WM_MOUSEHWHEEL | WM_NCMOUSEMOVE | WM_NCMOUSELEAVE
+            | WM_NCLBUTTONDOWN | WM_NCLBUTTONUP | WM_KEYDOWN => paint_frame_corners(card, card_radius(GetDpiForWindow(card)), outer),
+            _ => {}
+        }
+    }
+}
+
+/// The corners of a card that fall in its non-client area (its scroll bars): call after the window's own
+/// WM_NCPAINT, and after anything that redraws a scroll bar.
+pub unsafe fn paint_frame_corners(hwnd: HWND, radius: i32, outer: u32) {
+    unsafe {
+        let (mut wr, mut cr) = (RECT::default(), RECT::default());
+        if GetWindowRect(hwnd, &mut wr).is_err() || GetClientRect(hwnd, &mut cr).is_err() {
+            return;
+        }
+        // The client area, in window coordinates, paints its own corners.
+        let mut origin = POINT::default();
+        let _ = ClientToScreen(hwnd, &mut origin);
+        let dc = GetWindowDC(Some(hwnd));
+        let (ox, oy) = (origin.x - wr.left, origin.y - wr.top);
+        ExcludeClipRect(dc, ox, oy, ox + cr.right, oy + cr.bottom);
+        paint_corners(dc, &RECT { left: 0, top: 0, right: wr.right - wr.left, bottom: wr.bottom - wr.top }, radius, outer);
+        ReleaseDC(Some(hwnd), dc);
+    }
+}
+
 /// Clips a child window to a rounded rectangle of its current size (a "card"); call again after each resize.
+/// Jagged (a region has no partial pixels): only for windows that cannot paint their own corners (the embedded
+/// Explorer view, the palette popup).
 pub fn round_corners(hwnd: HWND, radius: i32) {
     unsafe {
         let mut r = RECT::default();
@@ -218,6 +341,50 @@ mod tests {
         assert_eq!(blend(0x102030, 0xF0E0D0, 1.0), 0xF0E0D0);
         assert_eq!(blend(0x000000, 0xFEFEFE, 0.5), 0x7F7F7F);
         assert_eq!(blend(0x000000, 0xFFFFFF, 2.0), 0xFFFFFF);
+    }
+
+    #[test]
+    fn corner_coverage() {
+        let r = 10;
+        assert_eq!(coverage(r - 1, r - 1, r), 1.0, "next to the center: all card");
+        assert_eq!(coverage(0, 0, r), 0.0, "the far corner: all frame");
+        let arc = coverage(3, 2, r);
+        assert!(arc > 0.0 && arc < 1.0, "the arc crosses pixel (3, 2): {arc}");
+        assert_eq!(coverage(0, r - 1, r), coverage(r - 1, 0, r), "symmetric");
+    }
+
+    #[test]
+    fn painted_corners_blend_and_repaint_the_same() {
+        unsafe {
+            let dc = CreateCompatibleDC(None);
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER { biSize: size_of::<BITMAPINFOHEADER>() as u32, biWidth: 40, biHeight: -40, biPlanes: 1, biBitCount: 32, biCompression: BI_RGB.0, ..Default::default() },
+                ..Default::default()
+            };
+            let mut bits = std::ptr::null_mut();
+            let bmp = CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
+            let old = SelectObject(dc, bmp.into());
+            let rc = RECT { left: 0, top: 0, right: 40, bottom: 40 };
+            let surface = CreateSolidBrush(COLORREF(0x2060A0));
+            FillRect(dc, &rc, surface);
+            // Read the bitmap's memory (0x00RRGGBB), not GetPixel.
+            let px = std::slice::from_raw_parts(bits as *const u32, 1600);
+            let at = |x: usize, y: usize| { let _ = GdiFlush(); px[y * 40 + x] & 0xFF_FFFF };
+            paint_corners(dc, &rc, 10, 0x000000);
+            let first: Vec<u32> = (0..40).flat_map(|y| (0..40).map(move |x| (x, y))).map(|(x, y)| at(x, y)).collect();
+            assert_eq!((at(0, 0), at(39, 0), at(0, 39), at(39, 39)), (0, 0, 0, 0), "every corner is the frame");
+            assert_eq!((at(20, 20), at(9, 9), at(30, 30)), (0xA06020, 0xA06020, 0xA06020), "the card untouched");
+            let mid = at(3, 2);
+            assert!(mid & 0xFF > 0 && mid & 0xFF < 0x20, "the arc pixel is a blend: {mid:#08x}");
+            assert_eq!(at(36, 2), mid, "mirrored");
+            paint_corners(dc, &rc, 10, 0x000000);
+            let second: Vec<u32> = (0..40).flat_map(|y| (0..40).map(move |x| (x, y))).map(|(x, y)| at(x, y)).collect();
+            assert_eq!(first, second, "idempotent");
+            SelectObject(dc, old);
+            let _ = DeleteObject(surface.into());
+            let _ = DeleteObject(bmp.into());
+            let _ = DeleteDC(dc);
+        }
     }
 
     #[test]

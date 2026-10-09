@@ -1,4 +1,4 @@
-//! The command bar under the header, as Explorer has it: New v | Cut, Copy, Paste, Rename, Delete | Sort v, View v |
+//! The command bar under the header, as Explorer has it: New v | Cut, Copy, Paste, Rename, Share, Delete | Sort v, View v |
 //! More, and Preview at the right edge. Each command is a shell verb on the selection or the folder background, or
 //! a menu of them; the buttons are enabled for what the active tab can do right now.
 
@@ -18,6 +18,7 @@ pub(crate) unsafe fn create(hwnd: HWND) -> Result<HWND> {
             (0xE8C8, CMD_COPY, "Copy (Ctrl+C)"),
             (0xE77F, CMD_PASTE, "Paste (Ctrl+V)"),
             (0xE8AC, CMD_RENAME, "Rename (F2)"),
+            (0xE72D, CMD_SHARE, "Share"),
             (0xE74D, CMD_DELETE, "Delete (Del)"),
             toolbar::SEPARATOR,
             (0xE8CB, CMD_SORT, "Sort"),
@@ -65,12 +66,57 @@ pub(crate) unsafe fn update(app: *mut App) {
         (CMD_COPY, (shell || search) && sel > 0),
         (CMD_PASTE, shell && clipboard_has_files()),
         (CMD_RENAME, shell && sel == 1),
+        (CMD_SHARE, shell && sel > 0),
         (CMD_DELETE, (shell || search) && sel > 0),
         (CMD_SORT, shell && !home),
     ] {
         toolbar::set_enabled(bar, cmd, on);
     }
     toolbar::set_checked(bar, CMD_TOGGLE_PREVIEW, a.session.show_preview);
+}
+
+/// Share: the Windows share sheet for the selected files. Folders cannot be shared (as in Explorer): beeps.
+pub(crate) unsafe fn share(app: *mut App) {
+    let rows = list::selected_indices((*app).list);
+    let paths: Vec<String> = listing(app)
+        .map(|l| rows.iter().filter_map(|&i| l.items.get(i)).map(|i| i.parsing_name()).filter(|p| std::path::Path::new(p).is_file()).collect())
+        .unwrap_or_default();
+    if paths.is_empty() || share_files((*app).hwnd, paths).is_err() {
+        let _ = MessageBeep(MB_OK);
+    }
+}
+
+/// Opens the share sheet over `hwnd` for `paths`. The shell's own "Windows.ModernShare" verb fails from a desktop
+/// app (0x80070578, invalid window), so this goes through IDataTransferManagerInterop as Microsoft documents.
+unsafe fn share_files(hwnd: HWND, paths: Vec<String>) -> windows::core::Result<()> {
+    use windows::ApplicationModel::DataTransfer::{DataRequestedEventArgs, DataTransferManager};
+    use windows_collections::IIterable;
+    use windows::Foundation::TypedEventHandler;
+    use windows::Storage::{IStorageItem, StorageFile};
+    use windows::Win32::UI::Shell::IDataTransferManagerInterop;
+    use windows::core::{HSTRING, Interface, Ref};
+    // The handler registered by the previous Share, removed so one request does not fill the sheet twice.
+    static TOKEN: std::sync::Mutex<Option<i64>> = std::sync::Mutex::new(None);
+    let interop = windows::core::factory::<DataTransferManager, IDataTransferManagerInterop>()?;
+    let manager: DataTransferManager = unsafe { interop.GetForWindow(hwnd)? };
+    if let Some(t) = TOKEN.lock().unwrap().take() {
+        let _ = manager.RemoveDataRequested(t);
+    }
+    let handler = TypedEventHandler::new(move |_, args: Ref<DataRequestedEventArgs>| {
+        let data = args.ok()?.Request()?.Data()?;
+        let title = match &paths[..] {
+            [one] => std::path::Path::new(one).file_name().map_or(one.clone(), |n| n.to_string_lossy().into_owned()),
+            many => format!("{} items", many.len()),
+        };
+        data.Properties()?.SetTitle(&HSTRING::from(title))?;
+        let mut items = Vec::new();
+        for p in &paths {
+            items.push(Some(StorageFile::GetFileFromPathAsync(&HSTRING::from(p.as_str()))?.join()?.cast::<IStorageItem>()?));
+        }
+        data.SetStorageItemsReadOnly(&IIterable::<IStorageItem>::from(items))
+    });
+    *TOKEN.lock().unwrap() = Some(manager.DataRequested(&handler)?);
+    unsafe { interop.ShowShareUIForWindow(hwnd) }
 }
 
 /// Below the button that sends `cmd`.

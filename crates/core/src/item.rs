@@ -2,7 +2,7 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
 use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::System::SystemServices::{SFGAO_FOLDER, SFGAO_HIDDEN};
-use windows::Win32::System::Variant::{VariantToStringAlloc, VariantToUInt64};
+use windows::Win32::System::Variant::{VariantToBoolean, VariantToStringAlloc, VariantToUInt64};
 use windows::Win32::UI::Shell::Common::{SHELLDETAILS, STRRET};
 use windows::Win32::UI::Shell::{
     ILCombine, IShellFolder, IShellFolder2, SHFILEINFOW, SHGDN_FORPARSING, SHGDN_INFOLDER,
@@ -72,6 +72,15 @@ impl ShellItem {
             let p = VariantToStringAlloc(&v).ok()?;
             let s = crate::com::take_cotaskmem_string(p);
             (!s.is_empty()).then_some(s)
+        }
+    }
+
+    /// A boolean property (`GetDetailsEx` + `VariantToBoolean`); None when the item has no value for it.
+    pub fn property_bool(&self, key: &PROPERTYKEY) -> Option<bool> {
+        let f2 = self.parent.cast::<IShellFolder2>().ok()?;
+        unsafe {
+            let v = f2.GetDetailsEx(self.pidl.as_ptr(), key).ok()?;
+            VariantToBoolean(&v).ok().map(|b| b.as_bool())
         }
     }
 

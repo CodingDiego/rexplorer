@@ -171,7 +171,7 @@ pub(crate) unsafe fn register_drop(app: *mut App) {
 }
 
 /// The shell context menu at the cursor for the selection (`on_item`) or the folder background. On the Home page
-/// our own entry on folders is "Unpin from Home"; elsewhere it is "Pin to Home".
+/// our own entry on folders is "Unpin from Home" (pinned) or "Pin to Home" (frequent); elsewhere "Pin to Home".
 pub(crate) unsafe fn show_menu(app: *mut App, on_item: bool) {
     let hwnd = (*app).hwnd;
     let mut pt = POINT::default();
@@ -188,9 +188,17 @@ pub(crate) unsafe fn show_menu(app: *mut App, on_item: bool) {
     let Some(menu) = menu else { return };
     let home = listing(app).is_some_and(nav::is_home);
     let folders = listing(app).is_some_and(|l| sel.iter().filter_map(|&i| l.items.get(i)).any(|i| i.is_folder()));
+    // On Home a selection with a pinned folder offers Unpin; frequent folders offer Pin.
+    let pinned = home
+        && listing(app).is_some_and(|l| {
+            let tiles = l.home.as_ref().map_or(&[][..], |c| &c.tiles[..]);
+            let pinned_key = |k: &str| tiles.iter().any(|t| t.pinned && t.key.eq_ignore_ascii_case(k));
+            sel.iter().filter_map(|&i| l.items.get(i)).any(|i| i.is_folder() && pinned_key(&i.parsing_name()))
+        });
     // Pinning applies to the current folder (background) or to selected folders of a shell listing.
     let own: &[&str] = match (home, on_item) {
-        (true, true) if folders => &[UNPIN_FROM_HOME],
+        (true, true) if folders && pinned => &[UNPIN_FROM_HOME],
+        (true, true) if folders => &[PIN_TO_HOME],
         (true, _) => &[],
         (false, _) if listing(app).is_some() && (!on_item || folders) => &[PIN_TO_HOME],
         _ => &[],
@@ -202,10 +210,15 @@ pub(crate) unsafe fn show_menu(app: *mut App, on_item: bool) {
     match picked {
         Ok(Picked::Rename) => begin_rename(app),
         Ok(Picked::Own(_)) if home => {
-            verb_on_selection(app, "unpinfromhome", false);
+            verb_on_selection(app, if pinned { "unpinfromhome" } else { "pintohome" }, false);
             panes::sidebar_changed(app);
+            SetTimer(Some(hwnd), TIMER_REFRESH, 300, None);
         }
         Ok(Picked::Own(_)) => pin_to_home(app),
+        // The shell's own entries can change Home (add to or remove from Favorites, remove from the list).
+        Ok(Picked::Invoked) if home => {
+            SetTimer(Some(hwnd), TIMER_REFRESH, 300, None);
+        }
         _ => {}
     }
 }
@@ -382,7 +395,12 @@ unsafe fn draw_item(app: *mut App, cd: &mut NMLVCUSTOMDRAW) -> u32 {
             if (*app).skeleton {
                 draw_skeleton(app, cd.nmcd.hdc);
             }
-            CDRF_NOTIFYITEMDRAW
+            CDRF_NOTIFYITEMDRAW | CDRF_NOTIFYPOSTPAINT
+        }
+        CDDS_POSTPAINT => {
+            let list = (*app).list;
+            theme::paint_card_corners(list, list, cd.nmcd.hdc, (*app).theme.background);
+            CDRF_DODEFAULT
         }
         CDDS_ITEMPREPAINT => {
             let (list, t) = ((*app).list, &(*app).theme);
@@ -428,11 +446,6 @@ pub(crate) unsafe extern "system" fn subclass(hwnd: HWND, msg: u32, wparam: WPAR
     if msg == WM_NOTIFY && (*(lparam.0 as *const NMHDR)).code == NM_CUSTOMDRAW {
         return LRESULT(draw_header(&(*(data as *mut App)).theme, &*(lparam.0 as *const NMCUSTOMDRAW)) as isize);
     }
-    if msg == WM_SIZE {
-        let r = DefSubclassProc(hwnd, msg, wparam, lparam);
-        theme::round_corners(hwnd, 10 * GetDpiForWindow(hwnd) as i32 / 96);
-        return r;
-    }
     if msg == WM_MBUTTONUP {
         let mut ht = LVHITTESTINFO { pt: POINT { x: lparam.0 as i16 as i32, y: (lparam.0 >> 16) as i16 as i32 }, ..Default::default() };
         let i = SendMessageW(hwnd, LVM_HITTEST, None, Some(LPARAM(&mut ht as *mut _ as isize))).0;
@@ -441,7 +454,9 @@ pub(crate) unsafe extern "system" fn subclass(hwnd: HWND, msg: u32, wparam: WPAR
         }
         return LRESULT(0);
     }
-    DefSubclassProc(hwnd, msg, wparam, lparam)
+    let r = DefSubclassProc(hwnd, msg, wparam, lparam);
+    theme::card_message(hwnd, msg, (*(data as *mut App)).theme.background);
+    r
 }
 
 /// A flat header in both themes (the DarkMode header themes are ignored on this Windows build): surface fill,
@@ -488,6 +503,10 @@ unsafe fn draw_header(t: &Theme, nm: &NMCUSTOMDRAW) -> u32 {
                 right = right.max(r.right);
             }
             fill(&RECT { left: right, ..nm.rc }, t.surface);
+            // The header covers the card's top corners.
+            if let Ok(list) = GetParent(header) {
+                theme::paint_card_corners(list, header, nm.hdc, t.background);
+            }
             CDRF_DODEFAULT
         }
         _ => CDRF_DODEFAULT,

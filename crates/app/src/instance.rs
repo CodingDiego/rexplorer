@@ -9,7 +9,7 @@ use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, SMTO_ABORTIFHUNG, SW_SHOWNORMAL, SendMessageTimeoutW, SetForegroundWindow,
+    FindWindowExW, GetPropW, SMTO_ABORTIFHUNG, SetPropW, SW_SHOWNORMAL, SendMessageTimeoutW, SetForegroundWindow,
     WM_COPYDATA,
 };
 use windows::core::{Error, HSTRING, PCWSTR, Result, w};
@@ -26,10 +26,22 @@ impl Drop for Guard {
     }
 }
 
+/// Instances are single per settings folder: a launch with another %APPDATA% (the smoke test's scratch profiles)
+/// runs beside the user's window instead of handing off to it.
+fn group() -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    rexplorer_core::settings::dir().to_string_lossy().to_lowercase().hash(&mut h);
+    h.finish() as usize | 1
+}
+
+const GROUP_PROP: PCWSTR = w!("RexplorerGroup");
+
 /// Some(guard) if this is the first instance; None if another already holds the mutex.
 pub fn claim() -> Option<Guard> {
     unsafe {
-        let h = CreateMutexW(None, false, w!("Local\\rexplorer-single-instance")).ok()?;
+        let name = HSTRING::from(format!("Local\\rexplorer-single-instance-{:x}", group()));
+        let h = CreateMutexW(None, false, &name).ok()?;
         if GetLastError() == ERROR_ALREADY_EXISTS {
             let _ = CloseHandle(h);
             None
@@ -39,8 +51,23 @@ pub fn claim() -> Option<Guard> {
     }
 }
 
+/// Tags the main window with this instance's group, for `find_main_window`.
+pub fn mark(hwnd: HWND) {
+    unsafe {
+        let _ = SetPropW(hwnd, GROUP_PROP, Some(HANDLE(group() as *mut _)));
+    }
+}
+
+/// The main window of this settings folder's instance.
 pub fn find_main_window() -> Option<HWND> {
-    unsafe { FindWindowW(w!("RexplorerMain"), PCWSTR::null()).ok() }
+    let mut after = None;
+    while let Ok(h) = unsafe { FindWindowExW(None, after, w!("RexplorerMain"), PCWSTR::null()) } {
+        if unsafe { GetPropW(h, GROUP_PROP) }.0 as usize == group() {
+            return Some(h);
+        }
+        after = Some(h);
+    }
+    None
 }
 
 pub fn send(hwnd: HWND, payload: &str) -> bool {

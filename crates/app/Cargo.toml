@@ -5,7 +5,13 @@ edition = "2024"
 
 [dependencies]
 rexplorer-core = { path = "../core" }
+# The windows crate's own WinRT collections (already in the lock through it): IIterable for the share sheet.
+windows-collections = "0.3.2"
 windows = { workspace = true, features = [
+    "ApplicationModel_DataTransfer",
+    "Foundation_Collections",
+    "Storage",
+    "Storage_Streams",
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",

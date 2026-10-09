@@ -4,7 +4,7 @@
 param([switch]$Screenshots, [string]$Only)
 $ErrorActionPreference = 'Stop'
 $Exe = Join-Path (Split-Path $PSScriptRoot -Parent) 'target\release\rexplorer.exe'
-Add-Type -AssemblyName System.Windows.Forms, Microsoft.VisualBasic, UIAutomationClient, UIAutomationTypes
+Add-Type -AssemblyName System.Windows.Forms, System.Drawing, Microsoft.VisualBasic, UIAutomationClient, UIAutomationTypes
 Add-Type @'
 using System; using System.Text; using System.Runtime.InteropServices; using System.Collections.Generic;
 public static class W {
@@ -84,6 +84,51 @@ public static class W {
     rar.AddRange(Header(new byte[] { 5, 0, 0 }));
     return rar.ToArray();
   }
+  [DllImport("shell32.dll", CharSet=CharSet.Unicode)] public static extern void SHAddToRecentDocs(uint flags, string path);
+  [DllImport("dwmapi.dll", EntryPoint="DwmGetWindowAttribute")] static extern int DwmGetInt(IntPtr h, int attr, out int v, int size);
+  // DWMWA_CLOAKED: the shell keeps hidden app frames "visible" but cloaked.
+  public static bool Cloaked(IntPtr h) { int v; return DwmGetInt(h, 14, out v, 4) == 0 && v != 0; }
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
+  [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
+  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+  [DllImport("user32.dll")] public static extern int GetSystemMetrics(int i);
+  [StructLayout(LayoutKind.Sequential)] struct MOUSEINPUT { public int dx, dy; public uint data, flags, time; public IntPtr extra; }
+  [StructLayout(LayoutKind.Sequential)] struct INPUT { public uint type; public MOUSEINPUT mi; }  // 40 bytes on x64, as SendInput checks
+  [DllImport("user32.dll")] static extern uint SendInput(uint n, INPUT[] inputs, int size);
+  static void Mouse(uint flags, int x, int y) {
+    // Absolute coordinates over the virtual desktop, 0..65535.
+    int vx = GetSystemMetrics(76), vy = GetSystemMetrics(77), vw = GetSystemMetrics(78), vh = GetSystemMetrics(79);
+    var i = new INPUT { type = 0, mi = new MOUSEINPUT { dx = (int)((x - vx) * 65535L / (vw - 1)), dy = (int)((y - vy) * 65535L / (vh - 1)), flags = flags | 0x8000 | 0x4000 | 0x0001 } };
+    SendInput(1, new[] { i }, Marshal.SizeOf(typeof(INPUT)));
+  }
+  // A real mouse drag (SendInput): press at (x1, y1), `steps` moves over `ms` to (x2, y2), release.
+  public static void Drag(int x1, int y1, int x2, int y2, int steps, int ms) {
+    Mouse(0, x1, y1); System.Threading.Thread.Sleep(50);
+    Mouse(0x0002, x1, y1);
+    for (int k = 1; k <= steps; k++) { System.Threading.Thread.Sleep(ms / steps); Mouse(0, x1 + (x2 - x1) * k / steps, y1 + (y2 - y1) * k / steps); }
+    System.Threading.Thread.Sleep(100);
+    Mouse(0x0004, x2, y2);
+  }
+  [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+  [DllImport("kernel32.dll")] static extern IntPtr VirtualAllocEx(IntPtr p, IntPtr a, UIntPtr size, uint type, uint protect);
+  [DllImport("kernel32.dll")] static extern bool VirtualFreeEx(IntPtr p, IntPtr a, UIntPtr size, uint type);
+  [DllImport("kernel32.dll")] static extern bool WriteProcessMemory(IntPtr p, IntPtr a, int[] buf, UIntPtr n, out UIntPtr done);
+  [DllImport("kernel32.dll")] static extern bool ReadProcessMemory(IntPtr p, IntPtr a, int[] buf, UIntPtr n, out UIntPtr done);
+  [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+  [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr h, ref POINT p);
+  // Row i's bounds in screen pixels: LVM_GETITEMRECT (LVIR_BOUNDS) with the RECT in the list's own process.
+  public static RECT ItemRect(IntPtr list, int i) {
+    uint pid; GetWindowThreadProcessId(list, out pid);
+    IntPtr p = OpenProcess(0x0008 | 0x0010 | 0x0020, false, pid);
+    IntPtr mem = VirtualAllocEx(p, IntPtr.Zero, (UIntPtr)16, 0x3000, 0x04);
+    int[] buf = { 0, 0, 0, 0 }; UIntPtr n;
+    WriteProcessMemory(p, mem, buf, (UIntPtr)16, out n);
+    SendMessage(list, 0x100E, (IntPtr)i, mem);
+    ReadProcessMemory(p, mem, buf, (UIntPtr)16, out n);
+    VirtualFreeEx(p, mem, UIntPtr.Zero, 0x8000); CloseHandle(p);
+    var a = new POINT { X = buf[0], Y = buf[1] }; ClientToScreen(list, ref a);
+    return new RECT { L = a.X, T = a.Y, R = a.X + buf[2] - buf[0], B = a.Y + buf[3] - buf[1] };
+  }
   // First top-level window of process `pid` with window class `cls`.
   public static IntPtr FindOfProcess(uint pid, string cls) {
     IntPtr found = IntPtr.Zero;
@@ -100,6 +145,11 @@ public static class W {
 
 # Window rects in physical pixels, like the app's own layout.
 $null = [W]::SetProcessDPIAware()
+# Every launch runs on a scratch %APPDATA%: the user's settings and window.txt stay untouched, and the single-instance
+# hand-off (one instance per settings folder) never reaches a rexplorer the user has open.
+$RealAppData = $env:APPDATA
+$env:APPDATA = Join-Path $env:TEMP "rexplorer-smoke-profile-$PID"
+New-Item -ItemType Directory -Path $env:APPDATA -Force | Out-Null
 function Out-Check($status, $name, $detail) { Write-Output ("{0} {1} {2}" -f $status, $name, ($detail -replace '\s+', ' ')) }
 function Start-App($arg) {
   if ($arg) { $p = Start-Process -FilePath $Exe -ArgumentList ('"{0}"' -f $arg) -PassThru } else { $p = Start-Process -FilePath $Exe -PassThru }
@@ -135,6 +185,20 @@ function Set-Foreground($m) {
     if ([W]::GetForegroundWindow() -eq $m) { return $true }
   }
   $false
+}
+# PrintWindow of `h` (the window itself, nothing else on screen) as a Bitmap; the caller disposes it.
+function Get-WindowBitmap($h) {
+  $r = New-Object W+RECT; $null = [W]::GetWindowRect($h, [ref]$r)
+  $bmp = New-Object System.Drawing.Bitmap ($r.R - $r.L), ($r.B - $r.T)
+  $g = [System.Drawing.Graphics]::FromImage($bmp)
+  $hdc = $g.GetHdc(); $null = [W]::PrintWindow($h, $hdc, 2); $g.ReleaseHdc($hdc); $g.Dispose()  # PW_RENDERFULLCONTENT
+  $bmp
+}
+# `child`'s window rect relative to `parent`'s window rect.
+function Get-RelativeRect($child, $parent) {
+  $c = New-Object W+RECT; $p = New-Object W+RECT
+  $null = [W]::GetWindowRect($child, [ref]$c); $null = [W]::GetWindowRect($parent, [ref]$p)
+  @{ L = $c.L - $p.L; T = $c.T - $p.T; R = $c.R - $p.L; B = $c.B - $p.T }
 }
 function Stop-App($p) { if ($p) { try { if (-not $p.HasExited) { $p.Kill(); $p.WaitForExit(2000) | Out-Null } } catch {} } }
 function Get-Explorers { $r = @{}; foreach ($w in (New-Object -ComObject Shell.Application).Windows()) { try { $r[[int64]$w.HWND] = $w } catch {} }; $r }
@@ -532,19 +596,27 @@ Run-Check 'look' {
     Wait-Until { (Get-Count $script:main) -ge 1 } 3000 | Out-Null
     $sb = [W]::FindWindowEx($script:main, [IntPtr]::Zero, 'RexSidebar', $null)
     if ($sb -eq [IntPtr]::Zero -or -not [W]::IsWindowVisible($sb)) { return @('FAIL', "RexSidebar present=$($sb -ne [IntPtr]::Zero), visible=false") }
-    $rgn = [W]::RegionType((Get-List $script:main))
+    # The list card's corners are painted in the frame color (no window region): its corner pixels match the frame
+    # beside the card, the card's inside differs.
+    $lr = Get-RelativeRect (Get-List $script:main) $script:main
+    $bmp = Get-WindowBitmap $script:main
+    $px = { param($x, $y) '{0:X6}' -f ($bmp.GetPixel($x, $y).ToArgb() -band 0xFFFFFF) }
+    $frame = & $px ($lr.L - 3) ($lr.T + 40); $tl = & $px $lr.L $lr.T; $br = & $px ($lr.R - 1) ($lr.B - 1); $inside = & $px ($lr.L + 40) ($lr.T + 40)
+    $bmp.Dispose()
+    $rgn = "corners TL=$tl BR=$br frame=$frame inside=$inside"
+    $round = $tl -eq $frame -and $br -eq $frame -and $inside -ne $frame
     # Favorites come from Quick Access, which pins Downloads by default.
     $dl = (New-Object -ComObject Shell.Application).NameSpace('shell:Downloads').Self
     $i = Find-Row $sb $dl.Path 5000
-    if ($i -lt 0) { return @('FAIL', "list region type=$rgn; no sidebar row for $($dl.Path) after 5 s") }
+    if ($i -lt 0) { return @('FAIL', "list $rgn; no sidebar row for $($dl.Path) after 5 s") }
     $want = $dl.Name
     $top = Click-Row $sb $i
     $went = Wait-Until { (Get-Title $script:main) -eq "$want - rexplorer" } 3000
     $t = Get-Title $script:main
     $how = Send-KeysOrCommand '^b' 23
     $hidden = Wait-Until { -not [W]::IsWindowVisible($sb) } 2000
-    $d = "RexSidebar shown; list region type=$rgn (3 = rounded); click on Downloads row $i (y=$top) -> '$t' (want '$want'); Ctrl+B ($how) hid the sidebar=$hidden"
-    if ($rgn -eq 3 -and $went -and $hidden) { @('PASS', $d) } else { @('FAIL', $d) }
+    $d = "RexSidebar shown; list $rgn; click on Downloads row $i (y=$top) -> '$t' (want '$want'); Ctrl+B ($how) hid the sidebar=$hidden"
+    if ($round -and $went -and $hidden) { @('PASS', $d) } else { @('FAIL', $d) }
   } finally { Remove-Fresh }
 }
 
@@ -706,8 +778,206 @@ Run-Check 'view-menu' {
   } finally { Remove-Fresh }
 }
 
+# Home's own hooks: WM_APP+0x53 selects the entry named by RexHome's window text (display or parsing name) and
+# answers its position (-1 none); WM_APP+0x54 answers a rect packed as four int16 (left, top, right, bottom).
+function Get-HomePage { [W]::FindWindowEx($script:main, [IntPtr]::Zero, 'RexHome', [NullString]::Value) }
+function Select-HomeNamed($hp, $name) { $null = [W]::SendText($hp, 0x000C, [IntPtr]::Zero, $name); [int][W]::SendMessage($hp, 0x8053, [IntPtr]::Zero, [IntPtr]::Zero) }
+function Get-HomeRect($hp, $i) {
+  $v = [int64][W]::SendMessage($hp, 0x8054, [IntPtr]$i, [IntPtr]::Zero)
+  if ($v -le 0) { return $v }
+  $w = { param($k) $x = ($v -shr (16 * $k)) -band 0xFFFF; if ($x -ge 0x8000) { $x - 0x10000 } else { $x } }
+  @{ L = (& $w 0); T = (& $w 1); R = (& $w 2); B = (& $w 3) }
+}
+
+Run-Check 'home-open' {
+  # A recent file Home lists, opened with Enter. Its extension is registered for this check only (HKCU) with an open
+  # command that writes a marker, so nothing visible opens. Under %LOCALAPPDATA%: Recent ignores %TEMP%.
+  $dir = Join-Path $env:LOCALAPPDATA 'rexplorer-smoke'
+  New-Item -ItemType Directory -Path $dir -Force | Out-Null
+  $file = Join-Path $dir "home-open-$PID.rexsmoke"; $marker = Join-Path $dir "home-open-$PID.opened"
+  Set-Content -Path $file -Value 'x'; Remove-Item $marker -ErrorAction SilentlyContinue
+  $cls = 'HKCU:\Software\Classes'
+  New-Item -Path "$cls\.rexsmoke" -Value 'rexplorer.smokefile' -Force | Out-Null
+  New-Item -Path "$cls\rexplorer.smokefile\shell\open\command" -Value ('cmd.exe /c type nul > "' + $marker + '"') -Force | Out-Null
+  $recent = Join-Path ([Environment]::GetFolderPath('Recent')) ("home-open-$PID.rexsmoke.lnk")
+  try {
+    [W]::SHAddToRecentDocs(3, $file)  # SHARD_PATHW
+    if (-not (Launch-Fresh $null)) { return @('FAIL', 'no main window within 5 s') }
+    $hp = [IntPtr]::Zero
+    $null = Wait-Until { $script:hp = Get-HomePage; $script:hp -ne [IntPtr]::Zero -and [W]::IsWindowVisible($script:hp) } 4000
+    $hp = $script:hp
+    if ($hp -eq [IntPtr]::Zero) { return @('FAIL', 'no RexHome') }
+    $script:at = -1
+    $null = Wait-Until { $script:at = Select-HomeNamed $hp $file; $script:at -ge 0 } 5000
+    if ($script:at -lt 0) { return @('FAIL', "Home does not list the recent file $file after 5 s") }
+    $null = [W]::PostMessage($hp, 0x100, [IntPtr]0x0D, [IntPtr]::Zero)
+    $opened = Wait-Until { Test-Path $marker } 5000
+    $d = "recent $file is Home entry $($script:at); Enter opened it with its registered app=$opened"
+    if ($opened) { @('PASS', $d) } else { @('FAIL', $d) }
+  } finally {
+    Remove-Fresh
+    # Off Home's list (its own "remove" verb), then the shortcut, the association and the files.
+    try { foreach ($it in (New-Object -ComObject Shell.Application).NameSpace('shell:::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}').Items()) { if ($it.Path -eq $file) { $it.InvokeVerb('remove') } } } catch {}
+    # Windows also adds the file's folder to Recent.
+    Remove-Item $recent, (Join-Path ([Environment]::GetFolderPath('Recent')) 'rexplorer-smoke.lnk') -ErrorAction SilentlyContinue
+    Remove-Item "$cls\.rexsmoke", "$cls\rexplorer.smokefile" -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item $file, $marker -ErrorAction SilentlyContinue
+    if (-not (Get-ChildItem $dir -Force)) { Remove-Item $dir -ErrorAction SilentlyContinue }
+  }
+}
+
+Run-Check 'remove-bookmark' {
+  $dir = Join-Path $env:TEMP "rexplorer-smoke-bookmark-$PID"
+  New-Item -ItemType Directory -Path $dir -Force | Out-Null
+  try {
+    # A scratch profile with one bookmark, removed through the sidebar's popup.
+    $script:fake = Join-Path $env:TEMP "rexplorer-smoke-appdata-$PID"
+    Remove-Item $script:fake -Recurse -Force -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Path (Join-Path $script:fake 'rexplorer') -Force | Out-Null
+    $ini = Join-Path $script:fake 'rexplorer\settings.ini'
+    Set-Content -Path $ini -Value "[general]`r`nprofile=default`r`n[profile default]`r`nbookmark.Repo=$dir`r`n"
+    $appdata = $env:APPDATA
+    try { $env:APPDATA = $script:fake; $up = Launch 'C:\Windows' } finally { $env:APPDATA = $appdata }
+    if (-not $up) { return @('FAIL', 'no main window within 5 s') }
+    $sb = Get-Sidebar
+    $i = Find-Row $sb $dir 5000
+    if ($i -lt 0) { return @('FAIL', "no sidebar row for the bookmark $dir") }
+    $null = Click-Row $sb $i -Right
+    $script:menu = [IntPtr]::Zero
+    $null = Wait-Until { $script:menu = [W]::FindOfProcess([uint32]$script:cur.Id, '#32768'); $script:menu -ne [IntPtr]::Zero } 2000
+    if ($script:menu -eq [IntPtr]::Zero) { return @('FAIL', "right-click on row $i showed no popup menu") }
+    $null = [W]::PostMessage($script:menu, 0x100, [IntPtr]0x28, [IntPtr]::Zero)
+    $null = [W]::PostMessage($script:menu, 0x100, [IntPtr]0x0D, [IntPtr]::Zero)
+    $rowGone = Wait-Until { (Get-RowTargets $sb) -notcontains $dir } 3000
+    $lineGone = -not (Select-String -Path $ini -Pattern '^bookmark\.Repo=' -Quiet)
+    $d = "bookmark row $i; Remove bookmark -> row gone=$rowGone, settings.ini line gone=$lineGone"
+    if ($rowGone -and $lineGone) { @('PASS', $d) } else { @('FAIL', $d) }
+  } finally { Remove-Fresh; Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Run-Check 'share' {
+  $dir = Join-Path $env:TEMP "rexplorer-smoke-share-$PID"
+  New-Item -ItemType Directory -Path $dir -Force | Out-Null
+  $file = Join-Path $dir 'share-me.txt'; Set-Content -Path $file -Value 'x'
+  $sheet = [IntPtr]::Zero
+  try {
+    if (-not (Launch-FreshArgs "--select `"$file`"")) { return @('FAIL', 'no main window within 5 s') }
+    $bar = Get-CmdBar
+    $off = Get-ButtonState $bar 49
+    $on = Wait-Until { ((Get-ButtonState $bar 49) -band 1) -eq 1 } 4000
+    if (-not $on) { return @('FAIL', "Share state=$(Get-ButtonState $bar 49) with $file selected") }
+    # The share sheet only opens over the foreground window.
+    if (-not (Set-Foreground $script:main)) { return @('SKIP', 'could not activate') }
+    # The sheet is a top-level window created by the click that takes the foreground (owned by the shell; its title
+    # is localized, e.g. "Compartir"). Windows that existed before do not count.
+    $before = @{}; $null = [W]::EnumWindows({ param($h, $l) $before[[int64]$h] = 1; $true }, [IntPtr]::Zero)
+    Click-Button $bar 49
+    $script:sheet = [IntPtr]::Zero
+    $null = Wait-Until { $f = [W]::GetForegroundWindow(); if ($f -ne $script:main -and -not $before.ContainsKey([int64]$f) -and -not [W]::Cloaked($f)) { $script:sheet = $f }; $script:sheet -ne [IntPtr]::Zero } 4000
+    $sheet = $script:sheet
+    if ($sheet -eq [IntPtr]::Zero) {
+      if ($before.ContainsKey([int64][W]::GetForegroundWindow())) { return @('SKIP', 'focus moved to another window during the check') }
+      return @('FAIL', 'Share click: no new window came to the foreground within 4 s')
+    }
+    $cls = New-Object System.Text.StringBuilder 128; $null = [W]::GetClassName($sheet, $cls, 128)
+    [uint32]$owner = 0; $null = [W]::GetWindowThreadProcessId($sheet, [ref]$owner)
+    $title = "$(Get-Title $sheet)' class $cls of $((Get-Process -Id $owner -ErrorAction SilentlyContinue).ProcessName)"
+    [System.Windows.Forms.SendKeys]::SendWait('{ESC}')
+    $closed = Wait-Until { [W]::GetForegroundWindow() -ne $sheet } 2000
+    @('PASS', "Share enabled with a file selected; click -> share sheet '$title' in the foreground; Escape closed it=$closed")
+  } finally {
+    if ($sheet -ne [IntPtr]::Zero -and [W]::GetForegroundWindow() -eq $sheet) { [System.Windows.Forms.SendKeys]::SendWait('{ESC}') }
+    Remove-Fresh; Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+  }
+}
+
+Run-Check 'access-denied' {
+  $sv = 'C:\System Volume Information'
+  try {
+    if (-not (Launch-Fresh $sv)) { return @('FAIL', 'no main window within 5 s') }
+    $ok = Wait-Until { (Get-Status) -like 'Access denied:*' } 3000
+    $d = "status='$(Get-Status)' count=$(Get-Count $script:main)"
+    if ($ok) { @('PASS', $d) } else { @('FAIL', $d) }
+  } finally { Remove-Fresh }
+}
+
+Run-Check 'crash-recovery' {
+  $script:rec = $null
+  try {
+    $env:REXPLORER_CRASH_AFTER_MS = '1500'
+    try { $up = Launch-Fresh 'C:\Windows' } finally { Remove-Item Env:REXPLORER_CRASH_AFTER_MS -ErrorAction SilentlyContinue }
+    if (-not $up) { return @('FAIL', 'no main window within 5 s') }
+    $first = $script:cur.Id
+    # The crash handler relaunches the exe with --recover on the folder it was showing.
+    $null = Wait-Until {
+      $p = Get-CimInstance Win32_Process -Filter "Name='rexplorer.exe'" | Where-Object { $_.ProcessId -ne $first -and $_.CommandLine -like '*--recover*' } | Select-Object -First 1
+      if ($p) { $script:rec = Get-Process -Id $p.ProcessId -ErrorAction SilentlyContinue }
+      $null -ne $script:rec
+    } 6000
+    if (-not $script:rec) { return @('FAIL', "no rexplorer.exe --recover within 6 s; first exited=$($script:cur.HasExited)") }
+    $script:recMain = [IntPtr]::Zero
+    $titled = Wait-Until { $script:recMain = [W]::FindOfProcess([uint32]$script:rec.Id, 'RexplorerMain'); $script:recMain -ne [IntPtr]::Zero -and (Get-Title $script:recMain) -eq 'Windows - rexplorer' } 4000
+    $t = if ($script:recMain -ne [IntPtr]::Zero) { Get-Title $script:recMain } else { '' }
+    $d = "crashed pid $first exited=$($script:cur.HasExited); recovery pid $($script:rec.Id) titled '$t'"
+    if ($titled) { @('PASS', $d) } else { @('FAIL', $d) }
+  } finally { Stop-App $script:rec; Remove-Fresh }
+}
+
+Run-Check 'dnd' {
+  $dir = Join-Path $env:TEMP "rexplorer-smoke-dnd-$PID"
+  New-Item -ItemType Directory -Path (Join-Path $dir 'target') -Force | Out-Null
+  $file = Join-Path $dir 'drag-me.txt'; $moved = Join-Path $dir 'target\drag-me.txt'
+  Set-Content -Path $file -Value 'x'
+  $cursor = New-Object W+POINT; $null = [W]::GetCursorPos([ref]$cursor)
+  try {
+    if (-not (Launch-Fresh $dir)) { return @('FAIL', 'no main window within 5 s') }
+    if (-not (Wait-Until { (Get-Count $script:main) -eq 2 } 4000)) { return @('FAIL', "count=$(Get-Count $script:main)") }
+    if (-not (Set-Foreground $script:main)) { return @('SKIP', 'could not activate') }
+    # Row rects with LVM_GETITEMRECT through a buffer in the app's process (UI Automation sees no rows in this
+    # list). Folders sort first: row 0 is the folder "target", row 1 the file.
+    $list = Get-List $script:main
+    $dst = [W]::ItemRect($list, 0); $src = [W]::ItemRect($list, 1)
+    if ($src.B -le $src.T -or $dst.B -le $dst.T) { return @('FAIL', 'LVM_GETITEMRECT gave no row rects') }
+    $x1 = $src.L + 40; $y1 = [int](($src.T + $src.B) / 2); $x2 = $dst.L + 40; $y2 = [int](($dst.T + $dst.B) / 2)
+    [W]::Drag($x1, $y1, $x2, $y2, 8, 400)
+    $ok = Wait-Until { (Test-Path $moved) -and -not (Test-Path $file) } 3000
+    $at = New-Object W+POINT; $null = [W]::GetCursorPos([ref]$at)
+    $d = "SendInput drag of drag-me.txt ($x1,$y1) onto the folder row target ($x2,$y2): moved into it=$ok (cursor ended at $($at.X),$($at.Y), selected rows $([int][W]::SendMessage($list, 0x1032, [IntPtr]::Zero, [IntPtr]::Zero)), foreground ours=$([W]::GetForegroundWindow() -eq $script:main))"
+    if ($ok) { @('PASS', $d) }
+    elseif ([W]::GetForegroundWindow() -ne $script:main) { @('SKIP', "focus lost during the drag; $d") }
+    else { @('FAIL', $d) }
+  } finally {
+    $null = [W]::SetCursorPos($cursor.X, $cursor.Y)
+    Remove-Fresh
+    if (Test-Path $moved) { Move-Item $moved $file -Force -ErrorAction SilentlyContinue }
+    Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+  }
+}
+
 # Window screenshots for the README: dark on C:\Windows (details, a row selected), light on the wallpapers with
 # the preview pane, dark on Home. PrintWindow renders the window itself, so nothing else on screen is captured.
+# Pixelates a rect of `bmp`: down to 1/12 and back up, nearest neighbor.
+function Hide-Rect($bmp, $x, $y, $w, $h) {
+  $x = [Math]::Max(0, $x); $y = [Math]::Max(0, $y); $w = [Math]::Min($w, $bmp.Width - $x); $h = [Math]::Min($h, $bmp.Height - $y)
+  if ($w -le 0 -or $h -le 0) { return }
+  $small = New-Object System.Drawing.Bitmap ([Math]::Max(1, [int]($w / 12))), ([Math]::Max(1, [int]($h / 12)))
+  $g = [System.Drawing.Graphics]::FromImage($small); $g.InterpolationMode = 'NearestNeighbor'
+  $g.DrawImage($bmp, (New-Object System.Drawing.Rectangle 0, 0, $small.Width, $small.Height), (New-Object System.Drawing.Rectangle $x, $y, $w, $h), 'Pixel'); $g.Dispose()
+  $g = [System.Drawing.Graphics]::FromImage($bmp); $g.InterpolationMode = 'NearestNeighbor'; $g.PixelOffsetMode = 'Half'
+  $g.DrawImage($small, (New-Object System.Drawing.Rectangle $x, $y, $w, $h), (New-Object System.Drawing.Rectangle 0, 0, $small.Width, $small.Height), 'Pixel'); $g.Dispose()
+  $small.Dispose()
+}
+# Home's recent rows and the tile subtitles that are paths (not "Stored locally"), pixelated in `bmp`.
+function Hide-HomeText($bmp) {
+  $hp = Get-HomePage
+  if ($hp -eq [IntPtr]::Zero -or -not [W]::IsWindowVisible($hp)) { return 0 }
+  $o = Get-RelativeRect $hp $script:main
+  $n = 0
+  $rects = @(Get-HomeRect $hp 0xFFFF)
+  for ($i = 0; $i -lt 200; $i++) { $r = Get-HomeRect $hp $i; if ($r -is [hashtable]) { $rects += $r } elseif ($r -lt 0) { break } }
+  foreach ($r in $rects) { if ($r -is [hashtable]) { Hide-Rect $bmp ($o.L + $r.L) ($o.T + $r.T) ($r.R - $r.L) ($r.B - $r.T); $n++ } }
+  $n
+}
 function Save-Shot($theme, $folder, $preview, $file, $place) {
   $script:fake = Join-Path $env:TEMP "rexplorer-smoke-appdata-$PID"
   Remove-Item $script:fake -Recurse -Force -ErrorAction SilentlyContinue
@@ -722,21 +992,19 @@ function Save-Shot($theme, $folder, $preview, $file, $place) {
   $list = Get-List $script:main
   foreach ($k in 0x24, 0x28, 0x28) { $null = [W]::PostMessage($list, 0x100, [IntPtr]$k, [IntPtr]::Zero) }
   Start-Sleep -Milliseconds 2000
-  $r = New-Object W+RECT
-  $null = [W]::GetWindowRect($script:main, [ref]$r)
-  $bmp = New-Object System.Drawing.Bitmap ($r.R - $r.L), ($r.B - $r.T)
-  $g = [System.Drawing.Graphics]::FromImage($bmp)
-  $hdc = $g.GetHdc(); $null = [W]::PrintWindow($script:main, $hdc, 2); $g.ReleaseHdc($hdc)  # PW_RENDERFULLCONTENT
+  $bmp = Get-WindowBitmap $script:main
+  $hidden = Hide-HomeText $bmp
   $bmp.Save($file, [System.Drawing.Imaging.ImageFormat]::Png)
-  $g.Dispose(); $bmp.Dispose()
-  @('PASS', "$file ($($r.R - $r.L)x$($r.B - $r.T))")
+  $size = "$($bmp.Width)x$($bmp.Height)"; $bmp.Dispose()
+  @('PASS', "$file ($size; $hidden areas pixelated)")
 }
 if ($Screenshots) {
-  Add-Type -AssemblyName System.Drawing
   $shots = Join-Path (Split-Path $PSScriptRoot -Parent) 'docs\screenshots'
   New-Item -ItemType Directory -Path $shots -Force | Out-Null
   Run-Check 'screenshot-dark' { try { Save-Shot 'dark' 'C:\Windows' 'false' (Join-Path $shots 'dark.png') } finally { Remove-Fresh } }
   Run-Check 'screenshot-light' { try { Save-Shot 'light' 'C:\Windows\Web\Wallpaper\Windows' 'true' (Join-Path $shots 'light.png') } finally { Remove-Fresh } }
   Run-Check 'screenshot-home' { try { Save-Shot 'dark' $null 'false' (Join-Path $shots 'home.png') '1 40 40 1480 1040' } finally { Remove-Fresh } }
 }
+$scratch = $env:APPDATA; $env:APPDATA = $RealAppData
+Remove-Item $scratch -Recurse -Force -ErrorAction SilentlyContinue
 exit 0

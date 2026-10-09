@@ -33,6 +33,8 @@ pub struct Subject {
 
 struct State {
     bg: u32,
+    /// The frame color around the card, for its painted corners.
+    frame: u32,
     text: u32,
     secondary: u32,
     brush: HBRUSH,
@@ -114,6 +116,7 @@ pub fn create(parent: HWND, id: usize) -> Result<HWND> {
         });
         let st = Box::into_raw(Box::new(State {
             bg: 0x00FF_FFFF,
+            frame: 0x00F5_F5F7,
             text: 0,
             secondary: 0x0080_8080,
             brush: CreateSolidBrush(COLORREF(0x00FF_FFFF)),
@@ -284,6 +287,7 @@ unsafe fn paint(hwnd: HWND, s: *mut State) {
             SelectObject(mem, of);
         }
 
+        crate::theme::paint_card_corners(hwnd, hwnd, mem, (*s).frame);
         let _ = BitBlt(hdc, 0, 0, w, h, Some(mem), 0, 0, SRCCOPY);
         SelectObject(mem, old);
         let _ = DeleteObject(bmp.into());
@@ -302,6 +306,7 @@ pub fn set_theme(hwnd: HWND, t: &Theme) {
         // A card: surface colored, like the list.
         (*s).brush = CreateSolidBrush(COLORREF(t.surface));
         (*s).bg = t.surface;
+        (*s).frame = t.background;
         (*s).text = t.text;
         (*s).secondary = t.secondary_text;
         let _ = InvalidateRect(Some(hwnd), None, true);
