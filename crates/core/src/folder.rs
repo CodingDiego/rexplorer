@@ -1,14 +1,21 @@
+use std::collections::HashSet;
 use std::ptr;
 
 use windows::Win32::Foundation::{HWND, LPARAM};
+use windows::Win32::System::Registry::{
+    HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegEnumKeyExW, RegOpenKeyExW,
+};
 use windows::Win32::UI::Shell::Common::{ITEMIDLIST, SHCOLSTATE_ONBYDEFAULT, SHELLDETAILS};
 use windows::Win32::UI::Shell::{
-    BHID_SFObject, IEnumIDList, ILCombine, ILRemoveLastID, IShellFolder, IShellFolder2,
-    IShellItem, SHCONTF_FOLDERS, SHCONTF_INCLUDEHIDDEN, SHCONTF_NONFOLDERS,
+    BHID_SFObject, IEnumIDList, ILClone, ILCombine, ILFindLastID, ILRemoveLastID, IShellFolder,
+    IShellFolder2, IShellItem, SHCONTF_FOLDERS, SHCONTF_INCLUDEHIDDEN, SHCONTF_NONFOLDERS,
     SHCreateItemFromIDList, SHCreateItemFromParsingName, SHGetIDListFromObject,
-    SIGDN_DESKTOPABSOLUTEEDITING, SIGDN_DESKTOPABSOLUTEPARSING, SIGDN_NORMALDISPLAY,
+    SHParseDisplayName, SIGDN_DESKTOPABSOLUTEEDITING, SIGDN_DESKTOPABSOLUTEPARSING,
+    SIGDN_NORMALDISPLAY,
 };
-use windows::core::{HSTRING, Interface, PCWSTR, Result};
+use windows::core::{HSTRING, Interface, PCWSTR, PWSTR, Result, w};
+
+const THIS_PC: &str = "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}";
 
 use crate::com::{Pidl, strret_to_string, take_cotaskmem_string};
 use crate::item::ShellItem;
@@ -102,7 +109,45 @@ impl ShellFolder {
                 out.push(ShellItem { parent: self.folder.clone(), pidl: unsafe { Pidl::from_raw(*p) } });
             }
         }
+        if self.parsing_name == THIS_PC {
+            self.append_known_folders(&mut out);
+        }
         Ok(out)
+    }
+
+    /// shortcut: EnumObjects on This PC returns drives only; Explorer adds the folders registered under
+    /// MyComputer\NameSpace itself. Drop this if a Windows build starts enumerating them.
+    fn append_known_folders(&self, out: &mut Vec<ShellItem>) {
+        let mut key = HKEY::default();
+        let path = w!(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\MyComputer\NameSpace");
+        if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, path, None, KEY_READ, &mut key) }.is_err() {
+            return;
+        }
+        let mut seen: HashSet<String> = out.iter().map(|i| i.parsing_name()).collect();
+        for index in 0.. {
+            let mut name = [0u16; 128];
+            let mut len = name.len() as u32;
+            let hr = unsafe { RegEnumKeyExW(key, index, Some(PWSTR(name.as_mut_ptr())), &mut len, None, None, None, None) };
+            if hr.is_err() {
+                break;
+            }
+            let guid = String::from_utf16_lossy(&name[..len as usize]);
+            if !guid.starts_with('{') {
+                continue;
+            }
+            let full = HSTRING::from(format!("{THIS_PC}\\::{guid}"));
+            let mut abs = ptr::null_mut();
+            if unsafe { SHParseDisplayName(PCWSTR(full.as_ptr()), None, &mut abs, 0, None) }.is_err() {
+                continue;
+            }
+            let abs = unsafe { Pidl::from_raw(abs) };
+            let child = unsafe { Pidl::from_raw(ILClone(ILFindLastID(abs.as_ptr()))) };
+            let item = ShellItem { parent: self.folder.clone(), pidl: child };
+            if !item.display_name().is_empty() && seen.insert(item.parsing_name()) {
+                out.push(item);
+            }
+        }
+        let _ = unsafe { RegCloseKey(key) };
     }
 
     /// The columns this folder shows by default (Name, Date modified, Type, Size for filesystem folders).
@@ -197,6 +242,16 @@ mod tests {
             assert!(!f.columns().is_empty(), "{name} has columns");
             let _ = items.len();
         }
+    }
+
+    #[test]
+    fn this_pc_lists_drives_and_user_folders() {
+        let _c = ComInit::sta();
+        let (_, items) = list("shell:MyComputerFolder").unwrap();
+        let names: Vec<String> = items.iter().map(|i| i.display_name()).collect();
+        assert!(items.iter().any(|i| i.parsing_name() == r"C:\"), "{names:?}");
+        assert!(items.iter().filter(|i| !i.is_hidden()).count() >= 2, "{names:?}");
+        assert!(items.iter().all(|i| i.is_folder()), "{names:?}");
     }
 
     #[test]
