@@ -2,6 +2,18 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 #![allow(unsafe_op_in_unsafe_fn)]
 
+mod archive_view;
+mod breadcrumb;
+mod connect;
+mod instance;
+mod palette;
+mod preview_pane;
+mod session;
+mod statusbar;
+mod tabs;
+mod theme;
+mod thumbs;
+
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::path::PathBuf;
