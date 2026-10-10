@@ -424,9 +424,28 @@ pub(crate) unsafe fn selection_menu(app: *mut App, rows: &[usize]) -> Option<Con
     }
 }
 
+/// False when a selected shell item cannot be deleted, such as Home's OneDrive cloud recent files: the shell's
+/// delete verb fails on them with 0x80004002. Home reports no SFGAO_CANDELETE even for its local files, which do
+/// delete, so a file system item counts as deletable. A file system folder (its parsing name is a path) is not
+/// checked: Ctrl+A in a huge folder would ask every item.
+pub(crate) unsafe fn can_delete(app: *mut App, rows: &[usize]) -> bool {
+    use windows::Win32::System::SystemServices::{SFGAO_CANDELETE, SFGAO_FILESYSTEM};
+    let Some(Source::Shell(l)) = source(app) else { return true };
+    if std::path::Path::new(&l.folder.parsing_name).is_absolute() {
+        return true;
+    }
+    let mask = SFGAO_CANDELETE.0 | SFGAO_FILESYSTEM.0;
+    rows.iter().filter_map(|&i| l.items.get(i)).all(|it| it.attributes(mask) & mask != 0)
+}
+
 pub(crate) unsafe fn verb_on_selection(app: *mut App, verb: &str, shift: bool) {
     let hwnd = (*app).hwnd;
-    if let Some(menu) = selection_menu(app, &selected_indices((*app).list)) {
+    let rows = selected_indices((*app).list);
+    if verb == "delete" && !can_delete(app, &rows) {
+        let _ = MessageBeep(MB_OK);
+        return;
+    }
+    if let Some(menu) = selection_menu(app, &rows) {
         let _ = menu.invoke_verb(hwnd, verb, shift);
     }
 }
@@ -538,6 +557,9 @@ unsafe fn draw_item(app: *mut App, cd: &mut NMLVCUSTOMDRAW) -> u32 {
     }
 }
 
+/// The list's own timer that restores full-row select during a marquee (an id the ListView's own timers do not use).
+const MARQUEE_TIMER: usize = 0x5258;
+
 /// The header is 32 px high (96 DPI) whatever the font asks for.
 pub(crate) unsafe extern "system" fn header_subclass(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM, _id: usize, _data: usize) -> LRESULT {
     let r = DefSubclassProc(hwnd, msg, wparam, lparam);
@@ -573,6 +595,45 @@ pub(crate) unsafe extern "system" fn subclass(hwnd: HWND, msg: u32, wparam: WPAR
         let on_item = focus >= 0 && SendMessageW(hwnd, LVM_GETITEMSTATE, Some(WPARAM(focus as usize)), Some(LPARAM(LVIS_SELECTED.0 as isize))).0 != 0;
         show_menu(app, on_item, Some(menu_point(hwnd, on_item.then_some(focus as usize))));
         return LRESULT(0);
+    }
+    // Explorer box-selects when a drag starts on a row's other columns; a full-row ListView would drag the item. So
+    // such a press reaches the ListView with full-row select off: to it the press is on blank space and a drag draws
+    // a marquee. A timer that fires inside the marquee's loop turns full-row back on, else the marquee would only
+    // take rows whose name it touches. A press released without a drag runs again with full-row on, as a click on
+    // the row. shortcut: a drag from blank space right of a name drags the item, unlike Explorer; measure the name's
+    // text width if that matters.
+    let full = LVS_EX_FULLROWSELECT as usize;
+    if msg == WM_TIMER && wparam.0 == MARQUEE_TIMER {
+        let _ = KillTimer(Some(hwnd), MARQUEE_TIMER);
+        SendMessageW(hwnd, LVM_SETEXTENDEDLISTVIEWSTYLE, Some(WPARAM(full)), Some(LPARAM(full as isize)));
+        return LRESULT(0);
+    }
+    if msg == WM_LBUTTONDOWN && (*app).views.view == views::View::Details {
+        let pt = POINT { x: lparam.0 as i16 as i32, y: (lparam.0 >> 16) as i16 as i32 };
+        let mut ht = LVHITTESTINFO { pt, ..Default::default() };
+        SendMessageW(hwnd, LVM_SUBITEMHITTEST, None, Some(LPARAM(&mut ht as *mut _ as isize)));
+        if ht.iItem >= 0 && ht.iSubItem > 0 {
+            SendMessageW(hwnd, LVM_SETEXTENDEDLISTVIEWSTYLE, Some(WPARAM(full)), Some(LPARAM(0)));
+            SetTimer(Some(hwnd), MARQUEE_TIMER, 1, None);
+            let r = DefSubclassProc(hwnd, msg, wparam, lparam);
+            let _ = KillTimer(Some(hwnd), MARQUEE_TIMER);
+            SendMessageW(hwnd, LVM_SETEXTENDEDLISTVIEWSTYLE, Some(WPARAM(full)), Some(LPARAM(full as isize)));
+            // Where the button came up: the last message the ListView's mouse loop took.
+            let up = GetMessagePos();
+            let mut down = pt;
+            let _ = ClientToScreen(hwnd, &mut down);
+            let dragged = (up as i16 as i32 - down.x).abs() > GetSystemMetrics(SM_CXDRAG)
+                || ((up >> 16) as i16 as i32 - down.y).abs() > GetSystemMetrics(SM_CYDRAG);
+            if dragged {
+                return r;
+            }
+            // The ListView's click handling waits for a button-up; the first pass took the real one.
+            let mut queued = MSG::default();
+            if !PeekMessageW(&mut queued, Some(hwnd), WM_LBUTTONUP, WM_LBUTTONUP, PM_NOREMOVE).as_bool() {
+                let _ = PostMessageW(Some(hwnd), WM_LBUTTONUP, WPARAM(wparam.0 & !(windows::Win32::System::SystemServices::MK_LBUTTON.0 as usize)), lparam);
+            }
+            return DefSubclassProc(hwnd, msg, wparam, lparam);
+        }
     }
     if msg == WM_MOUSEMOVE {
         if !(*app).panes.hover_tracking {

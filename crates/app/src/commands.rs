@@ -67,7 +67,7 @@ pub(crate) unsafe fn update(app: *mut App) {
         (CMD_PASTE, shell && clipboard_has_files()),
         (CMD_RENAME, shell && sel == 1),
         (CMD_SHARE, shell && sel > 0),
-        (CMD_DELETE, (shell || search) && sel > 0),
+        (CMD_DELETE, (shell || search) && sel > 0 && list::can_delete(app, &list::selected_indices(a.list))),
         (CMD_SORT, shell && !home),
     ] {
         toolbar::set_enabled(bar, cmd, on);

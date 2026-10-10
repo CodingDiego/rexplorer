@@ -624,13 +624,9 @@ pub(crate) unsafe fn new_tab(app: *mut App, target: Target, activate: bool, sele
     session_changed(app);
 }
 
-/// A new tab at the active tab's place (Ctrl+T, the strip's + button); a search tab duplicates its folder.
-pub(crate) unsafe fn duplicate_tab(app: *mut App) {
-    let target = match source(app) {
-        Some(s) => s.location(),
-        None => Target::Name((*app).profile.start.clone()),
-    };
-    new_tab(app, target, true, None);
+/// Ctrl+T and the tab strip's +: a tab at the profile's start place, as in Explorer.
+pub(crate) unsafe fn new_start_tab(app: *mut App) {
+    new_tab(app, Target::Name((*app).profile.start.clone()), true, None);
 }
 
 pub(crate) unsafe fn switch_tab(app: *mut App, t: usize) {

@@ -185,7 +185,7 @@ Every change is written to the active profile in settings.ini and applies at onc
 | F2, Delete, Shift+Delete, Ctrl+C/X/V, Ctrl+A, Alt+Enter | Shell verbs on the selection (F2 on shell items only) |
 | Right-click | Full shell context menu (Shift adds the extended verbs); the background adds View, Sort by, Refresh, Paste, Pin on top; archives get the extract menu |
 | Ctrl+Shift+E | Open the current folder in Windows Explorer (an archive: its folder) |
-| Ctrl+T, Ctrl+W | New tab at the same place, close tab (closing the last tab closes the window) |
+| Ctrl+T, Ctrl+W | New tab at the start place, close tab (closing the last tab closes the window) |
 | Ctrl+Tab, Ctrl+Shift+Tab, Ctrl+1..8, Ctrl+9 | Next, previous, nth, last tab |
 | Middle-click a folder | Open it in a background tab (middle-click a tab closes it) |
 | Ctrl+P | Palette: recent places, bookmarks, cloud roots and the current subfolders, fuzzy matched |
@@ -243,8 +243,9 @@ else Explorer-style (`/idlist,...`, an unknown `/` switch, URLs such as `ms-sett
 Paths) and the process exits. A second launch hands its folders (and `--search`) to the running window and
 exits (36-78 ms measured from process creation to the new tab's title); a second launch without folders (Win+E once
 installed) opens a tab at the profile's start place. One instance runs per settings folder, so a launch with
-another `%APPDATA%` (the smoke test) runs on its own. A plain first launch restores the session; a launch with
-folders opens just those. After a crash the process relaunches itself with `--recover`; each `--recover` start
+another `%APPDATA%` (the smoke test) runs on its own. A plain first launch opens a tab at the start place, as
+Explorer does (view and panes still come from the session); a launch with folders opens just those. After a crash
+the process relaunches itself with `--recover`; each `--recover` start
 counts itself in `%APPDATA%\rexplorer\crash-count.txt`, and the second within 60 s opens the folder in Windows
 Explorer instead of running (so a crash loop stops at Explorer). A start without `--recover` resets the count.
 Ctrl+Shift+E and the fallbacks start `%SystemRoot%\explorer.exe` by full path, so they reach Explorer even when
@@ -343,7 +344,7 @@ Home does not exist (older Windows), the default start is This PC. Lines startin
 profile=default                  ; the active profile
 
 [profile default]
-start=shell:::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}   ; where a first run (or a launch without a session) starts: Home
+start=shell:::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}   ; where a launch without folders, and a new tab, start: Home
 theme=dark                       ; a file name in themes\ without .ini
 view=details                     ; details | icons | thumbnails (the view segment writes it back here)
 show_tree=false                  ; the folder tree instead of the sidebar
