@@ -49,6 +49,11 @@ fn binary(key: &str, name: &str) -> Option<Vec<u8>> {
     Some(buf)
 }
 
+/// Whether Windows' "app mode" is dark (Settings > Personalization > Colors), which Explorer's menus follow.
+pub fn apps_use_dark() -> bool {
+    dword(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", "AppsUseLightTheme") == Some(0)
+}
+
 /// Reads Explorer's values from the real HKCU (read only).
 pub fn read() -> Raw {
     Raw {

@@ -8,7 +8,7 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::Controls::*;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{BOOL, HSTRING, PCWSTR, w};
+use windows::core::{BOOL, HSTRING, PCSTR, PCWSTR, w};
 
 pub struct Brushes {
     pub background: HBRUSH,
@@ -38,6 +38,29 @@ impl Drop for Brushes {
             }
         }
     }
+}
+
+static MENUS_DARK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Dark or light popup menus for the whole process, through uxtheme's unnamed SetPreferredAppMode (ordinal 135;
+/// 2 forces dark, 3 forces light) and FlushMenuThemes (ordinal 136), as Explorer and Notepad do. Windows 11 also
+/// rounds their corners. Builds without the ordinals keep the classic menus.
+pub fn set_menu_theme(dark: bool) {
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    MENUS_DARK.store(dark, std::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        let Ok(ux) = LoadLibraryW(w!("uxtheme.dll")) else { return };
+        let (Some(set), Some(flush)) = (GetProcAddress(ux, PCSTR(135 as *const u8)), GetProcAddress(ux, PCSTR(136 as *const u8))) else { return };
+        let set: unsafe extern "system" fn(i32) -> i32 = std::mem::transmute(set);
+        let flush: unsafe extern "system" fn() = std::mem::transmute(flush);
+        set(if dark { 2 } else { 3 });
+        flush();
+    }
+}
+
+/// What `set_menu_theme` last chose: menu glyphs are drawn in the matching text color.
+pub fn menus_dark() -> bool {
+    MENUS_DARK.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn dwm_set<T>(hwnd: HWND, attr: DWMWINDOWATTRIBUTE, v: &T) {

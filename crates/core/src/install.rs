@@ -3,8 +3,9 @@
 //!
 //! `install` copies the running exe to `<dir>\rexplorer.exe`, registers the copy (register.rs: Folder, Directory,
 //! Drive and File Explorer's CLSID verbs), points `App Paths\explorer.exe` at it (ShellExecute callers of
-//! `explorer.exe` by bare name; CreateProcess callers still get Explorer), adds a Start menu shortcut (on the real
-//! base only), and records every key, value and file it created in `<dir>\install.txt`. `uninstall` reverts what
+//! `explorer.exe` by bare name; CreateProcess callers still get Explorer), adds a Start menu shortcut and a Startup
+//! shortcut to `rexplorer --desktop` (the desktop's context menu; both on the real base only), and records every
+//! key, value and file it created in `<dir>\install.txt`. `uninstall` reverts what
 //! install.txt lists and leaves other programs' values alone. Everything lives under HKCU: no elevation.
 //!
 //! `install` journals each change before making it (a value's prior data, the keys and folders it creates, a
@@ -15,7 +16,9 @@ use std::path::{Path, PathBuf};
 use windows::Win32::Foundation::{E_FAIL, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, IPersistFile};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RegDeleteKeyValueW};
-use windows::Win32::UI::Shell::{FOLDERID_Programs, IShellLinkW, KF_FLAG_DEFAULT, SHGetKnownFolderPath, ShellLink};
+use windows::Win32::UI::Shell::{
+    FOLDERID_Programs, FOLDERID_Startup, IShellLinkW, KF_FLAG_DEFAULT, SHGetKnownFolderPath, ShellLink,
+};
 use windows::core::{Error, HSTRING, Interface, PCWSTR, Result, w};
 
 use crate::com::{ComInit, take_cotaskmem_string};
@@ -65,11 +68,12 @@ pub fn plan(dir: &Path, reg_base: &str) -> String {
         app_paths(reg_base)
     );
     if reg_base == REAL_REG_BASE {
-        s.push_str("\nAdd rexplorer to the Start menu.\n");
+        s.push_str("\nAdd rexplorer to the Start menu, and show its context menu on the desktop from now on (a small helper \
+                    that starts at sign-in).\n");
     }
     s.push_str(
-        "\nPer-user only: nothing under HKLM changes and no elevation is needed. The desktop, the taskbar and other \
-         programs' Open / Save dialogs stay Explorer's. Undo with rexplorer --uninstall or More > Uninstall.",
+        "\nPer-user only: nothing under HKLM changes and no elevation is needed. The desktop itself, the taskbar and \
+         other programs' Open / Save dialogs stay Explorer's. Undo with rexplorer --uninstall or More > Uninstall.",
     );
     s
 }
@@ -245,16 +249,17 @@ fn same_file(a: &Path, b: &Path) -> bool {
     matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
 }
 
-fn start_menu_programs() -> Result<PathBuf> {
-    let p = unsafe { SHGetKnownFolderPath(&FOLDERID_Programs, KF_FLAG_DEFAULT, None)? };
+fn known_folder(id: &windows::core::GUID) -> Result<PathBuf> {
+    let p = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None)? };
     Ok(PathBuf::from(unsafe { take_cotaskmem_string(p) }))
 }
 
-fn shortcut(target: &Path, lnk: &Path) -> Result<()> {
+fn shortcut(target: &Path, args: &str, lnk: &Path) -> Result<()> {
     let _com = ComInit::sta();
     unsafe {
         let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
         link.SetPath(&HSTRING::from(target.as_os_str()))?;
+        link.SetArguments(&HSTRING::from(args))?;
         link.SetDescription(w!("rexplorer file manager"))?;
         link.cast::<IPersistFile>()?.Save(&HSTRING::from(lnk.as_os_str()), true)
     }
@@ -321,10 +326,14 @@ fn apply(dir: &Path, reg_base: &str, journal: &mut Rollback) -> Result<String> {
         summary.push("Programs that start explorer.exe by name get rexplorer".to_string());
         // Under a test base the real Start menu is left alone.
         if reg_base == REAL_REG_BASE {
-            let lnk = start_menu_programs()?.join("rexplorer.lnk");
+            let lnk = known_folder(&FOLDERID_Programs)?.join("rexplorer.lnk");
             push(&mut rec, format!("file {}", lnk.display()));
-            journal.file(&lnk, || shortcut(&target, &lnk))?;
+            journal.file(&lnk, || shortcut(&target, "", &lnk))?;
             summary.push("Start menu shortcut added".to_string());
+            let lnk = known_folder(&FOLDERID_Startup)?.join("rexplorer desktop menu.lnk");
+            push(&mut rec, format!("file {}", lnk.display()));
+            journal.file(&lnk, || shortcut(&target, "--desktop", &lnk))?;
+            summary.push("The desktop shows rexplorer's context menu (started now and at every sign-in)".to_string());
         }
         Ok(())
     })();

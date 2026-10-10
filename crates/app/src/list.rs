@@ -262,7 +262,7 @@ pub(crate) unsafe fn show_menu(app: *mut App, on_item: bool, at: Option<POINT>) 
         own.push(Entry::sep());
     }
     let mut bitmaps = Vec::new();
-    let hmenu = ui::build_menu(app, &own, &mut bitmaps);
+    let hmenu = ui::build_menu(hwnd, &own, &mut bitmaps);
     let at = GetMenuItemCount(Some(hmenu)).max(0) as u32;
     let extended = GetKeyState(VK_SHIFT.0 as i32) < 0;
     (*app).active_menu = Some(menu);

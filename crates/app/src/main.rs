@@ -9,6 +9,7 @@ mod archive_view;
 mod breadcrumb;
 mod commands;
 mod connect;
+mod desktop;
 mod edit;
 mod folder_options;
 mod home;
@@ -256,6 +257,9 @@ fn main() -> Result<()> {
     // A folder window never runs elevated unless asked (see core::elevation); the registry flows above are HKCU-only.
     if !args.elevated && rexplorer_core::elevation::is_elevated() && rexplorer_core::elevation::relaunch_unelevated().is_ok() {
         return Ok(());
+    }
+    if args.desktop {
+        return desktop::run();
     }
     if args.recover && !crash::record_recovery(CRASH_GUARD_SECS) {
         // The second crash in a row: show the folder in Windows Explorer rather than crash again.

@@ -229,6 +229,7 @@ rexplorer [options] [folder...]
   --import-explorer   copy Windows Explorer's settings into the active profile (backs up settings.ini)
   --overwrite         with --import-explorer: also replace values you changed in rexplorer
   --recover           restore the previous session after a crash
+  --desktop           run the helper that shows rexplorer's context menu on the desktop (install starts it)
   --elevated          when started elevated, stay so (drive-wide indexed search) instead of restarting unelevated
   -h, --help          show this help
 ```
@@ -267,8 +268,8 @@ with where rexplorer is installed, how to start it and how to uninstall. `-Exe <
 `-Uninstall` reverts.
 
 The import is `rexplorer.exe --import-explorer [--overwrite]`, which you can run any time. It only reads Explorer's
-values and sets these keys of the active profile in `settings.ini` (comments kept; a key it changes moves to the top
-of the profile's section):
+values and sets these keys of the active profile in `settings.ini` (comments, line endings and spacing kept; a key
+already there changes in place, a new one goes to the top of the profile's section):
 
 | Explorer value | rexplorer key |
 |---|---|
@@ -298,8 +299,8 @@ target\release\rexplorer.exe --install
 Uninstall: `powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Uninstall`, or
 `%LOCALAPPDATA%\Programs\rexplorer\rexplorer.exe --uninstall`, or More > **Uninstall...**.
 
-What it changes is listed in the next section. The desktop, the taskbar and the Start menu stay Explorer's (Start
-only gains a rexplorer shortcut). To go back
+What it changes is listed in the next section. The taskbar and the Start menu stay Explorer's (Start only gains a
+rexplorer shortcut), and Explorer keeps drawing the desktop: only the desktop's right-click menu becomes rexplorer's. To go back
 to Explorer, uninstall; if rexplorer will not start, run `C:\Windows\explorer.exe` and use Win+R to run the uninstall
 command above.
 
@@ -307,7 +308,8 @@ command above.
 
 `rexplorer --install` (or More > **Install as default file manager...**) copies the running exe to
 `%LOCALAPPDATA%\Programs\rexplorer\rexplorer.exe` and points Windows' entry points for folder windows at that copy.
-It replaces Explorer's folder windows only: the desktop, the taskbar and the Start menu stay Explorer.
+It replaces Explorer's folder windows and the desktop's right-click menu: the desktop itself, the taskbar and the
+Start menu stay Explorer.
 
 | Entry point | After `--install` | How |
 |---|---|---|
@@ -315,8 +317,9 @@ It replaces Explorer's folder windows only: the desktop, the taskbar and the Sta
 | Win+E, the taskbar's File Explorer icon, Start's "File Explorer" | rexplorer, at the start place (Home) | `HKCU\Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}\shell\{open, opennewwindow}\command` = `"<copy>"` |
 | Programs that run `explorer.exe` by bare name through `ShellExecute` (`explorer.exe /select,<file>`, `explorer.exe <folder>`) | rexplorer, with the arguments above | `HKCU\Software\Microsoft\Windows\CurrentVersion\App Paths\explorer.exe` = the copy, `Path` = its folder |
 | Start menu | a "rexplorer" shortcut | `<Start Menu>\Programs\rexplorer.lnk` |
+| Right-click on the desktop | rexplorer's menu | `<Startup>\rexplorer desktop menu.lnk` runs `rexplorer --desktop` at sign-in; install also starts it |
 | Programs that start `C:\Windows\explorer.exe` with `CreateProcess`, or call `SHOpenFolderAndSelectItems` (Chrome-style "Show in folder") | still Explorer | not reachable per-user |
-| The desktop, the taskbar, Start, other programs' Open / Save dialogs, Explorer windows already open | still Explorer | untouched |
+| The desktop itself (icons, wallpaper, keyboard menus), the taskbar, Start, other programs' Open / Save dialogs, Explorer windows already open | still Explorer | untouched |
 
 Each command key also gets an empty `DelegateExecute` value, which stops Windows from using Explorer's own handler.
 `--install` refuses, changing nothing, when another program already overrides one of these keys. Everything it
@@ -335,6 +338,22 @@ and exit 0, or non-zero on an error. If rexplorer keeps crashing, the crash guar
 Nothing touches HKLM and nothing needs elevation: all of it is per-user under HKCU and `%LOCALAPPDATA%`.
 `--register` / `--unregister` remain the registry-only subset: they point the five command keys at the exe they run
 from, without copying it, without App Paths and without a shortcut.
+
+### The desktop menu
+
+Explorer is the Windows shell (taskbar, Start, desktop) and keeps running: rexplorer never replaces that process.
+`rexplorer --desktop` is a small helper (one per sign-in) with a low-level mouse hook. A right-click that lands on
+the desktop's icon list is taken from Explorer and answered with rexplorer's menu, built like the file list's: on
+an icon, the shell's verbs for the selection (an unselected icon is selected first, a selected one keeps the
+selection, as in Explorer); on the background, View (icon sizes, Auto arrange, Align to grid), Sort by, Refresh and
+Paste, then the shell's background verbs (New, Display settings, Personalize and installed extensions). Shift+right-click
+adds the extended verbs. Everything else, a right-click on any other window included, passes through untouched.
+
+The helper reaches Explorer's desktop view through `IShellWindows` (as Explorer's own tools do) and reads the icon
+under the cursor through the list's accessibility object. Uninstall closes it and removes the Startup shortcut. To
+turn it off without uninstalling, delete `rexplorer desktop menu.lnk` from the Startup folder (`shell:startup`) and
+end `rexplorer.exe --desktop`. Not covered: right-dragging desktop icons (the press goes to the menu), and Shift+F10 /
+the Menu key on the desktop, which still open Explorer's menu.
 
 ### Files under `%APPDATA%\rexplorer`
 

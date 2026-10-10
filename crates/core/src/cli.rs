@@ -26,6 +26,8 @@ pub struct Args {
     pub overwrite: bool,
     /// Keep an elevated token (drive-wide indexed search) instead of restarting under the desktop shell's.
     pub elevated: bool,
+    /// Run the desktop context-menu helper (install starts it at sign-in).
+    pub desktop: bool,
     /// Not ours to handle: pass the whole command line to Windows Explorer and exit.
     pub forward: bool,
 }
@@ -156,6 +158,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> std::result::Result<Arg
             "--import-explorer" => out.import_explorer = true,
             "--overwrite" => out.overwrite = true,
             "--elevated" => out.elevated = true,
+            "--desktop" => out.desktop = true,
             "-h" | "--help" => out.help = true,
             _ if a.starts_with('-') => return Err(format!("unknown option: {a}")),
             _ if a.starts_with('/') && !explorer_switches(&a, &mut it, &mut out) => {
@@ -187,6 +190,7 @@ pub fn usage() -> String {
      \x20 --import-explorer   copy Windows Explorer's settings into the active profile (backs up settings.ini)\n\
      \x20 --overwrite         with --import-explorer: also replace values you changed in rexplorer\n\
      \x20 --recover           restore the previous session after a crash\n\
+     \x20 --desktop           run the helper that shows rexplorer's context menu on the desktop\n\
      \x20 --elevated          when started elevated, stay so (drive-wide indexed search) instead of restarting unelevated\n\
      \x20 -h, --help          show this help\n"
         .to_string()
@@ -337,6 +341,7 @@ mod tests {
         let a = p(&["--import-explorer"]).unwrap();
         assert!(a.import_explorer && !a.overwrite);
         assert!(p(&["--elevated"]).unwrap().elevated && !p(&[]).unwrap().elevated);
+        assert!(p(&["--desktop"]).unwrap().desktop && !p(&[]).unwrap().desktop);
     }
 
     #[test]
@@ -356,7 +361,7 @@ mod tests {
     fn usage_mentions_every_option() {
         let u = usage();
         assert!(u.starts_with("rexplorer [options] [folder...]\n"));
-        for o in ["--select", "/select,", "--profile", "--new-tab", "-t", "--register", "--unregister", "--install", "--uninstall", "--import-explorer", "--overwrite", "--recover", "--elevated", "--search", "-h", "--help"] {
+        for o in ["--select", "/select,", "--profile", "--new-tab", "-t", "--register", "--unregister", "--install", "--uninstall", "--import-explorer", "--overwrite", "--recover", "--elevated", "--desktop", "--search", "-h", "--help"] {
             assert!(u.contains(o), "{o}");
         }
     }
