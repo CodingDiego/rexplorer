@@ -6,8 +6,8 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, DestroyMenu, GMDI_GOINTOPOPUPS, GetMenuDefaultItem, GetMenuItemCount, GetMenuItemID,
-    GetMenuStringW, GetSubMenu, HMENU, InsertMenuW, MF_BYPOSITION, MF_SEPARATOR, MF_STRING, SW_SHOWNORMAL,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WM_INITMENUPOPUP,
+    GetMenuStringW, GetSubMenu, HMENU, MF_BYPOSITION, SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    TrackPopupMenuEx, WM_INITMENUPOPUP,
 };
 use windows::core::{HSTRING, Interface, PCSTR, PCWSTR, PSTR, Result};
 
@@ -16,8 +16,8 @@ use crate::item::ShellItem;
 
 const ID_FIRST: u32 = 1;
 const ID_LAST: u32 = 0x7FFF;
-/// The caller's own entries (`show_with`) take ids from here, above the shell's range.
-const OWN_FIRST: u32 = 0x8000;
+/// The caller's own entries (`show_in`) take ids from here, above the shell's range.
+pub const OWN_FIRST: u32 = 0x8000;
 
 /// What the user picked from a shown menu.
 pub enum Picked {
@@ -26,7 +26,7 @@ pub enum Picked {
     /// Rename is the one verb the view must perform itself.
     Rename,
     Cancelled,
-    /// One of the caller's own entries passed to `show_with`, by its index there.
+    /// One of the caller's own entries of a `show_in` menu: its id minus `OWN_FIRST`.
     Own(usize),
 }
 
@@ -55,29 +55,18 @@ impl ContextMenu {
         Ok(ContextMenu { menu2: menu.cast().ok(), menu3: menu.cast().ok(), menu, hmenu })
     }
 
-    /// Shows the menu at screen point (x, y) and invokes the chosen command.
-    /// The owning window must forward menu messages to `handle_message` while this runs.
-    pub fn show(&self, hwnd: HWND, x: i32, y: i32, extended: bool) -> Result<Picked> {
-        self.show_with(hwnd, x, y, extended, &[])
-    }
-
-    /// Like `show`, with the caller's own entries on top (then a separator); picking one returns `Picked::Own`.
-    pub fn show_with(&self, hwnd: HWND, x: i32, y: i32, extended: bool, own: &[&str]) -> Result<Picked> {
+    /// Shows the caller's `menu` at screen point (x, y) with the shell's entries inserted at position `at`, and
+    /// invokes a chosen shell command. The caller's entries carry ids `OWN_FIRST + n` and come back as
+    /// `Picked::Own(n)`. The owning window must forward menu messages to `handle_message` while this runs.
+    pub fn show_in(&self, hwnd: HWND, menu: HMENU, at: u32, x: i32, y: i32, extended: bool) -> Result<Picked> {
         let mut flags = CMF_EXPLORE | CMF_CANRENAME;
         if extended {
             flags |= CMF_EXTENDEDVERBS;
         }
         unsafe {
-            self.menu.QueryContextMenu(self.hmenu, 0, ID_FIRST, ID_LAST, flags).ok()?;
-            if !own.is_empty() {
-                InsertMenuW(self.hmenu, 0, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null())?;
-                for (i, text) in own.iter().enumerate().rev() {
-                    let t = HSTRING::from(*text);
-                    InsertMenuW(self.hmenu, 0, MF_BYPOSITION | MF_STRING, (OWN_FIRST as usize) + i, PCWSTR(t.as_ptr()))?;
-                }
-            }
-            let picked = TrackPopupMenuEx(self.hmenu, (TPM_RETURNCMD | TPM_RIGHTBUTTON).0, x, y, hwnd, None).0 as u32;
-            if picked >= OWN_FIRST && ((picked - OWN_FIRST) as usize) < own.len() {
+            self.menu.QueryContextMenu(menu, at, ID_FIRST, ID_LAST, flags).ok()?;
+            let picked = TrackPopupMenuEx(menu, (TPM_RETURNCMD | TPM_RIGHTBUTTON).0, x, y, hwnd, None).0 as u32;
+            if picked >= OWN_FIRST {
                 return Ok(Picked::Own((picked - OWN_FIRST) as usize));
             }
             if picked < ID_FIRST {

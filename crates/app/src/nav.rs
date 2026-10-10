@@ -135,6 +135,7 @@ pub(crate) unsafe fn listing<'a>(app: *mut App) -> Option<&'a Listing> {
 /// Loads `target` into tab `t` on a worker thread.
 pub(crate) unsafe fn navigate(app: *mut App, t: usize, target: Target, history: History) {
     (*app).generation += 1;
+    crate::panes::stop_hover(app);
     let generation = (*app).generation;
     let Some(tab) = (&mut (*app).tabs).get_mut(t) else { return };
     tab.pending = generation;
@@ -153,9 +154,10 @@ pub(crate) unsafe fn navigate(app: *mut App, t: usize, target: Target, history: 
         s.stop();
     }
     let hwnd = (*app).hwnd.0 as isize;
+    let show_hidden = (*app).profile.show_hidden;
     std::thread::spawn(move || {
         let _com = ComInit::mta();
-        let done = Box::new(EnumDone { generation, history, result: load(target) });
+        let done = Box::new(EnumDone { generation, history, result: load(target, show_hidden) });
         let _ = PostMessageW(Some(HWND(hwnd as *mut c_void)), WM_ENUM_DONE, WPARAM(0), LPARAM(Box::into_raw(done) as isize));
     });
 }
@@ -165,7 +167,7 @@ pub(crate) unsafe fn go(app: *mut App, target: Target, history: History) {
     navigate(app, (*app).active, target, history);
 }
 
-fn load(target: Target) -> std::result::Result<Loaded, LoadError> {
+fn load(target: Target, show_hidden: bool) -> std::result::Result<Loaded, LoadError> {
     if let Target::Name(n) = &target {
         if let Some((archive, dir)) = archive_view::split_archive_path(n).filter(|(a, _)| a.is_file()) {
             return source::load_archive(&archive, &dir).map_err(|err| LoadError { name: n.clone(), err });
@@ -188,7 +190,9 @@ fn load(target: Target) -> std::result::Result<Loaded, LoadError> {
             None => return Ok(Loaded { source: Source::Browser(source::BrowserPlace::of(&folder)), crumbs, icon }),
         },
     };
-    items.retain(|i| !i.is_hidden());
+    if !show_hidden {
+        items.retain(|i| !i.is_hidden());
+    }
     if items.is_empty() && denied.is_none() {
         denied = why();
     }
@@ -252,7 +256,7 @@ pub(crate) unsafe fn on_enum_done(app: *mut App, done: Box<EnumDone>) {
             } else if let Some(s) = source(app) {
                 set_text((*app).addr, &s.editing_name());
             }
-            message(hwnd, &format!("Cannot open {name}\n\n{err}"));
+            message(hwnd, &format!("Cannot open {}\n\n{err}", crate::connect::redact(&name)));
             return;
         }
         Ok(loaded) => loaded,
@@ -302,9 +306,9 @@ pub(crate) unsafe fn on_enum_done(app: *mut App, done: Box<EnumDone>) {
     tab.name = src.parsing_name();
     tab.crumbs = loaded.crumbs;
     tab.icon = loaded.icon;
-    tabs::set_title((*app).strip, t, &src.title());
+    tabs::set_title((*app).strip, t, &crate::connect::redact(&src.title()));
     if !refresh {
-        (*app).recent.push(&tab.name);
+        (*app).recent.push(&crate::connect::redact(&tab.name)); // recents are saved to disk
         (*app).recent.save();
     }
     tab.source = Some(src);
@@ -343,7 +347,7 @@ unsafe fn show_source(app: *mut App, mode: Show) {
         SendMessageW(list, LVM_SETITEMCOUNT, Some(WPARAM(0)), Some(LPARAM(0)));
         panes::schedule_preview(app);
         set_columns(app, &[]);
-        set_text((*app).addr, &tab.name);
+        set_text((*app).addr, &crate::connect::redact(&tab.name));
         set_text(hwnd, "rexplorer");
         ui::set_crumbs(app);
         sync_home(app);
@@ -368,9 +372,14 @@ unsafe fn show_source(app: *mut App, mode: Show) {
     if !matches!(mode, Show::Restore { columns: false, .. }) {
         set_columns(app, &src.columns());
     }
-    set_text((*app).addr, &src.editing_name());
-    set_text(hwnd, &format!("{} - rexplorer", src.title()));
-    set_text((*app).search, if let Source::Search(s) = src { &s.needle } else { "" });
+    // The shell's FTP folder keeps user:password in its names; nothing on screen shows the password.
+    set_text((*app).addr, &crate::connect::redact(&src.editing_name()));
+    set_text(hwnd, &format!("{} - rexplorer", crate::connect::redact(&src.title())));
+    // Rewriting text the user is typing would move the caret to the start and drop trailing spaces.
+    let needle = if let Source::Search(s) = src { s.needle.as_str() } else { "" };
+    if window_text((*app).search).trim() != needle {
+        set_text((*app).search, needle);
+    }
     ui::set_crumbs(app);
     sidebar::select((*app).sidebar, &tab.name);
     if let Source::Shell(l) = src {
@@ -488,7 +497,7 @@ pub(crate) unsafe fn on_home_notify(app: *mut App, nm: &home::NmHome) {
         home::HN_ACTIVATE => source::activate(app, nm.index),
         home::HN_CONTEXT => list::show_menu(app, nm.index != usize::MAX),
         home::HN_KEYDOWN => list::on_key(app, VIRTUAL_KEY(nm.index as u16)),
-        home::HN_RENAME => list::rename_item(app, nm.index, &home::rename_text((*app).home)),
+        home::HN_RENAME => list::rename_item(app, nm.index, &home::rename_text((*app).home), false),
         home::HN_FILTER => cur(app).home_filter = home::filter((*app).home),
         _ => {}
     }
@@ -671,7 +680,7 @@ fn destination(target: &Target) -> (String, String) {
                     }
                 }
             }
-            (n.clone(), n.clone())
+            (crate::connect::redact(n), n.clone()) // the name is shown, the parsing name keeps the password for the load
         }
     }
 }
@@ -684,7 +693,7 @@ unsafe fn present_loading(app: *mut App) {
     let Some(l) = &tab.loading else { return };
     set_text(hwnd, &format!("{} - rexplorer", l.name));
     if !IsWindowVisible((*app).addr).as_bool() {
-        set_text((*app).addr, &l.parsing);
+        set_text((*app).addr, &crate::connect::redact(&l.parsing));
     }
     sidebar::select((*app).sidebar, &l.parsing);
     let waited = l.since.elapsed();

@@ -4,7 +4,7 @@ use std::path::Path;
 use windows::Win32::Foundation::{E_FAIL, HWND, RECT};
 use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
 use windows::Win32::System::Com::{
-    CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER, CLSIDFromString, CoCreateInstance, STGM_READ,
+    CLSCTX_LOCAL_SERVER, CLSIDFromString, CoCreateInstance, STGM_READ,
     STGM_SHARE_DENY_NONE,
 };
 use windows::Win32::UI::Shell::PropertiesSystem::{IInitializeWithFile, IInitializeWithStream};
@@ -67,6 +67,13 @@ pub fn handler_clsid(ext: &str) -> Option<GUID> {
     }
 }
 
+/// Mark-of-the-Web says the file came from the Internet (3) or Restricted (4) zone. Explorer stopped previewing
+/// those (handlers fetch what the document references); the caller shows the thumbnail and caption instead.
+fn internet_zone(path: &Path) -> bool {
+    std::fs::read_to_string(format!("{}:Zone.Identifier", path.display()))
+        .is_ok_and(|z| z.lines().any(|l| matches!(l.trim(), "ZoneId=3" | "ZoneId=4")))
+}
+
 /// A live preview handler hosted in a parent window; unloaded on drop.
 pub struct Preview {
     handler: IPreviewHandler,
@@ -80,9 +87,12 @@ pub fn open(path: &Path, host: HWND, rect: RECT) -> Result<Preview> {
         .ok_or_else(|| Error::new(E_FAIL, "file has no extension"))?;
     let clsid = handler_clsid(ext)
         .ok_or_else(|| Error::new(E_FAIL, format!("no preview handler for .{ext}")))?;
+    if internet_zone(path) {
+        return Err(Error::new(E_FAIL, "internet zone file: no handler preview"));
+    }
     unsafe {
-        let handler: IPreviewHandler =
-            CoCreateInstance(&clsid, None, CLSCTX_LOCAL_SERVER | CLSCTX_INPROC_SERVER)?;
+        // Out of process only (Explorer isolates handlers in prevhost.exe); never load a third-party DLL here.
+        let handler: IPreviewHandler = CoCreateInstance(&clsid, None, CLSCTX_LOCAL_SERVER)?;
         let wide = HSTRING::from(path.as_os_str());
         let mode = STGM_READ.0;
         if let Ok(init) = handler.cast::<IInitializeWithStream>() {
@@ -147,6 +157,21 @@ mod tests {
     fn txt_has_a_system_preview_handler() {
         let _com = ComInit::sta();
         assert!(handler_clsid("txt").is_some());
+    }
+
+    #[test]
+    fn internet_zone_files_get_no_handler() {
+        let dir = std::env::temp_dir().join(format!("rexplorer-preview-motw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (local, downloaded) = (dir.join("l.txt"), dir.join("d.txt"));
+        std::fs::write(&local, "x").unwrap();
+        std::fs::write(&downloaded, "x").unwrap();
+        std::fs::write(format!("{}:Zone.Identifier", downloaded.display()), "[ZoneTransfer]\r\nZoneId=3\r\n").unwrap();
+        let (l, d) = (internet_zone(&local), internet_zone(&downloaded));
+        let err = open(&downloaded, HWND::default(), RECT::default()).err().map(|e| e.message());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!l && d);
+        assert!(err.as_deref().is_some_and(|m| m.contains("internet zone")), "{err:?}");
     }
 
     #[test]

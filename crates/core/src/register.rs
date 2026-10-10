@@ -8,10 +8,10 @@
 //! still launch rexplorer, and the keys left empty above them up to `<base>`.
 use std::path::Path;
 
-use windows::Win32::Foundation::{E_FAIL, ERROR_FILE_NOT_FOUND};
+use windows::Win32::Foundation::{E_FAIL, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, KEY_READ, REG_SZ, RRF_RT_REG_SZ, RegCloseKey, RegDeleteTreeW, RegGetValueW, RegOpenKeyExW,
-    RegSetKeyValueW,
+    HKEY, HKEY_CURRENT_USER, KEY_READ, REG_SZ, RRF_RT_REG_SZ, RegCloseKey, RegDeleteKeyValueW, RegGetValueW,
+    RegOpenKeyExW, RegQueryInfoKeyW, RegSetKeyValueW,
 };
 use windows::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify, SHDeleteEmptyKeyW};
 use windows::core::{Error, HSTRING, PCWSTR, Result, w};
@@ -55,15 +55,39 @@ pub(crate) fn delete_empty(key: &str) -> bool {
     unsafe { SHDeleteEmptyKeyW(HKEY_CURRENT_USER, &HSTRING::from(key)) }.is_ok()
 }
 
-/// Deletes the tree at `key` unless its default value is another program's. Ok(false) when it was left alone.
+/// True when `key` has any value or subkey.
+fn has_content(key: &HSTRING) -> bool {
+    let mut h = HKEY::default();
+    if unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, key, None, KEY_READ, &mut h) }.is_err() {
+        return false;
+    }
+    let (mut subkeys, mut values) = (0u32, 0u32);
+    let ok = unsafe {
+        RegQueryInfoKeyW(h, None, None, None, Some(&mut subkeys), None, None, Some(&mut values), None, None, None, None)
+    }
+    .is_ok();
+    let _ = unsafe { RegCloseKey(h) };
+    !ok || subkeys + values > 0
+}
+
+/// A key that holds anything but a default value naming rexplorer is another program's.
+pub(crate) fn is_foreign(key: &HSTRING) -> bool {
+    !read_default(key).is_some_and(|v| is_ours(&v)) && has_content(key)
+}
+
+/// Deletes the values rexplorer writes (default, `DelegateExecute`, App Paths' `Path`) and then the key if that
+/// leaves it empty, so values another program added survive. Ok(false) when the key was left alone as foreign.
 pub(crate) fn remove_if_ours(key: &HSTRING) -> Result<bool> {
-    if read_default(key).is_some_and(|v| !is_ours(&v)) {
+    if is_foreign(key) {
         return Ok(false);
     }
-    let err = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, key) };
-    if err != ERROR_FILE_NOT_FOUND {
-        err.ok()?;
+    for name in [PCWSTR::null(), w!("DelegateExecute"), w!("Path")] {
+        let err = unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, key, name) };
+        if err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND {
+            err.ok()?;
+        }
     }
+    delete_empty(&key.to_string());
     Ok(true)
 }
 
@@ -115,7 +139,7 @@ pub(crate) fn notify() {
 
 /// The first command key holding another program's override, if any.
 pub fn foreign_override(base: &str) -> Option<HSTRING> {
-    command_keys(base).into_iter().map(|(k, _)| k).find(|k| read_default(k).is_some_and(|v| !is_ours(&v)))
+    command_keys(base).into_iter().map(|(k, _)| k).find(is_foreign)
 }
 
 /// Point the folder open verbs and File Explorer's verbs at `exe`. Refuses (writing nothing) if another
@@ -160,6 +184,7 @@ pub fn is_registered(base: &str, exe: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::System::Registry::RegDeleteTreeW;
 
     fn test_base(tag: &str) -> (String, HSTRING) {
         let root = format!(r"Software\rexplorer-test-{}-{tag}", std::process::id());
@@ -196,6 +221,32 @@ mod tests {
         set_sz(&command_key(&base, "Folder"), PCWSTR::null(), r"C:\other.exe %1").unwrap();
         assert!(register(&base, Path::new(r"C:\x\rexplorer.exe")).is_err());
         assert!(read_default(&command_key(&base, "Directory")).is_none());
+        cleanup(&root);
+    }
+
+    #[test]
+    fn register_refuses_a_key_with_only_other_values() {
+        let (base, root) = test_base("d");
+        let key = command_key(&base, "Folder");
+        set_sz(&key, w!("DelegateExecute"), "{GUID}").unwrap();
+        assert!(register(&base, Path::new(r"C:\x\rexplorer.exe")).is_err());
+        assert!(read_default(&command_key(&base, "Directory")).is_none());
+        // Unregister must not delete a key that is not ours.
+        unregister(&base).unwrap();
+        assert!(key_exists(&format!(r"{base}\Folder\shell\open\command")));
+        cleanup(&root);
+    }
+
+    #[test]
+    fn unregister_keeps_other_values_in_our_key() {
+        let (base, root) = test_base("e");
+        let exe = Path::new(r"C:\x\rexplorer.exe");
+        register(&base, exe).unwrap();
+        let key = command_key(&base, "Folder");
+        set_sz(&key, w!("Extra"), "keep").unwrap();
+        unregister(&base).unwrap();
+        assert!(read_default(&key).is_none());
+        assert!(key_exists(&format!(r"{base}\Folder\shell\open\command")));
         cleanup(&root);
     }
 

@@ -4,10 +4,12 @@
 use std::ffi::c_void;
 use std::io::Read;
 use std::mem::size_of;
-use std::path::PathBuf;
-use std::sync::Once;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Once};
+use std::time::SystemTime;
 
-use rexplorer_core::com::Pidl;
+use rexplorer_core::com::{ComInit, Pidl};
 use rexplorer_core::preview::{self, Kind, Preview};
 use rexplorer_core::{images, settings::Theme};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -19,8 +21,136 @@ use windows::core::{HSTRING, PCWSTR, Result, w};
 
 /// Reserved for the parent's notifications; the pane currently sends none.
 pub const PVN_FIRST: u32 = 0x9000;
+/// Posted to the pane by a worker that filled the cache for a file; the pane shows the subject again from the cache.
+const PV_READY: u32 = WM_APP + 0x51;
 
 const MAX_TEXT: u64 = 256 * 1024;
+
+/// An owned GDI bitmap, shared between the cache and the pane; the last holder deletes it.
+struct Bmp(HBITMAP);
+unsafe impl Send for Bmp {}
+unsafe impl Sync for Bmp {}
+impl Drop for Bmp {
+    fn drop(&mut self) {
+        let _ = unsafe { DeleteObject(self.0.into()) };
+    }
+}
+
+const CACHE_MAX: usize = 16;
+
+type Stamp = (SystemTime, u64);
+type Thumb = (Arc<Bmp>, i32, i32);
+
+/// What was prepared for one file version; `thumb` remembers the size it was requested at.
+struct Entry {
+    path: PathBuf,
+    stamp: Stamp,
+    text: Option<String>,
+    thumb: Option<(i32, Thumb)>,
+}
+
+/// Oldest first. Written by the UI thread and the hover prefetch thread.
+static CACHE: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
+
+fn stamp(p: &Path) -> Option<Stamp> {
+    let m = std::fs::metadata(p).ok()?;
+    Some((m.modified().ok()?, m.len()))
+}
+
+fn lookup<T>(path: &Path, st: Stamp, pick: impl FnOnce(&Entry) -> Option<T>) -> Option<T> {
+    let c = CACHE.lock().ok()?;
+    c.iter().find(|e| e.path == path && e.stamp == st).and_then(pick)
+}
+
+fn store(path: &Path, st: Stamp, set: impl FnOnce(&mut Entry)) {
+    let Ok(mut c) = CACHE.lock() else { return };
+    c.retain(|e| e.path != path || e.stamp == st);
+    let i = c.iter().position(|e| e.path == path).unwrap_or_else(|| {
+        if c.len() >= CACHE_MAX {
+            c.remove(0);
+        }
+        c.push(Entry { path: path.to_path_buf(), stamp: st, text: None, thumb: None });
+        c.len() - 1
+    });
+    set(&mut c[i]);
+}
+
+/// The file's text (first 256 KB, decoded for the Edit), from the cache when its mtime and size still match.
+fn cached_text(path: &Path) -> Option<String> {
+    let st = stamp(path);
+    if let Some(t) = st.and_then(|st| lookup(path, st, |e| e.text.clone())) {
+        return Some(t);
+    }
+    let mut buf = Vec::new();
+    std::fs::File::open(path).ok()?.take(MAX_TEXT).read_to_end(&mut buf).ok()?;
+    let t = decode_text(&buf);
+    if let Some(st) = st {
+        store(path, st, |e| e.text = Some(t.clone()));
+    }
+    Some(t)
+}
+
+/// The premultiplied shell thumbnail; `key` is the file to cache it under (none for folders and non-filesystem items).
+fn cached_thumb(key: Option<&Path>, abs: &Pidl, size: i32) -> Option<Thumb> {
+    let key = key.and_then(|p| Some((p, stamp(p)?)));
+    if let Some((p, st)) = key {
+        if let Some(t) = lookup(p, st, |e| e.thumb.as_ref().filter(|(sz, _)| *sz == size).map(|(_, t)| t.clone())) {
+            return Some(t);
+        }
+    }
+    let b = images::thumbnail(abs, size).ok()?;
+    // Straight alpha from the shell; AlphaBlend expects premultiplied or the edges halo.
+    images::premultiply(b);
+    let mut bm = BITMAP::default();
+    unsafe { GetObjectW(b.into(), size_of::<BITMAP>() as i32, Some(&mut bm as *mut _ as *mut c_void)) };
+    let t = (Arc::new(Bmp(b)), bm.bmWidth, bm.bmHeight);
+    if let Some((p, st)) = key {
+        store(p, st, |e| e.thumb = Some((size, t.clone())));
+    }
+    Some(t)
+}
+
+/// Whether files with a registered shell preview handler use it; off, they get the thumbnail and caption.
+pub(crate) static HANDLERS: AtomicBool = AtomicBool::new(true);
+
+fn kind_of(path: &Path) -> Kind {
+    match preview::kind(path.extension().and_then(|e| e.to_str()).unwrap_or("")) {
+        Kind::Handler if !HANDLERS.load(Ordering::Relaxed) => Kind::None,
+        k => k,
+    }
+}
+
+/// Fills the cache for a hovered file on a worker thread; shell-handler previews need the UI thread and are skipped.
+pub fn prefetch(path: PathBuf, abs: Pidl, size: i32) {
+    let kind = kind_of(&path);
+    if kind != Kind::Handler {
+        fetch(path, abs, size, kind, 0);
+    }
+}
+
+/// Reads the file (text) or asks the shell (thumbnail) off the UI thread, so a stalled network file never hangs the
+/// window; `notify` is the pane to post PV_READY to, or 0.
+fn fetch(path: PathBuf, abs: Pidl, size: i32, kind: Kind, notify: isize) {
+    std::thread::spawn(move || {
+        let _com = ComInit::mta();
+        if kind == Kind::Text {
+            let _ = cached_text(&path);
+        } else {
+            let _ = cached_thumb(Some(&path), &abs, size);
+        }
+        if notify != 0 {
+            let _ = unsafe { PostMessageW(Some(HWND(notify as *mut c_void)), PV_READY, WPARAM(0), LPARAM(0)) };
+        }
+    });
+}
+
+/// The thumbnail edge `present` asks the shell for at the pane's current size.
+pub fn request_size(hwnd: HWND) -> i32 {
+    unsafe {
+        let rc = content_rect(hwnd);
+        thumb_size(rc.right - rc.left, rc.bottom - rc.top, caption_height(hwnd))
+    }
+}
 
 pub struct Subject {
     pub path: Option<PathBuf>,
@@ -40,10 +170,12 @@ struct State {
     brush: HBRUSH,
     ui_font: HFONT,
     edit: HWND,
-    bitmap: Option<(HBITMAP, i32, i32)>,
+    bitmap: Option<(Arc<Bmp>, i32, i32)>,
     name: String,
     detail: String,
     preview: Option<Preview>,
+    /// What is shown, kept for PV_READY.
+    subject: Option<Subject>,
 }
 
 /// Formats a byte count like "1.5 MB" (binary units, one decimal above 1 KB).
@@ -126,6 +258,7 @@ pub fn create(parent: HWND, id: usize) -> Result<HWND> {
             name: String::new(),
             detail: String::new(),
             preview: None,
+            subject: None,
         }));
         let r = CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -191,8 +324,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             paint(hwnd, s);
             LRESULT(0)
         }
+        PV_READY => {
+            // Cache only: a file that cannot be cached (vanished) would otherwise spawn a worker per PV_READY.
+            // A handler already showing stays (a stale PV_READY must not open a second one).
+            if let Some(sub) = (*s).subject.take().filter(|_| (*s).preview.is_none()) {
+                present(hwnd, s, &sub, false);
+                (*s).subject = Some(sub);
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            LRESULT(0)
+        }
         WM_DESTROY => {
             (*s).preview = None;
+            (*s).subject = None;
             clear_bitmap(s);
             LRESULT(0)
         }
@@ -207,9 +351,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 }
 
 unsafe fn clear_bitmap(s: *mut State) {
-    if let Some((b, _, _)) = (*s).bitmap.take() {
-        let _ = DeleteObject(b.into());
-    }
+    (*s).bitmap = None;
 }
 
 /// The client area inside the card's 12 px padding.
@@ -245,7 +387,7 @@ unsafe fn paint(hwnd: HWND, s: *mut State) {
         let old = SelectObject(mem, bmp.into());
         FillRect(mem, &rc, (*s).brush);
 
-        if let Some((hb, bw, bh)) = (*s).bitmap {
+        if let Some((hb, bw, bh)) = (*s).bitmap.clone() {
             let c = content_rect(hwnd);
             let cap = caption_height(hwnd);
             let area_h = (c.bottom - c.top - cap).max(1);
@@ -255,7 +397,7 @@ unsafe fn paint(hwnd: HWND, s: *mut State) {
             let x = c.left + ((c.right - c.left - dw) / 2).max(0);
             let y = c.top + ((area_h - dh) / 2).max(0);
             let src = CreateCompatibleDC(Some(hdc));
-            let prev = SelectObject(src, hb.into());
+            let prev = SelectObject(src, hb.0.into());
             let bf = BLENDFUNCTION {
                 BlendOp: AC_SRC_OVER as u8,
                 BlendFlags: 0,
@@ -334,32 +476,43 @@ pub fn show(hwnd: HWND, subject: Option<Subject>) {
             return;
         }
         (*s).preview = None;
+        (*s).subject = None;
         clear_bitmap(s);
         (*s).name.clear();
         (*s).detail.clear();
         let _ = ShowWindow((*s).edit, SW_HIDE);
         let _ = SetWindowTextW((*s).edit, w!(""));
         if let Some(sub) = subject {
-            present(hwnd, s, &sub);
+            present(hwnd, s, &sub, true);
+            (*s).subject = Some(sub);
         }
         let _ = InvalidateRect(Some(hwnd), None, false);
     }
 }
 
-unsafe fn present(hwnd: HWND, s: *mut State, sub: &Subject) {
+/// Shows `sub` from the cache; a file not cached yet gets the caption now and, when `spawn`, a worker that posts
+/// PV_READY. Folders and virtual items (no cache key) are asked for synchronously.
+unsafe fn present(hwnd: HWND, s: *mut State, sub: &Subject, spawn: bool) {
     let kind = match (&sub.path, sub.is_folder) {
-        (Some(p), false) => preview::kind(p.extension().and_then(|e| e.to_str()).unwrap_or("")),
+        (Some(p), false) => kind_of(p),
         _ => Kind::None,
     };
-    let path = sub.path.as_deref().unwrap_or(std::path::Path::new(""));
+    let path = sub.path.as_deref().unwrap_or(Path::new(""));
+    let key = sub.path.as_deref().filter(|_| !sub.is_folder);
+    let size = request_size(hwnd);
+    let start = |kind: Kind| {
+        if spawn {
+            fetch(path.to_path_buf(), sub.abs_pidl.clone(), size, kind, hwnd.0 as isize);
+        }
+    };
     if kind == Kind::Text {
-        if let Ok(f) = std::fs::File::open(path) {
-            let mut buf = Vec::new();
-            if f.take(MAX_TEXT).read_to_end(&mut buf).is_ok() {
-                let _ = SetWindowTextW((*s).edit, &HSTRING::from(decode_text(&buf)));
+        match stamp(path).and_then(|st| lookup(path, st, |e| e.text.clone())) {
+            Some(t) => {
+                let _ = SetWindowTextW((*s).edit, &HSTRING::from(t));
                 let _ = ShowWindow((*s).edit, SW_SHOW);
                 return;
             }
+            None => start(Kind::Text),
         }
     } else if kind == Kind::Handler {
         if let Ok(p) = preview::open(path, hwnd, content_rect(hwnd)) {
@@ -368,13 +521,16 @@ unsafe fn present(hwnd: HWND, s: *mut State, sub: &Subject) {
         }
     }
     // Image, None, and every failure above: thumbnail plus caption.
-    let rc = content_rect(hwnd);
-    let size = thumb_size(rc.right - rc.left, rc.bottom - rc.top, caption_height(hwnd));
-    if let Ok(b) = images::thumbnail(&sub.abs_pidl, size) {
-        let mut bm = BITMAP::default();
-        GetObjectW(b.into(), size_of::<BITMAP>() as i32, Some(&mut bm as *mut _ as *mut c_void));
-        (*s).bitmap = Some((b, bm.bmWidth, bm.bmHeight));
-    }
+    (*s).bitmap = match key.and_then(|p| Some((p, stamp(p)?))) {
+        Some((p, st)) => {
+            let hit = lookup(p, st, |e| e.thumb.as_ref().filter(|(sz, _)| *sz == size).map(|(_, t)| t.clone()));
+            if hit.is_none() && kind != Kind::Text {
+                start(Kind::Image);
+            }
+            hit
+        }
+        None => cached_thumb(None, &sub.abs_pidl, size),
+    };
     (*s).name = sub.name.clone();
     (*s).detail = detail_text(sub.size, &sub.type_text);
 }
@@ -455,7 +611,14 @@ mod tests {
                 path: Some(file.clone()), abs_pidl: parse(&file), name: "a.txt".into(),
                 is_folder: false, size: Some(10), type_text: "Text".into(),
             }));
-            pump();
+            // The text arrives from a worker through PV_READY.
+            for _ in 0..200 {
+                pump();
+                if !edit_text(pane).is_empty() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
             assert_eq!(edit_text(pane), "hola\r\nmundo");
 
             show(pane, Some(Subject {

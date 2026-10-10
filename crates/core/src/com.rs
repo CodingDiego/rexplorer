@@ -69,7 +69,7 @@ pub struct Pidl(*mut ITEMIDLIST);
 impl Pidl {
     /// Takes ownership of a PIDL allocated by the shell.
     pub unsafe fn from_raw(p: *mut ITEMIDLIST) -> Self {
-        debug_assert!(!p.is_null());
+        assert!(!p.is_null(), "null PIDL");
         Pidl(p)
     }
 

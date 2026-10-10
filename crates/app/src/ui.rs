@@ -8,6 +8,7 @@
 use super::*;
 use crate::nav::{Target, cur, go, listing, source};
 use windows::Win32::Foundation::COLORREF;
+use windows::Win32::Graphics::Gdi::{COLOR_MENUTEXT, CreateCompatibleDC, DT_NOCLIP, DeleteDC, GdiFlush, GetSysColor, HBITMAP};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DrawTextW, EndPaint, FillRect, PAINTSTRUCT, SelectObject,
     SetBkMode, SetTextColor, TRANSPARENT,
@@ -88,6 +89,8 @@ pub(crate) unsafe fn create_children(app: *mut App) -> Result<()> {
     // wparam 1: the cue stays visible while the box has the focus and is empty.
     SendMessageW((*app).search, EM_SETCUEBANNER, Some(WPARAM(1)), Some(LPARAM(w!("Search").as_ptr() as isize)));
     let _ = SetWindowSubclass((*app).search, Some(source::search_subclass), 2, app as usize);
+    edit::attach((*app).search);
+    edit::attach((*app).addr);
     (*app).tools = toolbar::create(
         hwnd,
         ID_TOOLS,
@@ -114,6 +117,7 @@ pub(crate) unsafe fn create_children(app: *mut App) -> Result<()> {
         Some(hinst),
         None,
     )?;
+    // The profile's styles come from sync_list_style (after apply_theme: WM_THEMECHANGED replaces the state list).
     let ex = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_HEADERDRAGDROP;
     SendMessageW((*app).list, LVM_SETEXTENDEDLISTVIEWSTYLE, Some(WPARAM(0)), Some(LPARAM(ex as isize)));
     let _ = SetWindowSubclass((*app).list, Some(list::subclass), 1, app as usize);
@@ -127,12 +131,81 @@ pub(crate) unsafe fn create_children(app: *mut App) -> Result<()> {
     }
     (*app).status = statusbar::create(hwnd, ID_STATUS)?;
     apply_theme(app);
+    sync_list_style(app);
     apply_font(app);
     views::init(app);
     panes::refresh_sidebar(app);
     Ok(())
 }
 
+
+/// The list's extended styles that follow the profile: single click with its underlining, check boxes.
+pub(crate) const LIST_EX_PROFILE: u32 = LVS_EX_ONECLICKACTIVATE | LVS_EX_UNDERLINEHOT | LVS_EX_UNDERLINECOLD | LVS_EX_CHECKBOXES;
+
+pub(crate) fn list_ex(p: &Profile) -> u32 {
+    let underline = if p.underline_titles == "always" { LVS_EX_UNDERLINEHOT | LVS_EX_UNDERLINECOLD } else { LVS_EX_UNDERLINEHOT };
+    (if p.single_click { LVS_EX_ONECLICKACTIVATE | underline } else { 0 }) | if p.item_checkboxes { LVS_EX_CHECKBOXES } else { 0 }
+}
+
+/// Sets the profile's extended list styles; the check boxes' state images come from our own dispinfo answers.
+pub(crate) unsafe fn sync_list_style(app: *mut App) {
+    let p = &(*app).profile;
+    let list = (*app).list;
+    // The control owns the state image list it holds even with LVS_SHAREIMAGELISTS: it destroys it when the check
+    // box style is cleared or the theme changes. So each list we hand it is a fresh one, never kept on our side.
+    SendMessageW(list, LVM_SETEXTENDEDLISTVIEWSTYLE, Some(WPARAM(LIST_EX_PROFILE as usize)), Some(LPARAM(list_ex(p) as isize)));
+    SendMessageW(list, LVM_SETCALLBACKMASK, Some(WPARAM(if p.item_checkboxes { LVIS_STATEIMAGEMASK.0 as usize } else { 0 })), None);
+    if p.item_checkboxes {
+        let checks = check_images(&(*app).theme, GetDpiForWindow((*app).hwnd) as i32);
+        let auto = HIMAGELIST(SendMessageW(list, LVM_SETIMAGELIST, Some(WPARAM(LVSIL_STATE as usize)), Some(LPARAM(checks.0))).0);
+        if auto.0 != 0 && auto != checks {
+            let _ = ImageList_Destroy(Some(auto));
+        }
+    }
+}
+
+/// The list's check box state images (1 unchecked, 2 checked) in the theme's colors: the system's stay light
+/// on the dark list.
+unsafe fn check_images(t: &Theme, dpi: i32) -> HIMAGELIST {
+    const KEY: u32 = 0x00FF_00FF;
+    let g = 16 * dpi / 96;
+    let il = ImageList_Create(g, g, ILC_COLOR32, 2, 0);
+    let glyphs = theme::icon_font(dpi as u32, 12);
+    let dc = CreateCompatibleDC(None);
+    let radius = 4 * dpi / 96;
+    let r = RECT { left: 0, top: 0, right: g, bottom: g };
+    for on in [false, true] {
+        let Some((bmp, bits)) = views::dib(g, g) else { continue };
+        let old = SelectObject(dc, bmp.into());
+        let key = windows::Win32::Graphics::Gdi::CreateSolidBrush(COLORREF(KEY));
+        FillRect(dc, &r, key);
+        let _ = DeleteObject(key.into());
+        if on {
+            theme::fill_round(dc, &r, t.accent, radius);
+            let old_font = SelectObject(dc, glyphs.into());
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, COLORREF(0x00FF_FFFF));
+            let mut gr = r;
+            DrawTextW(dc, &mut "\u{E73E}".encode_utf16().collect::<Vec<u16>>(), &mut gr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            SelectObject(dc, old_font);
+        } else {
+            theme::fill_round(dc, &r, t.secondary_text, radius);
+            theme::fill_round(dc, &RECT { left: 1, top: 1, right: g - 1, bottom: g - 1 }, KEY, (radius - 1).max(0));
+        }
+        let _ = GdiFlush();
+        // The key color becomes transparent, the rest opaque.
+        let px = std::slice::from_raw_parts_mut(bits as *mut u32, (g * g) as usize);
+        for p in px.iter_mut() {
+            *p = if *p & 0x00FF_FFFF == KEY { 0 } else { *p | 0xFF00_0000 };
+        }
+        SelectObject(dc, old);
+        ImageList_Add(il, bmp, None);
+        let _ = DeleteObject(bmp.into());
+    }
+    let _ = DeleteDC(dc);
+    let _ = DeleteObject(glyphs.into());
+    il
+}
 
 pub(crate) unsafe fn apply_theme(app: *mut App) {
     let t = &(*app).theme;
@@ -208,7 +281,9 @@ pub(crate) unsafe fn layout(app: *mut App) {
     // The command bar: a second 44 px row, its spacer pushing Preview to the right edge.
     let _ = MoveWindow((*app).cmdbar, pad, th + hh + (hh - nh) / 2, (w - 2 * pad).max(0), nh, true);
 
-    let sh = statusbar::height(dpi);
+    let show_status = (*app).profile.show_status;
+    let sh = if show_status { statusbar::height(dpi) } else { 0 };
+    let _ = ShowWindow((*app).status, if show_status { SW_SHOW } else { SW_HIDE });
     let _ = MoveWindow((*app).status, 0, rc.bottom - sh, w, sh, true);
     panes::layout(app, th + 2 * hh, rc.bottom - sh, w);
 }
@@ -249,7 +324,7 @@ pub(crate) unsafe fn set_crumbs(app: *mut App) {
     let tab = cur(app);
     let names: Vec<String> = match &tab.loading {
         Some(l) => vec![l.name.clone()],
-        None => tab.crumbs.iter().map(|c| c.name.clone()).collect(),
+        None => tab.crumbs.iter().map(|c| crate::connect::redact(&c.name)).collect(),
     };
     let editing = IsWindowVisible((*app).addr).as_bool();
     breadcrumb::set_crumbs((*app).crumbs, if editing { &[] } else { &names });
@@ -313,6 +388,121 @@ pub(crate) unsafe fn popup(app: *mut App, entries: &[(usize, String)], checked: 
     picked
 }
 
+/// An entry of a context menu built by `build_menu`: id 0 with no children is a separator; children make a
+/// submenu; `glyph` is a Segoe Fluent Icons code point drawn as the item's icon, 0 for none.
+pub(crate) struct Entry {
+    pub id: usize,
+    pub text: String,
+    pub glyph: u16,
+    pub enabled: bool,
+    pub checked: bool,
+    pub sub: Vec<Entry>,
+}
+
+impl Entry {
+    pub fn new(id: usize, text: &str, glyph: u16) -> Entry {
+        Entry { id, text: text.to_string(), glyph, enabled: true, checked: false, sub: Vec::new() }
+    }
+
+    pub fn sep() -> Entry {
+        Entry::new(0, "", 0)
+    }
+
+    pub fn enabled(mut self, on: bool) -> Entry {
+        self.enabled = on;
+        self
+    }
+
+    /// A submenu from `popup`-style entries (id, text) with the ids in `checked` ticked, each id offset by `base`.
+    pub fn submenu(text: &str, glyph: u16, entries: &[(usize, String)], checked: &[usize], base: usize) -> Entry {
+        let mut e = Entry::new(0, text, glyph);
+        e.sub = entries
+            .iter()
+            .map(|(id, t)| match *id {
+                0 => Entry::sep(),
+                id => Entry { checked: checked.contains(&id), ..Entry::new(base + id, t, 0) },
+            })
+            .collect();
+        e
+    }
+}
+
+/// A popup menu of `entries`, every non-zero id offset by `menu::OWN_FIRST` so the shell's own ids (below it)
+/// can share the menu. Glyph bitmaps are pushed to `bitmaps`: delete them after the menu closes.
+pub(crate) unsafe fn build_menu(app: *mut App, entries: &[Entry], bitmaps: &mut Vec<HBITMAP>) -> HMENU {
+    let Ok(menu) = CreatePopupMenu() else { return HMENU::default() };
+    for (pos, e) in entries.iter().enumerate() {
+        if e.id == 0 && e.sub.is_empty() {
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            continue;
+        }
+        let text = HSTRING::from(e.text.as_str());
+        let mut flags = MF_STRING | if e.enabled { MF_ENABLED } else { MF_GRAYED } | if e.checked { MF_CHECKED } else { MF_UNCHECKED };
+        let id = if e.sub.is_empty() {
+            rexplorer_core::menu::OWN_FIRST as usize + e.id
+        } else {
+            flags |= MF_POPUP;
+            build_menu(app, &e.sub, bitmaps).0 as usize
+        };
+        let _ = AppendMenuW(menu, flags, id, PCWSTR(text.as_ptr()));
+        if e.glyph != 0 {
+            if let Some(b) = glyph_bitmap(app, e.glyph) {
+                bitmaps.push(b);
+                let mii = MENUITEMINFOW { cbSize: size_of::<MENUITEMINFOW>() as u32, fMask: MIIM_BITMAP, hbmpItem: b, ..Default::default() };
+                let _ = SetMenuItemInfoW(menu, pos as u32, true, &mii);
+            }
+        }
+    }
+    menu
+}
+
+/// Shows `entries` as a popup at screen point (x, y) and returns the picked entry's id (None when dismissed).
+/// For pages whose background menu is all our own (Home, the future Desktop).
+pub(crate) unsafe fn pick_entries(app: *mut App, entries: &[Entry], x: i32, y: i32) -> Option<usize> {
+    let mut bitmaps = Vec::new();
+    let menu = build_menu(app, entries, &mut bitmaps);
+    let picked = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, x, y, None, (*app).hwnd, None).0 as usize;
+    let _ = DestroyMenu(menu);
+    for b in bitmaps {
+        let _ = DeleteObject(b.into());
+    }
+    picked.checked_sub(rexplorer_core::menu::OWN_FIRST as usize)
+}
+
+/// A 16 px (at 96 DPI) premultiplied ARGB bitmap of `glyph` in the menu text color, for a menu item. The glyph
+/// is drawn white on black and that gray becomes the alpha, since GDI text leaves a DIB's alpha untouched.
+unsafe fn glyph_bitmap(app: *mut App, glyph: u16) -> Option<HBITMAP> {
+    let dpi = GetDpiForWindow((*app).hwnd);
+    let size = (16 * dpi / 96) as i32;
+    let (bmp, bits) = views::dib(size, size)?;
+    let dc = CreateCompatibleDC(None);
+    let old = SelectObject(dc, bmp.into());
+    let font = theme::icon_font(dpi, 14);
+    let old_font = SelectObject(dc, font.into());
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, COLORREF(0x00FF_FFFF));
+    let mut text = [glyph];
+    let mut r = RECT { left: 0, top: 0, right: size, bottom: size };
+    DrawTextW(dc, &mut text, &mut r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOCLIP);
+    let _ = GdiFlush();
+    SelectObject(dc, old_font);
+    let _ = DeleteObject(font.into());
+    SelectObject(dc, old);
+    let _ = DeleteDC(dc);
+    // Popup menus follow the system colors, not our theme: so does the glyph.
+    let color = GetSysColor(COLOR_MENUTEXT);
+    let (cr, cg, cb) = (color & 0xFF, (color >> 8) & 0xFF, (color >> 16) & 0xFF);
+    let px = std::slice::from_raw_parts_mut(bits, (size * size * 4) as usize);
+    for p in px.chunks_exact_mut(4) {
+        let a = p[0].max(p[1]).max(p[2]) as u32;
+        p[0] = (cb * a / 255) as u8;
+        p[1] = (cg * a / 255) as u8;
+        p[2] = (cr * a / 255) as u8;
+        p[3] = a as u8;
+    }
+    Some(bmp)
+}
+
 /// Breadcrumb chevron: the subfolders of crumb `index`, listed on the UI thread only where that is cheap.
 pub(crate) unsafe fn crumb_dropdown(app: *mut App, index: usize) {
     let Some(c) = cur(app).crumbs.get(index) else { return };
@@ -321,7 +511,8 @@ pub(crate) unsafe fn crumb_dropdown(app: *mut App, index: usize) {
         return;
     }
     let Ok(folder) = ShellFolder::from_pidl(pidl) else { return };
-    let Ok(mut items) = folder.enumerate() else { return };
+    // Bounded: this runs on the UI thread, and the menu shows 500 at most anyway.
+    let Ok(mut items) = folder.subfolders_up_to(2000) else { return };
     items.retain(|i| i.is_folder() && !i.is_hidden());
     items.sort_by(|a, b| folder.compare(0, a, b));
     // shortcut: a menu past a few hundred entries is unusable anyway; a scrolling flyout would replace it
@@ -351,6 +542,7 @@ pub(crate) unsafe fn more_menu(app: *mut App) {
         reg,
         (CMD_INSTALL as usize, "Install as default file manager...".to_string()),
         (CMD_UNINSTALL as usize, "Uninstall...".to_string()),
+        (CMD_FOLDER_OPTIONS as usize, "Folder options...".to_string()),
         (CMD_SETTINGS as usize, "Settings folder".to_string()),
         (0, String::new()),
         (CMD_ABOUT as usize, "About rexplorer".to_string()),
@@ -438,6 +630,42 @@ pub(crate) unsafe fn install_flow(owner: Option<HWND>, uninstall: bool, confirm:
     };
     let t = HSTRING::from(text);
     MessageBoxW(owner, PCWSTR(t.as_ptr()), w!("rexplorer"), MB_OK | icon);
+    ok
+}
+
+/// --import-explorer: copies Windows Explorer's settings (read only) into the profile's keys in settings.ini,
+/// after a dated backup, and reports what was imported and skipped. True unless writing failed.
+pub(crate) unsafe fn import_explorer_flow(profile: Option<&str>, overwrite: bool) -> bool {
+    use rexplorer_core::import_explorer as ie;
+    let dir = settings::dir();
+    Settings::ensure_files(&dir);
+    let s = Settings::load_from(&dir);
+    let p = profile.and_then(|n| s.profiles.iter().find(|p| p.name == n)).unwrap_or_else(|| s.active_profile());
+    let mapped = ie::map(&ie::read());
+    let found = mapped.len();
+    let (write, skip) = ie::decide(p, mapped, overwrite);
+    let ini = dir.join("settings.ini");
+    let t = windows::Win32::System::SystemInformation::GetLocalTime();
+    let day = format!("settings.ini.bak-{:04}-{:02}-{:02}", t.wYear, t.wMonth, t.wDay);
+    // Never reuse an existing backup: it may predate values set by hand since.
+    let bak = (1..).map(|n| dir.join(if n == 1 { day.clone() } else { format!("{day}-{n}") })).find(|b| !b.exists()).unwrap();
+    let ok = write.is_empty() || (std::fs::copy(&ini, &bak).is_ok() && views::try_save_profile_keys(&p.name, &write).is_ok());
+    let list = |v: Vec<String>| if v.is_empty() { "  (none)".to_string() } else { v.join("\n") };
+    let text = if !ok {
+        format!("Import failed: could not back up or write {}. Nothing was changed.", ini.display())
+    } else {
+        format!(
+            "Imported from Windows Explorer into profile \"{}\" ({} of {} Explorer values were set):\n\n{}\n\nSkipped:\n{}\n\nBackup: {}\nExplorer's settings were only read.",
+            p.name,
+            write.len(),
+            found,
+            list(write.iter().map(|(k, v)| format!("  {k} = {v}")).collect()),
+            list(skip.iter().map(|(k, why)| format!("  {k}: {why}")).collect()),
+            if write.is_empty() { "(not needed, nothing changed)".to_string() } else { bak.display().to_string() },
+        )
+    };
+    let h = HSTRING::from(text);
+    MessageBoxW(None, PCWSTR(h.as_ptr()), w!("rexplorer"), MB_OK | if ok { MB_ICONINFORMATION } else { MB_ICONERROR });
     ok
 }
 

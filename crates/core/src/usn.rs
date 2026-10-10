@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use std::ptr;
 
 use windows::Win32::Foundation::{CloseHandle, ERROR_HANDLE_EOF, HANDLE};
-use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE,
     OPEN_EXISTING,
@@ -15,7 +14,6 @@ use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::{
     FSCTL_ENUM_USN_DATA, FSCTL_QUERY_USN_JOURNAL, MFT_ENUM_DATA_V0, USN_JOURNAL_DATA_V0,
 };
-use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::core::{HSTRING, Result};
 
 const FRN_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
@@ -32,27 +30,8 @@ pub struct VolumeIndex {
     entries: HashMap<u64, Entry>,
 }
 
-/// True when the current process token is elevated (required by `build`).
-pub fn is_elevated() -> bool {
-    unsafe {
-        let mut token = HANDLE::default();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
-            return false;
-        }
-        let mut elev = TOKEN_ELEVATION::default();
-        let mut ret = 0u32;
-        let ok = GetTokenInformation(
-            token,
-            TokenElevation,
-            Some(&mut elev as *mut _ as *mut c_void),
-            size_of::<TOKEN_ELEVATION>() as u32,
-            &mut ret,
-        )
-        .is_ok();
-        let _ = CloseHandle(token);
-        ok && elev.TokenIsElevated != 0
-    }
-}
+/// `build` needs an elevated token.
+pub use crate::elevation::is_elevated;
 
 /// Enumerates the MFT of `drive:`. Fails with the Win32 error (access denied when not elevated).
 pub fn build(drive: char) -> Result<VolumeIndex> {

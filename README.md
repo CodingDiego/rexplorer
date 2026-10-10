@@ -78,6 +78,10 @@ shell's `System.Home.IsPinned` property. The rows are built on a worker thread, 
 a pin or unpin from rexplorer, so the sidebar fills in after the first listing. More > **Folder tree** shows the
 shell's folder tree in the sidebar's place (choose it again for the sidebar).
 
+The folder background's right-click menu opens as Explorer's does: **View** and **Sort by** submenus, **Refresh**,
+**Paste** (enabled with files on the clipboard) and **Pin to Home**, each with its command-bar glyph, then the
+shell's own entries (Open in Terminal, the editors' "Open with", Give access to, New, Properties).
+
 Pins: **Ctrl+D**, **Pin to Home** at the top of the list's context menu, or More > **Pin to Home** run the shell's
 own "pin to Home" verb on the selected folders, or on the current folder when nothing is selected. The pin lands
 in Explorer's Quick Access too, and unpinning from either side shows in both.
@@ -106,7 +110,7 @@ Delete with Shift deletes permanently, as in the list. Cut, Copy, Paste, Rename 
 verbs. The old list / grid view segment is gone: the views are in View v and on Ctrl+Shift+1/2/3.
 
 Home page: Home and Quick Access open a page of their own in the list's place, drawn like Explorer's: a "Quick
-access" title, a responsive grid of 300x72 folder tiles (40 px icon, name, the parent folder relative to the
+access" title, a responsive grid of 280x72 folder tiles (as many columns as fit, re-flowed on resize and DPI change) (40 px icon, name, the parent folder relative to the
 profile, a pin glyph on pinned folders only), three pills and a table of files (icon, name with its folder
 below, Date modified, Type, Size, and Activity when the shell has any, e.g. "X edited this" on cloud files; column
 titles from the shell, so localized), newest access first. The pills filter the table: **Recent** (the recent
@@ -115,7 +119,10 @@ group); each tab keeps its own pill (not saved). Empty tables read "No recent fi
 "Nothing shared with you". A file the shell lists in two groups (recent and a favorite) is one row with both. It scrolls (wheel and
 scroll bar) and follows the theme and the DPI. Hover, click (Ctrl+click toggles), double-click or Enter opens;
 right-click shows the shell's context menu, with **Unpin from Home** on pinned tiles and **Pin to Home** on
-frequent ones (the shell's own entries, such as add to or remove from Favorites, refresh the page); Up / Down / Home / End move,
+frequent ones (the shell's own entries, such as add to or remove from Favorites, refresh the page); right-click on empty
+space (or Shift+F10 / the Menu key with nothing selected) shows Home's own menu: Refresh, **Show recently used files** and
+**Show frequently used folders** (ticked toggles; they flip the Folder options keys live and in settings.ini) and
+**Folder options...**; Left / Right step one entry, Up / Down move a whole row of tiles, PageUp / PageDown a page, Home / End,
 Ctrl+A selects the rows, Delete deletes, F5 refreshes, F2 renames in place. The status bar, the preview pane and
 the command bar follow its selection. While Home loads,
 the list's placeholder rows show as for any folder.
@@ -123,6 +130,16 @@ the list's placeholder rows show as for any folder.
 More menu: Folder tree, Pin to Home, Open in Explorer, register / unregister as the folder handler, **Install as
 default file manager...** and **Uninstall...** (each asks first, listing what changes; see below), the settings
 folder, About, and **Quick access**: the profile's bookmarks and the cloud-sync roots.
+
+**Folder options...** (More menu) is a themed tabbed dialog with OK, Cancel and Apply. General: the start folder (Home,
+This PC or the profile's own), single or double click to open with the underline choice (`underline_titles`), Home's
+Privacy switches (`show_recent`, `show_frequent`) and a Clear button for the Ctrl+P recent folders list (rexplorer's own
+`recent.txt`; Windows' Recent folder is never touched). View: hidden files, hide extensions (folder lists and search results alike; ZIP and CAB files count as files, and a
+rename keeps the hidden extension), status bar
+(`show_status`), shell preview handlers in the preview pane (`preview_handlers`), check boxes to select items
+(`item_checkboxes`), and the search and hover-preview delays (clamped to 50..5000 and 200..10000 ms). Search: whether a
+walk of a non-indexed place enters system folders (`search_system`) and archives such as ZIP and CAB (`search_archives`).
+Every change is written to the active profile in settings.ini and applies at once; Restore defaults resets one tab.
 
 ### What a tab can show
 
@@ -143,8 +160,10 @@ folder, About, and **Quick access**: the profile's bookmarks and the cloud-sync 
   folder and every subfolder on a worker thread (archives, links and hidden `C:\$...` folders are skipped);
   results stream into the list as each folder finishes, with columns Name, Folder, Type, Size. The tab and
   window title read `Search: <text>`. Escape stops the search and keeps what it found; F5 runs it again;
-  navigating anywhere stops it. When rexplorer runs elevated and the folder is a drive root, the drive's NTFS
-  index (read once per drive from the MFT, then kept for the session) answers instead, up to 5000 results.
+  navigating anywhere stops it. When rexplorer runs elevated (`rexplorer --elevated` from an admin console; an
+  elevated start without the flag restarts itself unelevated, as Explorer never shows an elevated folder window)
+  and the folder is a drive root, the drive's NTFS index (read once per drive from the MFT, then kept for the
+  session) answers instead, up to 5000 results.
   Enter on a result opens it (folders and .rar files in place); the context menu, Delete and Ctrl+C / Ctrl+X
   work on results that share one folder.
 - **The embedded Explorer view**: a folder that exists but cannot be listed (a phone, an odd namespace
@@ -164,7 +183,7 @@ folder, About, and **Quick access**: the profile's bookmarks and the cloud-sync 
 | Ctrl+F | Search box (Enter searches, Escape stops and returns to the list) |
 | Escape (list) | Stop a running search |
 | F2, Delete, Shift+Delete, Ctrl+C/X/V, Ctrl+A, Alt+Enter | Shell verbs on the selection (F2 on shell items only) |
-| Right-click | Full shell context menu (Shift adds the extended verbs); archives get the extract menu |
+| Right-click | Full shell context menu (Shift adds the extended verbs); the background adds View, Sort by, Refresh, Paste, Pin on top; archives get the extract menu |
 | Ctrl+Shift+E | Open the current folder in Windows Explorer (an archive: its folder) |
 | Ctrl+T, Ctrl+W | New tab at the same place, close tab (closing the last tab closes the window) |
 | Ctrl+Tab, Ctrl+Shift+Tab, Ctrl+1..8, Ctrl+9 | Next, previous, nth, last tab |
@@ -181,7 +200,18 @@ folder, About, and **Quick access**: the profile's bookmarks and the cloud-sync 
 Shortcuts work while the tree, the search box or the embedded Explorer view has the focus, except Enter and
 Escape, which those keep.
 
-Icon and thumbnail images render on a worker thread and land as they finish; the last 512 are cached. Drag items
+They can be rebound in a `[keys]` section of `settings.ini`: one line per command, `cmd.new_tab=Ctrl+Y` or
+several chords `cmd.back=Alt+Left, Backspace`. Commands: `cmd.back`, `cmd.forward`, `cmd.up`, `cmd.refresh`,
+`cmd.address`, `cmd.explorer`, `cmd.enter`, `cmd.escape`, `cmd.properties`, `cmd.new_tab`, `cmd.close_tab`,
+`cmd.next_tab`, `cmd.prev_tab`, `cmd.palette`, `cmd.terminal`, `cmd.toggle_sidebar`, `cmd.toggle_preview`,
+`cmd.search`, `cmd.pin`, `cmd.view_details`, `cmd.view_icons`, `cmd.view_thumbnails`. A chord is `Ctrl`, `Alt`,
+`Shift` in any combination plus a key: a letter, digit or backquote (these need Ctrl or Alt, so typing keeps
+working), `F1`..`F24`, `Left`, `Right`, `Up`, `Down`, `Enter`, `Esc`, `Tab`, `Space`, `Backspace`, `Delete`,
+`Insert`, `Home`, `End`, `PageUp`, `PageDown`. A command whose line has no valid chord keeps its defaults.
+
+Icon and thumbnail images render on a worker thread and land as they finish; the last 512 are cached. In both
+icon views and in the preview pane a folder shows the shell's composed thumbnail, as Explorer's: the folder with a
+peek at a file inside (a picture strip, a document sheet; the shell picks the file). Drag items
 out of the list to anywhere that accepts files, or drop files onto a folder item or the list background.
 
 ### Command line
@@ -196,7 +226,10 @@ rexplorer [options] [folder...]
   --unregister        undo --register
   --install           copy rexplorer to %LOCALAPPDATA%\Programs and make it the default file manager
   --uninstall         undo --install
+  --import-explorer   copy Windows Explorer's settings into the active profile (backs up settings.ini)
+  --overwrite         with --import-explorer: also replace values you changed in rexplorer
   --recover           restore the previous session after a crash
+  --elevated          when started elevated, stay so (drive-wide indexed search) instead of restarting unelevated
   -h, --help          show this help
 ```
 
@@ -216,6 +249,57 @@ counts itself in `%APPDATA%\rexplorer\crash-count.txt`, and the second within 60
 Explorer instead of running (so a crash loop stops at Explorer). A start without `--recover` resets the count.
 Ctrl+Shift+E and the fallbacks start `%SystemRoot%\explorer.exe` by full path, so they reach Explorer even when
 rexplorer answers for `explorer.exe`.
+
+### Install
+
+Option A, the script (no administrator prompt: rexplorer installs per user, under `HKCU` and `%LOCALAPPDATA%`, and
+running it elevated would only hand user-writable files rights they should not have):
+
+```
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1
+```
+
+It builds `target\release\rexplorer.exe` if missing, runs `rexplorer.exe --install`, then asks whether to import your
+Windows Explorer settings (Y/n, default Y; `-ImportExplorer` answers yes and `-NoImport` no, without asking) and ends
+with where rexplorer is installed, how to start it and how to uninstall. `-Exe <path>` installs another build;
+`-Uninstall` reverts.
+
+The import is `rexplorer.exe --import-explorer [--overwrite]`, which you can run any time. It only reads Explorer's
+values and sets these keys of the active profile in `settings.ini` (comments kept; a key it changes moves to the top
+of the profile's section):
+
+| Explorer value | rexplorer key |
+|---|---|
+| `Advanced\Hidden` (1 show, 2 do not) | `show_hidden` |
+| `Advanced\HideFileExt` | `show_extensions` (inverted) |
+| `Advanced\ShowStatusBar` | `show_status` |
+| `Advanced\ShowPreviewHandlers` | `preview_handlers` |
+| `Advanced\AutoCheckSelect` | `item_checkboxes` |
+| `Advanced\LaunchTo` (1 This PC, 2 Home, 3 Downloads) | `start` |
+| `ShowRecent`, `ShowFrequent` | `show_recent`, `show_frequent` |
+| `ShellState` flag "double-click to open" | `single_click` (when it is off) |
+
+A value Windows has not written (common: LaunchTo, ShowPreviewHandlers, ShowRecent) imports nothing. A key is only
+set while the profile still has rexplorer's default for it; `--overwrite` replaces the others too. Before the first
+change it copies `settings.ini` to `settings.ini.bak-<yyyy-mm-dd>` (`-2`, `-3`... when that
+name exists, so an earlier backup is never overwritten or reused), and a message box lists what was imported, what
+was skipped and why, and the backup file it wrote. If the backup or the write fails, it says so and exits with code 1. Uninstalling does not undo an import: your
+settings stay.
+
+Option B, a terminal, no elevation:
+
+```
+cargo build --release
+target\release\rexplorer.exe --install
+```
+
+Uninstall: `powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Uninstall`, or
+`%LOCALAPPDATA%\Programs\rexplorer\rexplorer.exe --uninstall`, or More > **Uninstall...**.
+
+What it changes is listed in the next section. The desktop, the taskbar and the Start menu stay Explorer's (Start
+only gains a rexplorer shortcut). To go back
+to Explorer, uninstall; if rexplorer will not start, run `C:\Windows\explorer.exe` and use Win+R to run the uninstall
+command above.
 
 ### Make it the default file manager
 
@@ -295,8 +379,19 @@ rewritten with the current ones at startup; edited files are left alone.
 
 Icon themes: `icons\<name>\` holds PNGs named by extension (`rs.png`, `pdf.png`...) plus `folder.png` and
 `file.png` (the fallback for unknown extensions); the details view draws them, at the small-icon size, instead of
-the system icons, for folders, archive members and search results alike. A starter set is written to
-`icons\default` on first run.
+the system icons, for folders, archive members and search results alike. A folder whose name ends in a themed
+extension (a zip, a folder to the shell) gets that extension's PNG. PNGs are decoded on first use, so a theme of
+hundreds costs nothing at startup. `icons\default` is written on first run: `folder.png` and `file.png` in the
+theme's accent, then, in the background (about ten seconds), Windows' own 48 px icon for every extension registered
+on the machine that has an icon of its own (about 560 here; `system-icons.txt` lists them and marks the export
+done; delete it to pick up extensions registered since). The export never overwrites a PNG, so edit or replace any.
+
+Opening-app icons: a file type Windows registers without an icon of its own shows Explorer's blank page (`.ps1` on
+a machine whose PowerShell file type was never registered, `.py` or `.md` opened with an editor that registers no
+icon). rexplorer shows the icon of the app that opens it instead, as Finder and Nautilus do, in every view, in search
+and archive rows and in the exported theme. The app comes from the shell's "open" association; a registered path
+that no longer exists (a WinSxS copy removed by a Windows update) is searched by name on PATH. A type with neither
+an icon nor an opener keeps the blank page.
 
 Written by the app: `session.txt` (`tab=` lines, `active=`, `view=`, `tree=` / `sidebar=` / `preview=` as 0 or 1,
 the pane widths; saved within 2 s of each change and on exit; a search tab is saved as its folder), `recent.txt`
@@ -368,3 +463,91 @@ through WM_APP+0x54.
 - `ftp://` browsing goes through the shell's FTP folder (present on Windows 11 25H2, untested against a live
   server); where it is missing the URL shows the not-found error.
 - No keyboard context menu; small icons of shell folders resolve on the UI thread.
+
+## Benchmark
+
+`scripts\bench-vs-explorer.ps1 [-Runs 7] [-ShotDir <dir>]` opens the same folders in rexplorer and in Windows Explorer's
+folder windows, one program after the other, and writes the table to `scripts\bench-results.md`. Last run, 2026-10-10:
+12th Gen Intel Core i5-12450H (12 logical cores), 32 GB RAM, Windows 11 10.0.26200, Explorer 10.0.26100.8875,
+`target\release\rexplorer.exe` (1636 KB). 7 runs per cell after 1 warm-up (the cell is median, then min-max), generated
+folders of tiny `.txt` files under `%TEMP%` (removed afterwards), rexplorer on a scratch `%APPDATA%`.
+
+| Metric | rexplorer | Windows Explorer | rexplorer / Explorer |
+|---|---|---|---|
+| First window visible, 200-file folder (ms) | 153 (141-168) | 337 (316-782) | 0.45x |
+| Open a 200-file folder (ms) | 226 (214-240) | 899 (866-954) | 0.25x |
+| Open a 1,000-file folder (ms) | 243 (214-266) | 873 (858-927) | 0.28x |
+| Open a 20,000-file folder (ms) | 421 (419-452) | 925 (783-947) | 0.45x |
+| Navigate 200 -> 5000 files in the open window (ms) | 65 (64-70) | 166 (160-179) | 0.39x |
+| Private working set after opening 200 files (MB) | 5.3 (5.1-5.3) | 100.8 (100.3-101.4) | 0.05x |
+| Private working set after opening 1,000 files (MB) | 5.4 (5.4-5.5) | 100.8 (100.4-101.1) | 0.05x |
+| Private working set after opening 20,000 files (MB) | 8.3 (7.9-8.6) | 105.9 (105.4-106.5) | 0.08x |
+
+Explorer windows hosted by a new explorer.exe process: 21 of 21 measured opens.
+
+rexplorer won every row here, by about 2x to 4x in time and about 12x to 20x in memory. The rows are not equally
+solid: see the caveats.
+
+Method, the same for both programs (black box, wall clock from a `Stopwatch`):
+
+- **Open**: from starting the program on the folder to the folder's rows being on screen. rexplorer is
+  `rexplorer.exe "<folder>"`, started by the script; the clock stops when its list control (`LVM_GETITEMCOUNT`) holds
+  the folder's count, which is set in the same frame as its rows (its list is owner-data, filled once the enumeration
+  is done; checked with frame captures: "Loading..." in one frame, count and rows in the next). Explorer is
+  `explorer.exe "<folder>"`; the clock stops at the first `PrintWindow` frame of the new `CabinetWClass` window with
+  ink (pixels unlike the dominant colour) in the row slots of its folder view (`SHELLDLL_DefView`: 110 px below its
+  top, 110 px tall, left 40 %, starting 50 px in, scaled by DPI; rows 4 to 6 at 125 %). Frames taken while the view's
+  rect still sits at the client area's top are skipped: Explorer reports that during layout while the pixels are
+  drawn lower, and the band would read the column header. Explorer's status bar count (`System.StatusBarViewItemCount`
+  through UI Automation) is not used for the time: it usually lands one frame (230-280 ms) after the rows, sometimes
+  with them, and the first UI Automation lookup on a fresh window costs 200-250 ms by itself. It is awaited
+  afterwards, untimed, so a run only counts when the window reached the whole folder. "First window visible" stops at
+  the first visible top-level window, before any list.
+- **Navigate**: one window per program on the 200-file folder, then sent to the 5,000-file folder. rexplorer: the
+  address Edit's text (control id 100, not the search box) is set and its Enter command posted, the clock starts there
+  and stops on the list count as above. Explorer: `Shell.Application` `Navigate2` on the window with that handle;
+  Explorer creates a new view window per folder, so the clock stops on the first frame with row ink in the new
+  view (the old one is skipped), then the count is awaited untimed. Both then go back.
+- **Memory**: private working set (performance counter `WorkingSetPrivate`) 1.5 s after the list showed the folder.
+  rexplorer is its own process. For Explorer it is the process that owns the new window. On this machine every
+  `explorer.exe "<folder>"` window opened in a new process (`explorer.exe /factory,{75dff2b7-...} -Embedding`, even with
+  `SeparateProcess` = 0), not in the desktop's, so the figure is that whole process, like rexplorer's. Were the window
+  hosted by a process that already existed, the script would report its growth over the open instead; the line under
+  the table counts which case each open was.
+- `-ShotDir` saves one `PrintWindow` capture per program and case, taken after the count check, so it shows that the
+  window reached the right folder, not the moment the clock stopped. The row-ink detector itself was checked with
+  per-frame captures (two sampler runs, 16 opens and 6 navigations in the last pass): it fires on the first frame
+  with rows that passes the layout guard, never on the navigation pane or the column header (which, drawn before the
+  rows together with a centred "Working on it..." text, fired it in 3 of 23 sampled opens before the guard existed).
+  The guard can skip a frame that already had rows, which made it one frame late in 1 of 16 opens.
+
+Caveats:
+
+- Explorer is partly warm: each measured open starts a new host process, as rexplorer's does, but its DLLs are
+  already in the file cache and the shell's broker services are running for the desktop, which helps its open time.
+  Its ~101 MB is the cost of a window in its own process; what one more window costs inside an Explorer process that
+  already has one was not measured.
+- "Rows on screen" is the first usable state, not a finished window. Explorer's rows are painted while its tab strip,
+  address bar and command bar are not drawn yet and its status bar mostly still reads 0 items; rexplorer's sidebar is
+  still empty when its count lands. On the 20,000-file folder Explorer shows its first rows while still counting
+  (its status bar reaches 20,000 about 250 ms later); rexplorer shows no rows until its enumeration is done and then
+  all of them at once, so its 421 ms is the whole folder. This favours neither program exactly, but it is not a "last
+  pixel" measurement.
+- rexplorer renders icons and thumbnails lazily and the shell's per-item data (Date modified, Type, Size) only for
+  visible rows; Explorer fills its columns lazily too. Neither clock waits for every cell.
+- Explorer's window appears at about 320 ms in some runs and about 750-800 ms in others (the mix varies from run to
+  run, which is why "First window visible" swings between 0.2x and 0.45x), but its rows land at about 750-950 ms
+  either way, occasionally earlier; in the late case the first frame already has them.
+- A `PrintWindow` frame costs about 30 ms, and the first frames of a fresh window up to about 190 ms, so Explorer's open
+  times are late by one frame, up to about 220 ms (the frame that first shows the rows is stamped when it
+  finishes), and by one more frame when the layout guard skipped a frame that already had rows.
+  rexplorer's count is read with one `SendMessage`, but on 5,000 rows it can be read up to about 40 ms before the
+  paint. The `Navigate2` COM calls and the `PrintWindow` renders compete with the shell for the CPU.
+- The windows differ: Explorer opens at its saved size (large here), rexplorer at its default; Explorer also loads a
+  navigation pane and a tab strip.
+- Noise: earlier runs the same day, which stopped Explorer's clock on its status bar count instead of its rows, gave
+  Explorer open times of 1.07-1.13 s (and 1.6-1.9 s in one run under load) against 0.87-0.93 s here. Read the ratios
+  as "about 2x to 4x", not as exact figures. The machine ran other programs (the user's own desktop) during every run.
+- Small, flat folders of tiny files only: no network, no cloud placeholders, no thumbnails or icon-heavy folders, no
+  sorting or grouping, one machine. Idle CPU was not measured.
+- The `bench` example above times shell enumeration inside rexplorer alone and is not comparable to this table.

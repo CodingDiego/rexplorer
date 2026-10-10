@@ -112,6 +112,46 @@ fn parent_pidl(p: &Pidl) -> Option<Pidl> {
     unsafe { ILRemoveLastID(Some(p.as_mut_ptr())) }.as_bool().then_some(p)
 }
 
+/// Folder options > Show file extensions: off hides the extension in the Name column of files.
+pub(crate) static SHOW_EXT: AtomicBool = AtomicBool::new(true);
+
+/// `a.tar.gz` -> `a.tar`; a leading dot is part of the name (`.gitignore` stays).
+fn strip_ext(name: &str) -> &str {
+    match name.rfind('.') {
+        Some(i) if i > 0 => &name[..i],
+        _ => name,
+    }
+}
+
+/// Name column text of `e` under Show file extensions, and what a rename puts after the edited text to make the
+/// whole file name (None: the text is the shell's display name, which renames as it is).
+pub(crate) fn name_cell(e: &ShellItem) -> (String, Option<String>) {
+    thread_local!(static NEVER: std::cell::RefCell<HashMap<String, bool>> = Default::default());
+    let shown = e.display_name();
+    // Archives (.zip) are folders to the shell but files by name.
+    let (folder, stream) = (windows::Win32::System::SystemServices::SFGAO_FOLDER.0, windows::Win32::System::SystemServices::SFGAO_STREAM.0);
+    let attrs = e.attributes(folder | stream);
+    if attrs & folder != 0 && attrs & stream == 0 {
+        return (shown, None);
+    }
+    let never = |ext: &str| NEVER.with_borrow_mut(|m| *m.entry(ext.to_lowercase()).or_insert_with(|| rexplorer_core::item::never_shows_ext(ext)));
+    file_name_cell(shown, &e.file_name(), SHOW_EXT.load(Ordering::Relaxed), never)
+}
+
+/// The shell's display name already follows Explorer's own "hide extensions": the extension comes from the file
+/// name and is cut or added only where the display name disagrees with `show`.
+fn file_name_cell(shown: String, file: &str, show: bool, never_shown: impl FnOnce(&str) -> bool) -> (String, Option<String>) {
+    let ext = &file[strip_ext(file).len()..];
+    let has = !ext.is_empty() && shown.ends_with(ext);
+    if !show && has {
+        (shown[..shown.len() - ext.len()].to_string(), Some(ext.to_string()))
+    } else if show && !ext.is_empty() && !has && file.strip_suffix(ext) == Some(shown.as_str()) && !never_shown(ext) {
+        (file.to_string(), Some(String::new()))
+    } else {
+        (shown, None)
+    }
+}
+
 impl Source {
     pub fn len(&self) -> usize {
         match self {
@@ -126,7 +166,7 @@ impl Source {
     pub fn text(&self, i: usize, sub: usize) -> String {
         match self {
             Source::Shell(l) => match l.items.get(i) {
-                Some(e) if sub == 0 => e.display_name(),
+                Some(e) if sub == 0 => name_cell(e).0,
                 Some(e) => l.columns.get(sub).map(|c| e.detail(c.index)).unwrap_or_default(),
                 None => String::new(),
             },
@@ -135,6 +175,7 @@ impl Source {
                 .rows
                 .get(i)
                 .map(|r| match sub {
+                    0 if !SHOW_EXT.load(Ordering::Relaxed) => name_cell(&r.item).0,
                     0 => r.name.clone(),
                     1 => r.folder.clone(),
                     2 => r.kind.clone(),
@@ -253,7 +294,7 @@ pub(crate) fn sys_icon(name: &str, dir: bool) -> (usize, i32) {
     let h = HSTRING::from(name);
     let flags = SHGFI_USEFILEATTRIBUTES | SHGFI_SYSICONINDEX | SHGFI_SMALLICON;
     let himl = unsafe { SHGetFileInfoW(PCWSTR(h.as_ptr()), attr, Some(&mut fi), size_of::<SHFILEINFOW>() as u32, flags) };
-    (himl, fi.iIcon)
+    (himl, rexplorer_core::icons::app_fallback(fi.iIcon, || name.to_string()))
 }
 
 /// Icon-theme icon, else the system icon for the name (the system list goes into the ListView on first use).
@@ -463,6 +504,7 @@ pub(crate) unsafe fn start_search(app: *mut App, t: usize, needle: &str, push: b
 
     let hwnd = (*app).hwnd.0 as isize;
     let usn_cache = (*app).usn.clone();
+    let scope = search::Scope { system: (*app).profile.search_system, archives: (*app).profile.search_archives };
     std::thread::spawn(move || {
         let _com = ComInit::mta();
         let post = |rows: Vec<SearchRow>, done: bool| {
@@ -474,7 +516,7 @@ pub(crate) unsafe fn start_search(app: *mut App, t: usize, needle: &str, push: b
         let mut sink = |hits: Vec<Hit>| post(rows_of(hits), false);
         let indexed = drive.is_some_and(|d| usn_search(&usn_cache, d, &needle, &cancel, &mut sink).is_ok());
         if !indexed {
-            let _ = search::walk(&root, &needle, &cancel, &mut sink);
+            let _ = search::walk(&root, &needle, scope, &cancel, &mut sink);
         }
         post(Vec::new(), true);
     });
@@ -597,6 +639,26 @@ pub(crate) unsafe fn cancel_search(app: *mut App) -> bool {
     }
 }
 
+/// TIMER_SEARCH: the box text settled. The box also changes when a tab shows its own state; that matches the
+/// active search (or is empty with none), so only a real edit gets through.
+pub(crate) unsafe fn on_search_timer(app: *mut App) {
+    let text = window_text((*app).search);
+    let text = text.trim();
+    let (active, searching) = ((*app).active, matches!(&cur(app).source, Some(Source::Search(_))));
+    let same = matches!(&cur(app).source, Some(Source::Search(s)) if s.needle == text);
+    if text.is_empty() {
+        if searching {
+            cancel_search(app);
+            match cur(app).back.is_empty() {
+                false => nav::go_back(app),
+                true => nav::go_up(app),
+            }
+        }
+    } else if !same && matches!(cur(app).source, Some(Source::Shell(_) | Source::Search(_))) {
+        start_search(app, active, text, !searching);
+    }
+}
+
 /// The search box: Enter searches the active tab, Escape stops the search; both return to the list.
 pub(crate) unsafe extern "system" fn search_subclass(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM, _id: usize, data: usize) -> LRESULT {
     let app = data as *mut App;
@@ -604,10 +666,13 @@ pub(crate) unsafe extern "system" fn search_subclass(hwnd: HWND, msg: u32, wpara
         WM_KEYDOWN if wparam.0 == VK_RETURN.0 as usize => {
             let text = window_text(hwnd);
             let _ = SetFocus(Some(ui::view_hwnd(app)));
-            start_search(app, (*app).active, &text, true);
+            // A search's own place in the history is its root folder, already recorded when it started.
+            let push = !matches!(cur(app).source, Some(Source::Search(_)));
+            start_search(app, (*app).active, &text, push);
             LRESULT(0)
         }
         WM_KEYDOWN if wparam.0 == VK_ESCAPE.0 as usize => {
+            let _ = KillTimer(Some((*app).hwnd), crate::TIMER_SEARCH);
             cancel_search(app);
             let _ = SetFocus(Some(ui::view_hwnd(app)));
             LRESULT(0)
@@ -703,6 +768,22 @@ mod tests {
     }
 
     #[test]
+    fn name_cell_follows_show_extensions() {
+        let cell = |shown: &str, file: &str, show: bool| file_name_cell(shown.to_string(), file, show, |e| e == ".lnk");
+        let own = |t: &str, s: Option<&str>| (t.to_string(), s.map(str::to_string));
+        // The shell shows extensions.
+        assert_eq!(cell("report v1.2.txt", "report v1.2.txt", false), own("report v1.2", Some(".txt")));
+        assert_eq!(cell("report v1.2.txt", "report v1.2.txt", true), own("report v1.2.txt", None));
+        // The shell hides them: never cut into the name, and put the extension back when asked to show it.
+        assert_eq!(cell("report v1.2", "report v1.2.txt", false), own("report v1.2", None));
+        assert_eq!(cell("report v1.2", "report v1.2.txt", true), own("report v1.2.txt", Some("")));
+        assert_eq!(cell("Chrome", "Chrome.lnk", true), own("Chrome", None));
+        assert_eq!(cell("Recycled name", "$R1X2.txt", true), own("Recycled name", None));
+        assert_eq!(cell(".gitignore", ".gitignore", false), own(".gitignore", None));
+        assert!(rexplorer_core::item::never_shows_ext(".lnk") && !rexplorer_core::item::never_shows_ext(".txt"));
+    }
+
+    #[test]
     fn search_rows_from_walker_and_paths() {
         let _com = ComInit::mta();
         let dir = std::env::temp_dir().join(format!("rexplorer-source-{}", std::process::id()));
@@ -710,7 +791,7 @@ mod tests {
         std::fs::write(dir.join("needle.txt"), b"12345").unwrap();
         let root = ShellFolder::parse(dir.to_str().unwrap()).unwrap().pidl;
         let mut rows = Vec::new();
-        search::walk(&root, "needle", &AtomicBool::new(false), &mut |h| rows.extend(rows_of(h))).unwrap();
+        search::walk(&root, "needle", search::Scope::default(), &AtomicBool::new(false), &mut |h| rows.extend(rows_of(h))).unwrap();
         let by_path = hit_for_path(&dir.join("needle.txt")).map(|h| rows_of(vec![h]));
         std::fs::remove_dir_all(&dir).unwrap();
         rows.sort_by(|a, b| a.name.cmp(&b.name));

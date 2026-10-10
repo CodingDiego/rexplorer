@@ -91,8 +91,17 @@ impl ShellFolder {
 
     /// Lists folders and files, hidden ones included (the UI decides what to show).
     pub fn enumerate(&self) -> Result<Vec<ShellItem>> {
+        self.enumerate_with(SHCONTF_FOLDERS.0 | SHCONTF_NONFOLDERS.0, usize::MAX)
+    }
+
+    /// Subfolders only, and no more than `max` of them (UI-thread callers bound their work).
+    pub fn subfolders_up_to(&self, max: usize) -> Result<Vec<ShellItem>> {
+        self.enumerate_with(SHCONTF_FOLDERS.0, max)
+    }
+
+    fn enumerate_with(&self, what: i32, max: usize) -> Result<Vec<ShellItem>> {
         let mut e: Option<IEnumIDList> = None;
-        let flags = (SHCONTF_FOLDERS.0 | SHCONTF_NONFOLDERS.0 | SHCONTF_INCLUDEHIDDEN.0) as u32;
+        let flags = (what | SHCONTF_INCLUDEHIDDEN.0) as u32;
         unsafe { self.folder.EnumObjects(HWND::default(), flags, &mut e).ok()? };
         // S_FALSE with no enumerator means an empty folder.
         let Some(e) = e else { return Ok(Vec::new()) };
@@ -107,6 +116,9 @@ impl ShellFolder {
             }
             for p in &batch[..fetched as usize] {
                 out.push(ShellItem { parent: self.folder.clone(), pidl: unsafe { Pidl::from_raw(*p) } });
+            }
+            if out.len() >= max {
+                break;
             }
         }
         if self.parsing_name == THIS_PC {
@@ -177,6 +189,10 @@ impl ShellFolder {
     /// Shell-correct ordering by a column (folders first, locale-aware names, real dates and sizes).
     pub fn compare(&self, column: u32, a: &ShellItem, b: &ShellItem) -> std::cmp::Ordering {
         let hr = unsafe { self.folder.CompareIDs(LPARAM(column as isize), a.pidl.as_ptr(), b.pidl.as_ptr()) };
+        // A failure HRESULT is no ordering; decoding it would make sort_by's comparator inconsistent.
+        if hr.is_err() {
+            return std::cmp::Ordering::Equal;
+        }
         // The low 16 bits of the HRESULT hold the signed comparison result.
         ((hr.0 & 0xFFFF) as i16).cmp(&0)
     }

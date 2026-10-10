@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Once};
 
 use rexplorer_core::com::{ComInit, Pidl, strret_to_string};
@@ -27,7 +27,7 @@ use windows::Win32::UI::Controls::{NMHDR, SetScrollInfo, WC_EDITW, WM_MOUSELEAVE
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, GetKeyState, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VIRTUAL_KEY, VK_A, VK_CONTROL, VK_DOWN, VK_END,
-    VK_ESCAPE, VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP,
+    VK_ESCAPE, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_UP,
 };
 use windows::Win32::UI::Shell::Common::SHELLDETAILS;
 use windows::Win32::UI::Shell::{DefSubclassProc, IShellFolder, IShellFolder2, SetWindowSubclass};
@@ -169,6 +169,10 @@ fn columns_by_key(folder: &IShellFolder) -> Vec<(PROPERTYKEY, u32, String)> {
     out
 }
 
+/// The profile's Privacy keys: whether `build` lists frequent folders and recent files.
+pub(crate) static SHOW_FREQUENT: AtomicBool = AtomicBool::new(true);
+pub(crate) static SHOW_RECENT: AtomicBool = AtomicBool::new(true);
+
 /// A tile's subtitle for the profile's own folders, as Explorer labels them.
 const STORED_LOCALLY: &str = "Stored locally";
 
@@ -226,12 +230,17 @@ pub fn build(folder: &ShellFolder, items: &[ShellItem]) -> Content {
             shared: false,
         };
         if attrs & SFGAO_FOLDER != 0 && attrs & SFGAO_STREAM == 0 {
-            tiles.push(e);
+            if e.pinned || SHOW_FREQUENT.load(Ordering::Relaxed) {
+                tiles.push(e);
+            }
             continue;
         }
         e.pinned = pinned == Some(true);
         e.shared = item.property_text(&GROUPING).as_deref() == Some(SHARED_GROUP);
         e.recent = !e.pinned && !e.shared;
+        if e.recent && !SHOW_RECENT.load(Ordering::Relaxed) {
+            continue;
+        }
         // Home lists a file once per group it is in (a favorite that is also recent, a shared file opened lately).
         if let Some((_, r)) = rows.iter_mut().find(|(_, r)| r.key.eq_ignore_ascii_case(&e.key)) {
             r.pinned |= e.pinned;
@@ -263,7 +272,7 @@ pub fn build(folder: &ShellFolder, items: &[ShellItem]) -> Content {
 
 const PAD: i32 = 20;
 const TITLE_H: i32 = 36;
-const TILE_W: i32 = 300;
+const TILE_W: i32 = 280;
 const TILE_H: i32 = 72;
 const GAP: i32 = 8;
 const SECTION_GAP: i32 = 20;
@@ -280,6 +289,8 @@ fn scale(px: i32, dpi: u32) -> i32 {
 pub struct Layout {
     pub title: RECT,
     pub tiles: Vec<RECT>,
+    /// Tiles per row.
+    pub per_row: usize,
     /// The filter pills, in `PILLS` order.
     pub pills: Vec<RECT>,
     pub header: RECT,
@@ -319,7 +330,7 @@ pub fn layout(width: i32, tiles: usize, rows: usize, pill_ws: &[i32], dpi: u32) 
     let row_rects: Vec<RECT> = (0..rows as i32).map(|i| RECT { left, top: y + i * s(ROW_H), right, bottom: y + (i + 1) * s(ROW_H) }).collect();
     let empty = RECT { left, top: y, right, bottom: y + if rows == 0 { s(ROW_H) } else { 0 } };
     y = row_rects.last().map_or(empty.bottom, |r| r.bottom);
-    Layout { title, tiles: tile_rects, pills, header, rows: row_rects, empty, height: y + s(PAD) }
+    Layout { title, tiles: tile_rects, per_row, pills, header, rows: row_rects, empty, height: y + s(PAD) }
 }
 
 /// Left edge of each table column in `left..right`: the name takes 45%, the others share the rest.
@@ -330,15 +341,30 @@ fn column_lefts(left: i32, right: i32, n: usize) -> Vec<i32> {
     (0..n).map(|i| if i == 0 { left } else { left + name + (i as i32 - 1) * rest }).collect()
 }
 
-/// Keyboard move over `n` entries (tiles, then rows): Up/Left back, Down/Right forward, Home, End.
-fn step(n: usize, focus: Option<usize>, key: VIRTUAL_KEY) -> Option<usize> {
+/// Keyboard move over `n` entries (`tiles` tiles in rows of `per_row`, then the table's rows): Left/Right and
+/// Up/Down step one entry, except Up/Down over tiles, which move a whole row of them; Home, End.
+fn step(n: usize, tiles: usize, per_row: usize, focus: Option<usize>, key: VIRTUAL_KEY) -> Option<usize> {
     if n == 0 {
         return None;
     }
     let f = focus.unwrap_or(0);
     Some(match key {
-        VK_UP | VK_LEFT if focus.is_some() => f.saturating_sub(1),
-        VK_DOWN | VK_RIGHT if focus.is_some() => (f + 1).min(n - 1),
+        VK_LEFT if focus.is_some() => f.saturating_sub(1),
+        VK_RIGHT if focus.is_some() => (f + 1).min(n - 1),
+        VK_UP if focus.is_some() => match f {
+            // The first table row goes back to the first tile of the last row of tiles.
+            f if f == tiles && tiles > 0 => tiles - 1 - (tiles - 1) % per_row,
+            f if f < tiles => if f >= per_row { f - per_row } else { f },
+            f => f.saturating_sub(1),
+        },
+        VK_DOWN if focus.is_some() => match f {
+            f if f + per_row < tiles => f + per_row,
+            // A shorter last row below: its last tile.
+            f if f < tiles && f / per_row < (tiles - 1) / per_row => tiles - 1,
+            // The last row of tiles: the first table row, if any.
+            f if f < tiles => if tiles < n { tiles } else { f },
+            f => (f + 1).min(n - 1),
+        },
         VK_HOME => 0,
         VK_END => n - 1,
         _ => f,
@@ -616,6 +642,7 @@ pub fn begin_rename(hwnd: HWND, index: usize) -> bool {
         let end = name[..end].encode_utf16().count();
         SendMessageW(edit, windows::Win32::UI::Controls::EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(end as isize)));
         let _ = SetWindowSubclass(edit, Some(edit_subclass), 1, hwnd.0 as usize);
+        crate::edit::attach(edit);
         let _ = SetFocus(Some(edit));
         true
     }
@@ -833,7 +860,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
         WM_PAINT => paint(hwnd, s),
-        WM_SIZE => sync_scroll(hwnd, s),
+        WM_SIZE | WM_DPICHANGED_AFTERPARENT => {
+            sync_scroll(hwnd, s);
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
         HM_COUNTS => return LRESULT(((s.content.tiles.len() << 16) | s.shown.len()) as isize),
         HM_SELECT_NAMED => {
             let mut buf = [0u16; 1024];
@@ -961,6 +991,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 notify(hwnd, HN_ACTIVATE, index);
             }
         }
+        // Shift+F10 and the Menu key: the focused entry's menu, else the background's.
+        WM_CONTEXTMENU if lparam.0 as i32 == -1 => {
+            let index = s.focus.filter(|&e| s.selected[e]).and_then(|e| s.entry(e)).map_or(usize::MAX, |x| x.index);
+            notify(hwnd, HN_CONTEXT, index);
+        }
         WM_RBUTTONUP => {
             let index = entry_at(hwnd, s, lparam).and_then(|e| s.entry(e)).map_or(usize::MAX, |x| x.index);
             notify(hwnd, HN_CONTEXT, index);
@@ -969,8 +1004,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let key = VIRTUAL_KEY(wparam.0 as u16);
             let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
             match key {
-                VK_UP | VK_DOWN | VK_LEFT | VK_RIGHT | VK_HOME | VK_END => {
-                    let to = step(s.count(), s.focus, key);
+                VK_UP | VK_DOWN | VK_LEFT | VK_RIGHT | VK_HOME | VK_END | VK_PRIOR | VK_NEXT => {
+                    let (n, nt) = (s.count(), s.content.tiles.len());
+                    let l = current_layout(hwnd, s);
+                    let to = match key {
+                        // A page: Up/Down until the entry's top has moved by the page's height.
+                        VK_PRIOR | VK_NEXT => {
+                            let (arrow, page) = if key == VK_NEXT { (VK_DOWN, 1) } else { (VK_UP, -1) };
+                            let (mut e, top0) = (s.focus, s.focus.map_or(0, |f| entry_rect(&l, nt, f).top));
+                            while let Some(next) = step(n, nt, l.per_row, e, arrow).filter(|&x| Some(x) != e) {
+                                e = Some(next);
+                                if (entry_rect(&l, nt, next).top - top0) * page >= client(hwnd).bottom {
+                                    break;
+                                }
+                            }
+                            e
+                        }
+                        _ => step(n, nt, l.per_row, s.focus, key),
+                    };
                     select_only(s, to);
                     if let Some(e) = to {
                         ensure_visible(hwnd, s, e);
@@ -1172,9 +1223,9 @@ mod tests {
 
     #[test]
     fn layout_wraps_tiles_and_stacks_sections() {
-        // 2 * 20 padding + 3 tiles of 300 with gaps of 8: 956 px hold three per row.
+        // 2 * 20 padding + 3 tiles of 280 with gaps of 8: 896 px hold three per row.
         let l = layout(956, 4, 2, &[80, 90, 70], 96);
-        assert_eq!((l.tiles[0].left, l.tiles[2].left, l.tiles[3].left), (20, 636, 20));
+        assert_eq!((l.tiles[0].left, l.tiles[2].left, l.tiles[3].left), (20, 596, 20));
         assert_eq!(l.tiles[3].top, l.tiles[0].bottom + 8);
         assert_eq!(l.pills[0].top, l.tiles[3].bottom + 20);
         assert_eq!((l.pills[0].right - l.pills[0].left, l.pills[1].left, l.pills[2].left), (80, 108, 206), "side by side, 8 apart");
@@ -1185,19 +1236,46 @@ mod tests {
         let l = layout(200, 2, 0, &[80], 96);
         assert_eq!((l.tiles[1].left, l.tiles[1].top), (20, l.tiles[0].bottom + 8));
         assert_eq!(l.empty.bottom - l.empty.top, 48, "the empty line takes a row");
-        assert_eq!(layout(956, 4, 2, &[80], 192).tiles[0].right - layout(956, 4, 2, &[80], 192).tiles[0].left, 600);
+        assert_eq!(layout(956, 4, 2, &[80], 192).tiles[0].right - layout(956, 4, 2, &[80], 192).tiles[0].left, 560);
+    }
+
+    #[test]
+    fn tiles_flow_as_wide_as_fits() {
+        let per = |w, dpi| layout(w, 9, 0, &[], dpi).per_row;
+        assert_eq!([per(300, 96), per(700, 96), per(1400, 96)], [1, 2, 4]);
+        assert_eq!([per(300, 144), per(700, 144), per(1400, 144)], [1, 1, 3]);
+        // Every cell inside the content, none overlapping, a row's tiles on one line, and the height covers the last.
+        for (w, dpi) in [(300, 96), (700, 96), (1400, 96), (700, 144), (1400, 144)] {
+            let l = layout(w, 9, 3, &[80], dpi);
+            for (i, r) in l.tiles.iter().enumerate() {
+                assert!(r.left >= 20 * dpi as i32 / 96 && r.bottom <= l.height);
+                assert_eq!((r.top == l.tiles[0].top), i < l.per_row);
+                assert_eq!(r.left == l.tiles[0].left, i % l.per_row == 0);
+                assert!(l.tiles[..i].iter().all(|o| o.right <= r.left || o.left >= r.right || o.bottom <= r.top || o.top >= r.bottom));
+            }
+            assert!(l.pills[0].top >= l.tiles[8].bottom);
+        }
     }
 
     #[test]
     fn keys_step_across_tiles_then_rows() {
-        assert_eq!(step(5, None, VK_DOWN), Some(0));
-        assert_eq!(step(5, Some(0), VK_DOWN), Some(1));
-        assert_eq!(step(5, Some(4), VK_DOWN), Some(4));
-        assert_eq!(step(5, Some(0), VK_UP), Some(0));
-        assert_eq!(step(5, Some(3), VK_LEFT), Some(2));
-        assert_eq!(step(5, Some(2), VK_END), Some(4));
-        assert_eq!(step(5, Some(2), VK_HOME), Some(0));
-        assert_eq!(step(0, None, VK_DOWN), None);
+        assert_eq!(step(5, 5, 1, None, VK_DOWN), Some(0));
+        assert_eq!(step(5, 5, 1, Some(0), VK_DOWN), Some(1));
+        assert_eq!(step(5, 5, 1, Some(4), VK_DOWN), Some(4));
+        assert_eq!(step(5, 5, 1, Some(0), VK_UP), Some(0));
+        assert_eq!(step(5, 5, 1, Some(3), VK_LEFT), Some(2));
+        assert_eq!(step(5, 5, 1, Some(2), VK_END), Some(4));
+        assert_eq!(step(5, 5, 1, Some(2), VK_HOME), Some(0));
+        assert_eq!(step(0, 0, 1, None, VK_DOWN), None);
+        // No tiles at all (nothing pinned, frequent folders hidden): the first row stays put.
+        assert_eq!((step(3, 0, 3, Some(0), VK_UP), step(3, 0, 3, Some(0), VK_PRIOR)), (Some(0), Some(0)));
+        // 7 tiles in rows of 3 (0 1 2 / 3 4 5 / 6), then 2 table rows (7, 8).
+        let k = |f, key| step(9, 7, 3, Some(f), key);
+        assert_eq!((k(1, VK_DOWN), k(4, VK_DOWN), k(5, VK_DOWN)), (Some(4), Some(6), Some(6)), "a short last row: its last tile");
+        assert_eq!((k(0, VK_DOWN), k(4, VK_UP), k(1, VK_UP), k(2, VK_RIGHT), k(3, VK_LEFT)), (Some(3), Some(1), Some(1), Some(3), Some(2)));
+        assert_eq!((k(6, VK_DOWN), k(7, VK_UP), k(7, VK_DOWN), k(8, VK_UP), k(8, VK_DOWN)), (Some(7), Some(6), Some(8), Some(7), Some(8)));
+        // The first table row goes up to the first tile of the last row of tiles.
+        assert_eq!(step(9, 6, 3, Some(6), VK_UP), Some(3));
         assert_eq!(column_lefts(0, 1000, 4), [0, 450, 633, 816]);
     }
 

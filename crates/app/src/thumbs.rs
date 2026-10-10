@@ -18,7 +18,6 @@ struct Request {
     id: usize,
     abs: Pidl,
     size: i32,
-    icon_only: bool,
 }
 
 pub struct Thumbs {
@@ -46,7 +45,7 @@ pub fn start(hwnd: HWND, msg: u32) -> Thumbs {
             if r.gen_ < latest.load(Ordering::SeqCst) {
                 continue;
             }
-            let bmp = if r.icon_only { images::icon(&r.abs, r.size) } else { images::thumbnail(&r.abs, r.size) };
+            let bmp = images::thumbnail(&r.abs, r.size);
             let Ok(bmp) = bmp else { continue };
             let posted = unsafe {
                 PostMessageW(Some(HWND(hwnd as *mut _)), msg, WPARAM(r.id), LPARAM(bmp.0 as isize))
@@ -61,18 +60,18 @@ pub fn start(hwnd: HWND, msg: u32) -> Thumbs {
 }
 
 impl Thumbs {
-    pub fn request(&self, id: usize, abs: Pidl, size: i32, icon_only: bool) {
-        self.send(self.generation(), id, abs, size, icon_only);
+    pub fn request(&self, id: usize, abs: Pidl, size: i32) {
+        self.send(self.generation(), id, abs, size);
     }
 
     #[cfg(test)]
-    pub fn request_with_generation(&self, gen_: u64, id: usize, abs: Pidl, size: i32, icon_only: bool) {
-        self.send(gen_, id, abs, size, icon_only);
+    pub fn request_with_generation(&self, gen_: u64, id: usize, abs: Pidl, size: i32) {
+        self.send(gen_, id, abs, size);
     }
 
-    fn send(&self, gen_: u64, id: usize, abs: Pidl, size: i32, icon_only: bool) {
+    fn send(&self, gen_: u64, id: usize, abs: Pidl, size: i32) {
         if let Some(tx) = &self.tx {
-            let _ = tx.send(Request { gen_, id, abs, size, icon_only });
+            let _ = tx.send(Request { gen_, id, abs, size });
         }
     }
 
@@ -154,7 +153,7 @@ mod tests {
         }
         .unwrap();
         let t = start(hwnd, MSG_ID);
-        t.request(7, temp_pidl(), 64, false);
+        t.request(7, temp_pidl(), 64);
         let m = wait_msg(5000).expect("no thumbnail within 5s");
         let d = done(m.wParam, m.lParam);
         assert_eq!(d.id, 7);
@@ -166,10 +165,10 @@ mod tests {
         let old = t.generation();
         t.invalidate();
         assert_eq!(t.generation(), old + 1);
-        t.request_with_generation(old, 8, temp_pidl(), 64, false);
+        t.request_with_generation(old, 8, temp_pidl(), 64);
         assert!(wait_msg(1000).is_none(), "stale request was delivered");
         // A current-generation request still works after invalidate.
-        t.request(9, temp_pidl(), 64, true);
+        t.request(9, temp_pidl(), 64);
         let m = wait_msg(5000).expect("no icon within 5s");
         let _ = unsafe { DeleteObject(HGDIOBJ(done(m.wParam, m.lParam).bitmap.0)) };
 

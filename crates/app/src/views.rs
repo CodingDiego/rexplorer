@@ -146,6 +146,11 @@ pub(crate) unsafe fn tall_icon(app: *mut App, index: i32) -> i32 {
     if let Some(&t) = v.tall_index.get(&index) {
         return t;
     }
+    if ImageList_GetImageCount(v.tall) >= MAX_IMAGES {
+        rebuild_tall(app); // bounded: every row asks for its icon again
+        let _ = InvalidateRect(Some((*app).list), None, false);
+    }
+    let v = &mut (*app).views;
     let (mut w, mut h, mut sw, mut sh) = (0, 0, 0, 0);
     let _ = ImageList_GetIconSize(v.tall, Some(&mut w), Some(&mut h));
     let _ = ImageList_GetIconSize(v.small, Some(&mut sw), Some(&mut sh));
@@ -180,7 +185,7 @@ unsafe fn load_icon_theme(dir: &std::path::Path, size: i32) -> Option<ThemeIcons
     if !dir.is_dir() {
         return None;
     }
-    let theme = icons::load_theme(dir, size).ok()?;
+    let mut theme = icons::load_theme(dir, size).ok()?;
     if theme.bitmap_for("x", true).is_none() && theme.bitmap_for("x.\u{1}", false).is_none() {
         return None;
     }
@@ -309,7 +314,7 @@ unsafe fn request(app: *mut App, i: usize) -> i32 {
         return index;
     }
     let Some(t) = &v.thumbs else { return 0 };
-    t.request((v.token << 32) | i, l.folder.child_pidl(item), v.size, v.view == View::Icons);
+    t.request((v.token << 32) | i, l.folder.child_pidl(item), v.size);
     v.slots[i] = REQUESTED;
     0
 }
@@ -364,7 +369,7 @@ pub(crate) unsafe fn destroy(app: *mut App) {
 }
 
 /// A zeroed (fully transparent) top-down 32-bit DIB and its pixels.
-unsafe fn dib(w: i32, h: i32) -> Option<(HBITMAP, *mut u8)> {
+pub(crate) unsafe fn dib(w: i32, h: i32) -> Option<(HBITMAP, *mut u8)> {
     if w <= 0 || h <= 0 {
         return None;
     }
@@ -483,37 +488,51 @@ pub(crate) fn remove_profile_key(profile: &str, key: &str) {
     let _ = std::fs::write(&path, remove_ini_key(&text, &format!("profile {profile}"), key));
 }
 
-unsafe fn save_profile_key(profile: &str, key: &str, value: &str) {
+pub(crate) unsafe fn save_profile_key(profile: &str, key: &str, value: &str) {
     let path = settings::dir().join("settings.ini");
     let text = std::fs::read_to_string(&path).unwrap_or_default();
     let _ = std::fs::write(&path, set_ini_key(&text, &format!("profile {profile}"), key, value));
 }
 
-const STARTER: [&str; 8] = ["folder", "file", "rs", "txt", "png", "zip", "rar", "pdf"];
-
-/// Writes `icons\default\*.png` once (when the folder does not exist yet) so users see how themes work.
-pub(crate) fn ensure_starter_theme(t: &Theme) {
-    let dir = settings::dir().join("icons").join("default");
-    if dir.exists() || std::fs::create_dir_all(&dir).is_err() {
-        return;
+/// Sets several keys of the profile's section in settings.ini in one write; an unreadable file is an error, not empty.
+pub(crate) fn try_save_profile_keys(profile: &str, pairs: &[(&str, String)]) -> std::io::Result<()> {
+    let path = settings::dir().join("settings.ini");
+    let mut text = std::fs::read_to_string(&path)?;
+    for (k, v) in pairs {
+        text = set_ini_key(&text, &format!("profile {profile}"), k, v);
     }
-    for name in STARTER {
-        let _ = icons::save_png(&starter_icon(name, t), 32, 32, &dir.join(format!("{name}.png")));
-    }
+    std::fs::write(&path, text)
 }
 
-/// 32x32 straight-alpha BGRA: a folder silhouette, or a page in a per-type hue tinted toward the accent.
+const STARTER: [&str; 2] = ["folder", "file"];
+
+/// Writes `icons\default\`: `folder.png` and `file.png` once (when the folder does not exist yet), then, in the
+/// background, Windows' own icon for every registered extension; `system-icons.txt` lists those and marks the
+/// export done (delete it to export again, say after installing a program).
+pub(crate) fn ensure_starter_theme(t: &Theme) {
+    let dir = settings::dir().join("icons").join("default");
+    if !dir.exists() {
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        for name in STARTER {
+            let _ = icons::save_png(&starter_icon(name, t), 32, 32, &dir.join(format!("{name}.png")));
+        }
+    }
+    let done = dir.join("system-icons.txt");
+    if done.exists() {
+        return;
+    }
+    std::thread::spawn(move || {
+        let _com = rexplorer_core::com::ComInit::mta();
+        let exts = icons::export_system_icons(&dir);
+        let _ = std::fs::write(done, exts.join("\n"));
+    });
+}
+
+/// 32x32 straight-alpha BGRA: a folder silhouette in the accent, or a page tinted toward it.
 fn starter_icon(name: &str, t: &Theme) -> Vec<u8> {
-    let tint = |c: u32| theme::blend(c, t.accent, 0.35);
-    let color = match name {
-        "folder" => t.accent,
-        "file" => theme::blend(t.secondary_text, t.accent, 0.2),
-        "rs" => tint(0x0010_6ADE),
-        "txt" => tint(0x00A0_A0A0),
-        "png" => tint(0x0060_B040),
-        "zip" | "rar" => tint(0x0020_B0E0),
-        _ => tint(0x0030_30D0),
-    };
+    let color = if name == "folder" { t.accent } else { theme::blend(t.secondary_text, t.accent, 0.2) };
     // (left, top, right, bottom, radius) rounded rects in pixel units.
     let shapes: &[(f32, f32, f32, f32, f32)] = if name == "folder" {
         &[(2.0, 5.0, 14.0, 11.0, 2.0), (2.0, 8.0, 30.0, 28.0, 3.0)]

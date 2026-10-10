@@ -37,7 +37,7 @@ pub(crate) unsafe fn create(hwnd: HWND) -> Result<HWND> {
 }
 
 /// Files on the clipboard: CF_HDROP (15) or the shell's own "Shell IDList Array".
-unsafe fn clipboard_has_files() -> bool {
+pub(crate) unsafe fn clipboard_has_files() -> bool {
     let idlist = RegisterClipboardFormatW(w!("Shell IDList Array"));
     IsClipboardFormatAvailable(15).is_ok() || (idlist != 0 && IsClipboardFormatAvailable(idlist).is_ok())
 }
@@ -179,27 +179,48 @@ pub(crate) unsafe fn rename_new_item(app: *mut App) {
     list::begin_rename(app);
 }
 
-/// Sort v: the listing's columns (the active one checked), then the direction.
-pub(crate) unsafe fn sort_menu(app: *mut App) {
-    const ASC: usize = 0x100;
-    const DESC: usize = 0x101;
-    let Some(l) = listing(app) else { return };
+const SORT_ASC: usize = 0x100;
+const SORT_DESC: usize = 0x101;
+
+/// Sort entries: the listing's columns (id = position + 1, the active one checked), then the direction.
+/// (entries, checked); empty off a shell listing.
+pub(crate) unsafe fn sort_entries(app: *mut App) -> (Vec<(usize, String)>, Vec<usize>) {
+    let Some(l) = listing(app) else { return (Vec::new(), Vec::new()) };
     let mut entries: Vec<(usize, String)> = l.columns.iter().enumerate().map(|(i, c)| (i + 1, c.title.clone())).collect();
-    entries.extend([(0, String::new()), (ASC, "Ascending".to_string()), (DESC, "Descending".to_string())]);
+    entries.extend([(0, String::new()), (SORT_ASC, "Ascending".to_string()), (SORT_DESC, "Descending".to_string())]);
     let active = l.columns.iter().position(|c| c.index == l.sort_col).map(|i| i + 1);
-    let checked: Vec<usize> = active.into_iter().chain([if l.sort_desc { DESC } else { ASC }]).collect();
+    let checked = active.into_iter().chain([if l.sort_desc { SORT_DESC } else { SORT_ASC }]).collect();
+    (entries, checked)
+}
+
+/// Applies a pick from `sort_entries`.
+pub(crate) unsafe fn pick_sort(app: *mut App, id: usize) {
+    let Some(l) = listing(app) else { return };
     let (cols, col, desc): (Vec<u32>, u32, bool) = (l.columns.iter().map(|c| c.index).collect(), l.sort_col, l.sort_desc);
-    let (x, y) = anchor(app, CMD_SORT);
-    match ui::popup(app, &entries, &checked, x, y) {
+    match id {
         0 => {}
-        ASC => list::sort_by(app, col, false),
-        DESC => list::sort_by(app, col, true),
-        n => list::sort_by(app, cols[n - 1], desc),
+        SORT_ASC => list::sort_by(app, col, false),
+        SORT_DESC => list::sort_by(app, col, true),
+        n => {
+            if let Some(&c) = cols.get(n - 1) {
+                list::sort_by(app, c, desc);
+            }
+        }
     }
 }
 
-/// View v: the three list views, then the panes, each checked when it is on.
-pub(crate) unsafe fn view_menu(app: *mut App) {
+/// Sort v on the command bar.
+pub(crate) unsafe fn sort_menu(app: *mut App) {
+    let (entries, checked) = sort_entries(app);
+    if entries.is_empty() {
+        return;
+    }
+    let (x, y) = anchor(app, CMD_SORT);
+    pick_sort(app, ui::popup(app, &entries, &checked, x, y));
+}
+
+/// View entries: the three list views, then the panes, each checked when it is on. (entries, checked).
+pub(crate) unsafe fn view_entries(app: *mut App) -> (Vec<(usize, String)>, Vec<usize>) {
     let s = &(*app).session;
     let view = CMD_VIEW1 as usize
         + match (*app).views.view {
@@ -207,7 +228,7 @@ pub(crate) unsafe fn view_menu(app: *mut App) {
             views::View::Icons => 1,
             views::View::Thumbnails => 2,
         };
-    let entries = [
+    let entries = vec![
         (CMD_VIEW1 as usize, "Details\tCtrl+Shift+1".to_string()),
         (CMD_VIEW1 as usize + 1, "Icons\tCtrl+Shift+2".to_string()),
         (CMD_VIEW1 as usize + 2, "Thumbnails\tCtrl+Shift+3".to_string()),
@@ -222,11 +243,22 @@ pub(crate) unsafe fn view_menu(app: *mut App) {
             checked.push(cmd as usize);
         }
     }
-    let (x, y) = anchor(app, CMD_VIEW_MENU);
-    match ui::popup(app, &entries, &checked, x, y) {
+    (entries, checked)
+}
+
+/// Applies a pick from `view_entries`.
+pub(crate) unsafe fn pick_view(app: *mut App, id: usize) {
+    match id {
         0 => {}
         // Sidebar while the tree shows: the sidebar comes back in its place (Ctrl+B would hide both).
         id if id == CMD_TOGGLE_SIDEBAR as usize && (*app).session.show_tree => panes::toggle_tree(app),
         id => on_command(app, id as u16),
     }
+}
+
+/// View v on the command bar.
+pub(crate) unsafe fn view_menu(app: *mut App) {
+    let (entries, checked) = view_entries(app);
+    let (x, y) = anchor(app, CMD_VIEW_MENU);
+    pick_view(app, ui::popup(app, &entries, &checked, x, y));
 }

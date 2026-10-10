@@ -14,7 +14,7 @@ use windows::Win32::UI::Shell::{FOLDERID_Programs, IShellLinkW, KF_FLAG_DEFAULT,
 use windows::core::{Error, HSTRING, Interface, PCWSTR, Result, w};
 
 use crate::com::{ComInit, take_cotaskmem_string};
-use crate::register::{self, delete_empty, is_ours, key_exists, read_default, remove_if_ours, set_sz};
+use crate::register::{self, delete_empty, is_foreign, key_exists, remove_if_ours, set_sz};
 
 /// The real registry base, relative to HKCU.
 pub const REAL_REG_BASE: &str = "Software";
@@ -125,7 +125,7 @@ pub fn install(dir: &Path, reg_base: &str) -> Result<String> {
     if let Some(k) = register::foreign_override(&classes) {
         return Err(fail(format!("Another program already overrides HKCU\\{k}; nothing was changed.")));
     }
-    if read_default(&HSTRING::from(&ap)).is_some_and(|v| !is_ours(&v)) {
+    if is_foreign(&HSTRING::from(&ap)) {
         return Err(fail(format!("Another program already answers HKCU\\{ap}; nothing was changed.")));
     }
     let target = dir.join(EXE);
@@ -224,6 +224,14 @@ pub fn cleanup_old() {
     if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) {
         let _ = std::fs::remove_file(dir.join("rexplorer.old"));
     }
+    // Same name as archive_view::extract_dir(): one subfolder per archive version. A day old is past any app that
+    // still has one of its files open (another instance, or a scratch profile, may be using the recent ones).
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 3600);
+    for e in std::fs::read_dir(std::env::temp_dir().join("rexplorer-archive")).into_iter().flatten().flatten() {
+        if e.metadata().and_then(|m| m.modified()).is_ok_and(|t| t < old) {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
     let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else { return };
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().to_lowercase();
@@ -236,6 +244,7 @@ pub fn cleanup_old() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::register::read_default;
     use std::os::windows::fs::OpenOptionsExt;
 
     #[test]

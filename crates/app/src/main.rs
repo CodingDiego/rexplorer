@@ -9,9 +9,12 @@ mod archive_view;
 mod breadcrumb;
 mod commands;
 mod connect;
+mod edit;
+mod folder_options;
 mod home;
 #[allow(dead_code)] // parts of the API are for later steps
 mod instance;
+mod keys;
 mod list;
 mod nav;
 mod palette;
@@ -68,12 +71,16 @@ const TIMER_REFRESH: usize = 1;
 const TIMER_STATUS: usize = 2;
 const TIMER_SESSION: usize = 3;
 const TIMER_PREVIEW: usize = 4;
+/// The pointer has rested on one list item long enough to prefetch its preview.
+const TIMER_HOVER: usize = 10;
 const TIMER_TREE: usize = 5;
 const TIMER_SIDEBAR: usize = 6;
 /// A navigation has run long enough to show the skeleton.
 const TIMER_SKELETON: usize = 7;
 /// The skeleton's shade alternates.
 const TIMER_PULSE: usize = 8;
+/// Typing in the Search box has paused.
+pub(crate) const TIMER_SEARCH: usize = 9;
 const ICON_UNKNOWN: i32 = i32::MIN;
 
 const ID_ADDR: usize = 100;
@@ -137,6 +144,8 @@ const CMD_SHARE: u16 = 49;
 /// More > Install as default file manager... / Uninstall...
 const CMD_INSTALL: u16 = 50;
 const CMD_UNINSTALL: u16 = 51;
+/// More > Folder options...
+const CMD_FOLDER_OPTIONS: u16 = 52;
 /// Two crashes this close together (seconds) send the folder to Windows Explorer instead of a third start.
 const CRASH_GUARD_SECS: u64 = 60;
 
@@ -236,10 +245,18 @@ fn main() -> Result<()> {
     if args.install || args.uninstall {
         std::process::exit(if unsafe { ui::install_flow(None, args.uninstall, false) } { 0 } else { 1 });
     }
+    if args.import_explorer {
+        std::process::exit(if unsafe { ui::import_explorer_flow(args.profile.as_deref(), args.overwrite) } { 0 } else { 1 });
+    }
+    // A folder window never runs elevated unless asked (see core::elevation); the registry flows above are HKCU-only.
+    if !args.elevated && rexplorer_core::elevation::is_elevated() && rexplorer_core::elevation::relaunch_unelevated().is_ok() {
+        return Ok(());
+    }
     if args.recover && !crash::record_recovery(CRASH_GUARD_SECS) {
         // The second crash in a row: show the folder in Windows Explorer rather than crash again.
         let s = session::load();
-        let folder = s.tabs.get(s.active).map(|f| format!("\"{f}\"")).unwrap_or_default();
+        // A RAR entry name can hold a quote, which would inject Explorer arguments.
+        let folder = s.tabs.get(s.active).filter(|f| !f.chars().any(|c| c == '"' || c.is_control())).map(|f| format!("\"{f}\"")).unwrap_or_default();
         let _ = rexplorer_core::fallback::run_explorer(&folder);
         return Ok(());
     }
@@ -247,8 +264,9 @@ fn main() -> Result<()> {
     let _instance = instance::claim();
     if _instance.is_none() && !args.recover {
         if let Some(h) = instance::find_main_window() {
-            instance::send(h, &cli::payload(&args));
-            return Ok(());
+            if instance::send(h, &cli::payload(&args)) {
+                return Ok(());
+            } // else UIPI dropped it: open our own window
         }
     }
     if !args.recover {
@@ -292,6 +310,7 @@ fn main() -> Result<()> {
         if profile.start.eq_ignore_ascii_case(settings::HOME_START) && ShellFolder::parse(&profile.start).is_err() {
             profile.start = "shell:MyComputerFolder".into();
         }
+        folder_options::sync(&profile);
         let theme = settings.theme(&profile.theme).clone();
         let brushes = theme::Brushes::new(&theme);
         views::ensure_starter_theme(&theme);
@@ -369,7 +388,7 @@ fn main() -> Result<()> {
 
         open_startup_tabs(app, &args);
 
-        let accel_table = CreateAcceleratorTableW(&accels())?;
+        let accel_table = CreateAcceleratorTableW(&accels(&settings.keys))?;
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             // Accelerators only for keys aimed at our own controls; the ListView's label editor, the palette and the
@@ -412,9 +431,9 @@ unsafe fn pane_accel(app: *mut App, msg: &MSG, focus: HWND) -> bool {
     focus == (*app).search || (*app).panes.tree.as_ref().is_some_and(|t| inside(t.hwnd())) || source::browser_hwnd(app).is_some_and(inside)
 }
 
-fn accels() -> Vec<ACCEL> {
+fn accels(overrides: &[(String, String)]) -> Vec<ACCEL> {
     let digits = [VK_1, VK_2, VK_3, VK_4, VK_5, VK_6, VK_7, VK_8, VK_9];
-    ACCELS.iter().copied().chain(digits.iter().enumerate().map(|(i, &k)| accel(FCONTROL.0, k, CMD_TAB1 + i as u16))).collect()
+    keys::apply(&ACCELS, overrides).into_iter().chain(digits.iter().enumerate().map(|(i, &k)| accel(FCONTROL.0, k, CMD_TAB1 + i as u16))).collect()
 }
 
 /// The session's tabs on a plain launch or --recover; otherwise the command-line folders; else the profile's start.
@@ -476,7 +495,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if code == EN_KILLFOCUS as usize {
                     ui::hide_edit(app);
                 }
-            } else if id != ID_SEARCH {
+            } else if id == ID_SEARCH {
+                if code == EN_CHANGE as usize {
+                    SetTimer(Some(hwnd), TIMER_SEARCH, (*app).profile.search_delay_ms, None);
+                }
+            } else {
                 on_command(app, id as u16);
             }
         }
@@ -535,12 +558,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 TIMER_STATUS => ui::update_status(app),
                 TIMER_SESSION => nav::save_session(app),
                 TIMER_PREVIEW => panes::update_preview(app),
+                TIMER_HOVER => panes::prefetch_hovered(app),
                 TIMER_TREE => {
                     panes::ensure_tree(app);
                     ui::layout(app);
                 }
                 TIMER_SKELETON => nav::on_skeleton_timer(app),
                 TIMER_PULSE => nav::on_pulse_timer(app),
+                TIMER_SEARCH => source::on_search_timer(app),
                 TIMER_SIDEBAR if GetActiveWindow() == hwnd => {
                     panes::refresh_sidebar(app);
                     SetTimer(Some(hwnd), TIMER_SIDEBAR, 5000, None);
@@ -560,6 +585,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let r = &*(lparam.0 as *const RECT);
             let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
             ui::apply_font(app);
+            ui::sync_list_style(app);
             views::rebuild_tall(app);
             if let Some(s) = nav::source(app) {
                 nav::set_columns(app, &s.columns());
@@ -727,6 +753,7 @@ unsafe fn on_command(app: *mut App, cmd: u16) {
         CMD_INSTALL | CMD_UNINSTALL => {
             ui::install_flow(Some((*app).hwnd), cmd == CMD_UNINSTALL, true);
         }
+        CMD_FOLDER_OPTIONS => folder_options::run(app),
         CMD_SETTINGS => nav::new_tab(app, nav::Target::Name(settings::dir().display().to_string()), true, None),
         CMD_ABOUT => ui::about(app),
         CMD_PIN => list::pin_to_home(app),

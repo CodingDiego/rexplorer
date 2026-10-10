@@ -266,6 +266,7 @@ unsafe fn on_create(hwnd: HWND, st: *mut State) -> bool {
         SendMessageW(edit, WM_SETFONT, Some(WPARAM((*st).font.0 as usize)), Some(LPARAM(1)));
     }
     let _ = SetWindowSubclass(edit, Some(edit_proc), 1, 0);
+    crate::edit::attach(edit);
     true
 }
 

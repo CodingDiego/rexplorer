@@ -43,6 +43,9 @@ pub(crate) struct Panes {
     pub list_rect: RECT,
     /// Index for index with the sidebar's rows.
     pub sidebar_kinds: Vec<Kind>,
+    /// The list item under the pointer and whether a WM_MOUSELEAVE is pending for it.
+    pub hover: Option<usize>,
+    pub hover_tracking: bool,
 }
 
 fn scale(px: i32, dpi: u32) -> i32 {
@@ -503,7 +506,38 @@ pub(crate) unsafe fn end_drag(app: *mut App) {
 pub(crate) unsafe fn schedule_preview(app: *mut App) {
     if (*app).session.show_preview {
         SetTimer(Some((*app).hwnd), TIMER_PREVIEW, 150, None);
+        stop_hover(app);
     }
+}
+
+/// The hovered list item changed (None: the pointer left or is over empty space).
+pub(crate) unsafe fn set_hover(app: *mut App, item: Option<usize>) {
+    if (*app).panes.hover == item {
+        return;
+    }
+    (*app).panes.hover = item;
+    let _ = KillTimer(Some((*app).hwnd), TIMER_HOVER);
+    if item.is_some() && (*app).session.show_preview {
+        SetTimer(Some((*app).hwnd), TIMER_HOVER, (*app).profile.hover_preview_ms, None);
+    }
+}
+
+/// Selection change and navigation cancel a pending prefetch.
+pub(crate) unsafe fn stop_hover(app: *mut App) {
+    (*app).panes.hover = None;
+    let _ = KillTimer(Some((*app).hwnd), TIMER_HOVER);
+}
+
+/// TIMER_HOVER: warm the preview cache for the item still under the pointer. The work runs on a thread; nothing is shown.
+pub(crate) unsafe fn prefetch_hovered(app: *mut App) {
+    let Some(i) = (*app).panes.hover else { return };
+    let Some(item) = listing(app).and_then(|l| l.items.get(i).map(|it| (l, it))) else { return };
+    let (l, item) = item;
+    let parsing = item.parsing_name();
+    if item.is_folder() || !ui::is_fs_path(&parsing) {
+        return;
+    }
+    preview_pane::prefetch(PathBuf::from(&parsing), l.folder.child_pidl(item), preview_pane::request_size((*app).panes.preview));
 }
 
 /// Shows the focused (else first) selected item, or nothing without a selection.

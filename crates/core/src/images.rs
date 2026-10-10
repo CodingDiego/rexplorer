@@ -22,13 +22,20 @@ pub fn image(abs: &Pidl, size: i32, flags: SIIGBF) -> Result<HBITMAP> {
     unsafe { factory.GetImage(SIZE { cx: size, cy: size }, flags) }
 }
 
-/// Content thumbnail (falls back to the icon when the item has none).
+/// Content thumbnail (falls back to the icon when the item has none). An item the shell would show as the
+/// blank page gets its opening app's icon (`icons::app_icon_bitmap`), larger than `size`: callers fit it.
 pub fn thumbnail(abs: &Pidl, size: i32) -> Result<HBITMAP> {
+    if let Some(b) = crate::icons::app_icon_bitmap(abs, size) {
+        return Ok(b);
+    }
     image(abs, size, SIIGBF_RESIZETOFIT | SIIGBF_BIGGERSIZEOK)
 }
 
-/// The item's icon only, never a content thumbnail.
+/// The item's icon only, never a content thumbnail; the opening app's icon in place of the blank page.
 pub fn icon(abs: &Pidl, size: i32) -> Result<HBITMAP> {
+    if let Some(b) = crate::icons::app_icon_bitmap(abs, size) {
+        return Ok(b);
+    }
     image(abs, size, SIIGBF_ICONONLY | SIIGBF_RESIZETOFIT)
 }
 

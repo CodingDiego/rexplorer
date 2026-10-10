@@ -212,6 +212,20 @@ pub struct Profile {
     pub show_preview: bool,
     pub tree_width: i32,
     pub preview_width: i32,
+    pub show_hidden: bool,
+    pub show_extensions: bool,
+    pub single_click: bool,
+    pub search_delay_ms: u32,
+    pub hover_preview_ms: u32,
+    /// "hover" or "always": when single-click mode underlines item names.
+    pub underline_titles: String,
+    pub show_recent: bool,
+    pub show_frequent: bool,
+    pub show_status: bool,
+    pub preview_handlers: bool,
+    pub item_checkboxes: bool,
+    pub search_system: bool,
+    pub search_archives: bool,
     pub bookmarks: Vec<(String, String)>,
 }
 
@@ -226,6 +240,19 @@ impl Profile {
             show_preview: false,
             tree_width: 220,
             preview_width: 360,
+            show_hidden: false,
+            show_extensions: true,
+            single_click: false,
+            search_delay_ms: 250,
+            hover_preview_ms: 2000,
+            underline_titles: "hover".into(),
+            show_recent: true,
+            show_frequent: true,
+            show_status: true,
+            preview_handlers: true,
+            item_checkboxes: false,
+            search_system: true,
+            search_archives: false,
             // The sidebar's Favorites come from Quick Access with the shell's names; bookmarks are the user's own.
             bookmarks: Vec::new(),
         }
@@ -240,6 +267,19 @@ impl Profile {
             ("show_preview".to_string(), self.show_preview.to_string()),
             ("tree_width".to_string(), self.tree_width.to_string()),
             ("preview_width".to_string(), self.preview_width.to_string()),
+            ("show_hidden".to_string(), self.show_hidden.to_string()),
+            ("show_extensions".to_string(), self.show_extensions.to_string()),
+            ("single_click".to_string(), self.single_click.to_string()),
+            ("search_delay_ms".to_string(), self.search_delay_ms.to_string()),
+            ("hover_preview_ms".to_string(), self.hover_preview_ms.to_string()),
+            ("underline_titles".to_string(), self.underline_titles.clone()),
+            ("show_recent".to_string(), self.show_recent.to_string()),
+            ("show_frequent".to_string(), self.show_frequent.to_string()),
+            ("show_status".to_string(), self.show_status.to_string()),
+            ("preview_handlers".to_string(), self.preview_handlers.to_string()),
+            ("item_checkboxes".to_string(), self.item_checkboxes.to_string()),
+            ("search_system".to_string(), self.search_system.to_string()),
+            ("search_archives".to_string(), self.search_archives.to_string()),
         ];
         k.extend(self.bookmarks.iter().map(|(l, t)| (format!("bookmark.{l}"), t.clone())));
         (format!("profile {}", self.name), k)
@@ -257,6 +297,19 @@ impl Profile {
                 "show_preview" => p.show_preview = parse_bool(v).unwrap_or(p.show_preview),
                 "tree_width" => p.tree_width = v.parse().unwrap_or(p.tree_width),
                 "preview_width" => p.preview_width = v.parse().unwrap_or(p.preview_width),
+                "show_hidden" => p.show_hidden = parse_bool(v).unwrap_or(p.show_hidden),
+                "show_extensions" => p.show_extensions = parse_bool(v).unwrap_or(p.show_extensions),
+                "single_click" => p.single_click = parse_bool(v).unwrap_or(p.single_click),
+                "search_delay_ms" => p.search_delay_ms = v.parse().unwrap_or(p.search_delay_ms),
+                "hover_preview_ms" => p.hover_preview_ms = v.parse().unwrap_or(p.hover_preview_ms),
+                "underline_titles" => p.underline_titles = if v.trim().eq_ignore_ascii_case("always") { "always" } else { "hover" }.into(),
+                "show_recent" => p.show_recent = parse_bool(v).unwrap_or(p.show_recent),
+                "show_frequent" => p.show_frequent = parse_bool(v).unwrap_or(p.show_frequent),
+                "show_status" => p.show_status = parse_bool(v).unwrap_or(p.show_status),
+                "preview_handlers" => p.preview_handlers = parse_bool(v).unwrap_or(p.preview_handlers),
+                "item_checkboxes" => p.item_checkboxes = parse_bool(v).unwrap_or(p.item_checkboxes),
+                "search_system" => p.search_system = parse_bool(v).unwrap_or(p.search_system),
+                "search_archives" => p.search_archives = parse_bool(v).unwrap_or(p.search_archives),
                 _ => {
                     if let Some(label) = k.strip_prefix("bookmark.") {
                         p.bookmarks.push((label.to_string(), v.clone()));
@@ -273,11 +326,13 @@ pub struct Settings {
     pub active: String,
     pub profiles: Vec<Profile>,
     pub themes: Vec<Theme>,
+    /// The `[keys]` section: `cmd.name=Ctrl+T` accelerator overrides, kept as written.
+    pub keys: Vec<(String, String)>,
 }
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { active: "default".into(), profiles: vec![Profile::default_profile()], themes: vec![Theme::light(), Theme::dark()] }
+        Settings { active: "default".into(), profiles: vec![Profile::default_profile()], themes: vec![Theme::light(), Theme::dark()], keys: Vec::new() }
     }
 }
 
@@ -312,6 +367,8 @@ impl Settings {
             .find(|(n, _)| n == "general")
             .and_then(|(_, k)| k.iter().find(|(k, _)| k == "profile"))
             .map_or_else(|| s.profiles[0].name.clone(), |(_, v)| v.clone());
+
+        s.keys = sections.iter().filter(|(n, _)| n == "keys").flat_map(|(_, k)| k.clone()).collect();
 
         let mut files: Vec<PathBuf> = std::fs::read_dir(dir.join("themes"))
             .into_iter()
@@ -348,6 +405,9 @@ impl Settings {
     fn settings_text(&self) -> String {
         let mut sections = vec![("general".to_string(), vec![("profile".to_string(), self.active.clone())])];
         sections.extend(self.profiles.iter().map(Profile::to_section));
+        if !self.keys.is_empty() {
+            sections.push(("keys".to_string(), self.keys.clone()));
+        }
         write_ini(&sections)
     }
 
@@ -442,16 +502,41 @@ mod tests {
             name: "work".into(),
             theme: "sepia".into(),
             show_preview: true,
+            show_hidden: true,
+            show_extensions: false,
+            single_click: true,
+            search_delay_ms: 400,
+            hover_preview_ms: 1500,
+            underline_titles: "always".into(),
+            show_recent: false,
+            show_frequent: false,
+            show_status: false,
+            preview_handlers: false,
+            item_checkboxes: true,
+            search_system: false,
+            search_archives: true,
             bookmarks: vec![("Repos".into(), r"C:\Users\x\My Repos".into())],
             ..Profile::default_profile()
         });
         s.active = "work".into();
+        s.keys = vec![("cmd.new_tab".into(), "Ctrl+Y".into())];
         s.save_to(&d).unwrap();
         let back = Settings::load_from(&d);
         assert_eq!(back, s);
         assert_eq!(back.active_profile().name, "work");
         assert_eq!(back.theme("nope").name, "dark");
         cleanup("save");
+    }
+
+    #[test]
+    fn missing_new_keys_take_defaults() {
+        let p = Profile::from_section("x", &[("show_hidden".into(), "true".into()), ("search_delay_ms".into(), "junk".into())]);
+        assert!(p.show_hidden && p.show_extensions && !p.single_click);
+        assert_eq!((p.search_delay_ms, p.hover_preview_ms), (250, 2000));
+        assert_eq!(p.underline_titles, "hover");
+        assert!(p.show_recent && p.show_frequent && p.show_status && p.preview_handlers && p.search_system);
+        assert!(!p.item_checkboxes && !p.search_archives);
+        assert_eq!(Profile::from_section("x", &[("underline_titles".into(), "junk".into())]).underline_titles, "hover");
     }
 
     #[test]

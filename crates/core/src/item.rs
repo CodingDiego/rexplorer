@@ -1,14 +1,15 @@
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
 use windows::Win32::Foundation::PROPERTYKEY;
+use windows::Win32::System::Registry::{RRF_RT_ANY, RegCloseKey, RegGetValueW};
 use windows::Win32::System::SystemServices::{SFGAO_FOLDER, SFGAO_HIDDEN};
 use windows::Win32::System::Variant::{VariantToBoolean, VariantToStringAlloc, VariantToUInt64};
 use windows::Win32::UI::Shell::Common::{SHELLDETAILS, STRRET};
 use windows::Win32::UI::Shell::{
-    ILCombine, IShellFolder, IShellFolder2, SHFILEINFOW, SHGDN_FORPARSING, SHGDN_INFOLDER,
+    ASSOCF_NONE, ASSOCKEY_CLASS, AssocQueryKeyW, ILCombine, IShellFolder, IShellFolder2, SHFILEINFOW, SHGDN_FORPARSING, SHGDN_INFOLDER,
     SHGDN_NORMAL, SHGDNF, SHGFI_PIDL, SHGFI_SMALLICON, SHGFI_SYSICONINDEX, SHGetFileInfoW,
 };
-use windows::core::{GUID, HSTRING, Interface, PCWSTR, Result};
+use windows::core::{GUID, HSTRING, Interface, PCWSTR, Result, w};
 
 use crate::com::{Pidl, strret_to_string};
 
@@ -27,6 +28,11 @@ impl ShellItem {
     /// Full parsing name, e.g. `C:\Users` or `::{20D04FE0-...}`.
     pub fn parsing_name(&self) -> String {
         self.name(SHGDN_FORPARSING)
+    }
+
+    /// Name inside its folder with the extension the display name may hide (`a.txt`).
+    pub fn file_name(&self) -> String {
+        self.name(SHGDNF(SHGDN_INFOLDER.0 | SHGDN_FORPARSING.0))
     }
 
     fn name(&self, flags: SHGDNF) -> String {
@@ -103,7 +109,8 @@ impl ShellItem {
         self.attributes(SFGAO_HIDDEN.0) & SFGAO_HIDDEN.0 != 0
     }
 
-    /// Index into the system small image list. Returns the image list handle too (same for every call).
+    /// Index into the system small image list, the opening app's icon in place of the shell's blank page.
+    /// Returns the image list handle too (same for every call).
     pub fn icon_index(&self, folder_pidl: &Pidl) -> (usize, i32) {
         unsafe {
             let abs = Pidl::from_raw(ILCombine(Some(folder_pidl.as_ptr()), Some(self.pidl.as_ptr())));
@@ -115,12 +122,14 @@ impl ShellItem {
                 std::mem::size_of::<SHFILEINFOW>() as u32,
                 SHGFI_PIDL | SHGFI_SYSICONINDEX | SHGFI_SMALLICON,
             );
-            (himl, info.iIcon)
+            // The parsing name keeps the extension that "hide extensions" strips from the display name.
+            (himl, crate::icons::app_fallback(info.iIcon, || self.name(SHGDNF(SHGDN_INFOLDER.0 | SHGDN_FORPARSING.0))))
         }
     }
 
-    /// Renames the item in place; the shell shows its own error UI on failure.
-    pub fn rename(&mut self, hwnd: HWND, new_name: &str) -> Result<()> {
+    /// Renames the item in place; the shell shows its own error UI on failure. `literal` takes `new_name` as the
+    /// whole file name; otherwise it is a display name the shell puts a hidden extension back on.
+    pub fn rename(&mut self, hwnd: HWND, new_name: &str, literal: bool) -> Result<()> {
         let wide = HSTRING::from(new_name);
         let mut out = std::ptr::null_mut();
         unsafe {
@@ -128,7 +137,7 @@ impl ShellItem {
                 Some(hwnd),
                 self.pidl.as_ptr(),
                 PCWSTR(wide.as_ptr()),
-                SHGDN_INFOLDER,
+                if literal { SHGDNF(SHGDN_INFOLDER.0 | SHGDN_FORPARSING.0) } else { SHGDN_INFOLDER },
                 Some(&mut out),
             )?;
             if !out.is_null() {
@@ -136,5 +145,15 @@ impl ShellItem {
             }
         }
         Ok(())
+    }
+}
+
+/// The file type of `ext` (".lnk") is marked NeverShowExt: Explorer hides that extension even with extensions shown.
+pub fn never_shows_ext(ext: &str) -> bool {
+    unsafe {
+        let Ok(key) = AssocQueryKeyW(ASSOCF_NONE, ASSOCKEY_CLASS, &HSTRING::from(ext), PCWSTR::null()) else { return false };
+        let found = RegGetValueW(key, PCWSTR::null(), w!("NeverShowExt"), RRF_RT_ANY, None, None, None).is_ok();
+        let _ = RegCloseKey(key);
+        found
     }
 }

@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# RAR has no shell namespace handler; this bundles the unrar library and builds it with cc.
-unrar = "0.5"
+# RAR has no shell namespace handler; this bundles libunrar 7.21 beta 1 (past CVE-2025-6218 and CVE-2025-8088) and builds it with cc.
+unrar-ng = "0.7.7"
 windows-core = { workspace = true }
 windows = { workspace = true, features = [
     "Win32_Foundation",
@@ -25,6 +25,7 @@ windows = { workspace = true, features = [
     "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_System_Variant",
+    "Win32_UI_Controls",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
     "Win32_UI_Shell_PropertiesSystem",

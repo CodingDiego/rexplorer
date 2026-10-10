@@ -47,8 +47,27 @@ pub fn ftp_url(host: &str, port: Option<u16>, user: &str, password: &str, path: 
         url.push_str(&format!(":{p}"));
     }
     url.push('/');
-    url.push_str(path.replace('\\', "/").trim_start_matches('/'));
+    let path = path.replace('\\', "/");
+    url.push_str(&path.trim_start_matches('/').split('/').map(percent_encode).collect::<Vec<_>>().join("/"));
     url
+}
+
+/// The host goes into the URL raw, so it must not be able to end the authority or smuggle in a userinfo/port.
+fn valid_host(h: &str) -> bool {
+    !h.is_empty() && !h.chars().any(|c| matches!(c, '@' | '/' | '\\' | '?' | '#' | ':') || c.is_whitespace() || c.is_control())
+}
+
+/// `ftp://user:pw@host/..` without the password, for titles, messages and the session file; other names unchanged.
+pub fn redact(name: &str) -> String {
+    if !name.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("ftp://")) {
+        return name.to_string();
+    }
+    let rest = &name[6..];
+    let auth = &rest[..rest.find('/').unwrap_or(rest.len())];
+    match auth.rfind('@').and_then(|at| auth[..at].find(':').map(|c| (c, at))) {
+        Some((colon, at)) => format!("{}{}", &name[..6 + colon], &rest[at..]),
+        None => name.to_string(),
+    }
 }
 
 /// The JSON string after the first `"path":`; shortcut: any `\x` escape yields `x` (no \uXXXX), enough for paths.
@@ -157,6 +176,7 @@ fn register() {
         let wc = WNDCLASSW {
             hInstance: hinst,
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            hIcon: LoadIconW(Some(hinst), PCWSTR(1 as *const u16)).unwrap_or_default(),
             lpfnWndProc: Some(wndproc),
             lpszClassName: w!("RexConnect"),
             ..Default::default()
@@ -175,7 +195,7 @@ unsafe fn collect(st: &State) -> Option<String> {
     let t: Vec<String> = st.edits.iter().map(|&e| text_of(e)).collect();
     let host = t[0].trim();
     // An unparsable port is treated as absent.
-    (!host.is_empty()).then(|| ftp_url(host, t[1].trim().parse().ok(), t[2].trim(), &t[3], t[4].trim()))
+    valid_host(host).then(|| ftp_url(host, t[1].trim().parse().ok(), t[2].trim(), &t[3], t[4].trim()))
 }
 
 unsafe fn create_children(hwnd: HWND, st: &mut State) {
@@ -204,6 +224,7 @@ unsafe fn create_children(hwnd: HWND, st: &mut State) {
         let pw = if i == 3 { ES_PASSWORD as u32 } else { 0 };
         let style = WS_TABSTOP.0 | ES_AUTOHSCROLL as u32 | pw;
         st.edits[i] = mk(w!("EDIT"), PCWSTR::null(), style, WINDOW_EX_STYLE(0), ID_HOST + i as i32);
+        crate::edit::attach(st.edits[i]);
     }
     // Pills drawn on WM_DRAWITEM; Enter still means Connect through DM_GETDEFID.
     st.ok = mk(w!("BUTTON"), w!("Connect"), WS_TABSTOP.0 | BS_OWNERDRAW as u32, WINDOW_EX_STYLE(0), IDOK.0);
@@ -384,7 +405,11 @@ pub fn dialog(parent: HWND, t: &Theme, font: HFONT) -> Option<String> {
                 let _ = ShowWindow(hwnd, SW_SHOW);
                 let _ = SetFocus(Some(st.edits[0]));
                 let mut msg = MSG::default();
-                while !st.done && GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                while !st.done {
+                    if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                        PostQuitMessage(msg.wParam.0 as i32); // re-post WM_QUIT for the outer loop
+                        break;
+                    }
                     if !IsDialogMessageW(hwnd, &msg).as_bool() {
                         let _ = TranslateMessage(&msg);
                         DispatchMessageW(&msg);
@@ -416,6 +441,30 @@ mod tests {
         assert_eq!(ftp_url("h", None, "me@x.org", "p:w@d/1", ""), "ftp://me%40x.org:p%3Aw%40d%2F1@h/");
         assert_eq!(ftp_url("h", Some(2121), "u", "p", "\\\\dir\\sub"), "ftp://u:p@h:2121/dir/sub");
         assert_eq!(ftp_url("h", None, "\u{f1}", "", ""), "ftp://%C3%B1@h/");
+    }
+
+    #[test]
+    fn ftp_url_encodes_path_segments() {
+        assert_eq!(ftp_url("h", None, "", "", "my dir/a#b/c?d"), "ftp://h/my%20dir/a%23b/c%3Fd");
+    }
+
+    #[test]
+    fn host_validation() {
+        assert!(valid_host("ftp.example.com") && valid_host("10.0.0.1"));
+        for bad in ["", "a@b", "a/b", "a\\b", "a?b", "a#b", "a:21", "a b", "a\tb"] {
+            assert!(!valid_host(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn redact_drops_the_password_only() {
+        assert_eq!(redact("ftp://bob:s3cret@h/x"), "ftp://bob@h/x");
+        assert_eq!(redact("ftp://bob:s3cret@h:2121/x"), "ftp://bob@h:2121/x");
+        assert_eq!(redact("ftp://me%40x.org:p%40ss@h/"), "ftp://me%40x.org@h/");
+        assert_eq!(redact("ftp://bob@h/x"), "ftp://bob@h/x");
+        assert_eq!(redact("ftp://h/a:b@c"), "ftp://h/a:b@c"); // the colon and @ are in the path
+        assert_eq!(redact("C:\\a:b@c"), "C:\\a:b@c");
+        assert_eq!(redact(&ftp_url("h", None, "u", "p@:/", "")), "ftp://u@h/");
     }
 
     #[test]

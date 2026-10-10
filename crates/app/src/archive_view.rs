@@ -25,7 +25,7 @@ pub fn split_archive_path(text: &str) -> Option<(PathBuf, String)> {
     let mut start = 0;
     for comp in text.split(['\\', '/']) {
         let end = start + comp.len();
-        if comp.len() > 4 && comp[comp.len() - 4..].eq_ignore_ascii_case(".rar") {
+        if comp.len() > 4 && comp.as_bytes()[comp.len() - 4..].eq_ignore_ascii_case(b".rar") {
             return Some((PathBuf::from(&text[..end]), norm_dir(&text[end..])));
         }
         start = end + 1;
@@ -203,6 +203,13 @@ mod tests {
         assert_eq!(s("C:\\a\\b.rar"), Some(("C:\\a\\b.rar".into(), String::new())));
         assert_eq!(s("C:\\a\\b.txt"), None);
         assert_eq!(s("C:\\a.rarx\\b"), None);
+    }
+
+    #[test]
+    fn split_non_ascii_components() {
+        let s = |t: &str| split_archive_path(t).map(|(a, d)| (a.to_string_lossy().into_owned(), d));
+        assert_eq!(s("E:\\写真\\x.rar\\a"), Some(("E:\\写真\\x.rar".into(), "a".into())));
+        assert_eq!(s("E:\\写真\\b"), None);
     }
 
     #[test]

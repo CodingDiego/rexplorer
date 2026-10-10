@@ -21,6 +21,11 @@ pub struct Args {
     pub help: bool,
     pub install: bool,
     pub uninstall: bool,
+    pub import_explorer: bool,
+    /// With `--import-explorer`: also replace values the profile already changed.
+    pub overwrite: bool,
+    /// Keep an elevated token (drive-wide indexed search) instead of restarting under the desktop shell's.
+    pub elevated: bool,
     /// Not ours to handle: pass the whole command line to Windows Explorer and exit.
     pub forward: bool,
 }
@@ -123,6 +128,12 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> std::result::Result<Arg
     let mut out = Args::default();
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
+        // A `%1` holding a quote splits into extra arguments: after the first path, `-` options are paths too
+        // (Explorer's own `/` switches stay, Explorer accepts them anywhere and none changes the registry).
+        if !out.paths.is_empty() && a.starts_with('-') {
+            out.paths.push(clean(&a));
+            continue;
+        }
         if let Some(v) = long_value(&a, "--select", &mut it) {
             out.select = Some(v?);
             continue;
@@ -142,6 +153,9 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> std::result::Result<Arg
             "--recover" => out.recover = true,
             "--install" => out.install = true,
             "--uninstall" => out.uninstall = true,
+            "--import-explorer" => out.import_explorer = true,
+            "--overwrite" => out.overwrite = true,
+            "--elevated" => out.elevated = true,
             "-h" | "--help" => out.help = true,
             _ if a.starts_with('-') => return Err(format!("unknown option: {a}")),
             _ if a.starts_with('/') && !explorer_switches(&a, &mut it, &mut out) => {
@@ -170,7 +184,10 @@ pub fn usage() -> String {
      \x20 --unregister        remove the shell handler registration\n\
      \x20 --install           copy rexplorer to %LOCALAPPDATA%\\Programs and make it the default file manager\n\
      \x20 --uninstall         undo --install\n\
+     \x20 --import-explorer   copy Windows Explorer's settings into the active profile (backs up settings.ini)\n\
+     \x20 --overwrite         with --import-explorer: also replace values you changed in rexplorer\n\
      \x20 --recover           restore the previous session after a crash\n\
+     \x20 --elevated          when started elevated, stay so (drive-wide indexed search) instead of restarting unelevated\n\
      \x20 -h, --help          show this help\n"
         .to_string()
 }
@@ -217,7 +234,7 @@ mod tests {
 
     #[test]
     fn options_and_paths() {
-        let a = p(&["C:\\a", "--profile", "work", "-t", "--register", "--unregister", "--recover", "-h", "D:\\b"]).unwrap();
+        let a = p(&["--profile", "work", "-t", "--register", "--unregister", "--recover", "-h", "C:\\a", "D:\\b"]).unwrap();
         assert_eq!(a.paths, ["C:\\a", "D:\\b"]);
         assert_eq!(a.profile.as_deref(), Some("work"));
         assert!(a.new_tab && a.register && a.unregister && a.recover && a.help);
@@ -298,12 +315,28 @@ mod tests {
     }
 
     #[test]
+    fn options_after_a_path_are_paths() {
+        let a = p(&["C:\\x", "--uninstall", "--profile"]).unwrap();
+        assert!(!a.uninstall && a.profile.is_none());
+        assert_eq!(a.paths, ["C:\\x", "--uninstall", "--profile"]);
+    }
+
+    #[test]
     fn errors() {
         assert_eq!(p(&["--bogus"]).unwrap_err(), "unknown option: --bogus");
         assert!(p(&["--select"]).is_err());
         assert!(p(&["--profile"]).is_err());
         let a = p(&["--install", "--uninstall"]).unwrap();
         assert!(a.install && a.uninstall && !a.forward);
+    }
+
+    #[test]
+    fn import_explorer_flags() {
+        let a = p(&["--import-explorer", "--overwrite"]).unwrap();
+        assert!(a.import_explorer && a.overwrite && !a.forward);
+        let a = p(&["--import-explorer"]).unwrap();
+        assert!(a.import_explorer && !a.overwrite);
+        assert!(p(&["--elevated"]).unwrap().elevated && !p(&[]).unwrap().elevated);
     }
 
     #[test]
@@ -323,7 +356,7 @@ mod tests {
     fn usage_mentions_every_option() {
         let u = usage();
         assert!(u.starts_with("rexplorer [options] [folder...]\n"));
-        for o in ["--select", "/select,", "--profile", "--new-tab", "-t", "--register", "--unregister", "--install", "--uninstall", "--recover", "--search", "-h", "--help"] {
+        for o in ["--select", "/select,", "--profile", "--new-tab", "-t", "--register", "--unregister", "--install", "--uninstall", "--import-explorer", "--overwrite", "--recover", "--elevated", "--search", "-h", "--help"] {
             assert!(u.contains(o), "{o}");
         }
     }

@@ -85,6 +85,10 @@ impl Recent {
         let _ = std::fs::write(&self.path, self.items.join("\n"));
     }
 
+    pub fn clear(&mut self) {
+        self.items.clear();
+    }
+
     pub fn remove(&mut self, target: &str) {
         let t = target.to_lowercase();
         self.items.retain(|i| i.to_lowercase() != t);

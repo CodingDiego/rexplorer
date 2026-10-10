@@ -8,6 +8,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use crate::nav::{cur, go_up, listing, open_in_background, sort_listing, source};
 use crate::source::{Source, activate};
+use crate::ui::Entry;
 use rexplorer_core::dragdrop;
 use std::cell::RefCell;
 use windows::Win32::Foundation::POINTL;
@@ -26,6 +27,17 @@ pub(crate) unsafe fn on_notify(app: *mut App, lparam: LPARAM) -> LRESULT {
         LVN_GETDISPINFOW => {
             let di = &mut *(lparam.0 as *mut NMLVDISPINFOW);
             fill_dispinfo(app, &mut di.item);
+        }
+        // A click on a row's check box toggles its selection: a row is checked while it is selected.
+        NM_CLICK if (*app).profile.item_checkboxes => {
+            let nm = &*(lparam.0 as *const NMITEMACTIVATE);
+            let mut hit = LVHITTESTINFO { pt: nm.ptAction, ..Default::default() };
+            SendMessageW((*app).list, LVM_HITTEST, None, Some(LPARAM(&mut hit as *mut _ as isize)));
+            if hit.iItem >= 0 && hit.flags.0 & LVHT_ONITEMSTATEICON.0 != 0 {
+                let i = hit.iItem as usize;
+                let selected = SendMessageW((*app).list, LVM_GETITEMSTATE, Some(WPARAM(i)), Some(LPARAM(LVIS_SELECTED.0 as isize))).0 != 0;
+                set_item_state((*app).list, i, LIST_VIEW_ITEM_STATE_FLAGS(if selected { 0 } else { LVIS_SELECTED.0 }), LVIS_SELECTED);
+            }
         }
         LVN_COLUMNCLICK => {
             let nm = &*(lparam.0 as *const NMLISTVIEW);
@@ -87,6 +99,11 @@ pub(crate) fn find_prefix(n: usize, start: usize, wrap: bool, needle: &str, name
 
 unsafe fn fill_dispinfo(app: *mut App, item: &mut LVITEMW) {
     let i = item.iItem as usize;
+    // With check boxes a row is checked while it is selected.
+    if item.mask.contains(LVIF_STATE) && item.iSubItem == 0 && (*app).profile.item_checkboxes {
+        let selected = SendMessageW((*app).list, LVM_GETITEMSTATE, Some(WPARAM(i)), Some(LPARAM(LVIS_SELECTED.0 as isize))).0 != 0;
+        item.state = LIST_VIEW_ITEM_STATE_FLAGS((item.state.0 & !LVIS_STATEIMAGEMASK.0) | (if selected { 2 } else { 1 }) << 12);
+    }
     let icon_view = (*app).views.view != views::View::Details;
     if item.mask.contains(LVIF_IMAGE) && item.iSubItem == 0 && icon_view {
         item.iImage = views::image(app, i);
@@ -179,6 +196,9 @@ pub(crate) unsafe fn show_menu(app: *mut App, on_item: bool) {
     if let Some(Source::Archive(_)) = source(app) {
         return source::archive_menu(app);
     }
+    if !on_item && listing(app).is_some_and(nav::is_home) {
+        return home_menu(app, pt);
+    }
     let sel = selected_indices((*app).list);
     let menu = if on_item {
         selection_menu(app, &sel)
@@ -196,17 +216,42 @@ pub(crate) unsafe fn show_menu(app: *mut App, on_item: bool) {
             sel.iter().filter_map(|&i| l.items.get(i)).any(|i| i.is_folder() && pinned_key(&i.parsing_name()))
         });
     // Pinning applies to the current folder (background) or to selected folders of a shell listing.
-    let own: &[&str] = match (home, on_item) {
-        (true, true) if folders && pinned => &[UNPIN_FROM_HOME],
-        (true, true) if folders => &[PIN_TO_HOME],
-        (true, _) => &[],
-        (false, _) if listing(app).is_some() && (!on_item || folders) => &[PIN_TO_HOME],
-        _ => &[],
+    let pin = if pinned { Entry::new(CMD_PIN as usize, UNPIN_FROM_HOME, 0xE77A) } else { Entry::new(CMD_PIN as usize, PIN_TO_HOME, 0xE718) };
+    let mut own: Vec<Entry> = match (home, on_item) {
+        (true, true) if folders => vec![pin],
+        (true, _) => Vec::new(),
+        (false, _) if listing(app).is_some() && (!on_item || folders) => vec![pin],
+        _ => Vec::new(),
     };
+    // The background menu starts as Explorer's does: View, Sort by | Refresh, Paste (and our pin), then the shell's.
+    if !on_item && !home && listing(app).is_some() {
+        let (ve, vc) = commands::view_entries(app);
+        let (se, sc) = commands::sort_entries(app);
+        own.splice(
+            0..0,
+            [
+                Entry::submenu("View", 0xE8A9, &ve, &vc, VIEW_BASE),
+                Entry::submenu("Sort by", 0xE8CB, &se, &sc, SORT_BASE),
+                Entry::sep(),
+                Entry::new(CMD_REFRESH as usize, "Refresh\tF5", 0xE72C),
+                Entry::new(CMD_PASTE as usize, "Paste\tCtrl+V", 0xE77F).enabled(commands::clipboard_has_files()),
+            ],
+        );
+    }
+    if !own.is_empty() {
+        own.push(Entry::sep());
+    }
+    let mut bitmaps = Vec::new();
+    let hmenu = ui::build_menu(app, &own, &mut bitmaps);
+    let at = GetMenuItemCount(Some(hmenu)).max(0) as u32;
     let extended = GetKeyState(VK_SHIFT.0 as i32) < 0;
     (*app).active_menu = Some(menu);
-    let picked = (*app).active_menu.as_ref().unwrap().show_with(hwnd, pt.x, pt.y, extended, own);
+    let picked = (*app).active_menu.as_ref().unwrap().show_in(hwnd, hmenu, at, pt.x, pt.y, extended);
     (*app).active_menu = None;
+    let _ = DestroyMenu(hmenu);
+    for b in bitmaps {
+        let _ = DeleteObject(b.into());
+    }
     match picked {
         Ok(Picked::Rename) => begin_rename(app),
         Ok(Picked::Own(_)) if home => {
@@ -214,7 +259,9 @@ pub(crate) unsafe fn show_menu(app: *mut App, on_item: bool) {
             panes::sidebar_changed(app);
             SetTimer(Some(hwnd), TIMER_REFRESH, 300, None);
         }
-        Ok(Picked::Own(_)) => pin_to_home(app),
+        Ok(Picked::Own(id)) if id >= SORT_BASE => commands::pick_sort(app, id - SORT_BASE),
+        Ok(Picked::Own(id)) if id >= VIEW_BASE => commands::pick_view(app, id - VIEW_BASE),
+        Ok(Picked::Own(id)) => on_command(app, id as u16),
         // The shell's own entries can change Home (add to or remove from Favorites, remove from the list).
         Ok(Picked::Invoked) if home => {
             SetTimer(Some(hwnd), TIMER_REFRESH, 300, None);
@@ -222,6 +269,32 @@ pub(crate) unsafe fn show_menu(app: *mut App, on_item: bool) {
         _ => {}
     }
 }
+
+const HOME_RECENT: usize = 0x3001;
+const HOME_FREQUENT: usize = 0x3002;
+
+/// Home's background menu: the shell offers none, so it is all ours.
+unsafe fn home_menu(app: *mut App, pt: POINT) {
+    let p = &(*app).profile;
+    let entries = [
+        Entry::new(CMD_REFRESH as usize, "Refresh\tF5", 0xE72C),
+        Entry::sep(),
+        Entry { checked: p.show_recent, ..Entry::new(HOME_RECENT, "Show recently used files", 0) },
+        Entry { checked: p.show_frequent, ..Entry::new(HOME_FREQUENT, "Show frequently used folders", 0) },
+        Entry::sep(),
+        Entry::new(CMD_FOLDER_OPTIONS as usize, "Folder options...", 0xE713),
+    ];
+    match ui::pick_entries(app, &entries, pt.x, pt.y) {
+        Some(HOME_RECENT) => folder_options::toggle(app, true),
+        Some(HOME_FREQUENT) => folder_options::toggle(app, false),
+        Some(id) => on_command(app, id as u16),
+        None => {}
+    }
+}
+
+/// Context-menu ids of the View and Sort by submenu entries: the command bar's ids plus these.
+const VIEW_BASE: usize = 0x1000;
+const SORT_BASE: usize = 0x2000;
 
 /// Ctrl+D and the menus' "Pin to Home": the shell's canonical "pintohome" verb on the selected folders, or on the
 /// current folder when nothing is selected. Beeps when there is nothing to pin or the shell refuses.
@@ -366,17 +439,22 @@ pub(crate) unsafe fn begin_rename(app: *mut App) {
 
 unsafe fn on_end_edit(app: *mut App, item: &LVITEMW) {
     if !item.pszText.is_null() {
-        rename_item(app, item.iItem as usize, &item.pszText.to_string().unwrap_or_default());
+        rename_item(app, item.iItem as usize, &item.pszText.to_string().unwrap_or_default(), true);
     }
 }
 
 /// Renames item `index` of the active listing to `name` (the shell shows its own error UI).
-pub(crate) unsafe fn rename_item(app: *mut App, index: usize, name: &str) {
+pub(crate) unsafe fn rename_item(app: *mut App, index: usize, name: &str, cell: bool) {
     // Work on a copy: the shell may pump messages while renaming, and a refresh could replace the listing.
     let target = listing(app).and_then(|l| l.items.get(index).cloned());
     if let Some(mut target) = target {
-        if !name.is_empty() && name != target.display_name() {
-            let _ = target.rename((*app).hwnd, name);
+        // Home tiles edit the display name; the list edits its Name column, which Show file extensions may change.
+        let (shown, suffix) = if cell { source::name_cell(&target) } else { (target.display_name(), None) };
+        if !name.is_empty() && name != shown {
+            let _ = match suffix {
+                Some(ext) => target.rename((*app).hwnd, &format!("{name}{ext}"), true),
+                None => target.rename((*app).hwnd, name, false),
+            };
             SetTimer(Some((*app).hwnd), TIMER_REFRESH, 150, None);
         }
     }
@@ -443,7 +521,10 @@ pub(crate) unsafe extern "system" fn header_subclass(hwnd: HWND, msg: u32, wpara
 
 /// Middle-click support (the ListView ignores the middle button), the flat header and the card's rounded corners.
 pub(crate) unsafe extern "system" fn subclass(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM, _id: usize, data: usize) -> LRESULT {
-    if msg == WM_NOTIFY && (*(lparam.0 as *const NMHDR)).code == NM_CUSTOMDRAW {
+    // Only the header's custom draw; the label tooltip sends NM_CUSTOMDRAW too.
+    if msg == WM_NOTIFY && (*(lparam.0 as *const NMHDR)).code == NM_CUSTOMDRAW
+        && (*(lparam.0 as *const NMHDR)).hwndFrom.0 == SendMessageW(hwnd, LVM_GETHEADER, None, None).0 as *mut _
+    {
         return LRESULT(draw_header(&(*(data as *mut App)).theme, &*(lparam.0 as *const NMCUSTOMDRAW)) as isize);
     }
     if msg == WM_MBUTTONUP {
@@ -453,6 +534,19 @@ pub(crate) unsafe extern "system" fn subclass(hwnd: HWND, msg: u32, wparam: WPAR
             open_in_background(data as *mut App, i as usize);
         }
         return LRESULT(0);
+    }
+    let app = data as *mut App;
+    if msg == WM_MOUSEMOVE {
+        if !(*app).panes.hover_tracking {
+            let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
+            (*app).panes.hover_tracking = TrackMouseEvent(&mut tme).is_ok();
+        }
+        let mut ht = LVHITTESTINFO { pt: POINT { x: lparam.0 as i16 as i32, y: (lparam.0 >> 16) as i16 as i32 }, ..Default::default() };
+        let i = SendMessageW(hwnd, LVM_HITTEST, None, Some(LPARAM(&mut ht as *mut _ as isize))).0;
+        crate::panes::set_hover(app, usize::try_from(i).ok());
+    } else if msg == WM_MOUSELEAVE {
+        (*app).panes.hover_tracking = false;
+        crate::panes::stop_hover(app);
     }
     let r = DefSubclassProc(hwnd, msg, wparam, lparam);
     theme::card_message(hwnd, msg, (*(data as *mut App)).theme.background);

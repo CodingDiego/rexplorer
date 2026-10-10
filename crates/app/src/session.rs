@@ -66,7 +66,7 @@ pub fn parse(text: &str) -> Session {
 pub fn format(s: &Session) -> String {
     let mut out = String::new();
     for t in &s.tabs {
-        out.push_str(&format!("tab={t}\n"));
+        out.push_str(&format!("tab={}\n", crate::connect::redact(t)));
     }
     out.push_str(&format!(
         "active={}\nview={}\ntree={}\nsidebar={}\npreview={}\ntree_width={}\npreview_width={}\n",
@@ -141,6 +141,13 @@ mod tests {
     fn round_trip_with_equals_in_tab() {
         let s = sample();
         assert_eq!(parse(&format(&s)), s);
+    }
+
+    #[test]
+    fn ftp_passwords_are_not_persisted() {
+        let s = Session { tabs: vec!["ftp://u:pw@h/x".into()], ..Session::default() };
+        assert!(!format(&s).contains("pw"));
+        assert_eq!(parse(&format(&s)).tabs, vec!["ftp://u@h/x".to_string()]);
     }
 
     #[test]

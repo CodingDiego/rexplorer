@@ -4,13 +4,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use unrar::Archive;
+use unrar_ng::Archive;
 use windows::Win32::Foundation::E_FAIL;
 use windows::core::{Error, Result};
-
-// unrar_sys's crypt.o needs CryptGenRandom (advapi32) but its build script does not link it.
-#[link(name = "advapi32")]
-unsafe extern "C" {}
 
 /// One archive member. `path` uses backslashes, without leading or trailing separator.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +30,19 @@ fn norm(p: &Path) -> String {
     p.to_string_lossy().replace('/', "\\").trim_matches('\\').to_string()
 }
 
+/// An entry that climbs out of the extraction directory.
+fn escapes(path: &str) -> bool {
+    path.split('\\').any(|c| c == "..")
+}
+
+/// Best-effort Mark-of-the-Web: the archive carries a Zone.Identifier stream only when it was downloaded.
+fn inherit_motw(archive: &Path, target: &Path) {
+    let stream = |p: &Path| format!("{}:Zone.Identifier", p.display());
+    if let Ok(z) = std::fs::read(stream(archive)) {
+        let _ = std::fs::write(stream(target), z);
+    }
+}
+
 fn split(path: &str) -> (&str, &str) {
     match path.rfind('\\') {
         Some(i) => (&path[..i], &path[i + 1..]),
@@ -51,7 +60,7 @@ pub fn list(archive: &Path) -> Result<Vec<Entry>> {
     for h in Archive::new(archive).open_for_listing().map_err(err)? {
         let h = h.map_err(err)?;
         let path = norm(&h.filename);
-        if path.is_empty() || !seen.insert(path.to_lowercase()) {
+        if path.is_empty() || escapes(&path) || !seen.insert(path.to_lowercase()) {
             continue;
         }
         let (parent, name) = split(&path);
@@ -100,9 +109,10 @@ pub fn extract(archive: &Path, entry_path: &str, dest_dir: &Path) -> Result<Path
     let mut cur = Archive::new(archive).open_for_processing().map_err(err)?;
     while let Some(h) = cur.read_header().map_err(err)? {
         let path = norm(&h.entry().filename);
-        if path.eq_ignore_ascii_case(want) && !h.entry().is_directory() {
+        if !escapes(&path) && path.eq_ignore_ascii_case(want) && !h.entry().is_directory() {
             let target = dest_dir.join(split(&path).1);
             h.extract_to(&target).map_err(err)?;
+            inherit_motw(archive, &target);
             return Ok(target);
         }
         cur = h.skip().map_err(err)?;
@@ -113,12 +123,18 @@ pub fn extract(archive: &Path, entry_path: &str, dest_dir: &Path) -> Result<Path
 pub fn extract_all(archive: &Path, dest_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dest_dir).map_err(err)?;
     let mut cur = Archive::new(archive).open_for_processing().map_err(err)?;
+    let mut written = Vec::new();
     while let Some(h) = cur.read_header().map_err(err)? {
         cur = if h.entry().is_file() {
+            written.push(norm(&h.entry().filename));
             h.extract_with_base(dest_dir).map_err(err)?
         } else {
             h.skip().map_err(err)?
         };
+    }
+    // Only what this call wrote: "Extract here" lands next to files that were already there.
+    for p in written {
+        inherit_motw(archive, &dest_dir.join(p));
     }
     Ok(())
 }
@@ -226,6 +242,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(text, "hello");
         assert!(missing);
+    }
+
+    #[test]
+    fn escaping_entries() {
+        assert!(escapes("..\\..\\x") && escapes("a\\..\\b") && escapes(".."));
+        assert!(!escapes("a\\..b\\c") && !escapes("docs\\a.txt"));
+    }
+
+    #[test]
+    fn extracted_files_inherit_the_zone_stream() {
+        let dir = tmp("motw");
+        let rar = fixture(&dir);
+        let stream = |p: &Path| format!("{}:Zone.Identifier", p.display());
+        std::fs::write(stream(&rar), "[ZoneTransfer]\r\nZoneId=3\r\n").unwrap();
+        let one = extract(&rar, "docs\\a.txt", &dir.join("one")).unwrap();
+        extract_all(&rar, &dir.join("all")).unwrap();
+        let z1 = std::fs::read_to_string(stream(&one));
+        let z2 = std::fs::read_to_string(stream(&dir.join("all").join("docs").join("a.txt")));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(z1.unwrap().contains("ZoneId=3"));
+        assert!(z2.unwrap().contains("ZoneId=3"));
     }
 
     #[test]
