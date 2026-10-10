@@ -612,8 +612,12 @@ mod tests {
         let downloads = rows[1].target.to_lowercase();
         assert_eq!(rows.iter().filter(|r| r.target.to_lowercase() == downloads).count(), 1, "Quick Access does not repeat it");
         let recycle = "::{645FF040-5081-101B-9F08-00AA002F954E}";
-        let bin = rows.iter().position(|r| r.target.eq_ignore_ascii_case(recycle)).expect("Recycle Bin from Quick Access");
-        assert_eq!((rows[bin].section, &kinds[bin]), ("Favorites", &Kind::Pinned));
+        // The Recycle Bin is listed once: under Favorites when Quick Access pins it (a per-user choice), else elsewhere.
+        let bins: Vec<usize> = rows.iter().enumerate().filter(|(_, r)| r.target.eq_ignore_ascii_case(recycle)).map(|(i, _)| i).collect();
+        assert_eq!(bins.len(), 1, "Recycle Bin once: {names:?}");
+        if rows[bins[0]].section == "Favorites" {
+            assert_eq!(kinds[bins[0]], Kind::Pinned);
+        }
         assert!(rows.iter().any(|r| r.section == "This PC" && r.target == "C:\\"), "drives: {names:?}");
         assert!(!rows.iter().any(|r| r.section == "This PC" && r.target.len() > 3 && ui::is_fs_path(&r.target)), "no user folders under This PC");
         assert!(rows.iter().filter(|r| r.section == "Devices").all(|r| !NOT_DEVICES.contains(&r.target.as_str())));

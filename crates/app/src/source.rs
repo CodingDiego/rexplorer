@@ -794,15 +794,16 @@ mod tests {
         search::walk(&root, "needle", search::Scope::default(), &AtomicBool::new(false), &mut |h| rows.extend(rows_of(h))).unwrap();
         let by_path = hit_for_path(&dir.join("needle.txt")).map(|h| rows_of(vec![h]));
         std::fs::remove_dir_all(&dir).unwrap();
-        rows.sort_by(|a, b| a.name.cmp(&b.name));
-        let names: Vec<(&str, bool)> = rows.iter().map(|r| (r.name.as_str(), r.is_folder)).collect();
-        assert_eq!(names, [("needle-dir", true), ("needle.txt", false)]);
+        // Folders first. The file's name follows the user's "hide extensions for known file types" setting.
+        rows.sort_by(|a, b| b.is_folder.cmp(&a.is_folder).then(a.name.cmp(&b.name)));
+        let names: Vec<(&str, bool)> = rows.iter().map(|r| (r.name.trim_end_matches(".txt"), r.is_folder)).collect();
+        assert_eq!(names, [("needle-dir", true), ("needle", false)]);
         let file = &rows[1];
         // Type and size are localized shell text: only check that the shell filled them.
         assert!(!file.kind.is_empty() && !file.size.is_empty(), "kind={:?} size={:?}", file.kind, file.size);
         assert!(file.folder.ends_with(&format!("rexplorer-source-{}", std::process::id())), "{}", file.folder);
         let by_path = by_path.expect("path resolves to a shell item");
-        assert_eq!(by_path[0].name, "needle.txt");
+        assert_eq!(by_path[0].name, file.name);
         assert_eq!(by_path[0].size, file.size);
     }
 }

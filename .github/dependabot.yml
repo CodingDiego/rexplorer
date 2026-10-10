@@ -8,6 +8,7 @@ updates:
       # Pinned on purpose (see Cargo.toml): upgraded by hand, the API breaks across minors.
       - dependency-name: windows
       - dependency-name: windows-core
+      - dependency-name: windows-collections
   - package-ecosystem: github-actions
     directory: /
     schedule:
