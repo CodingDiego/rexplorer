@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --release --locked
+      - run: cargo build --release --locked
+      - name: Package
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}".TrimStart('v')
+          $d = "rexplorer-$v-x64"
+          New-Item -ItemType Directory $d | Out-Null
+          Copy-Item target\release\rexplorer.exe, LICENSE, THIRD-PARTY-NOTICES.md $d
+          @"
+          rexplorer $v (Windows x64)
+
+          Run rexplorer.exe to try it; nothing is installed.
+
+          Make it the default file manager (no administrator rights needed, everything is per-user):
+            rexplorer.exe --install
+            rexplorer.exe --import-explorer      (optional: copy your Windows Explorer settings)
+          Undo:
+            %LOCALAPPDATA%\Programs\rexplorer\rexplorer.exe --uninstall
+
+          Docs, source and security policy: https://github.com/${{ github.repository }}
+          "@ -replace '(?m)^ {10}', '' | Set-Content -Encoding utf8 "$d\README.txt"
+          Compress-Archive -Path $d -DestinationPath "$d.zip"
+          Get-FileHash "$d.zip", "$d\rexplorer.exe" -Algorithm SHA256 |
+            ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) } |
+            Set-Content -Encoding ascii SHA256SUMS.txt
+          "ZIP=$d.zip" >> $env:GITHUB_ENV
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" "${{ env.ZIP }}" SHA256SUMS.txt --title "rexplorer ${{ github.ref_name }}" --notes-file .github/release-notes.md --verify-tag
