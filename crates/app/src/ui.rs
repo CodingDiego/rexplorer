@@ -209,6 +209,7 @@ unsafe fn check_images(t: &Theme, dpi: i32) -> HIMAGELIST {
 
 pub(crate) unsafe fn apply_theme(app: *mut App) {
     let t = &(*app).theme;
+    theme::set_menu_theme(t.dark);
     theme::apply_window((*app).hwnd, t);
     theme::apply_list((*app).list, t);
     theme::apply_control((*app).addr, t);
@@ -429,7 +430,7 @@ impl Entry {
 
 /// A popup menu of `entries`, every non-zero id offset by `menu::OWN_FIRST` so the shell's own ids (below it)
 /// can share the menu. Glyph bitmaps are pushed to `bitmaps`: delete them after the menu closes.
-pub(crate) unsafe fn build_menu(app: *mut App, entries: &[Entry], bitmaps: &mut Vec<HBITMAP>) -> HMENU {
+pub(crate) unsafe fn build_menu(owner: HWND, entries: &[Entry], bitmaps: &mut Vec<HBITMAP>) -> HMENU {
     let Ok(menu) = CreatePopupMenu() else { return HMENU::default() };
     for (pos, e) in entries.iter().enumerate() {
         if e.id == 0 && e.sub.is_empty() {
@@ -442,11 +443,11 @@ pub(crate) unsafe fn build_menu(app: *mut App, entries: &[Entry], bitmaps: &mut 
             rexplorer_core::menu::OWN_FIRST as usize + e.id
         } else {
             flags |= MF_POPUP;
-            build_menu(app, &e.sub, bitmaps).0 as usize
+            build_menu(owner, &e.sub, bitmaps).0 as usize
         };
         let _ = AppendMenuW(menu, flags, id, PCWSTR(text.as_ptr()));
         if e.glyph != 0 {
-            if let Some(b) = glyph_bitmap(app, e.glyph) {
+            if let Some(b) = glyph_bitmap(owner, e.glyph) {
                 bitmaps.push(b);
                 let mii = MENUITEMINFOW { cbSize: size_of::<MENUITEMINFOW>() as u32, fMask: MIIM_BITMAP, hbmpItem: b, ..Default::default() };
                 let _ = SetMenuItemInfoW(menu, pos as u32, true, &mii);
@@ -460,7 +461,7 @@ pub(crate) unsafe fn build_menu(app: *mut App, entries: &[Entry], bitmaps: &mut 
 /// For pages whose background menu is all our own (Home, the future Desktop).
 pub(crate) unsafe fn pick_entries(app: *mut App, entries: &[Entry], x: i32, y: i32) -> Option<usize> {
     let mut bitmaps = Vec::new();
-    let menu = build_menu(app, entries, &mut bitmaps);
+    let menu = build_menu((*app).hwnd, entries, &mut bitmaps);
     let picked = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, x, y, None, (*app).hwnd, None).0 as usize;
     let _ = DestroyMenu(menu);
     for b in bitmaps {
@@ -471,8 +472,8 @@ pub(crate) unsafe fn pick_entries(app: *mut App, entries: &[Entry], x: i32, y: i
 
 /// A 16 px (at 96 DPI) premultiplied ARGB bitmap of `glyph` in the menu text color, for a menu item. The glyph
 /// is drawn white on black and that gray becomes the alpha, since GDI text leaves a DIB's alpha untouched.
-unsafe fn glyph_bitmap(app: *mut App, glyph: u16) -> Option<HBITMAP> {
-    let dpi = GetDpiForWindow((*app).hwnd);
+unsafe fn glyph_bitmap(owner: HWND, glyph: u16) -> Option<HBITMAP> {
+    let dpi = GetDpiForWindow(owner);
     let size = (16 * dpi / 96) as i32;
     let (bmp, bits) = views::dib(size, size)?;
     let dc = CreateCompatibleDC(None);
@@ -489,8 +490,8 @@ unsafe fn glyph_bitmap(app: *mut App, glyph: u16) -> Option<HBITMAP> {
     let _ = DeleteObject(font.into());
     SelectObject(dc, old);
     let _ = DeleteDC(dc);
-    // Popup menus follow the system colors, not our theme: so does the glyph.
-    let color = GetSysColor(COLOR_MENUTEXT);
+    // The glyph takes the menu's text color: white on dark menus, the system's menu text otherwise.
+    let color = if theme::menus_dark() { 0x00FF_FFFF } else { GetSysColor(COLOR_MENUTEXT) };
     let (cr, cg, cb) = (color & 0xFF, (color >> 8) & 0xFF, (color >> 16) & 0xFF);
     let px = std::slice::from_raw_parts_mut(bits, (size * size * 4) as usize);
     for p in px.chunks_exact_mut(4) {
@@ -635,24 +636,41 @@ pub(crate) unsafe fn install_flow(owner: Option<HWND>, uninstall: bool, confirm:
             return InstallOutcome::Cancelled;
         }
     }
+    // A running desktop helper holds the installed exe: close it before replacing or removing it, and start it
+    // again afterwards. A test base (REXPLORER_REG_BASE) leaves the real helper alone.
+    let real = base == install::REAL_REG_BASE;
+    let helper_was_running = real && crate::desktop::stop();
     let r = if uninstall {
         install::uninstall(&dir).map_err(|e| (e, None))
     } else {
         install::install(&dir, &base).map_err(|f| (f.error, Some(f.rollback)))
     };
-    let (text, icon, outcome) = match r {
-        Ok(s) => (s, MB_ICONINFORMATION, InstallOutcome::Done),
+    let (report, outcome) = match r {
+        Ok(s) => (Some((s, MB_ICONINFORMATION)), InstallOutcome::Done),
         Err((e, Some(rollback))) if !rollback.is_empty() => {
             offer_rollback(owner, &e, rollback, &dir);
-            return InstallOutcome::Failed;
+            (None, InstallOutcome::Failed)
         }
         Err((e, _)) => {
             let what = if uninstall { "Uninstall" } else { "Install" };
-            (format!("{what} failed:\n\n{}", e.message()), MB_ICONERROR, InstallOutcome::Failed)
+            (Some((format!("{what} failed:
+
+{}", e.message()), MB_ICONERROR)), InstallOutcome::Failed)
         }
     };
-    let t = HSTRING::from(text);
-    MessageBoxW(owner, PCWSTR(t.as_ptr()), w!("rexplorer"), MB_OK | icon);
+    // After a failure (rolled back or kept), the helper that was running comes back on whichever copy is in place.
+    let restart = match outcome {
+        InstallOutcome::Done => real && !uninstall,
+        _ => helper_was_running,
+    };
+    let exe = dir.join("rexplorer.exe");
+    if restart && exe.is_file() {
+        let _ = std::process::Command::new(exe).arg("--desktop").spawn();
+    }
+    if let Some((text, icon)) = report {
+        let t = HSTRING::from(text);
+        MessageBoxW(owner, PCWSTR(t.as_ptr()), w!("rexplorer"), MB_OK | icon);
+    }
     outcome
 }
 

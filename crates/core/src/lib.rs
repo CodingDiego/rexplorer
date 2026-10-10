@@ -5,6 +5,7 @@ pub mod cli;
 pub mod com;
 pub mod crash;
 pub mod dragdrop;
+pub mod desktop;
 pub mod elevation;
 pub mod fallback;
 pub mod folder;

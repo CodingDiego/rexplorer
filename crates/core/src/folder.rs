@@ -7,7 +7,7 @@ use windows::Win32::System::Registry::{
 };
 use windows::Win32::UI::Shell::Common::{ITEMIDLIST, SHCOLSTATE_ONBYDEFAULT, SHELLDETAILS};
 use windows::Win32::UI::Shell::{
-    BHID_SFObject, IEnumIDList, ILClone, ILCombine, ILFindLastID, ILRemoveLastID, IShellFolder,
+    BHID_SFObject, CSIDL_DESKTOP, IEnumIDList, SHGetFolderLocation, ILClone, ILCombine, ILFindLastID, ILRemoveLastID, IShellFolder,
     IShellFolder2, IShellItem, SHCONTF_FOLDERS, SHCONTF_INCLUDEHIDDEN, SHCONTF_NONFOLDERS,
     SHCreateItemFromIDList, SHCreateItemFromParsingName, SHGetIDListFromObject,
     SHParseDisplayName, SIGDN_DESKTOPABSOLUTEEDITING, SIGDN_DESKTOPABSOLUTEPARSING,
@@ -47,6 +47,11 @@ impl ShellFolder {
         let wide = HSTRING::from(name);
         let item: IShellItem = unsafe { SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None)? };
         Self::from_item(item)
+    }
+
+    /// The namespace root: the desktop as Explorer shows it (the user's and the public desktop folders merged).
+    pub fn desktop() -> Result<ShellFolder> {
+        Self::from_pidl(&unsafe { Pidl::from_raw(SHGetFolderLocation(None, CSIDL_DESKTOP as i32, None, 0)?) })
     }
 
     pub fn from_pidl(pidl: &Pidl) -> Result<ShellFolder> {
