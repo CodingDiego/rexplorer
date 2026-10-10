@@ -976,14 +976,39 @@ Run-Check 'handoff' {
   } finally { Stop-App $second; Stop-App $script:cur; Start-Sleep -Milliseconds 200; Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
+# WM_GETTEXT (ANSI: [W]::SendMessage binds SendMessageA), since GetWindowText reads nothing from another
+# process's controls. [NullString]: a $null title would reach FindWindowEx as "" and match only untitled statics.
+function Box-Text($dlg) {
+  $t = ''
+  $buf = [Runtime.InteropServices.Marshal]::AllocHGlobal(8192)
+  try {
+    for ($h = [W]::FindWindowEx($dlg, [IntPtr]::Zero, 'Static', [NullString]::Value); $h -ne [IntPtr]::Zero; $h = [W]::FindWindowEx($dlg, $h, 'Static', [NullString]::Value)) {
+      $null = [W]::SendMessage($h, 0x0D, [IntPtr]8192, $buf)
+      $t += [Runtime.InteropServices.Marshal]::PtrToStringAnsi($buf) + ' '
+    }
+  } finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($buf) }
+  $t
+}
+
 # Runs the exe with `$arg`, which ends in a message box: returns @(exit code, box text) once the box is closed.
-function Run-WithBox($arg) {
+# `$confirm`: a question box comes first, whose text must match it; it is answered Yes.
+function Run-WithBox($arg, $confirm) {
   $script:cur = Start-Process -FilePath $Exe -ArgumentList $arg -PassThru; $null = $script:cur.Handle
   $script:dlg = [IntPtr]::Zero
-  Wait-Until { $script:dlg = [W]::FindOfProcess([uint32]$script:cur.Id, '#32770'); $script:dlg -ne [IntPtr]::Zero } 5000 | Out-Null
-  if ($script:dlg -eq [IntPtr]::Zero) { return @(-1, 'no message box within 5 s') }
-  $text = ''
-  for ($h = [W]::FindWindowEx($script:dlg, [IntPtr]::Zero, 'Static', $null); $h -ne [IntPtr]::Zero; $h = [W]::FindWindowEx($script:dlg, $h, 'Static', $null)) { $text += (Get-Title $h) + ' ' }
+  $asked = [IntPtr]::Zero
+  if ($confirm) {
+    Wait-Until { $script:dlg = [W]::FindOfProcess([uint32]$script:cur.Id, '#32770'); $script:dlg -ne [IntPtr]::Zero } 5000 | Out-Null
+    if ($script:dlg -eq [IntPtr]::Zero) { return @(-1, 'no question box within 5 s') }
+    # The box can be found before its text is set.
+    Wait-Until { (Box-Text $script:dlg) -match $confirm } 2000 | Out-Null
+    $q = Box-Text $script:dlg
+    if ($q -notmatch $confirm) { $null = [W]::PostMessage($script:dlg, 0x111, [IntPtr]7, [IntPtr]::Zero); return @(-3, "question box without '$confirm': $q") }
+    $asked = $script:dlg
+    $null = [W]::PostMessage($script:dlg, 0x111, [IntPtr]6, [IntPtr]::Zero)  # WM_COMMAND IDYES
+  }
+  Wait-Until { $script:dlg = [W]::FindOfProcess([uint32]$script:cur.Id, '#32770'); $script:dlg -ne [IntPtr]::Zero -and $script:dlg -ne $asked } 5000 | Out-Null
+  if ($script:dlg -eq [IntPtr]::Zero -or $script:dlg -eq $asked) { return @(-1, 'no message box within 5 s') }
+  $text = Box-Text $script:dlg
   $null = [W]::PostMessage($script:dlg, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)
   if (-not $script:cur.WaitForExit(3000)) { return @(-2, "still running after its box closed; box: $text") }
   @($script:cur.ExitCode, $text)
@@ -1004,7 +1029,7 @@ Run-Check 'install-scratch' {
   Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
   $env:REXPLORER_INSTALL_DIR = $dir; $env:REXPLORER_REG_BASE = $base
   try {
-    $r = Run-WithBox '--install'
+    $r = Run-WithBox '--install' 'the running copy is replaced'
     $missing = @($keys | Where-Object { -not ((Get-ItemProperty -LiteralPath "$hk\$_" -ErrorAction SilentlyContinue).'(default)' -like "*$dir*") })
     $files = (Test-Path (Join-Path $dir 'rexplorer.exe')) -and (Test-Path (Join-Path $dir 'install.txt'))
     $u = Run-WithBox '--uninstall'

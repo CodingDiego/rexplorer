@@ -260,7 +260,8 @@ running it elevated would only hand user-writable files rights they should not h
 powershell -ExecutionPolicy Bypass -File scripts\install.ps1
 ```
 
-It builds `target\release\rexplorer.exe` if missing, runs `rexplorer.exe --install`, then asks whether to import your
+It builds `target\release\rexplorer.exe` if missing, runs `rexplorer.exe --install` (which warns first that it
+replaces Explorer and any running rexplorer, and offers Roll back if it fails), then asks whether to import your
 Windows Explorer settings (Y/n, default Y; `-ImportExplorer` answers yes and `-NoImport` no, without asking) and ends
 with where rexplorer is installed, how to start it and how to uninstall. `-Exe <path>` installs another build;
 `-Uninstall` reverts.
@@ -321,6 +322,9 @@ Each command key also gets an empty `DelegateExecute` value, which stops Windows
 `--install` refuses, changing nothing, when another program already overrides one of these keys. Everything it
 created (keys, values, the copy, the shortcut) is listed in `%LOCALAPPDATA%\Programs\rexplorer\install.txt`.
 Running it again updates the copy (a running copy is renamed to `rexplorer.old`, deleted at the next start).
+Every install first warns that it replaces Explorer and any running rexplorer copy, and exits with code 2 if you
+answer No. If an install fails partway, a dialog offers **Roll back**, which restores every value, key and file it
+had changed to what was there before, or **Keep changes**, which you can still undo with `--uninstall`.
 
 Escape hatch: `rexplorer --uninstall` (or More > **Uninstall...**, or `%LOCALAPPDATA%\Programs\rexplorer\rexplorer.exe
 --uninstall` from Win+R) reverts what install.txt lists: the values that still name rexplorer (a value another
@@ -430,8 +434,8 @@ shows the same folder), dnd (a real `SendInput` drag of a file row onto a folder
 is moved back whatever happens), handoff (with one instance running, a second launch with a folder, timed from the
 script's process creation to the new tab's title: under 300 ms, 36-78 ms measured), install-scratch (`--install`
 and `--uninstall` with the undocumented `REXPLORER_INSTALL_DIR` / `REXPLORER_REG_BASE` overrides pointing at a
-scratch folder and `HKCU\Software\rexplorer-test\<pid>`: the copy, install.txt, the five command keys and App Paths
-appear, then all of it is gone, the scratch key included; the real keys, App Paths and Start menu are never
+scratch folder and `HKCU\Software\rexplorer-test\<pid>`: the install warning is checked and answered Yes, the copy,
+install.txt, the five command keys and App Paths appear, then all of it is gone, the scratch key included; the real keys, App Paths and Start menu are never
 written) and explorer-args (`/select,<file>` selects it, `/e,<dir>` and `<dir>\` open it; `/idlist,x` and `/zzz`
 exit within 2 s, handed to Explorer, which opens a window for `/zzz`). `-Only <regex>` runs the matching checks. The whole run uses a scratch `APPDATA`,
 so the user's settings, window placement and open rexplorer window are never touched. The keyboard, share and dnd

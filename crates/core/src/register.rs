@@ -93,18 +93,19 @@ pub(crate) fn remove_if_ours(key: &HSTRING) -> Result<bool> {
 
 /// Default value of `HKCU\key`, or None if the key or value is missing.
 pub(crate) fn read_default(key: &HSTRING) -> Option<String> {
+    read_sz(key, PCWSTR::null())
+}
+
+/// The `name` value of `HKCU\key` (null or "" is the default value), or None if the key or value is missing.
+pub(crate) fn read_sz(key: &HSTRING, name: PCWSTR) -> Option<String> {
     let mut cb = 0u32;
-    unsafe {
-        RegGetValueW(HKEY_CURRENT_USER, key, PCWSTR::null(), RRF_RT_REG_SZ, None, None, Some(&mut cb))
-    }
-    .ok()
-    .ok()?;
+    unsafe { RegGetValueW(HKEY_CURRENT_USER, key, name, RRF_RT_REG_SZ, None, None, Some(&mut cb)) }.ok().ok()?;
     let mut buf = vec![0u16; cb as usize / 2 + 1];
     unsafe {
         RegGetValueW(
             HKEY_CURRENT_USER,
             key,
-            PCWSTR::null(),
+            name,
             RRF_RT_REG_SZ,
             None,
             Some(buf.as_mut_ptr().cast()),
@@ -148,13 +149,22 @@ pub fn register(base: &str, exe: &Path) -> Result<()> {
     if let Some(key) = foreign_override(base) {
         return Err(Error::new(E_FAIL, format!("another override exists: {key}")));
     }
-    for (key, arg) in command_keys(base) {
-        let cmd = if arg { format!("\"{}\" \"%1\"", exe.display()) } else { format!("\"{}\"", exe.display()) };
-        set_sz(&key, PCWSTR::null(), &cmd)?;
-        set_sz(&key, w!("DelegateExecute"), "")?;
+    for (key, name, value) in writes(base, exe) {
+        set_sz(&key, PCWSTR(HSTRING::from(name).as_ptr()), &value)?;
     }
     notify();
     Ok(())
+}
+
+/// The values `register` writes for `exe`: (key, value name with "" for the default value, data).
+pub(crate) fn writes(base: &str, exe: &Path) -> Vec<(HSTRING, &'static str, String)> {
+    let mut v = vec![];
+    for (key, arg) in command_keys(base) {
+        let cmd = if arg { format!("\"{}\" \"%1\"", exe.display()) } else { format!("\"{}\"", exe.display()) };
+        v.push((key.clone(), "", cmd));
+        v.push((key, "DelegateExecute", String::new()));
+    }
+    v
 }
 
 /// Remove the overrides written by `register`, leaving another program's in place, and the keys left empty

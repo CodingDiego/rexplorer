@@ -595,9 +595,15 @@ pub(crate) unsafe fn register_flow(owner: Option<HWND>, unregister: bool) {
     MessageBoxW(owner, PCWSTR(t.as_ptr()), w!("rexplorer"), MB_OK | icon);
 }
 
-/// --install / --uninstall and the More menu: optionally confirm (listing what changes), run, report. True on
-/// success.
-pub(crate) unsafe fn install_flow(owner: Option<HWND>, uninstall: bool, confirm: bool) -> bool {
+pub(crate) enum InstallOutcome {
+    Done,
+    Cancelled,
+    Failed,
+}
+
+/// --install / --uninstall and the More menu: optionally confirm (listing what changes), run, report. A failed
+/// install offers to roll back what it changed.
+pub(crate) unsafe fn install_flow(owner: Option<HWND>, uninstall: bool, confirm: bool) -> InstallOutcome {
     use rexplorer_core::install;
     let dir = install::default_dir();
     let base = install::reg_base();
@@ -615,22 +621,91 @@ pub(crate) unsafe fn install_flow(owner: Option<HWND>, uninstall: bool, confirm:
                 dir.join("install.txt").display()
             )
         } else {
-            format!("Make rexplorer the default file manager?\n\n{}", install::plan(&dir, &base))
+            format!(
+                "Install rexplorer as your file manager?\n\nThis replaces Windows Explorer for folders, drives, Win+E and \
+                 the taskbar's File Explorer. If rexplorer is already installed and running, the running copy is \
+                 replaced: its open windows keep working until you close them, and anything opened after this uses \
+                 the new copy.\n\n{}",
+                install::plan(&dir, &base)
+            )
         };
         let q = HSTRING::from(question);
-        if MessageBoxW(owner, PCWSTR(q.as_ptr()), w!("rexplorer"), MB_YESNO | MB_ICONQUESTION) != IDYES {
-            return false;
+        let icon = if uninstall { MB_ICONQUESTION } else { MB_ICONWARNING | MB_DEFBUTTON2 };
+        if MessageBoxW(owner, PCWSTR(q.as_ptr()), w!("rexplorer"), MB_YESNO | icon) != IDYES {
+            return InstallOutcome::Cancelled;
         }
     }
-    let r = if uninstall { install::uninstall(&dir) } else { install::install(&dir, &base) };
-    let ok = r.is_ok();
-    let (text, icon) = match r {
-        Ok(s) => (s, MB_ICONINFORMATION),
-        Err(e) => (format!("{} failed:\n\n{}", if uninstall { "Uninstall" } else { "Install" }, e.message()), MB_ICONERROR),
+    let r = if uninstall {
+        install::uninstall(&dir).map_err(|e| (e, None))
+    } else {
+        install::install(&dir, &base).map_err(|f| (f.error, Some(f.rollback)))
+    };
+    let (text, icon, outcome) = match r {
+        Ok(s) => (s, MB_ICONINFORMATION, InstallOutcome::Done),
+        Err((e, Some(rollback))) if !rollback.is_empty() => {
+            offer_rollback(owner, &e, rollback, &dir);
+            return InstallOutcome::Failed;
+        }
+        Err((e, _)) => {
+            let what = if uninstall { "Uninstall" } else { "Install" };
+            (format!("{what} failed:\n\n{}", e.message()), MB_ICONERROR, InstallOutcome::Failed)
+        }
     };
     let t = HSTRING::from(text);
     MessageBoxW(owner, PCWSTR(t.as_ptr()), w!("rexplorer"), MB_OK | icon);
-    ok
+    outcome
+}
+
+/// After a failed install: Roll back (the default) or Keep changes, then report the roll back.
+unsafe fn offer_rollback(
+    owner: Option<HWND>,
+    error: &windows::core::Error,
+    rollback: rexplorer_core::install::Rollback,
+    dir: &std::path::Path,
+) {
+    const ROLL_BACK: i32 = 100;
+    let content = HSTRING::from(format!(
+        "{}\n\nRoll back undoes every change this install made and restores your previous setup.",
+        error.message()
+    ));
+    let buttons = [
+        TASKDIALOG_BUTTON { nButtonID: ROLL_BACK, pszButtonText: w!("Roll back") },
+        TASKDIALOG_BUTTON { nButtonID: 101, pszButtonText: w!("Keep changes\nUndo them later with rexplorer --uninstall") },
+    ];
+    let config = TASKDIALOGCONFIG {
+        cbSize: size_of::<TASKDIALOGCONFIG>() as u32,
+        hwndParent: owner.unwrap_or_default(),
+        dwFlags: TDF_USE_COMMAND_LINKS,
+        pszWindowTitle: w!("rexplorer"),
+        Anonymous1: TASKDIALOGCONFIG_0 { pszMainIcon: TD_WARNING_ICON },
+        pszMainInstruction: w!("The install failed"),
+        pszContent: PCWSTR(content.as_ptr()),
+        cButtons: buttons.len() as u32,
+        pButtons: buttons.as_ptr(),
+        nDefaultButton: ROLL_BACK,
+        ..Default::default()
+    };
+    let mut picked = 0;
+    let roll_back = if TaskDialogIndirect(&config, Some(&mut picked), None, None).is_ok() {
+        picked == ROLL_BACK
+    } else {
+        let q = HSTRING::from(format!(
+            "Install failed:\n\n{}\n\nRoll back? Yes undoes every change this install made and restores your previous \
+             setup; No keeps them (undo them later with rexplorer --uninstall).",
+            error.message()
+        ));
+        MessageBoxW(owner, PCWSTR(q.as_ptr()), w!("rexplorer"), MB_YESNO | MB_ICONWARNING) == IDYES
+    };
+    if roll_back {
+        let (text, icon) = match rollback.run() {
+            Ok(s) => (s, MB_ICONINFORMATION),
+            Err(e) => (e.message(), MB_ICONERROR),
+        };
+        let t = HSTRING::from(text);
+        MessageBoxW(owner, PCWSTR(t.as_ptr()), w!("rexplorer"), MB_OK | icon);
+    } else {
+        rollback.commit(dir);
+    }
 }
 
 /// --import-explorer: copies Windows Explorer's settings (read only) into the profile's keys in settings.ini,

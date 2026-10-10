@@ -29,8 +29,12 @@ try {
 
     if ($InstallDir) { $env:REXPLORER_INSTALL_DIR = $InstallDir }
     if ($RegBase) { $env:REXPLORER_REG_BASE = $RegBase }
-    # The exe shows its own result box and exits 0 or non-zero.
+    # The exe asks first (install only), shows its own result box and exits 0, 2 when cancelled, or 1 on failure.
     $p = Start-Process -FilePath $Exe -ArgumentList $flag -Wait -PassThru
+    if ($p.ExitCode -eq 2) {
+        Write-Host 'Install cancelled; nothing was changed.' -ForegroundColor Yellow
+        exit 2
+    }
     if ($p.ExitCode) { throw "rexplorer $flag failed (exit code $($p.ExitCode)); see the message box it showed." }
 
     if ($Uninstall) {

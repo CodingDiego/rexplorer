@@ -243,7 +243,12 @@ fn main() -> Result<()> {
         return Ok(());
     }
     if args.install || args.uninstall {
-        std::process::exit(if unsafe { ui::install_flow(None, args.uninstall, false) } { 0 } else { 1 });
+        // Every install asks first (it replaces Explorer and any running copy); --uninstall stays unconfirmed.
+        std::process::exit(match unsafe { ui::install_flow(None, args.uninstall, !args.uninstall) } {
+            ui::InstallOutcome::Done => 0,
+            ui::InstallOutcome::Cancelled => 2,
+            ui::InstallOutcome::Failed => 1,
+        });
     }
     if args.import_explorer {
         std::process::exit(if unsafe { ui::import_explorer_flow(args.profile.as_deref(), args.overwrite) } { 0 } else { 1 });
