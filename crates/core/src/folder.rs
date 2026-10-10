@@ -229,13 +229,15 @@ mod tests {
             std::fs::write(dir.join(n), b"x").unwrap();
         }
         let (f, mut items) = list(dir.to_str().unwrap()).unwrap();
+        // Display names follow the user's "hide extensions for known file types" setting.
+        let bare = |s: String| s.trim_end_matches(".txt").to_string();
         items.sort_by(|a, b| f.compare(0, a, b));
         let names: Vec<(String, bool)> =
-            items.iter().map(|i| (i.display_name(), i.is_folder())).collect();
+            items.iter().map(|i| (bare(i.display_name()), i.is_folder())).collect();
         // Column titles are localized; filesystem folders always expose Name, Size, Type, Date modified.
         let cols = f.columns();
         assert!(cols.len() >= 4, "{} columns", cols.len());
-        let a = items.iter().find(|i| i.display_name() == "a.txt").unwrap();
+        let a = items.iter().find(|i| bare(i.display_name()) == "a").unwrap();
         let size_of_a = a.detail(cols[1].index);
         let sizes = (a.size(), items.iter().find(|i| i.is_folder()).unwrap().size());
         std::fs::remove_dir_all(&dir).unwrap();
@@ -244,9 +246,9 @@ mod tests {
             names,
             vec![
                 ("sub".into(), true),
-                ("a.txt".into(), false),
-                ("b.txt".into(), false),
-                ("c.txt".into(), false)
+                ("a".into(), false),
+                ("b".into(), false),
+                ("c".into(), false)
             ]
         );
         assert!(size_of_a.starts_with("1 "), "size text: {size_of_a:?}");

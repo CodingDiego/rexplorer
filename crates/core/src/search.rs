@@ -122,10 +122,12 @@ mod tests {
         });
         std::fs::remove_dir_all(&dir).unwrap();
         res.unwrap();
-        let mut names: Vec<String> = hits.iter().map(|h| h.item.display_name()).collect();
+        // Display names follow the user's "hide extensions for known file types" setting.
+        let bare = |s: String| s.trim_end_matches(".txt").to_string();
+        let mut names: Vec<String> = hits.iter().map(|h| bare(h.item.display_name())).collect();
         names.sort();
-        assert_eq!(names, ["needle-x.txt", "needle-y.txt"]);
-        let x = hits.iter().find(|h| h.item.display_name() == "needle-x.txt").unwrap();
+        assert_eq!(names, ["needle-x", "needle-y"]);
+        let x = hits.iter().find(|h| bare(h.item.display_name()) == "needle-x").unwrap();
         assert!(x.folder.ends_with('b'), "{}", x.folder);
     }
 
