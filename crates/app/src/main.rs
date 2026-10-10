@@ -436,11 +436,11 @@ fn accels(overrides: &[(String, String)]) -> Vec<ACCEL> {
     keys::apply(&ACCELS, overrides).into_iter().chain(digits.iter().enumerate().map(|(i, &k)| accel(FCONTROL.0, k, CMD_TAB1 + i as u16))).collect()
 }
 
-/// The session's tabs on a plain launch or --recover; otherwise the command-line folders; else the profile's start.
+/// The session's tabs on --recover (as Explorer, a plain launch does not restore them); otherwise the command-line
+/// folders; else the profile's start.
 unsafe fn open_startup_tabs(app: *mut App, args: &cli::Args) {
-    let plain = args.paths.is_empty() && args.select.is_none();
     let saved = std::mem::take(&mut (*app).session.tabs);
-    if (args.recover || plain) && !saved.is_empty() {
+    if args.recover && !saved.is_empty() {
         let active = (*app).session.active;
         for name in saved {
             nav::new_tab(app, nav::Target::Name(name), false, None);
@@ -629,7 +629,7 @@ unsafe fn on_notify(app: *mut App, lparam: LPARAM) -> LRESULT {
         match hdr.code {
             tabs::TN_SELECT => nav::switch_tab(app, nm.index),
             tabs::TN_CLOSE => nav::close_tab(app, nm.index),
-            tabs::TN_NEW => nav::duplicate_tab(app),
+            tabs::TN_NEW => nav::new_start_tab(app),
             _ => {}
         }
     } else if from == (*app).crumbs {
@@ -717,7 +717,7 @@ unsafe fn on_command(app: *mut App, cmd: u16) {
                 list::verb_on_selection(app, "properties", false);
             }
         }
-        CMD_NEW_TAB => nav::duplicate_tab(app),
+        CMD_NEW_TAB => nav::new_start_tab(app),
         CMD_CLOSE_TAB => nav::close_tab(app, (*app).active),
         CMD_NEXT_TAB => nav::cycle_tab(app, 1),
         CMD_PREV_TAB => nav::cycle_tab(app, -1),
