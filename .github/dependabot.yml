@@ -1,0 +1,14 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    ignore:
+      # Pinned on purpose (see Cargo.toml): upgraded by hand, the API breaks across minors.
+      - dependency-name: windows
+      - dependency-name: windows-core
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

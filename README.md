@@ -551,3 +551,9 @@ Caveats:
 - Small, flat folders of tiny files only: no network, no cloud placeholders, no thumbnails or icon-heavy folders, no
   sorting or grouping, one machine. Idle CPU was not measured.
 - The `bench` example above times shell enumeration inside rexplorer alone and is not comparable to this table.
+
+## License
+
+MIT, see [LICENSE](LICENSE). RAR support bundles the UnRAR library, which has its own license: see
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). Security reports: [SECURITY.md](SECURITY.md). Contributing:
+[CONTRIBUTING.md](CONTRIBUTING.md).

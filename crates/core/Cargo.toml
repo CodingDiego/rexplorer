@@ -2,6 +2,8 @@
 name = "rexplorer-core"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/CodingDiego/rexplorer"
 
 [dependencies]
 # RAR has no shell namespace handler; this bundles libunrar 7.21 beta 1 (past CVE-2025-6218 and CVE-2025-8088) and builds it with cc.
