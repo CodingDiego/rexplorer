@@ -397,12 +397,14 @@ Run-Check 'tabs' {
   $strip = [W]::FindWindowEx($script:main, [IntPtr]::Zero, 'RexTabs', $null)
   if ($strip -eq [IntPtr]::Zero) { return @('FAIL', 'no RexTabs child window') }
   if (-not (Set-Foreground $script:main)) { return @('SKIP', 'could not activate') }
+  # Ctrl+T opens the start place (Home on a scratch profile; its name is localized: ask the shell), not a copy.
+  $want = (New-Object -ComObject Shell.Application).NameSpace('shell:::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}').Self.Name
   [System.Windows.Forms.SendKeys]::SendWait('^t')
   Start-Sleep -Milliseconds 300
-  $ok = Wait-Until { (Get-Count $script:main) -eq $c0 } 2000
+  $ok = Wait-Until { (Get-Title $script:main) -eq "$want - rexplorer" -and (Get-Count $script:main) -gt 0 } 2000
   $t = Get-Title $script:main; $c = Get-Count $script:main
   $alive = -not $script:cur.HasExited
-  if ($alive -and $ok -and $t -eq $orig) { @('PASS', "RexTabs present; after Ctrl+T title='$t' count=$c") }
+  if ($alive -and $ok) { @('PASS', "RexTabs present; after Ctrl+T title '$orig' -> '$t' (want '$want - rexplorer') count=$c") }
   elseif ([W]::GetForegroundWindow() -ne $script:main) { @('SKIP', 'could not activate (focus lost)') }
   else { @('FAIL', "alive=$alive title '$orig' -> '$t' count $c0 -> $c") }
 }
