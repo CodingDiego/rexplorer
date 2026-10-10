@@ -43,6 +43,8 @@ pub const HN_KEYDOWN: u32 = 0x9054;
 pub const HN_RENAME: u32 = 0x9055;
 /// A pill was clicked; read the new filter with `filter`.
 pub const HN_FILTER: u32 = 0x9056;
+/// Shift+F10 or the Menu key: as HN_CONTEXT, shown at `menu_point` instead of the cursor.
+pub const HN_CONTEXT_KEY: u32 = 0x9057;
 /// Test hook: returns tiles << 16 | rows shown.
 pub const HM_COUNTS: u32 = WM_APP + 0x52;
 /// Test hook (the smoke test opens a recent file): selects and focuses the entry whose name or parsing name is
@@ -649,6 +651,23 @@ pub fn begin_rename(hwnd: HWND, index: usize) -> bool {
 }
 
 /// The name the last HN_RENAME committed.
+/// Screen point for a keyboard-opened menu: under the focused, selected entry's name when it is in view, else the
+/// page's top-left corner (as Explorer does).
+pub fn menu_point(hwnd: HWND) -> windows::Win32::Foundation::POINT {
+    use windows::Win32::Foundation::POINT;
+    unsafe {
+        let mut client = RECT::default();
+        let _ = GetClientRect(hwnd, &mut client);
+        let named = state(hwnd).and_then(|s| s.focus.filter(|&e| s.selected[e]).map(|e| name_rect(hwnd, s, e)));
+        let mut pt = match named {
+            Some(r) if r.bottom > client.top && r.top < client.bottom => POINT { x: r.left, y: r.bottom.min(client.bottom) },
+            _ => POINT { x: client.left, y: client.top },
+        };
+        let _ = ClientToScreen(hwnd, &mut pt);
+        pt
+    }
+}
+
 pub fn rename_text(hwnd: HWND) -> String {
     unsafe { state(hwnd).map(|s| s.rename_text.clone()).unwrap_or_default() }
 }
@@ -994,7 +1013,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         // Shift+F10 and the Menu key: the focused entry's menu, else the background's.
         WM_CONTEXTMENU if lparam.0 as i32 == -1 => {
             let index = s.focus.filter(|&e| s.selected[e]).and_then(|e| s.entry(e)).map_or(usize::MAX, |x| x.index);
-            notify(hwnd, HN_CONTEXT, index);
+            notify(hwnd, HN_CONTEXT_KEY, index);
         }
         WM_RBUTTONUP => {
             let index = entry_at(hwnd, s, lparam).and_then(|e| s.entry(e)).map_or(usize::MAX, |x| x.index);

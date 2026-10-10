@@ -433,7 +433,13 @@ unsafe fn fit(src: HBITMAP, size: i32) -> Option<HBITMAP> {
 
 // ---- persistence and the starter icon theme ------------------------------------------------------
 
-/// Sets `key=value` in `[section]` of ini text, keeping every other line (comments included).
+/// The file's own line ending, so a hand-edited CRLF file stays CRLF.
+fn eol(text: &str) -> &'static str {
+    if text.contains("\r\n") { "\r\n" } else { "\n" }
+}
+
+/// Sets `key=value` in `[section]` of ini text, keeping every other line (comments included). An existing key is
+/// changed where it is, with its spacing around `=`; a new one goes right under the section's header.
 fn set_ini_key(text: &str, section: &str, key: &str, value: &str) -> String {
     let header = |l: &str| l.trim().strip_prefix('[').and_then(|l| l.strip_suffix(']')).map(|n| n.trim().to_string());
     let is_section = |n: &str| match (n.strip_prefix("profile "), section.strip_prefix("profile ")) {
@@ -441,27 +447,34 @@ fn set_ini_key(text: &str, section: &str, key: &str, value: &str) -> String {
         _ => n == section,
     };
     let mut out: Vec<String> = Vec::new();
-    let (mut inside, mut done) = (false, false);
+    let (mut inside, mut done, mut under) = (false, false, None);
     for line in text.lines() {
         if let Some(name) = header(line) {
             inside = is_section(&name);
             out.push(line.to_string());
-            if inside && !done {
-                out.push(format!("{key}={value}"));
-                done = true;
+            if inside && under.is_none() {
+                under = Some(out.len());
             }
             continue;
         }
-        if inside && line.split_once('=').is_some_and(|(k, _)| k.trim() == key) {
-            continue; // replaced by the line written under the header
+        if inside && let Some((k, rest)) = line.split_once('=').filter(|(k, _)| k.trim() == key) {
+            if !done {
+                let lead = k.len() + 1 + rest.len() - rest.trim_start().len();
+                out.push(format!("{}{value}", &line[..lead]));
+                done = true;
+            }
+            continue; // later duplicates of the key are dropped
         }
         out.push(line.to_string());
     }
     if !done {
-        out.push(format!("[{section}]"));
-        out.push(format!("{key}={value}"));
+        match under {
+            Some(i) => out.insert(i, format!("{key}={value}")),
+            None => out.extend([format!("[{section}]"), format!("{key}={value}")]),
+        }
     }
-    out.join("\n") + "\n"
+    let eol = eol(text);
+    out.join(eol) + eol
 }
 
 /// Drops `key=...` lines from `[section]` of ini text, keeping every other line.
@@ -478,7 +491,8 @@ fn remove_ini_key(text: &str, section: &str, key: &str) -> String {
         }
         out.push(line);
     }
-    out.join("\n") + "\n"
+    let eol = eol(text);
+    out.join(eol) + eol
 }
 
 /// Removes a key of the profile's section in settings.ini (a sidebar bookmark), comments and order kept.
@@ -583,13 +597,23 @@ mod tests {
         let text = "; mine\n[general]\nprofile=default\n\n[profile default]\nstart=x\nview=details\n\n[profile work]\nview=icons\n";
         let out = set_ini_key(text, "profile default", "view", "thumbnails");
         assert!(out.contains("; mine"));
-        assert!(out.contains("[profile default]\nview=thumbnails\nstart=x\n"));
+        assert!(out.contains("[profile default]\nstart=x\nview=thumbnails\n"), "changed in place: {out}");
         assert!(!out.contains("view=details"));
         assert!(out.contains("[profile work]\nview=icons"));
         let parsed = rexplorer_core::settings::parse_ini(&out);
         assert_eq!(parsed.iter().filter(|(n, _)| n == "profile default").count(), 1);
+        let out = set_ini_key(text, "profile default", "theme", "light");
+        assert!(out.contains("[profile default]\ntheme=light\nstart=x\n"), "new key under the header: {out}");
         let out = set_ini_key("[general]\nprofile=p\n", "profile p", "view", "icons");
         assert!(out.ends_with("[profile p]\nview=icons\n"));
+    }
+
+    #[test]
+    fn ini_edits_keep_line_endings_and_spacing() {
+        let text = "; mine\r\n[profile p]\r\nview = details\r\nview=icons\r\nstart=x\r\n";
+        let out = set_ini_key(text, "profile p", "view", "thumbnails");
+        assert_eq!(out, "; mine\r\n[profile p]\r\nview = thumbnails\r\nstart=x\r\n");
+        assert_eq!(remove_ini_key(&out, "profile p", "start"), "; mine\r\n[profile p]\r\nview = thumbnails\r\n");
     }
 
     #[test]

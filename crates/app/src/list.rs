@@ -12,7 +12,7 @@ use crate::ui::Entry;
 use rexplorer_core::dragdrop;
 use std::cell::RefCell;
 use windows::Win32::Foundation::POINTL;
-use windows::Win32::Graphics::Gdi::ScreenToClient;
+use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
 use windows::Win32::System::Ole::IDropTarget;
 use windows::Win32::UI::Shell::{ILClone, ILFindLastID};
 
@@ -61,7 +61,7 @@ pub(crate) unsafe fn on_notify(app: *mut App, lparam: LPARAM) -> LRESULT {
         NM_CUSTOMDRAW => return LRESULT(draw_item(app, &mut *(lparam.0 as *mut NMLVCUSTOMDRAW)) as isize),
         NM_RCLICK => {
             let nm = &*(lparam.0 as *const NMITEMACTIVATE);
-            show_menu(app, nm.iItem >= 0);
+            show_menu(app, nm.iItem >= 0, None);
             return LRESULT(1);
         }
         LVN_KEYDOWN => {
@@ -187,14 +187,34 @@ pub(crate) unsafe fn register_drop(app: *mut App) {
     let _ = dragdrop::register((*app).list, Box::new(pick));
 }
 
-/// The shell context menu at the cursor for the selection (`on_item`) or the folder background. On the Home page
-/// our own entry on folders is "Unpin from Home" (pinned) or "Pin to Home" (frequent); elsewhere "Pin to Home".
-pub(crate) unsafe fn show_menu(app: *mut App, on_item: bool) {
+/// Screen point for a keyboard-opened menu: under the focused item's label when it is in view, else the list's
+/// top-left corner (as Explorer does).
+unsafe fn menu_point(list: HWND, item: Option<usize>) -> POINT {
+    let mut client = RECT::default();
+    let _ = GetClientRect(list, &mut client);
+    let mut r = RECT { left: LVIR_LABEL as i32, ..Default::default() };
+    let labelled = item.is_some_and(|i| SendMessageW(list, LVM_GETITEMRECT, Some(WPARAM(i)), Some(LPARAM(&mut r as *mut _ as isize))).0 != 0);
+    let mut pt = if labelled && r.bottom > client.top && r.top < client.bottom {
+        POINT { x: r.left, y: r.bottom.min(client.bottom) }
+    } else {
+        POINT { x: client.left, y: client.top }
+    };
+    let _ = ClientToScreen(list, &mut pt);
+    pt
+}
+
+/// The shell context menu for the selection (`on_item`) or the folder background, at `at` (screen) or the cursor.
+/// On the Home page our own entry on folders is "Unpin from Home" (pinned) or "Pin to Home" (frequent); elsewhere
+/// "Pin to Home".
+pub(crate) unsafe fn show_menu(app: *mut App, on_item: bool, at: Option<POINT>) {
     let hwnd = (*app).hwnd;
-    let mut pt = POINT::default();
-    let _ = GetCursorPos(&mut pt);
+    let pt = at.unwrap_or_else(|| {
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        pt
+    });
     if let Some(Source::Archive(_)) = source(app) {
-        return source::archive_menu(app);
+        return source::archive_menu(app, pt);
     }
     if !on_item && listing(app).is_some_and(nav::is_home) {
         return home_menu(app, pt);
@@ -501,6 +521,17 @@ unsafe fn draw_item(app: *mut App, cd: &mut NMLVCUSTOMDRAW) -> u32 {
             cd.nmcd.uItemState.0 &= !(CDIS_SELECTED.0 | CDIS_HOT.0 | CDIS_FOCUS.0);
             cd.clrText = COLORREF(t.text);
             cd.clrTextBk = COLORREF(CLR_NONE as u32);
+            CDRF_NEWFONT | CDRF_NOTIFYSUBITEMDRAW
+        }
+        // Single-click underlining applies to item names only, as in Explorer: other columns get the plain font.
+        s if s.0 == CDDS_ITEMPREPAINT.0 | CDDS_SUBITEM.0 => {
+            cd.nmcd.uItemState.0 &= !(CDIS_SELECTED.0 | CDIS_HOT.0 | CDIS_FOCUS.0);
+            cd.clrText = COLORREF((*app).theme.text);
+            cd.clrTextBk = COLORREF(CLR_NONE as u32);
+            if cd.iSubItem > 0 {
+                let font = SendMessageW((*app).list, WM_GETFONT, None, None).0;
+                windows::Win32::Graphics::Gdi::SelectObject(cd.nmcd.hdc, windows::Win32::Graphics::Gdi::HGDIOBJ(font as *mut c_void));
+            }
             CDRF_NEWFONT
         }
         _ => CDRF_DODEFAULT,
@@ -536,6 +567,13 @@ pub(crate) unsafe extern "system" fn subclass(hwnd: HWND, msg: u32, wparam: WPAR
         return LRESULT(0);
     }
     let app = data as *mut App;
+    // Shift+F10 and the Menu key (a right click arrives as NM_RCLICK instead).
+    if msg == WM_CONTEXTMENU && lparam.0 as i32 == -1 {
+        let focus = SendMessageW(hwnd, LVM_GETNEXTITEM, Some(WPARAM(usize::MAX)), Some(LPARAM(LVNI_FOCUSED as isize))).0;
+        let on_item = focus >= 0 && SendMessageW(hwnd, LVM_GETITEMSTATE, Some(WPARAM(focus as usize)), Some(LPARAM(LVIS_SELECTED.0 as isize))).0 != 0;
+        show_menu(app, on_item, Some(menu_point(hwnd, on_item.then_some(focus as usize))));
+        return LRESULT(0);
+    }
     if msg == WM_MOUSEMOVE {
         if !(*app).panes.hover_tracking {
             let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };

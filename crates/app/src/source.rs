@@ -338,11 +338,9 @@ pub(crate) unsafe fn small_icon(app: *mut App, i: usize) -> i32 {
 }
 
 /// The archive popup: extract everything into a picked folder, or next to the archive.
-pub(crate) unsafe fn archive_menu(app: *mut App) {
+pub(crate) unsafe fn archive_menu(app: *mut App, pt: POINT) {
     let Some(Source::Archive(a)) = source(app) else { return };
     let archive = a.listing.archive.clone();
-    let mut pt = POINT::default();
-    let _ = GetCursorPos(&mut pt);
     let entries = [(1, "Extract all to...".to_string()), (2, "Extract here".to_string())];
     let dest = match ui::popup(app, &entries, &[], pt.x, pt.y) {
         1 => pick_folder((*app).hwnd),

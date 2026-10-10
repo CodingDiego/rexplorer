@@ -462,7 +462,7 @@ through WM_APP+0x54.
   none left it beeps.
 - `ftp://` browsing goes through the shell's FTP folder (present on Windows 11 25H2, untested against a live
   server); where it is missing the URL shows the not-found error.
-- No keyboard context menu; small icons of shell folders resolve on the UI thread.
+- Small icons of shell folders resolve on the UI thread.
 
 ## Benchmark
 

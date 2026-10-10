@@ -495,7 +495,8 @@ pub(crate) unsafe fn on_home_notify(app: *mut App, nm: &home::NmHome) {
             }
         }
         home::HN_ACTIVATE => source::activate(app, nm.index),
-        home::HN_CONTEXT => list::show_menu(app, nm.index != usize::MAX),
+        home::HN_CONTEXT => list::show_menu(app, nm.index != usize::MAX, None),
+        home::HN_CONTEXT_KEY => list::show_menu(app, nm.index != usize::MAX, Some(home::menu_point((*app).home))),
         home::HN_KEYDOWN => list::on_key(app, VIRTUAL_KEY(nm.index as u16)),
         home::HN_RENAME => list::rename_item(app, nm.index, &home::rename_text((*app).home), false),
         home::HN_FILTER => cur(app).home_filter = home::filter((*app).home),
