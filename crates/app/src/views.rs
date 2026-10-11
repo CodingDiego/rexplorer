@@ -13,6 +13,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 
 pub(crate) const WM_THUMB_DONE: u32 = WM_APP + 7;
+/// The system-icon export into the default icon theme has finished.
+pub(crate) const WM_ICONS_EXPORTED: u32 = WM_APP + 10;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum View {
@@ -178,6 +180,42 @@ pub(crate) unsafe fn init(app: *mut App) {
         }
     }
     apply(app);
+    start_icon_export(a.hwnd, &a.theme);
+}
+
+/// While the theme uses `icon_theme=default`, exports Windows' own icon for every registered extension in the
+/// background (seconds), writes `system-icons.txt` (which lists them and marks the export done; delete it to export
+/// again, say after installing a program) and posts WM_ICONS_EXPORTED. Here, not before the window exists, so it has
+/// somewhere to post.
+fn start_icon_export(hwnd: HWND, t: &Theme) {
+    let dir = settings::dir().join("icons").join("default");
+    let done = dir.join("system-icons.txt");
+    if t.icon_theme.as_deref() != Some("default") || !dir.is_dir() || done.exists() {
+        return;
+    }
+    let hwnd = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        let _com = rexplorer_core::com::ComInit::mta();
+        let exts = icons::export_system_icons(&dir);
+        let _ = std::fs::write(done, exts.join("\n"));
+        let _ = unsafe { PostMessageW(Some(HWND(hwnd as *mut c_void)), WM_ICONS_EXPORTED, WPARAM(0), LPARAM(0)) };
+    });
+}
+
+/// The export wrote PNGs for types the theme had already cached as missing, and rows keep the generic icon they
+/// got: forget the misses and every tab's per-row icons (Shell, Archive, Search); rows ask again as they paint.
+pub(crate) unsafe fn on_icons_exported(app: *mut App) {
+    let Some(t) = (*app).views.icon_theme.as_mut() else { return };
+    t.theme.forget_missing();
+    for t in (&mut (*app).tabs).iter_mut() {
+        match &mut t.source {
+            Some(Source::Shell(l)) => l.icons.fill(ICON_UNKNOWN),
+            Some(Source::Archive(a)) => a.icons.fill(ICON_UNKNOWN),
+            Some(Source::Search(s)) => s.icons.fill(ICON_UNKNOWN),
+            _ => {}
+        }
+    }
+    let _ = InvalidateRect(Some((*app).list), None, false);
 }
 
 /// None when the folder is missing or has neither `folder.png` nor `file.png`: the system icons stay.
@@ -574,29 +612,19 @@ pub(crate) fn try_save_profile_keys(profile: &str, pairs: &[(&str, String)]) -> 
 
 const STARTER: [&str; 2] = ["folder", "file"];
 
-/// Writes `icons\default\`: `folder.png` and `file.png` once (when the folder does not exist yet), then, in the
-/// background and only while the theme uses `icon_theme=default`, Windows' own icon for every registered extension;
-/// `system-icons.txt` lists those and marks the export done (delete it to export again, say after installing a program).
+/// Writes `icons\default\folder.png` and `file.png` once (when the folder does not exist yet); the export of
+/// Windows' own icons starts in `init`, once the window exists.
 pub(crate) fn ensure_starter_theme(t: &Theme) {
     let dir = settings::dir().join("icons").join("default");
-    if !dir.exists() {
-        if std::fs::create_dir_all(&dir).is_err() {
-            return;
-        }
-        for name in STARTER {
-            let _ = icons::save_png(&starter_icon(name, t), 32, 32, &dir.join(format!("{name}.png")));
-        }
-    }
-    // The export only feeds an enabled default theme.
-    let done = dir.join("system-icons.txt");
-    if t.icon_theme.as_deref() != Some("default") || done.exists() {
+    if dir.exists() {
         return;
     }
-    std::thread::spawn(move || {
-        let _com = rexplorer_core::com::ComInit::mta();
-        let exts = icons::export_system_icons(&dir);
-        let _ = std::fs::write(done, exts.join("\n"));
-    });
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    for name in STARTER {
+        let _ = icons::save_png(&starter_icon(name, t), 32, 32, &dir.join(format!("{name}.png")));
+    }
 }
 
 /// 32x32 straight-alpha BGRA: a folder silhouette in the accent, or a page tinted toward it.

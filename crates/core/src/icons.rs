@@ -362,6 +362,11 @@ impl IconTheme {
         ext.and_then(|e| self.get(&e)).or_else(|| self.get(if is_folder { "folder" } else { "file" }))
     }
 
+    /// Drops the remembered misses, so a PNG written since is found on the next lookup.
+    pub fn forget_missing(&mut self) {
+        self.bitmaps.retain(|_, h| h.is_some());
+    }
+
     fn get(&mut self, key: &str) -> Option<HBITMAP> {
         if let Some(h) = self.bitmaps.get(key) {
             return *h;
@@ -440,6 +445,22 @@ mod tests {
         assert_eq!(t.bitmap_for("crate.rs", true), Some(rs), "a folder with a themed extension shows it");
         assert_eq!(t.bitmaps.len(), 5, "rs, file, folder and the missing unknownext and 2 are remembered");
         assert!(load_theme(&dir.join("nope"), 16).is_err());
+        drop(t);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn forgetting_misses_finds_a_png_written_since() {
+        let _com = ComInit::sta();
+        let dir = tmp("forget");
+        save_png(&blue(8, 8), 8, 8, &dir.join("folder.png")).unwrap();
+        let mut t = load_theme(&dir, 16).unwrap();
+        assert!(t.get("zzz").is_none());
+        save_png(&blue(8, 8), 8, 8, &dir.join("zzz.png")).unwrap();
+        assert!(t.get("zzz").is_none(), "the miss is cached");
+        t.forget_missing();
+        assert!(t.get("zzz").is_some());
+        assert!(t.get("folder").is_some(), "loaded bitmaps are kept");
         drop(t);
         std::fs::remove_dir_all(&dir).ok();
     }

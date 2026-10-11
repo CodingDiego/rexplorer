@@ -135,22 +135,33 @@ pub(crate) unsafe fn sort_by(app: *mut App, col: u32, desc: bool) {
     // items but not their PIDLs, so a PIDL's address is the item's identity (exact, unlike a case-folded name).
     let focus = SendMessageW(list, LVM_GETNEXTITEM, Some(WPARAM(usize::MAX)), Some(LPARAM(LVNI_FOCUSED as isize))).0;
     let key = |i: usize| l.items.get(i).map(|it| it.pidl.as_ptr() as usize);
-    let selected: std::collections::HashSet<usize> = selected_indices(list).into_iter().filter_map(key).collect();
+    // Ctrl+A then sort: every row stays selected whatever the order, so only the focus moves (collecting and
+    // re-setting each row costs 0.15 s per 20k rows).
+    let all = SendMessageW(list, LVM_GETSELECTEDCOUNT, None, None).0 as usize == l.items.len();
+    let selected: std::collections::HashSet<usize> = if all { Default::default() } else { selected_indices(list).into_iter().filter_map(key).collect() };
     let focused = usize::try_from(focus).ok().and_then(key);
     l.sort_col = col;
     l.sort_desc = desc;
     sort_listing(l);
     // Icon views keep images per row position: drop them, or thumbnails stay where their files were.
     views::reset(app, l.items.len());
-    set_item_state(list, usize::MAX, LIST_VIEW_ITEM_STATE_FLAGS(0), LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0));
+    let mask = if all { LVIS_FOCUSED.0 } else { LVIS_SELECTED.0 | LVIS_FOCUSED.0 };
+    set_item_state(list, usize::MAX, LIST_VIEW_ITEM_STATE_FLAGS(0), LIST_VIEW_ITEM_STATE_FLAGS(mask));
+    let mut row = None;
     for (i, it) in l.items.iter().enumerate() {
         let p = it.pidl.as_ptr() as usize;
-        if selected.contains(&p) {
+        if !all && selected.contains(&p) {
             set_item_state(list, i, LVIS_SELECTED, LVIS_SELECTED);
         }
         if focused == Some(p) {
             set_item_state(list, i, LVIS_FOCUSED, LVIS_FOCUSED);
+            row = Some(i);
         }
+    }
+    // The Shift+click anchor follows the focused item to its new row, and that row stays in view.
+    if let Some(i) = row {
+        SendMessageW(list, LVM_SETSELECTIONMARK, None, Some(LPARAM(i as isize)));
+        SendMessageW(list, LVM_ENSUREVISIBLE, Some(WPARAM(i)), Some(LPARAM(0)));
     }
     let _ = InvalidateRect(Some(list), None, true);
 }
