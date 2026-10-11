@@ -22,8 +22,9 @@ pub const OWN_FIRST: u32 = 0x8000;
 
 /// What the user picked from a shown menu.
 pub enum Picked {
-    /// The shell handled it (open, copy, delete, properties, third-party verbs...).
-    Invoked,
+    /// The shell handled it (open, copy, delete, properties, third-party verbs...); carries the canonical verb, empty
+    /// when the handler has none.
+    Invoked(String),
     /// Rename is the one verb the view must perform itself.
     Rename,
     Cancelled,
@@ -74,11 +75,12 @@ impl ContextMenu {
                 return Ok(Picked::Cancelled);
             }
             let id = picked - ID_FIRST;
-            if self.verb_of(id).eq_ignore_ascii_case("rename") {
+            let verb = self.verb_of(id);
+            if verb.eq_ignore_ascii_case("rename") {
                 return Ok(Picked::Rename);
             }
             self.invoke_id(hwnd, id, Some(POINT { x, y }), false)?;
-            Ok(Picked::Invoked)
+            Ok(Picked::Invoked(verb))
         }
     }
 

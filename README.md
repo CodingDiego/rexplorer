@@ -317,9 +317,9 @@ Start menu stay Explorer.
 | Win+E, the taskbar's File Explorer icon, Start's "File Explorer" | rexplorer, at the start place (Home) | `HKCU\Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}\shell\{open, opennewwindow}\command` = `"<copy>"` |
 | Programs that run `explorer.exe` by bare name through `ShellExecute` (`explorer.exe /select,<file>`, `explorer.exe <folder>`) | rexplorer, with the arguments above | `HKCU\Software\Microsoft\Windows\CurrentVersion\App Paths\explorer.exe` = the copy, `Path` = its folder |
 | Start menu | a "rexplorer" shortcut | `<Start Menu>\Programs\rexplorer.lnk` |
-| Right-click on the desktop | rexplorer's menu | `<Startup>\rexplorer desktop menu.lnk` runs `rexplorer --desktop` at sign-in; install also starts it |
+| Right-click, Shift+F10 or the Menu key on the desktop | rexplorer's menu | `<Startup>\rexplorer desktop menu.lnk` runs `rexplorer --desktop` at sign-in; install also starts it |
 | Programs that start `C:\Windows\explorer.exe` with `CreateProcess`, or call `SHOpenFolderAndSelectItems` (Chrome-style "Show in folder") | still Explorer | not reachable per-user |
-| The desktop itself (icons, wallpaper, keyboard menus), the taskbar, Start, other programs' Open / Save dialogs, Explorer windows already open | still Explorer | untouched |
+| The desktop itself (icons, wallpaper), the taskbar, Start, other programs' Open / Save dialogs, Explorer windows already open | still Explorer | untouched |
 
 Each command key also gets an empty `DelegateExecute` value, which stops Windows from using Explorer's own handler.
 `--install` refuses, changing nothing, when another program already overrides one of these keys. Everything it
@@ -342,18 +342,19 @@ from, without copying it, without App Paths and without a shortcut.
 ### The desktop menu
 
 Explorer is the Windows shell (taskbar, Start, desktop) and keeps running: rexplorer never replaces that process.
-`rexplorer --desktop` is a small helper (one per sign-in) with a low-level mouse hook. A right-click that lands on
+`rexplorer --desktop` is a small helper (one per sign-in) with low-level mouse and keyboard hooks. A right-click that lands on
 the desktop's icon list is taken from Explorer and answered with rexplorer's menu, built like the file list's: on
 an icon, the shell's verbs for the selection (an unselected icon is selected first, a selected one keeps the
 selection, as in Explorer); on the background, View (icon sizes, Auto arrange, Align to grid), Sort by, Refresh and
 Paste, then the shell's background verbs (New, Display settings, Personalize and installed extensions). Shift+right-click
-adds the extended verbs. Everything else, a right-click on any other window included, passes through untouched.
+adds the extended verbs. Shift+F10 and the Menu key on the focused desktop open the same menu, at the first selected icon.
+Right-dragging icons stays Explorer's: once the pointer leaves the drag box, the press is replayed to it. Everything
+else, a right-click on any other window included, passes through untouched.
 
 The helper reaches Explorer's desktop view through `IShellWindows` (as Explorer's own tools do) and reads the icon
 under the cursor through the list's accessibility object. Uninstall closes it and removes the Startup shortcut. To
 turn it off without uninstalling, delete `rexplorer desktop menu.lnk` from the Startup folder (`shell:startup`) and
-end `rexplorer.exe --desktop`. Not covered: right-dragging desktop icons (the press goes to the menu), and Shift+F10 /
-the Menu key on the desktop, which still open Explorer's menu.
+end `rexplorer.exe --desktop`.
 
 ### Files under `%APPDATA%\rexplorer`
 
