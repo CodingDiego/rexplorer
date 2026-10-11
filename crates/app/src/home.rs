@@ -56,6 +56,8 @@ pub const HM_SELECT_NAMED: u32 = WM_APP + 0x53;
 pub const HM_RECT: u32 = WM_APP + 0x54;
 /// wparam = generation << 32 | slot, lparam = HBITMAP (ours once received).
 const HM_ICON: u32 = WM_APP + 0x50;
+/// Coalesces the repaints HM_ICON asks for.
+const ICON_TIMER: usize = 1;
 /// wparam: 0 cancels the rename edit, 1 commits it (a key), 2 commits it (the edit lost the focus).
 const HM_END_EDIT: u32 = WM_APP + 0x51;
 
@@ -214,6 +216,8 @@ pub fn build(folder: &ShellFolder, items: &[ShellItem]) -> Content {
     let profile = std::env::var("USERPROFILE").unwrap_or_default();
     let mut tiles = Vec::new();
     let mut rows: Vec<(String, Entry)> = Vec::new();
+    // The columns of each local file's folder, mapped once per folder rather than once per row.
+    let mut by_dir: HashMap<String, Vec<(PROPERTYKEY, u32, String)>> = HashMap::new();
     for item in items {
         let key = item.parsing_name();
         let attrs = item.attributes(SFGAO_FOLDER | SFGAO_STREAM);
@@ -251,16 +255,22 @@ pub fn build(folder: &ShellFolder, items: &[ShellItem]) -> Content {
             continue;
         }
         // Home fills its columns for cloud files; a local file's own folder knows its details.
-        let mut own: Option<Option<(Vec<(PROPERTYKEY, u32, String)>, ShellItem)>> = None;
+        let mut own: Option<Option<(String, ShellItem)>> = None;
         e.cells = CELLS
             .iter()
             .map(|k| {
                 let text = find(&cols, k).map(|(c, _)| item.detail(c)).unwrap_or_default();
-                if !text.is_empty() || !is_fs_path(&e.key) {
+                // A network file's cells stay empty, as Home's own do: binding its folder can block on the share.
+                if !text.is_empty() || !is_fs_path(&e.key) || e.key.starts_with("\\\\") {
                     return text;
                 }
-                let o = own.get_or_insert_with(|| crate::source::hit_for_path(Path::new(&e.key)).map(|h| (columns_by_key(&h.item.parent), h.item)));
-                o.as_ref().and_then(|(c, it)| find(c, k).map(|(i, _)| it.detail(i))).unwrap_or_default()
+                let o = own.get_or_insert_with(|| {
+                    let h = crate::source::hit_for_path(Path::new(&e.key))?;
+                    let dir = h.folder.to_lowercase();
+                    by_dir.entry(dir.clone()).or_insert_with(|| columns_by_key(&h.item.parent));
+                    Some((dir, h.item))
+                });
+                o.as_ref().and_then(|(d, it)| find(&by_dir[d], k).map(|(i, _)| it.detail(i))).unwrap_or_default()
             })
             .collect();
         // The shell writes dates as yyyy/mm/dd:hh:mm:ss.fff, which sorts as text.
@@ -401,6 +411,8 @@ struct State {
     shown: Vec<usize>,
     /// Per slot (the tiles, then every row, shown or not); owned.
     icons: Vec<Option<HBITMAP>>,
+    /// ICON_TIMER is armed.
+    icon_timer: bool,
     /// Per entry.
     selected: Vec<bool>,
     focus: Option<usize>,
@@ -482,6 +494,7 @@ pub fn create(parent: HWND, id: usize) -> Result<HWND> {
             filter: Filter::Recent,
             shown: Vec::new(),
             icons: Vec::new(),
+            icon_timer: false,
             selected: Vec::new(),
             focus: None,
             hover: None,
@@ -922,10 +935,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if let Some(old) = s.icons[slot].replace(bmp) {
                     let _ = DeleteObject(old.into());
                 }
-                let _ = InvalidateRect(Some(hwnd), None, false);
+                // One repaint per batch of icons, not per icon; re-arming would postpone it for as long as icons keep coming.
+                if !s.icon_timer {
+                    s.icon_timer = SetTimer(Some(hwnd), ICON_TIMER, 50, None) != 0;
+                    if !s.icon_timer {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                }
             } else {
                 let _ = DeleteObject(bmp.into());
             }
+        }
+        WM_TIMER if wparam.0 == ICON_TIMER => {
+            let _ = KillTimer(Some(hwnd), ICON_TIMER);
+            s.icon_timer = false;
+            let _ = InvalidateRect(Some(hwnd), None, false);
         }
         HM_END_EDIT => end_edit(hwnd, s, wparam.0),
         WM_CTLCOLOREDIT => {

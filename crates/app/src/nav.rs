@@ -3,7 +3,10 @@
 
 use super::*;
 use crate::source::Source;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+use windows::Win32::Foundation::E_ABORT;
 use windows::Win32::UI::Shell::{SHGetNameFromIDList, SHParseDisplayName, SIGDN, SIGDN_DESKTOPABSOLUTEPARSING, SIGDN_NORMALDISPLAY};
 
 /// The shell's Home ("Inicio") and Quick Access, as parsing names.
@@ -59,6 +62,9 @@ pub(crate) struct Listing {
     pub items: Vec<ShellItem>,
     pub columns: Vec<Column>,
     pub icons: Vec<i32>,
+    /// Text per row and header position, filled when first asked for (the shell calls behind it are not cheap); a
+    /// row's cells are allocated then too.
+    pub cells: Vec<std::cell::OnceCell<Box<[std::cell::OnceCell<String>]>>>,
     /// Shell column index, not header position.
     pub sort_col: u32,
     pub sort_desc: bool,
@@ -79,10 +85,14 @@ pub(crate) struct Tab {
     pub source: Option<Source>,
     pub back: Vec<Target>,
     pub forward: Vec<Target>,
-    /// Only the active tab watches its folder.
+    /// Watches the folder from the tab's first show until it closes, so a tab switch need not reload.
     pub watch: Option<ChangeWatch>,
+    /// A change was notified in the folder since its load started: showing the tab reloads it.
+    pub dirty: bool,
     /// Generation of the load in flight for this tab, 0 when none.
     pub pending: u64,
+    /// Generation of the newest load started for this tab; an older one still running gives up after enumerating.
+    pub latest: Arc<AtomicU64>,
     pub top: i32,
     pub selected: Vec<String>,
     /// Parsing name to select once the first load lands (`--select`).
@@ -139,6 +149,9 @@ pub(crate) unsafe fn navigate(app: *mut App, t: usize, target: Target, history: 
     let generation = (*app).generation;
     let Some(tab) = (&mut (*app).tabs).get_mut(t) else { return };
     tab.pending = generation;
+    tab.latest.store(generation, Ordering::Relaxed);
+    // A change notified from here on is not in this load.
+    tab.dirty = false;
     if history != History::Refresh {
         (*app).new_item = None;
         let (name, parsing) = destination(&target);
@@ -153,11 +166,29 @@ pub(crate) unsafe fn navigate(app: *mut App, t: usize, target: Target, history: 
     if let Some(Source::Search(s)) = &mut tab.source {
         s.stop();
     }
+    // The worker sorts, as on_enum_done would: a refresh keeps the tab's sort, anything else starts by name.
+    let sort = match &tab.source {
+        Some(Source::Shell(l)) if history == History::Refresh => (l.sort_col, l.sort_desc),
+        _ => (0, false),
+    };
+    let latest = tab.latest.clone();
     let hwnd = (*app).hwnd.0 as isize;
     let show_hidden = (*app).profile.show_hidden;
+    // Details' first screen from the top; a refresh keeps its scroll position, so it (and theme icons) load as painted.
+    let prefill = if history == History::Refresh || views::icon_theme_active(app) || (*app).views.view != views::View::Details {
+        0
+    } else {
+        SendMessageW((*app).list, LVM_GETCOUNTPERPAGE, None, None).0.max(0) as usize + 1
+    };
     std::thread::spawn(move || {
         let _com = ComInit::mta();
-        let done = Box::new(EnumDone { generation, history, result: load(target, show_hidden) });
+        let superseded = || latest.load(Ordering::Relaxed) != generation;
+        let result = load(target, show_hidden, sort, prefill, &superseded);
+        // A newer load of this tab would make on_enum_done drop this one anyway.
+        if superseded() {
+            return;
+        }
+        let done = Box::new(EnumDone { generation, history, result });
         let _ = PostMessageW(Some(HWND(hwnd as *mut c_void)), WM_ENUM_DONE, WPARAM(0), LPARAM(Box::into_raw(done) as isize));
     });
 }
@@ -167,14 +198,19 @@ pub(crate) unsafe fn go(app: *mut App, target: Target, history: History) {
     navigate(app, (*app).active, target, history);
 }
 
-fn load(target: Target, show_hidden: bool) -> std::result::Result<Loaded, LoadError> {
+/// Worker side: the listing sorted by `sort` (shell column, descending), the first `prefill` icons looked up.
+/// Once `superseded` says a newer load of the tab started, gives up after enumerating (an error nobody reads).
+fn load(target: Target, show_hidden: bool, sort: (u32, bool), prefill: usize, superseded: &dyn Fn() -> bool) -> std::result::Result<Loaded, LoadError> {
     if let Target::Name(n) = &target {
         if let Some((archive, dir)) = archive_view::split_archive_path(n).filter(|(a, _)| a.is_file()) {
             return source::load_archive(&archive, &dir).map_err(|err| LoadError { name: n.clone(), err });
         }
     }
     let folder = match target {
-        Target::Name(n) => ShellFolder::parse(&n).map_err(|err| LoadError { name: n, err })?,
+        // Windows without Home: its start place is This PC.
+        Target::Name(n) => ShellFolder::parse(&n)
+            .or_else(|e| if n.eq_ignore_ascii_case(settings::HOME_START) { ShellFolder::parse("shell:MyComputerFolder") } else { Err(e) })
+            .map_err(|err| LoadError { name: n, err })?,
         Target::Pidl(p) => ShellFolder::from_pidl(&p).map_err(|err| LoadError { name: String::new(), err })?,
     };
     let crumbs = crumbs_of(&folder);
@@ -190,6 +226,9 @@ fn load(target: Target, show_hidden: bool) -> std::result::Result<Loaded, LoadEr
             None => return Ok(Loaded { source: Source::Browser(source::BrowserPlace::of(&folder)), crumbs, icon }),
         },
     };
+    if superseded() {
+        return Err(LoadError { name: String::new(), err: E_ABORT.into() });
+    }
     if !show_hidden {
         items.retain(|i| !i.is_hidden());
     }
@@ -198,9 +237,18 @@ fn load(target: Target, show_hidden: bool) -> std::result::Result<Loaded, LoadEr
     }
     let columns = folder.columns();
     let icons = vec![ICON_UNKNOWN; items.len()];
-    let mut l = Listing { folder, items, columns, icons, sort_col: 0, sort_desc: false, home: None, denied };
+    let cells = vec![std::cell::OnceCell::new(); items.len()];
+    let mut l = Listing { folder, items, columns, icons, cells, sort_col: sort.0, sort_desc: sort.1, home: None, denied };
     if is_home(&l) {
         l.home = Some(home::build(&l.folder, &l.items));
+    }
+    // After the Home build: its tiles keep the enumeration order.
+    unsafe { sort_listing(&mut l) };
+    // Home's list is hidden, nothing asks it for icons.
+    if l.home.is_none() {
+        for (icon, item) in l.icons.iter_mut().zip(&l.items).take(prefill) {
+            *icon = item.icon_index(&l.folder.pidl).1;
+        }
     }
     Ok(Loaded { source: Source::Shell(l), crumbs, icon })
 }
@@ -298,9 +346,12 @@ pub(crate) unsafe fn on_enum_done(app: *mut App, done: Box<EnumDone>) {
 
     let mut src = loaded.source;
     if let Source::Shell(l) = &mut src {
-        l.sort_col = sort_col;
-        l.sort_desc = sort_desc;
-        sort_listing(l);
+        // load() sorted by the sort the tab had then; only a sort changed meanwhile (a header click) sorts again.
+        if (l.sort_col, l.sort_desc) != (sort_col, sort_desc) {
+            l.sort_col = sort_col;
+            l.sort_desc = sort_desc;
+            sort_listing(l);
+        }
     }
     let shell = matches!(src, Source::Shell(_));
     tab.name = src.parsing_name();
@@ -323,7 +374,10 @@ pub(crate) unsafe fn on_enum_done(app: *mut App, done: Box<EnumDone>) {
     if let Some(q) = pending_search {
         source::start_search(app, t, &q, true);
     }
-    session_changed(app);
+    // A refresh reloads the same place; saving there made the settings folder refresh itself via session.txt.
+    if !refresh {
+        session_changed(app);
+    }
 }
 
 /// Puts the active tab into the list (or the embedded browser), address bar, breadcrumb, title and toolbar; a
@@ -340,7 +394,6 @@ unsafe fn show_source(app: *mut App, mode: Show) {
     let hwnd = (*app).hwnd;
     let list = (*app).list;
     let tab = cur(app);
-    tab.watch = None;
     let Some(src) = &tab.source else {
         source::leave_browser(app);
         views::reset(app, 0);
@@ -382,8 +435,13 @@ unsafe fn show_source(app: *mut App, mode: Show) {
     }
     ui::set_crumbs(app);
     sidebar::select((*app).sidebar, &tab.name);
-    if let Source::Shell(l) = src {
-        tab.watch = ChangeWatch::register(hwnd, &l.folder, WM_SHELL_CHANGE);
+    match src {
+        // Afresh on every show, the old one dropped first: one kept through steady churn gets 3 s SHCNE_UPDATEDIR batches.
+        Source::Shell(l) => {
+            tab.watch = None;
+            tab.watch = ChangeWatch::register(hwnd, &l.folder, WM_SHELL_CHANGE);
+        }
+        _ => tab.watch = None,
     }
 
     let count = src.len();
@@ -396,17 +454,11 @@ unsafe fn show_source(app: *mut App, mode: Show) {
     }
     let select = |names: &[String]| -> Option<usize> {
         let Source::Shell(l) = src else { return None };
-        let mut first = None;
-        if !names.is_empty() {
-            for (i, item) in l.items.iter().enumerate() {
-                let p = item.parsing_name();
-                if names.iter().any(|n| n.eq_ignore_ascii_case(&p)) {
-                    list::set_item_state(list, i, LVIS_SELECTED, LVIS_SELECTED);
-                    first.get_or_insert(i);
-                }
-            }
+        let hits = selection_matches(names, l.items.iter().map(|i| i.parsing_name()));
+        for &i in &hits {
+            list::set_item_state(list, i, LVIS_SELECTED, LVIS_SELECTED);
         }
-        first
+        hits.first().copied()
     };
     match mode {
         Show::Fresh(names) => {
@@ -436,6 +488,20 @@ unsafe fn show_source(app: *mut App, mode: Show) {
     }
     sync_home(app);
     update_chrome(app);
+}
+
+/// Indices of the items whose parsing name is one of `names` (ASCII case-insensitive), stopping at the last match.
+fn selection_matches(names: &[String], parsing: impl Iterator<Item = String>) -> Vec<usize> {
+    let mut wanted: std::collections::HashSet<String> = names.iter().map(|n| n.to_ascii_lowercase()).collect();
+    let mut parsing = parsing.enumerate();
+    let mut hits = Vec::new();
+    while !wanted.is_empty() {
+        let Some((i, p)) = parsing.next() else { break };
+        if wanted.remove(&p.to_ascii_lowercase()) {
+            hits.push(i);
+        }
+    }
+    hits
 }
 
 // ---- the Home page ----------------------------------------------------------------------------------
@@ -522,6 +588,7 @@ pub(crate) unsafe fn sort_listing(l: &mut Listing) {
         l.items.reverse();
     }
     l.icons.fill(ICON_UNKNOWN);
+    l.cells.fill(Default::default());
 }
 
 pub(crate) unsafe fn set_columns(app: *mut App, columns: &[Column]) {
@@ -567,7 +634,22 @@ pub(crate) unsafe fn refresh(app: *mut App) {
         Some(s) => s.location(),
         None => return,
     };
+    // This reload covers the changes notified so far.
+    let _ = KillTimer(Some((*app).hwnd), crate::TIMER_CHANGE);
     go(app, target, History::Refresh);
+}
+
+/// WM_SHELL_CHANGE: marks the tabs whose folder the notified `items` are about as changed. Returns whether the
+/// active tab is one. A notification that names no item, or no watched folder, concerns every tab.
+pub(crate) unsafe fn mark_changed(app: *mut App, items: &[Pidl]) -> bool {
+    let hit = |t: &Tab| t.watch.as_ref().is_some_and(|w| items.iter().any(|p| w.concerns(p)));
+    let all = !(&(*app).tabs).iter().any(hit);
+    // Watched tabs only: a search, archive or browser tab has nothing a shell change makes stale.
+    let marks = |t: &Tab| t.watch.is_some() && (all || hit(t));
+    for t in (&mut (*app).tabs).iter_mut() {
+        t.dirty |= marks(t);
+    }
+    (&(*app).tabs).get((*app).active).is_some_and(marks)
 }
 
 pub(crate) unsafe fn go_back(app: *mut App) {
@@ -603,7 +685,9 @@ pub(crate) unsafe fn new_tab(app: *mut App, target: Target, activate: bool, sele
         back: Vec::new(),
         forward: Vec::new(),
         watch: None,
+        dirty: false,
         pending: 0,
+        latest: Arc::default(),
         top: 0,
         selected: Vec::new(),
         select_after,
@@ -634,7 +718,6 @@ pub(crate) unsafe fn switch_tab(app: *mut App, t: usize) {
     if t >= (*app).tabs.len() || t == old {
         return;
     }
-    cur(app).watch = None;
     save_view_state(app);
     show_tab(app, t, true);
 }
@@ -751,10 +834,12 @@ unsafe fn show_tab(app: *mut App, t: usize, refresh_after: bool) {
     tabs::set_active((*app).strip, t);
     let tab = cur(app);
     let (top, selected) = (tab.top, std::mem::take(&mut tab.selected));
-    // Inactive tabs are not watched, so a shell listing catches up on changes made while away.
-    let watched = matches!(tab.source, Some(Source::Shell(_)));
+    // A watched folder reloads only if it changed while away. Virtual folders (Home) get no matching notifications,
+    // shares may send none (WSL, WebDAV), and a tab whose load landed while away watches none or the folder it left:
+    // those catch up on every show.
+    let catch_up = matches!(&tab.source, Some(Source::Shell(l)) if tab.dirty || !tab.watch.as_ref().is_some_and(|w| w.is_on(&l.folder.pidl)) || !ui::is_fs_path(&l.folder.parsing_name) || ui::is_remote(&l.folder.parsing_name));
     show(app, Show::Restore { top, selected, columns: true });
-    if watched && refresh_after {
+    if catch_up && refresh_after {
         refresh(app);
     }
     session_changed(app);
@@ -860,5 +945,57 @@ mod tests {
         assert_eq!(destination(&Target::Name(typed.clone())), (typed.clone(), typed));
         let bad = "shell:NoSuchFolder".to_string();
         assert_eq!(destination(&Target::Name(bad.clone())), (bad.clone(), bad));
+    }
+
+    fn shell_listing(dir: &std::path::Path, sort: (u32, bool), prefill: usize) -> Listing {
+        match load(Target::Name(dir.display().to_string()), true, sort, prefill, &|| false) {
+            Ok(Loaded { source: Source::Shell(l), .. }) => l,
+            _ => panic!("a shell listing"),
+        }
+    }
+
+    #[test]
+    fn load_sorts_on_the_worker_and_prefills_icons_and_caches_cells() {
+        let _com = ComInit::mta();
+        let dir = std::env::temp_dir().join(format!("rexplorer-nav-load-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        for n in ["c.txt", "a.txt", "b.txt"] {
+            std::fs::write(dir.join(n), b"x").unwrap();
+        }
+        let names = |l: &Listing| l.items.iter().map(|i| i.display_name().trim_end_matches(".txt").to_string()).collect::<Vec<_>>();
+        let l = shell_listing(&dir, (0, false), 3);
+        assert_eq!(names(&l), ["sub", "a", "b", "c"], "folders first, then by name");
+        assert!(l.icons[..3].iter().all(|&i| i != ICON_UNKNOWN), "the first icons are looked up on the worker");
+        assert_eq!(l.icons[3], ICON_UNKNOWN, "only as many as asked for");
+        assert_eq!(shell_listing(&dir, (0, true), 0).icons, vec![ICON_UNKNOWN; 4], "no prefill for a refresh or an icon theme");
+        assert_eq!(names(&shell_listing(&dir, (0, true), 0)), ["c", "b", "a", "sub"]);
+
+        let src = Source::Shell(l);
+        let Source::Shell(l) = &src else { unreachable!() };
+        assert!(l.cells.iter().all(|row| row.get().is_none()), "rows wait until asked for");
+        let name = src.text(1, 0);
+        assert_eq!(src.text(1, 0), name);
+        assert_eq!(l.cells[1].get().unwrap()[0].get(), Some(&name));
+        assert!(l.cells[1].get().unwrap().get(1).is_none_or(|c| c.get().is_none()), "other cells wait until asked for");
+        assert!(l.cells[2].get().is_none(), "other rows too");
+        assert_eq!(src.text(9, 0), "");
+        let mut src = src;
+        let Source::Shell(l) = &mut src else { unreachable!() };
+        unsafe { sort_listing(l) };
+        assert!(l.cells[1].get().is_none(), "sorting moves the rows");
+        assert!(load(Target::Name(dir.display().to_string()), true, (0, false), 0, &|| true).is_err(), "superseded");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn selection_matches_ascii_case_insensitively_and_stops_at_the_last() {
+        let names = ["C:\\A.txt".to_string(), "c:\\B.TXT".to_string()];
+        let parsing = ["c:\\a.TXT", "c:\\x", "C:\\b.txt", "never"].into_iter().enumerate().map(|(i, p)| {
+            assert!(i < 3, "read past the last match");
+            p.to_string()
+        });
+        assert_eq!(selection_matches(&names, parsing), [0, 2]);
+        assert!(selection_matches(&["É".to_string()], ["é".to_string()].into_iter()).is_empty(), "ASCII only, as eq_ignore_ascii_case");
+        assert!(selection_matches(&[], std::iter::once_with(|| -> String { panic!("no names, nothing to parse") })).is_empty());
     }
 }

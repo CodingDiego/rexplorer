@@ -165,10 +165,14 @@ impl Source {
     /// Text of row `i`, column `sub` (header position).
     pub fn text(&self, i: usize, sub: usize) -> String {
         match self {
-            Source::Shell(l) => match l.items.get(i) {
-                Some(e) if sub == 0 => name_cell(e).0,
-                Some(e) => l.columns.get(sub).map(|c| e.detail(c.index)).unwrap_or_default(),
-                None => String::new(),
+            Source::Shell(l) => match (l.items.get(i), l.cells.get(i).and_then(|row| row.get_or_init(|| vec![std::cell::OnceCell::new(); l.columns.len().max(1)].into()).get(sub))) {
+                (Some(e), Some(cell)) => cell.get().cloned().unwrap_or_else(|| {
+                    let text = if sub == 0 { name_cell(e).0 } else { e.detail(l.columns[sub].index) };
+                    // set, not get_or_init: a shell call that pumps messages may ask for this cell again meanwhile
+                    let _ = cell.set(text.clone());
+                    text
+                }),
+                _ => String::new(),
             },
             Source::Archive(a) => a.rows.get(i).map(|e| ArchiveListing::detail(e, sub)).unwrap_or_default(),
             Source::Search(s) => s
@@ -466,9 +470,12 @@ pub(crate) unsafe fn start_search(app: *mut App, t: usize, needle: &str, push: b
     };
     (*app).generation += 1;
     let generation = (*app).generation;
-    // A load still in flight for this tab no longer lands here.
+    // A load still in flight for this tab no longer lands here, nor does a change reload already armed, nor (for a
+    // background tab) the watch on the folder it searches.
     tab.pending = 0;
     tab.loading = None;
+    tab.dirty = false;
+    tab.watch = None;
     let old = tab.source.take();
     if let (true, Some(o)) = (push, &old) {
         tab.back.push(o.location());
@@ -511,7 +518,15 @@ pub(crate) unsafe fn start_search(app: *mut App, t: usize, needle: &str, push: b
                 drop(unsafe { Box::from_raw(b) });
             }
         };
-        let mut sink = |hits: Vec<Hit>| post(rows_of(hits), false);
+        // The walk has no result limit of its own; stop it where the USN path stops.
+        let mut n = 0usize;
+        let mut sink = |hits: Vec<Hit>| {
+            n += hits.len();
+            if n >= USN_LIMIT {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            post(rows_of(hits), false)
+        };
         let indexed = drive.is_some_and(|d| usn_search(&usn_cache, d, &needle, &cancel, &mut sink).is_ok());
         if !indexed {
             let _ = search::walk(&root, &needle, scope, &cancel, &mut sink);
@@ -533,8 +548,12 @@ fn usn_search(cache: &UsnCache, drive: char, needle: &str, cancel: &AtomicBool, 
             }
         }
     };
+    // A superseded search must not scan a whole index it no longer needs.
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(());
+    }
     let mut batch = Vec::new();
-    for path in index.search(needle, USN_LIMIT) {
+    for path in index.search(needle, USN_LIMIT, cancel) {
         if cancel.load(Ordering::Relaxed) {
             break;
         }

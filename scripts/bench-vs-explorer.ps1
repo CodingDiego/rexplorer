@@ -237,13 +237,12 @@ try {
   foreach ($c in $cases) { Write-Host "creating $($c.n) files ..."; New-Files (Join-Path $Work $c.dir) $c.n }
   Write-Host "creating $navN files ..."; New-Files (Join-Path $Work "files-$navN") $navN
 
-  # rexplorer's first run writes settings and exports about 560 icons for ten seconds; let that finish so the
-  # measured runs see a settled profile, as a user's would.
+  # rexplorer's first run writes settings and the starter icons; let that finish so the measured runs see a
+  # settled profile, as a user's would.
   Write-Host 'rexplorer first run on the scratch profile ...'
-  $marker = Join-Path $RexAppData 'rexplorer\icons\default\system-icons.txt'
+  $marker = Join-Path $RexAppData 'rexplorer\icons\default\folder.png'
   $first = [Diagnostics.Process]::Start((Start-Rex (Join-Path $Work $cases[0].dir)))
-  try { for ($i = 0; $i -lt 120 -and -not (Test-Path $marker); $i++) { Start-Sleep -Milliseconds 500 } } finally { try { $first.Kill(); $first.WaitForExit(3000) | Out-Null } catch {} }
-  if (-not (Test-Path $marker)) { throw 'rexplorer did not finish its first-run icon export within 60 s' }
+  try { for ($i = 0; $i -lt 20 -and -not (Test-Path $marker); $i++) { Start-Sleep -Milliseconds 500 } } finally { try { $first.Kill(); $first.WaitForExit(3000) | Out-Null } catch {} }
   Start-Sleep -Milliseconds 700
 
   foreach ($c in $cases) {

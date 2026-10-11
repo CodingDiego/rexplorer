@@ -282,14 +282,19 @@ fn confined_to_corner(bmp: HBITMAP, edge: u32) -> bool {
 /// For an item the shell gives the blank page: the opening app's icon as a straight-alpha DIB at least
 /// `size` px (48 or 256 wide; the caller scales). None when the shell has an icon of its own for it.
 pub fn app_icon_bitmap(abs: &Pidl, size: i32) -> Option<HBITMAP> {
+    let name = unsafe { take_cotaskmem_string(SHGetNameFromIDList(abs.as_ptr(), SIGDN_PARENTRELATIVEPARSING).ok()?) };
+    let ext = Path::new(&name).extension().and_then(|e| e.to_str())?;
+    // The registry-only check (no disk access) goes first: it spares most items the bind and icon extraction below.
+    if system_icon_index(ext) != generic_index() {
+        return None;
+    }
     let mut fi = SHFILEINFOW::default();
     let flags = SHGFI_PIDL | SHGFI_SYSICONINDEX | SHGFI_SMALLICON;
     let himl = unsafe { SHGetFileInfoW(PCWSTR(abs.as_ptr() as *const u16), FILE_FLAGS_AND_ATTRIBUTES(0), Some(&mut fi), size_of::<SHFILEINFOW>() as u32, flags) };
     if himl == 0 || Some(fi.iIcon) != generic_index() {
         return None;
     }
-    let name = unsafe { take_cotaskmem_string(SHGetNameFromIDList(abs.as_ptr(), SIGDN_PARENTRELATIVEPARSING).ok()?) };
-    let index = Path::new(&name).extension().and_then(|e| e.to_str()).and_then(app_icon_index)?;
+    let index = app_icon_index(ext)?;
     let mut bmp = None;
     if size > 48 {
         bmp = draw_system_icon(SHIL_JUMBO, index).filter(|&b| {

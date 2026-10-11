@@ -46,6 +46,8 @@ pub(crate) struct Panes {
     /// The list item under the pointer and whether a WM_MOUSELEAVE is pending for it.
     pub hover: Option<usize>,
     pub hover_tracking: bool,
+    /// When the sidebar's rows were last asked for.
+    pub sidebar_at: Option<Instant>,
 }
 
 fn scale(px: i32, dpi: u32) -> i32 {
@@ -89,8 +91,12 @@ pub(crate) unsafe fn theme_tree(app: *mut App) {
     }
 }
 
-/// Selects the active folder in the tree; folders the tree cannot show are ignored.
+/// Selects the active folder in the tree; folders the tree cannot show are ignored. A hidden tree is synced when
+/// it is shown again.
 pub(crate) unsafe fn sync_tree(app: *mut App) {
+    if !(*app).session.show_tree {
+        return;
+    }
     if let (Some(t), Some(l)) = (&(*app).panes.tree, listing(app)) {
         let _ = t.select(&l.folder.pidl);
     }
@@ -136,6 +142,7 @@ pub(crate) unsafe fn toggle_tree(app: *mut App) {
     s.show_sidebar |= !s.show_tree;
     if s.show_tree {
         ensure_tree(app);
+        sync_tree(app);
     }
     show_left(app);
 }
@@ -160,6 +167,10 @@ pub(crate) unsafe fn show_left(app: *mut App) {
         let _ = ShowWindow(t.hwnd(), if tree { SW_SHOW } else { SW_HIDE });
     }
     let _ = ShowWindow((*app).sidebar, if side { SW_SHOW } else { SW_HIDE });
+    // While hidden it is not polled, so it may have gone stale.
+    if side && sidebar_stale(app) {
+        refresh_sidebar(app);
+    }
     ui::layout(app);
     nav::session_changed(app);
 }
@@ -260,6 +271,7 @@ impl SidebarRows {
 /// Builds the sidebar rows on a worker: Home, Favorites (bookmarks, then Quick Access), This PC, Devices, Cloud
 /// and Network. Icons are loaded there too; the rows arrive as WM_SIDEBAR_ROWS.
 pub(crate) unsafe fn refresh_sidebar(app: *mut App) {
+    (*app).panes.sidebar_at = Some(Instant::now());
     if SIDEBAR_BUSY.swap(true, Ordering::SeqCst) {
         SIDEBAR_AGAIN.store(true, Ordering::SeqCst);
         return;
@@ -267,6 +279,7 @@ pub(crate) unsafe fn refresh_sidebar(app: *mut App) {
     let bookmarks = (*app).profile.bookmarks.clone();
     let hwnd = (*app).hwnd.0 as isize;
     std::thread::spawn(move || {
+        crate::ui::background_priority();
         let _com = ComInit::mta();
         let rows = Box::new(sidebar_rows(&bookmarks));
         SIDEBAR_BUSY.store(false, Ordering::SeqCst);
@@ -278,6 +291,12 @@ pub(crate) unsafe fn refresh_sidebar(app: *mut App) {
             }
         }
     });
+}
+
+/// The rows are older than 5 s. None is not stale: WM_ACTIVATE arrives inside WM_CREATE, before create_children's
+/// first build, and must not start a second one.
+pub(crate) unsafe fn sidebar_stale(app: *mut App) -> bool {
+    (*app).panes.sidebar_at.is_some_and(|t| t.elapsed() > Duration::from_secs(5))
 }
 
 /// After our own pin or unpin: rebuild now, and once more a second later in case the shell updates late.
@@ -510,11 +529,9 @@ pub(crate) unsafe fn schedule_preview(app: *mut App) {
     }
 }
 
-/// The hovered list item changed (None: the pointer left or is over empty space).
+/// The pointer moved over a list item (None: it is over empty space). Every move restarts the timer, so the
+/// prefetch only fires once the pointer has been still.
 pub(crate) unsafe fn set_hover(app: *mut App, item: Option<usize>) {
-    if (*app).panes.hover == item {
-        return;
-    }
     (*app).panes.hover = item;
     let _ = KillTimer(Some((*app).hwnd), TIMER_HOVER);
     if item.is_some() && (*app).session.show_preview {
@@ -537,7 +554,11 @@ pub(crate) unsafe fn prefetch_hovered(app: *mut App) {
     if item.is_folder() || !ui::is_fs_path(&parsing) {
         return;
     }
-    preview_pane::prefetch(PathBuf::from(&parsing), l.folder.child_pidl(item), preview_pane::request_size((*app).panes.preview));
+    let path = PathBuf::from(&parsing);
+    if !rexplorer_core::preview::prefetchable(path.extension().and_then(|e| e.to_str()).unwrap_or("")) {
+        return;
+    }
+    preview_pane::prefetch(path, l.folder.child_pidl(item), preview_pane::request_size((*app).panes.preview));
 }
 
 /// Shows the focused (else first) selected item, or nothing without a selection.

@@ -13,6 +13,9 @@ use windows::Win32::Graphics::Gdi::{
     BeginPaint, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DrawTextW, EndPaint, FillRect, PAINTSTRUCT, SelectObject,
     SetBkMode, SetTextColor, TRANSPARENT,
 };
+use windows::Win32::Storage::FileSystem::GetDriveTypeW;
+use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN};
+use windows::Win32::System::WindowsProgramming::DRIVE_REMOTE;
 
 pub(crate) const THIS_PC: &str = "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}";
 const HEADER_H: i32 = 44;
@@ -33,10 +36,21 @@ fn scale(px: i32, dpi: u32) -> i32 {
     px * dpi as i32 / 96
 }
 
+/// Puts the calling worker thread in background mode (lower CPU, I/O and memory priority): speculative work yields to the user.
+pub(crate) fn background_priority() {
+    let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) };
+}
+
 /// A drive path or UNC path: something a terminal can start in.
 pub(crate) fn is_fs_path(p: &str) -> bool {
     let b = p.as_bytes();
     (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':') || p.starts_with("\\\\")
+}
+
+/// A network path: a UNC name, or a drive letter mapped to a share.
+pub(crate) fn is_remote(p: &str) -> bool {
+    let drive = p.get(1..3) == Some(":\\");
+    p.starts_with("\\\\") || (drive && unsafe { GetDriveTypeW(&HSTRING::from(&p[..3])) } == DRIVE_REMOTE)
 }
 
 pub(crate) unsafe fn create_children(app: *mut App) -> Result<()> {
@@ -511,6 +525,10 @@ pub(crate) unsafe fn crumb_dropdown(app: *mut App, index: usize) {
     if !(is_fs_path(&c.parsing) || c.parsing.eq_ignore_ascii_case(THIS_PC)) {
         return;
     }
+    // A dead share would block here until the SMB timeout; the crumb itself still navigates.
+    if is_remote(&c.parsing) {
+        return;
+    }
     let Ok(folder) = ShellFolder::from_pidl(pidl) else { return };
     // Bounded: this runs on the UI thread, and the menu shows 500 at most anyway.
     let Ok(mut items) = folder.subfolders_up_to(2000) else { return };
@@ -800,12 +818,17 @@ pub(crate) unsafe fn on_palette(app: *mut App, hdr: &NMHDR) {
 }
 
 pub(crate) unsafe fn open_terminal(app: *mut App) {
-    match listing(app).map(|l| l.folder.parsing_name.clone()).filter(|p| is_fs_path(p)) {
-        Some(p) if instance::open_terminal(std::path::Path::new(&p)).is_ok() => {}
-        _ => {
+    let Some(p) = listing(app).map(|l| l.folder.parsing_name.clone()).filter(|p| is_fs_path(p)) else {
+        let _ = MessageBeep(MB_OK);
+        return;
+    };
+    // The click returns at once; ShellExecute on an app alias (wt.exe) can take a while.
+    std::thread::spawn(move || {
+        let _com = ComInit::sta();
+        if instance::open_terminal(std::path::Path::new(&p)).is_err() {
             let _ = MessageBeep(MB_OK);
         }
-    }
+    });
 }
 
 /// The status bar and the command bar's enabled states.

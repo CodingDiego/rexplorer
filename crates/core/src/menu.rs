@@ -1,6 +1,7 @@
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::UI::Shell::{
     CMF_CANRENAME, CMF_DEFAULTONLY, CMF_EXPLORE, CMF_EXTENDEDVERBS, CMF_NORMAL,
+    CMF_OPTIMIZEFORINVOKE,
     CMIC_MASK_PTINVOKE, CMIC_MASK_SHIFT_DOWN, CMINVOKECOMMANDINFO, CMINVOKECOMMANDINFOEX,
     GCS_VERBW, IContextMenu, IContextMenu2, IContextMenu3, SEE_MASK_UNICODE,
 };
@@ -98,7 +99,9 @@ impl ContextMenu {
         let narrow = std::ffi::CString::new(verb).expect("ascii verb");
         let wide = HSTRING::from(verb);
         unsafe {
-            self.menu.QueryContextMenu(self.hmenu, 0, ID_FIRST, ID_LAST, CMF_NORMAL).ok()?;
+            // The built-in verbs need no extension handlers; pins and "New" items do.
+            let flags = if matches!(verb, "copy" | "cut" | "paste" | "delete" | "properties") { CMF_OPTIMIZEFORINVOKE } else { CMF_NORMAL };
+            self.menu.QueryContextMenu(self.hmenu, 0, ID_FIRST, ID_LAST, flags).ok()?;
             self.invoke(hwnd, PCSTR(narrow.as_ptr() as *const u8), PCWSTR(wide.as_ptr()), None, shift)
         }
     }

@@ -153,7 +153,7 @@ pub(crate) unsafe fn new_menu(app: *mut App) {
     match done {
         Ok(()) => {
             (*app).new_item = Some((folder, before));
-            // The change watch refreshes too (and pushes this back while changes keep coming).
+            // The change watch may reload first; whichever reload starts cancels the other.
             SetTimer(Some(hwnd), TIMER_REFRESH, 300, None);
         }
         Err(_) => {
