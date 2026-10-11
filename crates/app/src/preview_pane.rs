@@ -21,10 +21,12 @@ use windows::core::{HSTRING, PCWSTR, Result, w};
 
 /// Reserved for the parent's notifications; the pane currently sends none.
 pub const PVN_FIRST: u32 = 0x9000;
-/// Posted to the pane by a worker that filled the cache for a file; the pane shows the subject again from the cache.
+/// Posted to the pane by a worker that filled the cache for a file (lparam = Box<PathBuf> of it); the pane shows the
+/// subject again from the cache if it is still that file.
 const PV_READY: u32 = WM_APP + 0x51;
 
-const MAX_TEXT: u64 = 256 * 1024;
+// The Edit word-wraps all of its text on every set and resize, so keep what goes in small.
+const MAX_TEXT: u64 = 64 * 1024;
 
 /// An owned GDI bitmap, shared between the cache and the pane; the last holder deletes it.
 struct Bmp(HBITMAP);
@@ -75,7 +77,7 @@ fn store(path: &Path, st: Stamp, set: impl FnOnce(&mut Entry)) {
     set(&mut c[i]);
 }
 
-/// The file's text (first 256 KB, decoded for the Edit), from the cache when its mtime and size still match.
+/// The file's text (first 64 KB, decoded for the Edit), from the cache when its mtime and size still match.
 fn cached_text(path: &Path) -> Option<String> {
     let st = stamp(path);
     if let Some(t) = st.and_then(|st| lookup(path, st, |e| e.text.clone())) {
@@ -120,18 +122,22 @@ fn kind_of(path: &Path) -> Kind {
     }
 }
 
-/// Fills the cache for a hovered file on a worker thread; shell-handler previews need the UI thread and are skipped.
+/// Fills the cache for a hovered file on a worker thread; only text and images: shell-handler previews need the UI
+/// thread, and PDFs, Office files and the like load only once selected.
 pub fn prefetch(path: PathBuf, abs: Pidl, size: i32) {
     let kind = kind_of(&path);
-    if kind != Kind::Handler {
+    if matches!(kind, Kind::Text | Kind::Image) {
         fetch(path, abs, size, kind, 0);
     }
 }
 
 /// Reads the file (text) or asks the shell (thumbnail) off the UI thread, so a stalled network file never hangs the
-/// window; `notify` is the pane to post PV_READY to, or 0.
+/// window; `notify` is the pane to post PV_READY (with the file's path) to, or 0 for a speculative hover fetch.
 fn fetch(path: PathBuf, abs: Pidl, size: i32, kind: Kind, notify: isize) {
     std::thread::spawn(move || {
+        if notify == 0 {
+            crate::ui::background_priority();
+        }
         let _com = ComInit::mta();
         if kind == Kind::Text {
             let _ = cached_text(&path);
@@ -139,7 +145,12 @@ fn fetch(path: PathBuf, abs: Pidl, size: i32, kind: Kind, notify: isize) {
             let _ = cached_thumb(Some(&path), &abs, size);
         }
         if notify != 0 {
-            let _ = unsafe { PostMessageW(Some(HWND(notify as *mut c_void)), PV_READY, WPARAM(0), LPARAM(0)) };
+            // shortcut: one still queued when the pane is destroyed leaks its path (only at exit today); drain
+            // PV_READY in WM_DESTROY if panes ever close earlier.
+            let p = Box::into_raw(Box::new(path));
+            if unsafe { PostMessageW(Some(HWND(notify as *mut c_void)), PV_READY, WPARAM(0), LPARAM(p as isize)) }.is_err() {
+                drop(unsafe { Box::from_raw(p) });
+            }
         }
     });
 }
@@ -176,6 +187,8 @@ struct State {
     preview: Option<Preview>,
     /// What is shown, kept for PV_READY.
     subject: Option<Subject>,
+    /// The shown file's mtime and size when its handler opened or its text was set: both are kept while they still match.
+    stamp: Option<Stamp>,
 }
 
 /// Formats a byte count like "1.5 MB" (binary units, one decimal above 1 KB).
@@ -259,6 +272,7 @@ pub fn create(parent: HWND, id: usize) -> Result<HWND> {
             detail: String::new(),
             preview: None,
             subject: None,
+            stamp: None,
         }));
         let r = CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -325,12 +339,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         PV_READY => {
+            let ready = Box::from_raw(lparam.0 as *mut PathBuf);
             // Cache only: a file that cannot be cached (vanished) would otherwise spawn a worker per PV_READY.
-            // A handler already showing stays (a stale PV_READY must not open a second one).
-            if let Some(sub) = (*s).subject.take().filter(|_| (*s).preview.is_none()) {
-                present(hwnd, s, &sub, false);
+            // A handler already showing stays (a stale PV_READY must not open a second one), and so does a
+            // completion for a file no longer shown (it would re-run a folder thumbnail on the UI thread).
+            if let Some(sub) = (*s).subject.take() {
+                if (*s).preview.is_none() && sub.path.as_ref() == Some(&*ready) {
+                    present(hwnd, s, &sub, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
                 (*s).subject = Some(sub);
-                let _ = InvalidateRect(Some(hwnd), None, false);
             }
             LRESULT(0)
         }
@@ -475,8 +493,24 @@ pub fn show(hwnd: HWND, subject: Option<Subject>) {
         if s.is_null() {
             return;
         }
+        // The same file version is already live in a handler (re-hosting reloads it out of process on the UI thread)
+        // or set as text (setting it again re-wraps all of it): keep it.
+        let same = match (&subject, &(*s).subject) {
+            (Some(new), Some(old)) => {
+                (if (*s).preview.is_some() { HANDLERS.load(Ordering::Relaxed) } else { (*s).stamp.is_some() })
+                    && new.path.is_some()
+                    && new.path == old.path
+                    && new.path.as_deref().and_then(stamp) == (*s).stamp
+            }
+            _ => false,
+        };
+        if same {
+            (*s).subject = subject;
+            return;
+        }
         (*s).preview = None;
         (*s).subject = None;
+        (*s).stamp = None;
         clear_bitmap(s);
         (*s).name.clear();
         (*s).detail.clear();
@@ -506,17 +540,25 @@ unsafe fn present(hwnd: HWND, s: *mut State, sub: &Subject, spawn: bool) {
         }
     };
     if kind == Kind::Text {
-        match stamp(path).and_then(|st| lookup(path, st, |e| e.text.clone())) {
+        let st = stamp(path);
+        match st.and_then(|st| lookup(path, st, |e| e.text.clone())) {
             Some(t) => {
-                let _ = SetWindowTextW((*s).edit, &HSTRING::from(t));
+                // PV_READY can repeat for a version already set.
+                if (*s).stamp != st {
+                    let _ = SetWindowTextW((*s).edit, &HSTRING::from(t));
+                    (*s).stamp = st;
+                }
                 let _ = ShowWindow((*s).edit, SW_SHOW);
                 return;
             }
             None => start(Kind::Text),
         }
     } else if kind == Kind::Handler {
+        // Stamped before the load: a write during it leaves the stamp behind, so the next show re-hosts.
+        let st = stamp(path);
         if let Ok(p) = preview::open(path, hwnd, content_rect(hwnd)) {
             (*s).preview = Some(p);
+            (*s).stamp = st;
             return;
         }
     }
@@ -620,6 +662,15 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             assert_eq!(edit_text(pane), "hola\r\nmundo");
+
+            // The same file version again leaves the Edit's text alone.
+            let _ = SetWindowTextW(GetWindow(pane, GW_CHILD).unwrap(), w!("kept"));
+            show(pane, Some(Subject {
+                path: Some(file.clone()), abs_pidl: parse(&file), name: "a.txt".into(),
+                is_folder: false, size: Some(10), type_text: "Text".into(),
+            }));
+            pump();
+            assert_eq!(edit_text(pane), "kept");
 
             show(pane, Some(Subject {
                 path: Some(dir.clone()), abs_pidl: parse(&dir), name: "d".into(),

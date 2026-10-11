@@ -1116,6 +1116,16 @@ unsafe fn apply_profile(app: *mut App, new: Profile) {
         }
     }
     sync(&new);
+    for tab in &mut (*app).tabs {
+        // Show hidden files changes what a listing holds: the other tabs reload when shown.
+        tab.dirty |= old.show_hidden != new.show_hidden;
+        // Show file extensions changes the Name column's text; the listings cached it.
+        if old.show_extensions != new.show_extensions {
+            if let Some(Source::Shell(l)) = &mut tab.source {
+                l.cells.fill(Default::default());
+            }
+        }
+    }
     ui::sync_list_style(app);
     let _ = InvalidateRect(Some((*app).list), None, true);
     ui::layout(app);

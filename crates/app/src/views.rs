@@ -193,6 +193,10 @@ unsafe fn load_icon_theme(dir: &std::path::Path, size: i32) -> Option<ThemeIcons
     (!list.is_invalid()).then(|| ThemeIcons { theme, list, index: HashMap::new() })
 }
 
+pub(crate) unsafe fn icon_theme_active(app: *mut App) -> bool {
+    (*app).views.icon_theme.is_some()
+}
+
 /// Small-icon index from the icon theme, or None when no theme is active.
 pub(crate) unsafe fn theme_icon(app: *mut App, item: &ShellItem) -> Option<i32> {
     (*app).views.icon_theme.as_ref()?;
@@ -291,15 +295,56 @@ pub(crate) unsafe fn on_cache_hint(app: *mut App, from: i32, to: i32) {
         let _ = InvalidateRect(Some((*app).list), None, false);
     }
     let count = (*app).views.slots.len();
-    for i in thumbs::visible_range(from, to - from + 1, count, LOOKAHEAD) {
+    // What the worker may still render: the screen (and the hint, should the two disagree) plus a lookahead. Slots
+    // requested outside it are dropped there, so they ask again if scrolled back to.
+    let screen = on_screen((*app).list);
+    let first = screen.start.min(from);
+    let win = thumbs::visible_range(first, screen.end.max(to + 1) - first, count, LOOKAHEAD);
+    let v = &mut (*app).views;
+    if let Some(t) = &v.thumbs {
+        t.set_window(win.clone());
+    }
+    let (before, rest) = v.slots.split_at_mut(win.start);
+    for s in before.iter_mut().chain(&mut rest[win.end - win.start..]) {
+        if *s == REQUESTED {
+            *s = UNKNOWN;
+        }
+    }
+    for i in thumbs::visible_range(from, to - from + 1, count, 0) {
         if (&(*app).views.slots)[i] == UNKNOWN {
+            request(app, i);
+        }
+    }
+    // The lookahead preloads pictures only: no off-screen PDF, Office or video rendering.
+    for i in thumbs::visible_range(from, to - from + 1, count, LOOKAHEAD) {
+        // shortcut: the extension comes from a parsing name asked per lookahead row; keep it per item if the hint gets hot
+        if (&(*app).views.slots)[i] == UNKNOWN && listing(app).and_then(|l| l.items.get(i)).is_some_and(|it| is_picture(&it.parsing_name())) {
             request(app, i);
         }
     }
 }
 
+/// The items an icon view has on screen, from its scroll position: after a thumbnail lands, its redraw can make
+/// LVN_ODCACHEHINT shrink to that one item.
+unsafe fn on_screen(list: HWND) -> std::ops::Range<i32> {
+    let mut origin = POINT::default();
+    SendMessageW(list, LVM_GETORIGIN, None, Some(LPARAM(&mut origin as *mut POINT as isize)));
+    let space = SendMessageW(list, LVM_GETITEMSPACING, Some(WPARAM(0)), None).0 as u32;
+    let (cx, cy) = ((space & 0xFFFF).max(1) as i32, (space >> 16).max(1) as i32);
+    let mut rc = RECT::default();
+    let _ = GetClientRect(list, &mut rc);
+    let per_row = (rc.right / cx).max(1);
+    let top = origin.y.max(0);
+    top / cy * per_row..(top + rc.bottom) / cy * per_row + per_row
+}
+
 fn cache_key(view: View, size: i32, parsing: &str) -> String {
     format!("{}:{size}:{parsing}", view.name())
+}
+
+/// Whether the file is a picture by its extension (no registry access).
+fn is_picture(parsing: &str) -> bool {
+    rexplorer_core::preview::is_image(std::path::Path::new(parsing).extension().and_then(|e| e.to_str()).unwrap_or(""))
 }
 
 /// From the cache when possible (image index), else queued on the worker (placeholder until it lands).
@@ -307,14 +352,21 @@ unsafe fn request(app: *mut App, i: usize) -> i32 {
     let Some(l) = listing(app) else { return 0 };
     let Some(item) = l.items.get(i) else { return 0 };
     let v = &mut (*app).views;
-    let key = cache_key(v.view, v.size, &item.parsing_name());
+    let parsing = item.parsing_name();
+    let key = cache_key(v.view, v.size, &parsing);
     if let Some(bmp) = v.cache.get(&key) {
         let index = ImageList_Add(v.normal, bmp, None).max(0);
         v.slots[i] = index;
         return index;
     }
     let Some(t) = &v.thumbs else { return 0 };
-    t.request((v.token << 32) | i, l.folder.child_pidl(item), v.size);
+    // Asked for off screen (LVM_GETITEM, accessibility): the worker would skip it, so it stays unknown until shown.
+    if !t.in_window(i) {
+        return 0;
+    }
+    // The Icons view shows pictures as thumbnails and everything else as its icon.
+    let icon_only = v.view == View::Icons && !is_picture(&parsing);
+    t.request((v.token << 32) | i, l.folder.child_pidl(item), v.size, icon_only);
     v.slots[i] = REQUESTED;
     0
 }
@@ -324,18 +376,17 @@ pub(crate) unsafe fn on_thumb_done(app: *mut App, wparam: WPARAM, lparam: LPARAM
     let d = thumbs::done(wparam, lparam);
     let (token, i) = (d.id >> 32, d.id & 0xFFFF_FFFF);
     let v = &mut (*app).views;
-    let live = v.thumbs.is_some() && token == v.token && v.view != View::Details && v.slots.get(i) == Some(&REQUESTED);
-    let fitted = if live { fit(d.bitmap, v.size) } else { None };
-    let _ = DeleteObject(d.bitmap.into());
+    let live = v.thumbs.is_some() && token == v.token && v.view != View::Details;
     if !live {
+        let _ = DeleteObject(d.bitmap.into());
         return;
     }
-    let Some(bmp) = fitted else {
-        v.slots[i] = 0; // placeholder for good, so it is not requested again
-        return;
-    };
-    let index = ImageList_Add(v.normal, bmp, None).max(0);
-    v.slots[i] = index;
+    let bmp = d.bitmap;
+    // One whose slot left the window while it rendered (a reload's jump to the end and back) is still cached.
+    let shown = v.slots.get(i) == Some(&REQUESTED);
+    if shown {
+        v.slots[i] = ImageList_Add(v.normal, bmp, None).max(0);
+    }
     let parsing = listing(app).and_then(|l| l.items.get(i)).map(|it| it.parsing_name());
     let v = &mut (*app).views;
     match parsing {
@@ -344,7 +395,9 @@ pub(crate) unsafe fn on_thumb_done(app: *mut App, wparam: WPARAM, lparam: LPARAM
             let _ = DeleteObject(bmp.into());
         }
     }
-    SendMessageW((*app).list, LVM_REDRAWITEMS, Some(WPARAM(i)), Some(LPARAM(i as isize)));
+    if shown {
+        SendMessageW((*app).list, LVM_REDRAWITEMS, Some(WPARAM(i)), Some(LPARAM(i as isize)));
+    }
 }
 
 /// WM_DESTROY: stop the worker, delete bitmaps already queued for us, free the image lists.
@@ -392,7 +445,8 @@ pub(crate) unsafe fn dib(w: i32, h: i32) -> Option<(HBITMAP, *mut u8)> {
 }
 
 /// Shrinks `src` to fit a `size` square (never enlarges) and centers it: image lists need exact-size images.
-unsafe fn fit(src: HBITMAP, size: i32) -> Option<HBITMAP> {
+/// Runs on the thumbs worker.
+pub(crate) unsafe fn fit(src: HBITMAP, size: i32) -> Option<HBITMAP> {
     let mut bm = BITMAP::default();
     if GetObjectW(src.into(), size_of::<BITMAP>() as i32, Some(&mut bm as *mut _ as *mut c_void)) == 0 {
         return None;
@@ -521,8 +575,8 @@ pub(crate) fn try_save_profile_keys(profile: &str, pairs: &[(&str, String)]) -> 
 const STARTER: [&str; 2] = ["folder", "file"];
 
 /// Writes `icons\default\`: `folder.png` and `file.png` once (when the folder does not exist yet), then, in the
-/// background, Windows' own icon for every registered extension; `system-icons.txt` lists those and marks the
-/// export done (delete it to export again, say after installing a program).
+/// background and only while the theme uses `icon_theme=default`, Windows' own icon for every registered extension;
+/// `system-icons.txt` lists those and marks the export done (delete it to export again, say after installing a program).
 pub(crate) fn ensure_starter_theme(t: &Theme) {
     let dir = settings::dir().join("icons").join("default");
     if !dir.exists() {
@@ -533,8 +587,9 @@ pub(crate) fn ensure_starter_theme(t: &Theme) {
             let _ = icons::save_png(&starter_icon(name, t), 32, 32, &dir.join(format!("{name}.png")));
         }
     }
+    // The export only feeds an enabled default theme.
     let done = dir.join("system-icons.txt");
-    if done.exists() {
+    if t.icon_theme.as_deref() != Some("default") || done.exists() {
         return;
     }
     std::thread::spawn(move || {

@@ -301,7 +301,7 @@ impl Profile {
                 "show_extensions" => p.show_extensions = parse_bool(v).unwrap_or(p.show_extensions),
                 "single_click" => p.single_click = parse_bool(v).unwrap_or(p.single_click),
                 "search_delay_ms" => p.search_delay_ms = v.parse().unwrap_or(p.search_delay_ms),
-                "hover_preview_ms" => p.hover_preview_ms = v.parse().unwrap_or(p.hover_preview_ms),
+                "hover_preview_ms" => p.hover_preview_ms = v.parse().map_or(p.hover_preview_ms, |n: u32| n.clamp(200, 10000)),
                 "underline_titles" => p.underline_titles = if v.trim().eq_ignore_ascii_case("always") { "always" } else { "hover" }.into(),
                 "show_recent" => p.show_recent = parse_bool(v).unwrap_or(p.show_recent),
                 "show_frequent" => p.show_frequent = parse_bool(v).unwrap_or(p.show_frequent),
@@ -537,6 +537,8 @@ mod tests {
         assert!(p.show_recent && p.show_frequent && p.show_status && p.preview_handlers && p.search_system);
         assert!(!p.item_checkboxes && !p.search_archives);
         assert_eq!(Profile::from_section("x", &[("underline_titles".into(), "junk".into())]).underline_titles, "hover");
+        let hover = |v: &str| Profile::from_section("x", &[("hover_preview_ms".into(), v.into())]).hover_preview_ms;
+        assert_eq!((hover("5"), hover("1500"), hover("999999"), hover("junk")), (200, 1500, 10000, 2000));
     }
 
     #[test]

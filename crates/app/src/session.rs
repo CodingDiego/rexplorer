@@ -118,6 +118,11 @@ impl Debounce {
             false
         }
     }
+
+    /// How long until `should_save` says yes again.
+    pub fn remaining(&self, now: Instant) -> Duration {
+        self.last.map_or(Duration::ZERO, |l| self.min.saturating_sub(now.saturating_duration_since(l)))
+    }
 }
 
 #[cfg(test)]
@@ -187,5 +192,7 @@ mod tests {
         assert!(!d.should_save(t0 + Duration::from_secs(1)));
         assert!(d.should_save(t0 + Duration::from_secs(2)));
         assert!(!d.should_save(t0 + Duration::from_secs(3)));
+        assert_eq!(d.remaining(t0 + Duration::from_secs(3)), Duration::from_secs(1));
+        assert_eq!(d.remaining(t0 + Duration::from_secs(9)), Duration::ZERO);
     }
 }

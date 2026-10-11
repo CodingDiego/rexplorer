@@ -36,7 +36,7 @@ mod views;
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rexplorer_core::cli;
 use rexplorer_core::com::{ComInit, Pidl};
@@ -82,6 +82,8 @@ const TIMER_SKELETON: usize = 7;
 const TIMER_PULSE: usize = 8;
 /// Typing in the Search box has paused.
 pub(crate) const TIMER_SEARCH: usize = 9;
+/// A shell change notification, debounced and at most one reload per second.
+const TIMER_CHANGE: usize = 11;
 const ICON_UNKNOWN: i32 = i32::MIN;
 
 const ID_ADDR: usize = 100;
@@ -214,6 +216,10 @@ pub(crate) struct App {
     image_list_set: bool,
     session: session::Session,
     debounce: session::Debounce,
+    /// Spaces the reloads that shell change notifications cause.
+    change_gate: session::Debounce,
+    /// A change arrived while minimized: reload once when the window is restored.
+    stale: bool,
     recent: Recent,
     panes: panes::Panes,
     views: views::Views,
@@ -281,7 +287,10 @@ fn main() -> Result<()> {
     if !args.recover {
         crash::reset_recoveries();
     }
-    std::thread::spawn(rexplorer_core::install::cleanup_old);
+    std::thread::spawn(|| {
+        ui::background_priority();
+        rexplorer_core::install::cleanup_old();
+    });
     crash::install(&["--recover".to_string()]);
     // Undocumented, for the smoke test: an access violation after this many ms exercises the recovery path. A
     // recovery launch inherits the variable and ignores it.
@@ -314,11 +323,7 @@ fn main() -> Result<()> {
         if let Some(p) = &args.profile {
             settings.active = p.clone();
         }
-        let mut profile = settings.active_profile().clone();
-        // Home needs a recent Windows; elsewhere the default start is This PC.
-        if profile.start.eq_ignore_ascii_case(settings::HOME_START) && ShellFolder::parse(&profile.start).is_err() {
-            profile.start = "shell:MyComputerFolder".into();
-        }
+        let profile = settings.active_profile().clone();
         folder_options::sync(&profile);
         let theme = settings.theme(&profile.theme).clone();
         let brushes = theme::Brushes::new(&theme);
@@ -368,6 +373,8 @@ fn main() -> Result<()> {
             views: views::Views::new(views::View::parse(&session.view)),
             session,
             debounce: session::Debounce::new(Duration::from_secs(2)),
+            change_gate: session::Debounce::new(Duration::from_secs(1)),
+            stale: false,
             recent: Recent::load(dir.join("recent.txt")),
             panes: panes::Panes::default(),
             browser: None,
@@ -484,12 +491,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         return DefWindowProcW(hwnd, msg, wparam, lparam);
     }
     match msg {
-        WM_SIZE => ui::layout(app),
+        WM_SIZE => {
+            ui::layout(app);
+            if wparam.0 as u32 != SIZE_MINIMIZED && std::mem::take(&mut (*app).stale) {
+                SetTimer(Some(hwnd), TIMER_CHANGE, 1, None);
+            }
+        }
         WM_PAINT => ui::paint(app),
         WM_ACTIVATE => {
-            // Drives come and go: the sidebar re-reads them every 5 s, only while the window is active.
+            // Pins change in Explorer: activation re-reads the sidebar if it is over 5 s old, else it polls every 30 s
+            // while the window is active (drives are announced by WM_DEVICECHANGE).
             if (wparam.0 & 0xFFFF) as u32 != WA_INACTIVE {
-                SetTimer(Some(hwnd), TIMER_SIDEBAR, 5000, None);
+                SetTimer(Some(hwnd), TIMER_SIDEBAR, if panes::sidebar_stale(app) { 1 } else { 30_000 }, None);
+            }
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+        WM_DEVICECHANGE => {
+            // DBT_DEVICEARRIVAL / DBT_DEVICEREMOVECOMPLETE: drives come and go without polling.
+            if matches!(wparam.0, 0x8000 | 0x8004) {
+                panes::sidebar_changed(app);
             }
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
@@ -557,17 +577,38 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_MOUSEMOVE => panes::on_mouse_move(app, lparam),
         WM_LBUTTONUP | WM_CAPTURECHANGED => panes::end_drag(app),
         WM_SHELL_CHANGE => {
-            ChangeWatch::acknowledge(wparam, lparam);
-            SetTimer(Some(hwnd), TIMER_REFRESH, 150, None);
+            // A change in a tab we are not showing only marks that tab; it reloads when shown.
+            if nav::mark_changed(app, &ChangeWatch::acknowledge(wparam, lparam)) {
+                if IsIconic(hwnd).as_bool() {
+                    (*app).stale = true;
+                } else {
+                    SetTimer(Some(hwnd), TIMER_CHANGE, 150, None);
+                }
+            }
         }
         WM_TIMER => {
             let _ = KillTimer(Some(hwnd), wparam.0);
             match wparam.0 {
                 TIMER_REFRESH => nav::refresh(app),
+                // Armed for the tab and folder active then: a clean one shown since has nothing to catch up on.
+                TIMER_CHANGE if !nav::cur(app).dirty => {}
+                TIMER_CHANGE => {
+                    let (now, tab) = (Instant::now(), nav::cur(app));
+                    // One change reload at a time (F5 and the rest still restart one): a change during it reloads once more after.
+                    if tab.pending != 0 && tab.loading.is_none() {
+                        SetTimer(Some(hwnd), TIMER_CHANGE, 500, None);
+                    } else if (*app).change_gate.should_save(now) {
+                        // Covers an in-app rename or new item whose own follow-up reload is still pending.
+                        let _ = KillTimer(Some(hwnd), TIMER_REFRESH);
+                        nav::refresh(app);
+                    } else {
+                        SetTimer(Some(hwnd), TIMER_CHANGE, (*app).change_gate.remaining(now).as_millis() as u32, None);
+                    }
+                }
                 TIMER_STATUS => ui::update_status(app),
                 TIMER_SESSION => nav::save_session(app),
                 TIMER_PREVIEW => panes::update_preview(app),
-                TIMER_HOVER => panes::prefetch_hovered(app),
+                TIMER_HOVER if GetForegroundWindow() == hwnd => panes::prefetch_hovered(app),
                 TIMER_TREE => {
                     panes::ensure_tree(app);
                     ui::layout(app);
@@ -576,8 +617,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 TIMER_PULSE => nav::on_pulse_timer(app),
                 TIMER_SEARCH => source::on_search_timer(app),
                 TIMER_SIDEBAR if GetActiveWindow() == hwnd => {
-                    panes::refresh_sidebar(app);
-                    SetTimer(Some(hwnd), TIMER_SIDEBAR, 5000, None);
+                    if IsWindowVisible((*app).sidebar).as_bool() && !IsIconic(hwnd).as_bool() {
+                        panes::refresh_sidebar(app);
+                    }
+                    SetTimer(Some(hwnd), TIMER_SIDEBAR, 30_000, None);
                 }
                 _ => {}
             }

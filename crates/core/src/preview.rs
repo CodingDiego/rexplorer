@@ -33,12 +33,23 @@ const IMAGE_EXTS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "bmp", "webp", "ico", "tif", "tiff", "heic", "heif", "avif", "jxl",
 ];
 
+/// Whether `ext` ("png" or ".png", any case) is an image type.
+pub fn is_image(ext: &str) -> bool {
+    IMAGE_EXTS.contains(&ext.trim_start_matches('.').to_ascii_lowercase().as_str())
+}
+
+/// Whether the hover prefetch may load `ext`: text and light images only, by extension (no registry access).
+pub fn prefetchable(ext: &str) -> bool {
+    let e = ext.trim_start_matches('.').to_ascii_lowercase();
+    TEXT_EXTS.contains(&e.as_str()) || matches!(e.as_str(), "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "ico")
+}
+
 /// Classifies `ext` ("rs" or ".rs", any case); the Handler arm queries the registry.
 pub fn kind(ext: &str) -> Kind {
     let e = ext.trim_start_matches('.').to_ascii_lowercase();
     if TEXT_EXTS.contains(&e.as_str()) {
         Kind::Text
-    } else if IMAGE_EXTS.contains(&e.as_str()) {
+    } else if is_image(&e) {
         Kind::Image
     } else if handler_clsid(&e).is_some() {
         Kind::Handler
@@ -151,6 +162,17 @@ mod tests {
         assert_eq!(kind(".CSV"), Kind::Text);
         assert_eq!(kind("png"), Kind::Image);
         assert_eq!(kind("zzz-not-a-type"), Kind::None);
+    }
+
+    #[test]
+    fn only_light_types_prefetch() {
+        for e in ["pdf", "docx", "heic", "mp4", "tif", "zzz-not-a-type"] {
+            assert!(!prefetchable(e), "{e}");
+        }
+        for e in ["txt", "JPG", ".png", "rs"] {
+            assert!(prefetchable(e), "{e}");
+        }
+        assert!(is_image("HEIC") && is_image(".png") && !is_image("pdf") && !is_image("txt"));
     }
 
     #[test]

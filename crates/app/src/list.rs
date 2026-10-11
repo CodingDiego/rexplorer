@@ -131,9 +131,27 @@ unsafe fn on_column_click(app: *mut App, sub: usize) {
 pub(crate) unsafe fn sort_by(app: *mut App, col: u32, desc: bool) {
     let list = (*app).list;
     let Some(Source::Shell(l)) = &mut cur(app).source else { return };
+    // The list keeps selection and focus per row position: carry them over to the same items. The sort moves the
+    // items but not their PIDLs, so a PIDL's address is the item's identity (exact, unlike a case-folded name).
+    let focus = SendMessageW(list, LVM_GETNEXTITEM, Some(WPARAM(usize::MAX)), Some(LPARAM(LVNI_FOCUSED as isize))).0;
+    let key = |i: usize| l.items.get(i).map(|it| it.pidl.as_ptr() as usize);
+    let selected: std::collections::HashSet<usize> = selected_indices(list).into_iter().filter_map(key).collect();
+    let focused = usize::try_from(focus).ok().and_then(key);
     l.sort_col = col;
     l.sort_desc = desc;
     sort_listing(l);
+    // Icon views keep images per row position: drop them, or thumbnails stay where their files were.
+    views::reset(app, l.items.len());
+    set_item_state(list, usize::MAX, LIST_VIEW_ITEM_STATE_FLAGS(0), LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0));
+    for (i, it) in l.items.iter().enumerate() {
+        let p = it.pidl.as_ptr() as usize;
+        if selected.contains(&p) {
+            set_item_state(list, i, LVIS_SELECTED, LVIS_SELECTED);
+        }
+        if focused == Some(p) {
+            set_item_state(list, i, LVIS_FOCUSED, LVIS_FOCUSED);
+        }
+    }
     let _ = InvalidateRect(Some(list), None, true);
 }
 
@@ -494,6 +512,12 @@ pub(crate) unsafe fn rename_item(app: *mut App, index: usize, name: &str, cell: 
                 Some(ext) => target.rename((*app).hwnd, &format!("{name}{ext}"), true),
                 None => target.rename((*app).hwnd, name, false),
             };
+            // The row asks the shell for its text again instead of showing the old name from the cache.
+            if let Some(Source::Shell(l)) = &mut cur(app).source {
+                if let Some(row) = l.cells.get_mut(index) {
+                    row.take();
+                }
+            }
             SetTimer(Some((*app).hwnd), TIMER_REFRESH, 150, None);
         }
     }
@@ -645,6 +669,8 @@ pub(crate) unsafe extern "system" fn subclass(hwnd: HWND, msg: u32, wparam: WPAR
         crate::panes::set_hover(app, usize::try_from(i).ok());
     } else if msg == WM_MOUSELEAVE {
         (*app).panes.hover_tracking = false;
+        crate::panes::stop_hover(app);
+    } else if msg == WM_MOUSEWHEEL {
         crate::panes::stop_hover(app);
     }
     let r = DefSubclassProc(hwnd, msg, wparam, lparam);

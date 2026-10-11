@@ -9,6 +9,7 @@ use std::thread::{self, JoinHandle};
 
 use rexplorer_core::com::{ComInit, Pidl};
 use rexplorer_core::images;
+use crate::views;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Gdi::{DeleteObject, HBITMAP, HGDIOBJ};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
@@ -18,15 +19,21 @@ struct Request {
     id: usize,
     abs: Pidl,
     size: i32,
+    icon_only: bool,
 }
+
+/// `window` before the first scroll: every item.
+const ALL: u64 = u32::MAX as u64;
 
 pub struct Thumbs {
     tx: Option<Sender<Request>>,
     gen_: Arc<AtomicU64>,
+    /// Items worth rendering, `start << 32 | end`: the worker skips requests outside it.
+    window: Arc<AtomicU64>,
     worker: Option<JoinHandle<()>>,
 }
 
-/// Decoded completion message; the receiver owns `bitmap` and must DeleteObject it.
+/// Decoded completion message; the receiver owns `bitmap` (already fitted to the request's size) and must DeleteObject it.
 pub struct Done {
     pub id: usize,
     pub bitmap: HBITMAP,
@@ -37,16 +44,23 @@ pub fn start(hwnd: HWND, msg: u32) -> Thumbs {
     let (tx, rx) = channel::<Request>();
     let gen_ = Arc::new(AtomicU64::new(0));
     let latest = gen_.clone();
+    let window = Arc::new(AtomicU64::new(ALL));
+    let win = window.clone();
     let hwnd = hwnd.0 as isize;
     let worker = thread::spawn(move || {
         let _com = ComInit::mta();
         // recv fails once the sender is dropped.
         while let Ok(r) = rx.recv() {
-            if r.gen_ < latest.load(Ordering::SeqCst) {
+            // Stale, or scrolled out of the window while queued.
+            if r.gen_ < latest.load(Ordering::SeqCst) || !in_window(&win, r.id & 0xFFFF_FFFF) {
                 continue;
             }
-            let bmp = images::thumbnail(&r.abs, r.size);
+            let bmp = if r.icon_only { images::icon(&r.abs, r.size) } else { images::thumbnail(&r.abs, r.size) };
             let Ok(bmp) = bmp else { continue };
+            // Scaled here: the UI thread only adds the image to its list.
+            let fitted = unsafe { views::fit(bmp, r.size) };
+            let _ = unsafe { DeleteObject(HGDIOBJ(bmp.0)) };
+            let Some(bmp) = fitted else { continue };
             let posted = unsafe {
                 PostMessageW(Some(HWND(hwnd as *mut _)), msg, WPARAM(r.id), LPARAM(bmp.0 as isize))
             };
@@ -56,33 +70,49 @@ pub fn start(hwnd: HWND, msg: u32) -> Thumbs {
             }
         }
     });
-    Thumbs { tx: Some(tx), gen_, worker: Some(worker) }
+    Thumbs { tx: Some(tx), gen_, window, worker: Some(worker) }
 }
 
 impl Thumbs {
-    pub fn request(&self, id: usize, abs: Pidl, size: i32) {
-        self.send(self.generation(), id, abs, size);
+    pub fn request(&self, id: usize, abs: Pidl, size: i32, icon_only: bool) {
+        self.send(self.generation(), id, abs, size, icon_only);
     }
 
     #[cfg(test)]
-    pub fn request_with_generation(&self, gen_: u64, id: usize, abs: Pidl, size: i32) {
-        self.send(gen_, id, abs, size);
+    pub fn request_with_generation(&self, gen_: u64, id: usize, abs: Pidl, size: i32, icon_only: bool) {
+        self.send(gen_, id, abs, size, icon_only);
     }
 
-    fn send(&self, gen_: u64, id: usize, abs: Pidl, size: i32) {
+    fn send(&self, gen_: u64, id: usize, abs: Pidl, size: i32, icon_only: bool) {
         if let Some(tx) = &self.tx {
-            let _ = tx.send(Request { gen_, id, abs, size });
+            let _ = tx.send(Request { gen_, id, abs, size, icon_only });
         }
     }
 
-    /// Navigation happened: queued requests from older generations are skipped.
+    /// Navigation happened: queued requests from older generations are skipped, and every item is in the window again.
     pub fn invalidate(&self) {
         self.gen_.fetch_add(1, Ordering::SeqCst);
+        self.window.store(ALL, Ordering::SeqCst);
+    }
+
+    /// The items on screen plus a lookahead: queued requests for others are skipped.
+    pub fn set_window(&self, items: Range<usize>) {
+        self.window.store((items.start as u64) << 32 | items.end as u64, Ordering::SeqCst);
     }
 
     pub fn generation(&self) -> u64 {
         self.gen_.load(Ordering::SeqCst)
     }
+
+    /// Whether a request for item `i` would be rendered now rather than skipped.
+    pub fn in_window(&self, i: usize) -> bool {
+        in_window(&self.window, i)
+    }
+}
+
+fn in_window(window: &AtomicU64, i: usize) -> bool {
+    let w = window.load(Ordering::SeqCst);
+    (w >> 32..w & ALL).contains(&(i as u64))
 }
 
 impl Drop for Thumbs {
@@ -153,25 +183,57 @@ mod tests {
         }
         .unwrap();
         let t = start(hwnd, MSG_ID);
-        t.request(7, temp_pidl(), 64);
+        t.request(7, temp_pidl(), 64, false);
         let m = wait_msg(5000).expect("no thumbnail within 5s");
         let d = done(m.wParam, m.lParam);
         assert_eq!(d.id, 7);
         let mut bm = BITMAP::default();
         let n = unsafe { GetObjectW(HGDIOBJ(d.bitmap.0), size_of::<BITMAP>() as i32, Some(&mut bm as *mut _ as *mut _)) };
-        assert!(n > 0 && bm.bmWidth > 0);
+        assert!(n > 0 && (bm.bmWidth, bm.bmHeight.abs()) == (64, 64), "fitted to the request's size on the worker");
         let _ = unsafe { DeleteObject(HGDIOBJ(d.bitmap.0)) };
 
         let old = t.generation();
         t.invalidate();
         assert_eq!(t.generation(), old + 1);
-        t.request_with_generation(old, 8, temp_pidl(), 64);
+        t.request_with_generation(old, 8, temp_pidl(), 64, false);
         assert!(wait_msg(1000).is_none(), "stale request was delivered");
         // A current-generation request still works after invalidate.
-        t.request(9, temp_pidl(), 64);
+        t.request(9, temp_pidl(), 64, true);
         let m = wait_msg(5000).expect("no icon within 5s");
         let _ = unsafe { DeleteObject(HGDIOBJ(done(m.wParam, m.lParam).bitmap.0)) };
 
+        drop(t);
+        let _ = unsafe { DestroyWindow(hwnd) };
+    }
+
+    #[test]
+    fn skips_requests_outside_the_window_until_invalidate() {
+        let _com = ComInit::sta();
+        let hwnd = unsafe {
+            CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR::null(), WS_OVERLAPPEDWINDOW, 0, 0, 800, 600, None, None, None, None)
+        }
+        .unwrap();
+        let t = start(hwnd, MSG_ID);
+        t.set_window(0..5);
+        assert!(t.in_window(4) && !t.in_window(5) && !t.in_window(9), "what the UI asks before requesting");
+        t.request(9, temp_pidl(), 64, true);
+        t.request(2, temp_pidl(), 64, true);
+        let m = wait_msg(5000).expect("the request inside the window is delivered");
+        let d = done(m.wParam, m.lParam);
+        assert_eq!(d.id, 2);
+        let _ = unsafe { DeleteObject(HGDIOBJ(d.bitmap.0)) };
+        assert!(wait_msg(1000).is_none(), "the request outside the window was rendered");
+        // The listing token in the high bits does not matter: only the item index is compared.
+        t.request((3 << 32) | 4, temp_pidl(), 64, true);
+        let m = wait_msg(5000).expect("item 4 is inside 0..5");
+        let _ = unsafe { DeleteObject(HGDIOBJ(done(m.wParam, m.lParam).bitmap.0)) };
+        t.invalidate();
+        assert!(t.in_window(9));
+        t.request(9, temp_pidl(), 64, true);
+        let m = wait_msg(5000).expect("invalidate opens the window again");
+        let d = done(m.wParam, m.lParam);
+        assert_eq!(d.id, 9);
+        let _ = unsafe { DeleteObject(HGDIOBJ(d.bitmap.0)) };
         drop(t);
         let _ = unsafe { DestroyWindow(hwnd) };
     }

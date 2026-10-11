@@ -74,7 +74,7 @@ Sidebar, every row read from the shell with its localized name and icon:
 Click a row to go there; the row of the current folder, or of its nearest ancestor, is highlighted. Right-click a
 pinned Quick Access folder for **Unpin from Home**, a frequent (not pinned) one for **Pin to Home**, a bookmark for
 **Remove bookmark** (its `bookmark.<label>` line leaves settings.ini). Pinned and frequent are told apart by the
-shell's `System.Home.IsPinned` property. The rows are built on a worker thread, rebuilt every 5 s while the window is active and right after
+shell's `System.Home.IsPinned` property. The rows are built on a worker thread, rebuilt when the window is activated, every 30 s while the sidebar shows, when a drive comes or goes, and right after
 a pin or unpin from rexplorer, so the sidebar fills in after the first listing. More > **Folder tree** shows the
 shell's folder tree in the sidebar's place (choose it again for the sidebar).
 
@@ -406,9 +406,10 @@ Icon themes: `icons\<name>\` holds PNGs named by extension (`rs.png`, `pdf.png`.
 the system icons, for folders, archive members and search results alike. A folder whose name ends in a themed
 extension (a zip, a folder to the shell) gets that extension's PNG. PNGs are decoded on first use, so a theme of
 hundreds costs nothing at startup. `icons\default` is written on first run: `folder.png` and `file.png` in the
-theme's accent, then, in the background (about ten seconds), Windows' own 48 px icon for every extension registered
-on the machine that has an icon of its own (about 560 here; `system-icons.txt` lists them and marks the export
-done; delete it to pick up extensions registered since). The export never overwrites a PNG, so edit or replace any.
+theme's accent. Only while a theme sets `icon_theme=default`, the app also exports, in the background (about ten
+seconds), Windows' own 48 px icon for every extension registered on the machine that has an icon of its own (about
+560 here; `system-icons.txt` lists them and marks the export done; delete it to pick up extensions registered
+since). The export never overwrites a PNG, so edit or replace any.
 
 Opening-app icons: a file type Windows registers without an icon of its own shows Explorer's blank page (`.ps1` on
 a machine whose PowerShell file type was never registered, `.py` or `.md` opened with an editor that registers no

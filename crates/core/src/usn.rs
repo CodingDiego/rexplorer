@@ -4,6 +4,7 @@ use std::ffi::c_void;
 use std::mem::size_of;
 use std::path::PathBuf;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows::Win32::Foundation::{CloseHandle, ERROR_HANDLE_EOF, HANDLE};
 use windows::Win32::Storage::FileSystem::{
@@ -147,11 +148,12 @@ impl VolumeIndex {
         None
     }
 
-    /// Case-insensitive substring match on file names; at most `limit` resolvable paths.
-    pub fn search(&self, needle: &str, limit: usize) -> Vec<PathBuf> {
+    /// Case-insensitive substring match on file names; at most `limit` resolvable paths. Setting `cancel` ends the scan.
+    pub fn search(&self, needle: &str, limit: usize, cancel: &AtomicBool) -> Vec<PathBuf> {
         let needle = needle.to_lowercase();
         self.entries
             .iter()
+            .take_while(|_| !cancel.load(Ordering::Relaxed))
             .filter(|(_, e)| e.name.to_lowercase().contains(&needle))
             .filter_map(|(&frn, _)| self.path_of(frn))
             .take(limit)
@@ -216,6 +218,14 @@ mod tests {
         }
         let idx = build('C').unwrap();
         assert!(idx.len() > 10_000);
-        assert!(!idx.search("notepad.exe", 5).is_empty());
+        assert!(!idx.search("notepad.exe", 5, &AtomicBool::new(false)).is_empty());
+    }
+
+    #[test]
+    fn search_stops_when_cancelled() {
+        let entries = HashMap::from([(5, Entry { parent: 5, name: String::new() }), (10, Entry { parent: 5, name: "a".into() })]);
+        let idx = VolumeIndex { drive: 'C', entries };
+        assert_eq!(idx.search("a", 5, &AtomicBool::new(false)), vec![PathBuf::from("C:\\a")]);
+        assert!(idx.search("a", 5, &AtomicBool::new(true)).is_empty());
     }
 }
