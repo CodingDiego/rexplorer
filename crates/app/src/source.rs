@@ -29,7 +29,9 @@ pub(crate) const WM_WORKER_ERROR: u32 = WM_APP + 6;
 /// Most results the volume index returns per search.
 const USN_LIMIT: usize = 5000;
 
-pub(crate) type UsnCache = Arc<Mutex<HashMap<char, Arc<VolumeIndex>>>>;
+/// Volume indexes per drive letter. Each drive has its own slot, so a build (seconds) stalls only searches of that
+/// drive, which then share its index instead of building their own.
+pub(crate) type UsnCache = Arc<Mutex<HashMap<char, Arc<Mutex<Option<Arc<VolumeIndex>>>>>>>;
 
 pub(crate) enum Source {
     Shell(Listing),
@@ -537,15 +539,13 @@ pub(crate) unsafe fn start_search(app: *mut App, t: usize, needle: &str, push: b
 
 /// Elevated search of a whole NTFS volume through its MFT index (built once per drive, kept for the session).
 fn usn_search(cache: &UsnCache, drive: char, needle: &str, cancel: &AtomicBool, sink: &mut dyn FnMut(Vec<Hit>)) -> Result<()> {
+    let slot = cache.lock().unwrap_or_else(|e| e.into_inner()).entry(drive).or_default().clone();
     let index = {
-        let mut m = cache.lock().unwrap_or_else(|e| e.into_inner());
-        match m.get(&drive) {
+        let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+        match &*slot {
             Some(i) => i.clone(),
-            None => {
-                let i = Arc::new(usn::build(drive)?);
-                m.insert(drive, i.clone());
-                i
-            }
+            None if cancel.load(Ordering::Relaxed) => return Ok(()),
+            None => slot.insert(Arc::new(usn::build(drive)?)).clone(),
         }
     };
     // A superseded search must not scan a whole index it no longer needs.
@@ -656,6 +656,10 @@ pub(crate) unsafe fn cancel_search(app: *mut App) -> bool {
     }
 }
 
+/// As-you-type searches start at this many characters; Enter searches any non-empty text. Below it a showing search
+/// stays: going back to the folder would rewrite the box under the user's typing.
+const MIN_TYPED: usize = 2;
+
 /// TIMER_SEARCH: the box text settled. The box also changes when a tab shows its own state; that matches the
 /// active search (or is empty with none), so only a real edit gets through.
 pub(crate) unsafe fn on_search_timer(app: *mut App) {
@@ -671,7 +675,7 @@ pub(crate) unsafe fn on_search_timer(app: *mut App) {
                 true => nav::go_up(app),
             }
         }
-    } else if !same && matches!(cur(app).source, Some(Source::Shell(_) | Source::Search(_))) {
+    } else if !same && text.chars().count() >= MIN_TYPED && matches!(cur(app).source, Some(Source::Shell(_) | Source::Search(_))) {
         start_search(app, active, text, !searching);
     }
 }

@@ -19,6 +19,8 @@ use windows::core::{GUID, Interface};
 pub(crate) const WM_TREE_SELECT: u32 = WM_APP + 3;
 /// lparam = Box<SidebarRows> built by the sidebar worker.
 pub(crate) const WM_SIDEBAR_ROWS: u32 = WM_APP + 8;
+/// wparam = 1 when the shell ran the pin or unpin verb, 0 when it refused it.
+pub(crate) const WM_QUICK_ACCESS_DONE: u32 = WM_APP + 9;
 /// Gap between the side panes and the cards, and the cards' margin from the window edges; it is the splitter.
 const SPLIT: i32 = 8;
 const MIN_WIDTH: i32 = 120;
@@ -347,20 +349,24 @@ pub(crate) unsafe fn sidebar_menu(app: *mut App, index: usize) {
 }
 
 /// A canonical verb ("unpinfromhome", "pintohome") on the Quick Access item for `target`; beeps when the shell
-/// refuses it (the item left Quick Access meanwhile).
+/// refuses it (the item left Quick Access meanwhile). On a worker: Quick Access can hold network folders, and a
+/// shell context menu needs an STA. One at a time: two quick unpins racing on the shell's Quick Access list lose one.
 unsafe fn quick_access_verb(app: *mut App, target: &str, verb: &str) {
-    let hwnd = (*app).hwnd;
-    let done = (|| {
-        let qa = ShellFolder::parse(&format!("shell:{}", nav::QUICK_ACCESS)).ok()?;
-        let items = qa.enumerate().ok()?;
-        let item = items.iter().find(|i| i.parsing_name().eq_ignore_ascii_case(target))?;
-        ContextMenu::for_items(&qa, &[item], hwnd).ok()?.invoke_verb(hwnd, verb, false).ok()
-    })();
-    if done.is_some() {
-        sidebar_changed(app);
-    } else {
-        let _ = MessageBeep(MB_OK);
-    }
+    static QUICK_ACCESS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let hwnd = (*app).hwnd.0 as isize;
+    let (target, verb) = (target.to_string(), verb.to_string());
+    std::thread::spawn(move || {
+        let _one = QUICK_ACCESS.lock().unwrap_or_else(|e| e.into_inner());
+        let _com = ComInit::sta();
+        let hwnd = HWND(hwnd as *mut c_void);
+        let done = (|| {
+            let qa = ShellFolder::parse(&format!("shell:{}", nav::QUICK_ACCESS)).ok()?;
+            let items = qa.enumerate().ok()?;
+            let item = items.iter().find(|i| i.parsing_name().eq_ignore_ascii_case(&target))?;
+            ContextMenu::for_items(&qa, &[item], hwnd).ok()?.invoke_verb(hwnd, &verb, false).ok()
+        })();
+        unsafe { PostMessageW(Some(hwnd), WM_QUICK_ACCESS_DONE, WPARAM(done.is_some() as usize), LPARAM(0)) }.ok();
+    });
 }
 
 fn small_icon(pidl: &Pidl) -> Option<HICON> {

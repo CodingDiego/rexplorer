@@ -42,6 +42,20 @@ pub(crate) unsafe fn clipboard_has_files() -> bool {
     IsClipboardFormatAvailable(15).is_ok() || (idlist != 0 && IsClipboardFormatAvailable(idlist).is_ok())
 }
 
+/// Whether the active tab is a shell listing that has finished loading (the only place Paste can act).
+unsafe fn shell_ready(app: *mut App) -> bool {
+    let tab = cur(app);
+    tab.loading.is_none() && matches!(tab.source, Some(Source::Shell(_)))
+}
+
+/// Paste's enabled state alone, for a clipboard change: skips the selection and attribute reads of `update`.
+pub(crate) unsafe fn update_paste(app: *mut App) {
+    if (*app).tabs.is_empty() {
+        return;
+    }
+    toolbar::set_enabled((*app).cmdbar, CMD_PASTE, shell_ready(app) && clipboard_has_files());
+}
+
 /// Enabled states for the active tab: nothing while it loads; selection verbs in a shell listing (Copy and Delete
 /// in search results too, which act on each file's own folder); Paste with files on the clipboard; New and Sort
 /// not on the Home page.
@@ -51,12 +65,8 @@ pub(crate) unsafe fn update(app: *mut App) {
         return;
     }
     let tab = cur(app);
-    let ready = tab.loading.is_none();
-    let (shell, search) = match &tab.source {
-        Some(Source::Shell(_)) => (ready, false),
-        Some(Source::Search(_)) => (false, ready),
-        _ => (false, false),
-    };
+    let search = tab.loading.is_none() && matches!(tab.source, Some(Source::Search(_)));
+    let shell = shell_ready(app);
     let home = IsWindowVisible(a.home).as_bool();
     let sel = SendMessageW(a.list, LVM_GETSELECTEDCOUNT, None, None).0 as usize;
     let bar = a.cmdbar;

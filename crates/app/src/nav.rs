@@ -490,16 +490,33 @@ unsafe fn show_source(app: *mut App, mode: Show) {
     update_chrome(app);
 }
 
-/// Indices of the items whose parsing name is one of `names` (ASCII case-insensitive), stopping at the last match.
-fn selection_matches(names: &[String], parsing: impl Iterator<Item = String>) -> Vec<usize> {
-    let mut wanted: std::collections::HashSet<String> = names.iter().map(|n| n.to_ascii_lowercase()).collect();
-    let mut parsing = parsing.enumerate();
+/// Indices of the items whose parsing name is one of `names`, stopping at the last match. Exact matches come
+/// first (a case-sensitive folder can hold `a.txt` and `A.txt`); a name with none falls back to an ASCII
+/// case-insensitive match on an item not already hit, so a rename that only changed case still reselects.
+fn selection_matches(names: &[String], mut parsing: impl Iterator<Item = String>) -> Vec<usize> {
+    let mut wanted: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
+    let mut seen = Vec::new(); // kept for the fallback pass: parsing a name is a shell call
     let mut hits = Vec::new();
     while !wanted.is_empty() {
-        let Some((i, p)) = parsing.next() else { break };
-        if wanted.remove(&p.to_ascii_lowercase()) {
-            hits.push(i);
+        let Some(p) = parsing.next() else { break };
+        if wanted.remove(p.as_str()) {
+            hits.push(seen.len());
         }
+        seen.push(p);
+    }
+    if !wanted.is_empty() {
+        // The walk ran out of items, so `seen` is all of them.
+        let mut loose: std::collections::HashSet<String> = wanted.iter().map(|n| n.to_ascii_lowercase()).collect();
+        let exact: std::collections::HashSet<usize> = hits.iter().copied().collect();
+        for (i, p) in seen.iter().enumerate() {
+            if loose.is_empty() {
+                break;
+            }
+            if !exact.contains(&i) && loose.remove(&p.to_ascii_lowercase()) {
+                hits.push(i);
+            }
+        }
+        hits.sort_unstable();
     }
     hits
 }
@@ -636,6 +653,7 @@ pub(crate) unsafe fn refresh(app: *mut App) {
     };
     // This reload covers the changes notified so far.
     let _ = KillTimer(Some((*app).hwnd), crate::TIMER_CHANGE);
+    (*app).change_armed = false;
     go(app, target, History::Refresh);
 }
 
@@ -988,13 +1006,18 @@ mod tests {
     }
 
     #[test]
-    fn selection_matches_ascii_case_insensitively_and_stops_at_the_last() {
-        let names = ["C:\\A.txt".to_string(), "c:\\B.TXT".to_string()];
-        let parsing = ["c:\\a.TXT", "c:\\x", "C:\\b.txt", "never"].into_iter().enumerate().map(|(i, p)| {
-            assert!(i < 3, "read past the last match");
+    fn selection_matches_exact_first_then_ascii_case_insensitively() {
+        let s = |v: &[&str]| v.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        let names = s(&["C:\\a.txt", "c:\\b.txt"]);
+        let parsing = ["C:\\a.txt", "c:\\x", "c:\\b.txt", "never"].into_iter().enumerate().map(|(i, p)| {
+            assert!(i < 3, "read past the last exact match");
             p.to_string()
         });
         assert_eq!(selection_matches(&names, parsing), [0, 2]);
+        assert_eq!(selection_matches(&s(&["C:\\a.txt"]), s(&["C:\\A.txt", "C:\\a.txt"]).into_iter()), [1], "the exact one wins in a case-sensitive folder");
+        assert_eq!(selection_matches(&s(&["C:\\a.txt"]), s(&["C:\\A.txt"]).into_iter()), [0], "a rename that only changed case still reselects");
+        assert_eq!(selection_matches(&s(&["C:\\a.txt", "C:\\A.txt"]), s(&["C:\\a.txt"]).into_iter()), [0], "an item already hit is not taken twice");
+        assert_eq!(selection_matches(&s(&["C:\\A.txt", "c:\\B.TXT"]), s(&["c:\\a.TXT", "c:\\x", "C:\\b.txt"]).into_iter()), [0, 2]);
         assert!(selection_matches(&["É".to_string()], ["é".to_string()].into_iter()).is_empty(), "ASCII only, as eq_ignore_ascii_case");
         assert!(selection_matches(&[], std::iter::once_with(|| -> String { panic!("no names, nothing to parse") })).is_empty());
     }

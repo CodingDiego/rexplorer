@@ -220,6 +220,9 @@ pub(crate) struct App {
     change_gate: session::Debounce,
     /// A change arrived while minimized: reload once when the window is restored.
     stale: bool,
+    /// TIMER_CHANGE is armed: a notification does not restart it (SetTimer would), so a folder written every few
+    /// milliseconds still reloads.
+    change_armed: bool,
     recent: Recent,
     panes: panes::Panes,
     views: views::Views,
@@ -375,6 +378,7 @@ fn main() -> Result<()> {
             debounce: session::Debounce::new(Duration::from_secs(2)),
             change_gate: session::Debounce::new(Duration::from_secs(1)),
             stale: false,
+            change_armed: false,
             recent: Recent::load(dir.join("recent.txt")),
             panes: panes::Panes::default(),
             browser: None,
@@ -494,7 +498,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_SIZE => {
             ui::layout(app);
             if wparam.0 as u32 != SIZE_MINIMIZED && std::mem::take(&mut (*app).stale) {
-                SetTimer(Some(hwnd), TIMER_CHANGE, 1, None);
+                arm_change(app, 1);
             }
         }
         WM_PAINT => ui::paint(app),
@@ -516,7 +520,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_SETFOCUS => {
             let _ = SetFocus(Some(source::browser_hwnd(app).unwrap_or_else(|| ui::view_hwnd(app))));
         }
-        WM_CLIPBOARDUPDATE => commands::update(app),
+        WM_CLIPBOARDUPDATE => commands::update_paste(app),
         WM_NOTIFY => return on_notify(app, lparam),
         WM_COMMAND => {
             let (id, code) = (wparam.0 & 0xFFFF, (wparam.0 >> 16) & 0xFFFF);
@@ -566,7 +570,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         source::WM_WORKER_ERROR => message(hwnd, &Box::from_raw(lparam.0 as *mut String)),
         panes::WM_SIDEBAR_ROWS => panes::on_sidebar_rows(app, Box::from_raw(lparam.0 as *mut panes::SidebarRows)),
         panes::WM_TREE_SELECT => panes::on_tree_select(app, Box::from_raw(lparam.0 as *mut Pidl)),
+        panes::WM_QUICK_ACCESS_DONE => {
+            if wparam.0 == 1 {
+                panes::sidebar_changed(app);
+            } else {
+                let _ = MessageBeep(MB_OK);
+            }
+        }
         views::WM_THUMB_DONE => views::on_thumb_done(app, wparam, lparam),
+        views::WM_ICONS_EXPORTED => views::on_icons_exported(app),
         WM_SETCURSOR => {
             if HWND(wparam.0 as *mut c_void) == hwnd && (lparam.0 & 0xFFFF) as u32 == HTCLIENT && panes::on_set_cursor(app) {
                 return LRESULT(1);
@@ -581,13 +593,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if nav::mark_changed(app, &ChangeWatch::acknowledge(wparam, lparam)) {
                 if IsIconic(hwnd).as_bool() {
                     (*app).stale = true;
-                } else {
-                    SetTimer(Some(hwnd), TIMER_CHANGE, 150, None);
+                } else if !(*app).change_armed {
+                    arm_change(app, 150);
                 }
             }
         }
         WM_TIMER => {
             let _ = KillTimer(Some(hwnd), wparam.0);
+            if wparam.0 == TIMER_CHANGE {
+                (*app).change_armed = false;
+            }
             match wparam.0 {
                 TIMER_REFRESH => nav::refresh(app),
                 // Armed for the tab and folder active then: a clean one shown since has nothing to catch up on.
@@ -596,13 +611,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let (now, tab) = (Instant::now(), nav::cur(app));
                     // One change reload at a time (F5 and the rest still restart one): a change during it reloads once more after.
                     if tab.pending != 0 && tab.loading.is_none() {
-                        SetTimer(Some(hwnd), TIMER_CHANGE, 500, None);
+                        arm_change(app, 500);
                     } else if (*app).change_gate.should_save(now) {
                         // Covers an in-app rename or new item whose own follow-up reload is still pending.
                         let _ = KillTimer(Some(hwnd), TIMER_REFRESH);
                         nav::refresh(app);
                     } else {
-                        SetTimer(Some(hwnd), TIMER_CHANGE, (*app).change_gate.remaining(now).as_millis() as u32, None);
+                        arm_change(app, (*app).change_gate.remaining(now).as_millis() as u32);
                     }
                 }
                 TIMER_STATUS => ui::update_status(app),
@@ -664,6 +679,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
     }
     LRESULT(0)
+}
+
+/// Arms TIMER_CHANGE for `ms` and records it, so a notification can tell it is already pending.
+unsafe fn arm_change(app: *mut App, ms: u32) {
+    (*app).change_armed = true;
+    SetTimer(Some((*app).hwnd), TIMER_CHANGE, ms, None);
 }
 
 unsafe fn on_notify(app: *mut App, lparam: LPARAM) -> LRESULT {
