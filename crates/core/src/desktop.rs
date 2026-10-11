@@ -13,7 +13,7 @@ use windows::Win32::UI::Shell::{
     SVSI_DESELECTOTHERS, SVSI_FOCUSED, SVSI_SELECT, SWC_DESKTOP, SWFO_NEEDDISPATCH, ShellWindows,
 };
 use windows::Win32::Foundation::{LPARAM, WPARAM};
-use windows::Win32::UI::Controls::{LVM_GETNEXTITEM, LVNI_SELECTED};
+use windows::Win32::UI::Controls::{LVM_GETNEXTITEM, LVNI_FOCUSED, LVNI_SELECTED};
 use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetParent, OBJID_CLIENT, SendMessageW};
 use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::UI::Shell::{FOLDERFLAGS, FVM_ICON, FWF_AUTOARRANGE, FWF_SNAPTOGRID, IFolderView2, SORT_ASCENDING, SORTCOLUMN, SVSI_EDIT};
@@ -97,6 +97,12 @@ impl DesktopView {
             }
             out.push(i as usize);
         }
+    }
+
+    /// Index of the focused item of desktop list `list`, if any.
+    pub fn focused(list: HWND) -> Option<usize> {
+        let i = unsafe { SendMessageW(list, LVM_GETNEXTITEM, Some(WPARAM(usize::MAX)), Some(LPARAM(LVNI_FOCUSED as isize))) }.0;
+        usize::try_from(i).ok()
     }
 
     /// What a right-button press does in Explorer: on an unselected icon, select just it; on a selected one, keep

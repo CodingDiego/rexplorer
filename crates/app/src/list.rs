@@ -301,7 +301,7 @@ pub(crate) unsafe fn show_menu(app: *mut App, on_item: bool, at: Option<POINT>) 
         Ok(Picked::Own(id)) if id >= VIEW_BASE => commands::pick_view(app, id - VIEW_BASE),
         Ok(Picked::Own(id)) => on_command(app, id as u16),
         // The shell's own entries can change Home (add to or remove from Favorites, remove from the list).
-        Ok(Picked::Invoked) if home => {
+        Ok(Picked::Invoked(_)) if home => {
             SetTimer(Some(hwnd), TIMER_REFRESH, 300, None);
         }
         _ => {}
