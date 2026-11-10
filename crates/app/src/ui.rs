@@ -291,16 +291,34 @@ pub(crate) unsafe fn apply_font(app: *mut App) {
     panes::set_preview_fonts(app);
 }
 
+/// After a DPI change (WM_DPICHANGED) or a Windows text size change: fonts, image lists, columns, view spacing
+/// and layout again, then a full repaint for the children whose size did not change.
+pub(crate) unsafe fn rescale(app: *mut App) {
+    use windows::Win32::Graphics::Gdi::{RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RedrawWindow};
+    apply_font(app);
+    sync_list_style(app);
+    views::rebuild_tall(app);
+    if let Some(s) = nav::source(app) {
+        nav::set_columns(app, &s.columns());
+        nav::apply_layout(app);
+    }
+    views::apply(app);
+    layout(app);
+    let _ = RedrawWindow(Some((*app).hwnd), None, None, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+}
+
 pub(crate) unsafe fn layout(app: *mut App) {
     let mut rc = RECT::default();
     let _ = GetClientRect((*app).hwnd, &mut rc);
     let dpi = GetDpiForWindow((*app).hwnd);
+    // Bar heights hold text, so they follow the Windows text size too; widths and glyphs stay at `dpi`.
+    let tdpi = theme::text_dpi(dpi);
     let (w, pad) = (rc.right, scale(PAD, dpi));
-    let th = tabs::height(dpi);
+    let th = tabs::height(tdpi);
     let _ = MoveWindow((*app).strip, 0, 0, w, th, true);
 
     // The header bar: 32 px controls centered in 44 px.
-    let (hh, nh) = (scale(HEADER_H, dpi), scale(CONTROL_H, dpi));
+    let (hh, nh) = (scale(HEADER_H, tdpi), scale(CONTROL_H, tdpi));
     let y = th + (hh - nh) / 2;
     let nw = toolbar::width((*app).nav);
     let tw = toolbar::width((*app).tools);
@@ -313,7 +331,7 @@ pub(crate) unsafe fn layout(app: *mut App) {
     let _ = MoveWindow((*app).crumbs, cx, y, cw, nh, true);
     // A single-line Edit draws its text at the top, so size it to one line and center it in the field,
     // right of the breadcrumb's icon (8 + 16 + 4 px).
-    let eh = (*app).theme.font_size * dpi as i32 / 72 * 4 / 3 + scale(4, dpi);
+    let eh = (*app).theme.font_size * tdpi as i32 / 72 * 4 / 3 + scale(4, dpi);
     let ex = scale(28, dpi);
     let _ = MoveWindow((*app).addr, cx + ex, y + (nh - eh) / 2, (cw - ex - 2 * pad).max(0), eh, true);
     // The search Edit sits in a rounded field the window paints, right of a magnifier glyph.
@@ -330,7 +348,7 @@ pub(crate) unsafe fn layout(app: *mut App) {
     let _ = MoveWindow((*app).cmdbar, pad, th + hh + (hh - nh) / 2, (w - 2 * pad).max(0), nh, true);
 
     let show_status = (*app).profile.show_status;
-    let sh = if show_status { statusbar::height(dpi) } else { 0 };
+    let sh = if show_status { statusbar::height(tdpi) } else { 0 };
     let _ = ShowWindow((*app).status, if show_status { SW_SHOW } else { SW_HIDE });
     let _ = MoveWindow((*app).status, 0, rc.bottom - sh, w, sh, true);
     panes::layout(app, th + 2 * hh, rc.bottom - sh, w);
@@ -350,13 +368,15 @@ fn next_pane(at: Option<usize>, n: usize, back: bool) -> usize {
     }
 }
 
-/// The panes in F6 order; the crumbs, the left pane and the strip are left out when hidden.
-fn panes_in_order<T>(view: T, crumbs: Option<T>, addr: T, search: T, left: Option<T>, strip: Option<T>) -> Vec<T> {
-    [Some(view), crumbs, Some(addr), Some(search), left, strip].into_iter().flatten().collect()
+/// The panes in F6 order; the crumbs, the left pane, the strip and the toolbars (navigation, tools, command bar)
+/// are left out when hidden.
+fn panes_in_order<T>(view: T, crumbs: Option<T>, addr: T, search: T, left: Option<T>, strip: Option<T>, bars: [Option<T>; 3]) -> Vec<T> {
+    let [nav, tools, cmds] = bars;
+    [Some(view), crumbs, Some(addr), Some(search), left, strip, nav, tools, cmds].into_iter().flatten().collect()
 }
 
 /// Moves the keyboard focus (F6, Tab) around the view, the breadcrumb, the address bar, the search box, the left
-/// pane (the folder tree, else the sidebar, when shown) and the tab strip.
+/// pane (the folder tree, else the sidebar, when shown), the tab strip and the toolbars.
 pub(crate) unsafe fn cycle_focus(app: *mut App, back: bool) {
     let view = source::browser_hwnd(app).unwrap_or_else(|| view_hwnd(app));
     let tree = (*app).panes.tree.as_ref().filter(|_| (*app).session.show_tree).map(|t| t.hwnd());
@@ -364,7 +384,8 @@ pub(crate) unsafe fn cycle_focus(app: *mut App, back: bool) {
     let left = tree.or_else(|| shown((*app).sidebar));
     // The address Edit covers the breadcrumb while it is shown.
     let crumbs = shown((*app).crumbs).filter(|_| !IsWindowVisible((*app).addr).as_bool());
-    let panes = panes_in_order(view, crumbs, (*app).addr, (*app).search, left, shown((*app).strip));
+    let bars = [(*app).nav, (*app).tools, (*app).cmdbar].map(shown);
+    let panes = panes_in_order(view, crumbs, (*app).addr, (*app).search, left, shown((*app).strip), bars);
     let focus = GetFocus();
     let at = panes.iter().position(|&h| h == focus || IsChild(h, focus).as_bool());
     let h = panes[next_pane(at, panes.len(), back)];
@@ -533,13 +554,12 @@ pub(crate) unsafe fn build_menu(owner: HWND, entries: &[Entry], bitmaps: &mut Ve
             build_menu(owner, &e.sub, bitmaps).0 as usize
         };
         let _ = AppendMenuW(menu, flags, id, PCWSTR(text.as_ptr()));
-        if e.glyph != 0 {
-            if let Some(b) = glyph_bitmap(owner, e.glyph) {
+        if e.glyph != 0
+            && let Some(b) = glyph_bitmap(owner, e.glyph) {
                 bitmaps.push(b);
                 let mii = MENUITEMINFOW { cbSize: size_of::<MENUITEMINFOW>() as u32, fMask: MIIM_BITMAP, hbmpItem: b, ..Default::default() };
                 let _ = SetMenuItemInfoW(menu, pos as u32, true, &mii);
             }
-        }
     }
     menu
 }
@@ -581,7 +601,7 @@ unsafe fn glyph_bitmap(owner: HWND, glyph: u16) -> Option<HBITMAP> {
     let color = if theme::menus_dark() { 0x00FF_FFFF } else { GetSysColor(COLOR_MENUTEXT) };
     let (cr, cg, cb) = (color & 0xFF, (color >> 8) & 0xFF, (color >> 16) & 0xFF);
     let px = std::slice::from_raw_parts_mut(bits, (size * size * 4) as usize);
-    for p in px.chunks_exact_mut(4) {
+    for p in px.as_chunks_mut::<4>().0 {
         let a = p[0].max(p[1]).max(p[2]) as u32;
         p[0] = (cb * a / 255) as u8;
         p[1] = (cg * a / 255) as u8;
@@ -646,6 +666,10 @@ pub(crate) unsafe fn more_menu(app: *mut App) {
         (0, String::new()),
         (CMD_ABOUT as usize, tr("menu.more.about").to_string()),
     ];
+    // The keyboard's way to the update notice's page.
+    if let Some(v) = UPDATE.get() {
+        entries.push((CMD_UPDATE as usize, trf("menu.more.update", &[("version", v)])));
+    }
     // Quick access: profile bookmarks, then cloud-sync roots.
     let quick: Vec<(String, String)> = (*app).profile.bookmarks.iter().chain(CLOUD.get().into_iter().flatten()).cloned().collect();
     if !quick.is_empty() {
@@ -692,12 +716,13 @@ pub(crate) enum InstallOutcome {
 }
 
 /// --install / --uninstall and the More menu: optionally confirm (listing what changes), run, report. A failed
-/// install offers to roll back what it changed.
-pub(crate) unsafe fn install_flow(owner: Option<HWND>, uninstall: bool, confirm: bool) -> InstallOutcome {
+/// install offers to roll back what it changed. `quiet` (a package manager's `--quiet`): no dialog at all, a failed
+/// install rolls back, the outcome is the only report.
+pub(crate) unsafe fn install_flow(owner: Option<HWND>, uninstall: bool, confirm: bool, quiet: bool) -> InstallOutcome {
     use rexplorer_core::install;
     let dir = install::default_dir();
     let base = install::reg_base();
-    if confirm {
+    if confirm && !quiet {
         let question = if uninstall {
             let record = std::fs::read_to_string(dir.join("install.txt")).unwrap_or_default();
             let listed: Vec<String> = record
@@ -729,7 +754,11 @@ pub(crate) unsafe fn install_flow(owner: Option<HWND>, uninstall: bool, confirm:
     let (report, outcome) = match r {
         Ok(s) => (Some((s, MB_ICONINFORMATION)), InstallOutcome::Done),
         Err((e, Some(rollback))) if !rollback.is_empty() => {
-            offer_rollback(owner, &e, rollback, &dir);
+            if quiet {
+                let _ = rollback.run();
+            } else {
+                offer_rollback(owner, &e, rollback, &dir);
+            }
             (None, InstallOutcome::Failed)
         }
         Err((e, _)) => {
@@ -746,7 +775,7 @@ pub(crate) unsafe fn install_flow(owner: Option<HWND>, uninstall: bool, confirm:
     if restart && exe.is_file() {
         let _ = std::process::Command::new(exe).arg("--desktop").spawn();
     }
-    if let Some((text, icon)) = report {
+    if let Some((text, icon)) = report.filter(|_| !quiet) {
         let t = HSTRING::from(text);
         MessageBoxW(owner, PCWSTR(t.as_ptr()), w!("rexplorer"), MB_OK | icon);
     }
@@ -864,11 +893,10 @@ pub(crate) unsafe fn open_palette(app: *mut App) {
 }
 
 pub(crate) unsafe fn on_palette(app: *mut App, hdr: &NMHDR) {
-    if hdr.code == palette::PN_PICK {
-        if let Some(target) = palette::picked(hdr.hwndFrom) {
+    if hdr.code == palette::PN_PICK
+        && let Some(target) = palette::picked(hdr.hwndFrom) {
             go(app, Target::Name(target), nav::History::Push);
         }
-    }
     let _ = SetFocus(Some(ui::view_hwnd(app)));
 }
 
@@ -922,17 +950,20 @@ pub(crate) unsafe fn selected_bytes(app: *mut App, selected: usize) -> Option<u6
 /// The status bar and the command bar's enabled states.
 pub(crate) unsafe fn update_status(app: *mut App) {
     commands::update(app);
+    let right = match UPDATE.get() {
+        Some(v) => format!("{}  \u{b7}  {}", trf("status.update", &[("version", v)]), (*app).profile.name),
+        None => (*app).profile.name.clone(),
+    };
     if cur(app).loading.is_some() {
-        return statusbar::set_text((*app).status, tr("status.loading"), &(*app).profile.name);
+        return statusbar::set_text((*app).status, tr("status.loading"), &right);
     }
     let count = source(app).map_or(0, |s| s.len());
     let selected = SendMessageW((*app).list, LVM_GETSELECTEDCOUNT, None, None).0 as usize;
     let mut left = statusbar::summary(count, selected, selected_bytes(app, selected));
-    if let Some(Source::Shell(l)) = source(app) {
-        if let Some(e) = &l.denied {
+    if let Some(Source::Shell(l)) = source(app)
+        && let Some(e) = &l.denied {
             left = trf("status.access_denied", &[("error", e)]);
         }
-    }
     if let Some(Source::Search(s)) = source(app) {
         if s.running && s.rows.is_empty() {
             left = tr("status.searching").to_string();
@@ -941,7 +972,7 @@ pub(crate) unsafe fn update_status(app: *mut App) {
             left.push_str(tr(if s.running { "status.search_running" } else { "status.search_done" }));
         }
     }
-    statusbar::set_text((*app).status, &left, &(*app).profile.name);
+    statusbar::set_text((*app).status, &left, &right);
 }
 
 #[cfg(test)]
@@ -965,10 +996,11 @@ mod tests {
         assert_eq!(next_pane(Some(0), 4, true), 3);
         assert_eq!(next_pane(Some(2), 3, true), 1);
         assert_eq!((next_pane(None, 3, false), next_pane(None, 3, true)), (0, 0));
-        let order = panes_in_order("view", Some("crumbs"), "addr", "search", Some("left"), Some("strip"));
-        assert_eq!(order, ["view", "crumbs", "addr", "search", "left", "strip"]);
-        let walked: Vec<_> = std::iter::successors(Some(0), |&i| Some(next_pane(Some(i), order.len(), false))).take(7).map(|i| order[i]).collect();
-        assert_eq!(walked, ["view", "crumbs", "addr", "search", "left", "strip", "view"]);
-        assert_eq!(panes_in_order("view", None, "addr", "search", None, None), ["view", "addr", "search"], "hidden panes are skipped");
+        let bars = [Some("nav"), Some("tools"), Some("cmds")];
+        let order = panes_in_order("view", Some("crumbs"), "addr", "search", Some("left"), Some("strip"), bars);
+        assert_eq!(order, ["view", "crumbs", "addr", "search", "left", "strip", "nav", "tools", "cmds"]);
+        let walked: Vec<_> = std::iter::successors(Some(0), |&i| Some(next_pane(Some(i), order.len(), false))).take(10).map(|i| order[i]).collect();
+        assert_eq!(walked, ["view", "crumbs", "addr", "search", "left", "strip", "nav", "tools", "cmds", "view"]);
+        assert_eq!(panes_in_order("view", None, "addr", "search", None, None, [None, Some("tools"), None]), ["view", "addr", "search", "tools"], "hidden panes are skipped");
     }
 }

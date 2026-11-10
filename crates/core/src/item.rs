@@ -27,6 +27,7 @@ pub fn split_icon(packed: i32) -> (i32, u32) {
 
 /// The shell's overlay slot (1-15; 0 none) for `child` of `parent`: shortcut arrow, sync state, shared.
 // shortcut: asks the overlay handlers synchronously on the calling thread; OI_ASYNC (cache only, E_PENDING on a miss) if a big OneDrive folder stutters.
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // child comes from a live PIDL the caller owns; an unsafe fn would only move the unsafe block to every caller
 pub fn overlay_slot(parent: &IShellFolder, child: *const windows::Win32::UI::Shell::Common::ITEMIDLIST) -> u32 {
     let Ok(o) = parent.cast::<IShellIconOverlay>() else { return 0 };
     let mut i = 0i32;

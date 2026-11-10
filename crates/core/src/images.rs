@@ -102,6 +102,10 @@ impl ImageCache {
         self.map.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
     pub fn clear(&mut self) {
         for (_, (bmp, _)) in self.map.drain() {
             delete(bmp);

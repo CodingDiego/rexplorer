@@ -63,8 +63,8 @@ pub(crate) unsafe fn update_paste(app: *mut App) {
 }
 
 /// Enabled states for the active tab: nothing while it loads; selection verbs in a shell listing (Copy and Delete
-/// in search results too, which act on each file's own folder); Paste with files on the clipboard; New and Sort
-/// not on the Home page.
+/// in search results too, which act on each file's own folder); Paste with files on the clipboard; New not on the
+/// Home page (Sort there orders its table).
 pub(crate) unsafe fn update(app: *mut App) {
     let a = &*app;
     if a.tabs.is_empty() {
@@ -84,7 +84,7 @@ pub(crate) unsafe fn update(app: *mut App) {
         (CMD_RENAME, (shell || search) && sel == 1),
         (CMD_SHARE, shell && sel > 0),
         (CMD_DELETE, (shell || search) && sel > 0 && list::can_delete(app, &list::selected_indices(a.list))),
-        (CMD_SORT, shell && !home),
+        (CMD_SORT, shell),
     ] {
         toolbar::set_enabled(bar, cmd, on);
     }
@@ -115,7 +115,7 @@ unsafe fn share_files(hwnd: HWND, paths: Vec<String>) -> windows::core::Result<(
     static TOKEN: std::sync::Mutex<Option<i64>> = std::sync::Mutex::new(None);
     let interop = windows::core::factory::<DataTransferManager, IDataTransferManagerInterop>()?;
     let manager: DataTransferManager = unsafe { interop.GetForWindow(hwnd)? };
-    if let Some(t) = TOKEN.lock().unwrap().take() {
+    if let Some(t) = TOKEN.lock().unwrap_or_else(|e| e.into_inner()).take() {
         let _ = manager.RemoveDataRequested(t);
     }
     let handler = TypedEventHandler::new(move |_, args: Ref<DataRequestedEventArgs>| {
@@ -131,7 +131,7 @@ unsafe fn share_files(hwnd: HWND, paths: Vec<String>) -> windows::core::Result<(
         }
         data.SetStorageItemsReadOnly(&IIterable::<IStorageItem>::from(items))
     });
-    *TOKEN.lock().unwrap() = Some(manager.DataRequested(&handler)?);
+    *TOKEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(manager.DataRequested(&handler)?);
     unsafe { interop.ShowShareUIForWindow(hwnd) }
 }
 
@@ -190,6 +190,14 @@ unsafe fn add_item(app: *mut App, menu: &ContextMenu, invoke: impl FnOnce(&Conte
     }
 }
 
+/// The context menu's New has made an item: rename and record it as the toolbar's New does. The caller makes sure
+/// the listing does not show the new item yet.
+pub(crate) unsafe fn new_item_made(app: *mut App) {
+    let Some(l) = listing(app) else { return };
+    (*app).new_item = Some((l.folder.parsing_name.clone(), l.items.iter().map(|i| i.parsing_name()).collect()));
+    SetTimer(Some((*app).hwnd), TIMER_REFRESH, 300, None);
+}
+
 /// After a load: the item New made has appeared, so select it and edit its name.
 pub(crate) unsafe fn rename_new_item(app: *mut App) {
     let Some((folder, before)) = &(*app).new_item else { return };
@@ -198,7 +206,11 @@ pub(crate) unsafe fn rename_new_item(app: *mut App) {
         return;
     }
     let mut added = l.items.iter().enumerate().filter(|(_, it)| !before.contains(&it.parsing_name()));
-    let Some((i, _)) = added.next() else { return };
+    // A New that made nothing must not stay armed: a later download would be renamed and claimed for undo.
+    let Some((i, _)) = added.next() else {
+        (*app).new_item = None;
+        return;
+    };
     // Two new items: one is somebody else's (a download landing now), so undo must not claim either.
     if added.next().is_none() {
         (*app).undo.record(Op::Created(vec![l.items[i].parsing_name()]));
@@ -222,6 +234,14 @@ const GROUP_BASE: usize = 0x200;
 /// the grouping (none, or by a column; the sort stays).
 /// (entries, checked); empty off a shell listing.
 pub(crate) unsafe fn sort_entries(app: *mut App) -> (Vec<(usize, String)>, Vec<usize>) {
+    // Home: its table's columns and the two directions; no groups.
+    if IsWindowVisible((*app).home).as_bool() {
+        let (cols, sort) = home::sort((*app).home);
+        let mut entries: Vec<(usize, String)> = cols.into_iter().enumerate().map(|(i, t)| (i + 1, t)).collect();
+        entries.extend([(0, String::new()), (SORT_ASC, tr("menu.sort.ascending").to_string()), (SORT_DESC, tr("menu.sort.descending").to_string())]);
+        let checked = sort.map_or_else(Vec::new, |(c, desc)| vec![c + 1, if desc { SORT_DESC } else { SORT_ASC }]);
+        return (entries, checked);
+    }
     let Some(l) = listing(app) else { return (Vec::new(), Vec::new()) };
     let mut entries: Vec<(usize, String)> = l.columns.iter().enumerate().map(|(i, c)| (i + 1, c.title.clone())).collect();
     entries.extend([(0, String::new()), (SORT_ASC, tr("menu.sort.ascending").to_string()), (SORT_DESC, tr("menu.sort.descending").to_string())]);
@@ -285,17 +305,33 @@ unsafe fn toggle_column(app: *mut App, all: &[Column], index: u32) {
         nav::set_columns(app, &s.columns());
     }
     nav::apply_layout(app);
-    if resort {
-        if let Some(l) = nav::listing(app) {
+    if resort
+        && let Some(l) = nav::listing(app) {
             list::sort_by(app, l.sort_col, l.sort_desc);
         }
-    }
     let _ = InvalidateRect(Some((*app).list), None, true);
     nav::remember_folder(app);
 }
 
+/// Home's sort after Sort menu pick `id` over its `ncols` columns; a direction without a column sorts by name.
+fn home_pick(id: usize, ncols: usize, sort: Option<(usize, bool)>) -> Option<(usize, bool)> {
+    match id {
+        SORT_ASC | SORT_DESC => Some((sort.map_or(0, |s| s.0), id == SORT_DESC)),
+        n if (1..=ncols).contains(&n) => Some(home::next_sort(sort, n - 1, false)),
+        _ => None,
+    }
+}
+
 /// Applies a pick from `sort_entries`.
 pub(crate) unsafe fn pick_sort(app: *mut App, id: usize) {
+    let h = (*app).home;
+    if IsWindowVisible(h).as_bool() {
+        let (cols, sort) = home::sort(h);
+        if let Some(picked) = home_pick(id, cols.len(), sort) {
+            home::set_sort(h, Some(picked));
+        }
+        return;
+    }
     let Some(l) = listing(app) else { return };
     let (cols, col, desc): (Vec<(u32, bool)>, u32, bool) = (l.columns.iter().map(|c| (c.index, c.descending_first())).collect(), l.sort_col, l.sort_desc);
     match id {
@@ -381,6 +417,15 @@ pub(crate) unsafe fn view_menu(app: *mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn home_sort_menu_picks() {
+        assert_eq!(home_pick(SORT_DESC, 6, None), Some((0, true)), "a direction alone sorts by name");
+        assert_eq!(home_pick(SORT_ASC, 6, Some((2, true))), Some((2, false)));
+        assert_eq!(home_pick(2, 6, None), Some((1, true)), "Date modified starts newest first");
+        assert_eq!(home_pick(2, 6, Some((1, false))), Some((1, false)), "the menu keeps the direction");
+        assert_eq!((home_pick(7, 6, None), home_pick(0, 6, None), home_pick(GROUP_NONE, 6, None)), (None, None, None));
+    }
 
     #[test]
     fn view_menu_chords_match_accels() {

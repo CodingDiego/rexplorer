@@ -107,6 +107,7 @@ pub(crate) unsafe fn sync_tree(app: *mut App) {
 
 /// WM_TREE_SELECT. Only the user's picks navigate: the tree also reports its own initial selection and our
 /// sync, so the tree must have the focus and the pick must differ from the current folder.
+#[allow(clippy::boxed_local)] // the Box is the posted message payload
 pub(crate) unsafe fn on_tree_select(app: *mut App, pidl: Box<Pidl>) {
     let Some(t) = &(*app).panes.tree else { return };
     let (tree, focus) = (t.hwnd(), GetFocus());
@@ -322,6 +323,7 @@ pub(crate) unsafe fn sidebar_changed(app: *mut App) {
     SetTimer(Some((*app).hwnd), TIMER_SIDEBAR, 1000, None);
 }
 
+#[allow(clippy::boxed_local)] // the Box is the posted message payload
 pub(crate) unsafe fn on_sidebar_rows(app: *mut App, rows: Box<SidebarRows>) {
     let SidebarRows { rows, kinds } = *rows;
     (*app).panes.sidebar_kinds = kinds;
@@ -337,6 +339,7 @@ pub(crate) unsafe fn on_sidebar_rows(app: *mut App, rows: Box<SidebarRows>) {
 
 /// Right-click on a sidebar row: "Unpin from Home" on a pinned Quick Access folder, "Pin to Home" on a frequent one,
 /// "Remove bookmark" on a bookmark.
+#[allow(clippy::needless_borrow)] // the explicit borrow of a raw-pointer field silences rustc's dangerous_implicit_autorefs
 pub(crate) unsafe fn sidebar_menu(app: *mut App, index: usize, at: Option<POINT>) {
     let kind = (&(*app).panes.sidebar_kinds).get(index).cloned();
     let text = match &kind {
@@ -477,11 +480,10 @@ fn sidebar_rows(bookmarks: &[(String, String)]) -> SidebarRows {
         }
     }
     // Libraries, as one row, when the shell has any (Explorer's nav pane option is not read).
-    if let Ok(f) = ShellFolder::parse("shell:Libraries") {
-        if f.enumerate().is_ok_and(|v| !v.is_empty()) {
+    if let Ok(f) = ShellFolder::parse("shell:Libraries")
+        && f.enumerate().is_ok_and(|v| !v.is_empty()) {
             b.add("", f.name.clone(), f.parsing_name.clone(), &f.pidl, Kind::Place, false);
         }
-    }
     if let Ok(f) = ShellFolder::parse("shell:NetworkPlacesFolder") {
         b.add(tr("side.network"), f.name.clone(), f.parsing_name.clone(), &f.pidl, Kind::Place, false);
     }
@@ -631,11 +633,45 @@ pub(crate) unsafe fn update_preview(app: *mut App) {
         return;
     }
     let subject = (|| {
+        if let Some(Source::Archive(a)) = source(app) {
+            return member_subject(app, a, focused_selected(app)?);
+        }
         let l = listing(app)?;
         let item = l.items.get(focused_selected(app)?)?;
         Some(subject_of(l, item))
     })();
     preview_pane::show((*app).panes.preview, subject);
+}
+
+/// Archive row `i` once extracted under `archive_view::show_dir`: pictures and text only. One not extracted yet is
+/// extracted on a worker, which asks for the preview again when done; until then, and for other members, nothing.
+unsafe fn member_subject(app: *mut App, a: &source::ArchiveView, i: usize) -> Option<preview_pane::Subject> {
+    let e = a.rows.get(i)?;
+    if !archive_view::showable(e, true) {
+        return None;
+    }
+    let ready = |p: &std::path::Path| std::fs::metadata(p).is_ok_and(|m| m.len() == e.size);
+    let path = archive_view::show_dir(&a.listing.archive).join(&e.parent).join(&e.name);
+    if !ready(&path) {
+        let (archive, e, hwnd) = (a.listing.archive.clone(), e.clone(), (*app).hwnd.0 as isize);
+        std::thread::spawn(move || {
+            // Only a file of the listed size: anything else would ask again forever.
+            let done = archive_view::extract_into(&archive, &e, &archive_view::show_dir(&archive)).is_ok_and(|p| std::fs::metadata(p).is_ok_and(|m| m.len() == e.size));
+            if done {
+                // As the preview timer firing: the UI thread shows the selection again.
+                let _ = PostMessageW(Some(HWND(hwnd as *mut c_void)), WM_TIMER, WPARAM(TIMER_PREVIEW), LPARAM(0));
+            }
+        });
+        return None;
+    }
+    Some(preview_pane::Subject {
+        abs_pidl: archive_view::path_pidl(&path)?,
+        path: Some(path),
+        name: e.name.clone(),
+        is_folder: false,
+        size: Some(e.size),
+        type_text: archive_view::ArchiveListing::detail(e, 2),
+    })
 }
 
 // ---- details -------------------------------------------------------------------------------------

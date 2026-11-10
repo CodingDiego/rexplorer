@@ -4,13 +4,15 @@
 //! `install` copies the running exe to `<dir>\rexplorer.exe`, registers the copy (register.rs: Folder, Directory,
 //! Drive and File Explorer's CLSID verbs), points `App Paths\explorer.exe` at it (ShellExecute callers of
 //! `explorer.exe` by bare name; CreateProcess callers still get Explorer), adds a Start menu shortcut and a Startup
-//! shortcut to `rexplorer --desktop` (the desktop's context menu; both on the real base only), and records every
-//! key, value and file it created in `<dir>\install.txt`. `uninstall` reverts what
+//! shortcut to `rexplorer --desktop` (the desktop's context menu; on the real base, or under a test base when
+//! `REXPLORER_PROGRAMS_DIR` and `REXPLORER_STARTUP_DIR` name scratch folders), and records every key, value, folder
+//! and file it created in `<dir>\install.txt`. `uninstall` reverts what
 //! install.txt lists and leaves other programs' values alone. Everything lives under HKCU: no elevation.
 //!
 //! `install` journals each change before making it (a value's prior data, the keys and folders it creates, a
 //! replaced file moved aside to `<path>.bak`), so a failed install hands back a `Rollback` that restores the
 //! previous setup exactly.
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use windows::Win32::Foundation::{E_FAIL, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
@@ -19,7 +21,7 @@ use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RegDeleteKeyValueW};
 use windows::Win32::UI::Shell::{
     FOLDERID_Programs, FOLDERID_Startup, IShellLinkW, KF_FLAG_DEFAULT, SHGetKnownFolderPath, ShellLink,
 };
-use windows::core::{Error, HSTRING, Interface, PCWSTR, Result, w};
+use windows::core::{Error, HSTRING, Interface, PCWSTR, Result};
 
 use crate::com::{ComInit, take_cotaskmem_string};
 use crate::i18n::{tr, trf};
@@ -29,6 +31,8 @@ use crate::register::{self, delete_empty, is_foreign, key_exists, read_sz, remov
 pub const REAL_REG_BASE: &str = "Software";
 const RECORD: &str = "install.txt";
 const EXE: &str = "rexplorer.exe";
+/// The previous exe, moved aside by an update while it ran.
+const OLD: &str = "rexplorer.old";
 
 /// `%LOCALAPPDATA%\Programs\rexplorer`; the undocumented `REXPLORER_INSTALL_DIR` overrides it for tests.
 pub fn default_dir() -> PathBuf {
@@ -188,7 +192,7 @@ impl Rollback {
             if let Undo::File { backup: Some(bak), .. } = u
                 && std::fs::remove_file(&bak).is_err()
             {
-                let old = dir.join("rexplorer.old");
+                let old = dir.join(OLD);
                 let _ = std::fs::remove_file(&old);
                 let _ = std::fs::rename(&bak, &old);
             }
@@ -259,8 +263,22 @@ fn shortcut(target: &Path, args: &str, lnk: &Path) -> Result<()> {
         let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
         link.SetPath(&HSTRING::from(target.as_os_str()))?;
         link.SetArguments(&HSTRING::from(args))?;
-        link.SetDescription(w!("rexplorer file manager"))?;
+        link.SetDescription(&HSTRING::from(tr("inst.shortcut_desc")))?;
         link.cast::<IPersistFile>()?.Save(&HSTRING::from(lnk.as_os_str()), true)
+    }
+}
+
+/// Where the Start menu and Startup shortcuts go: (Programs, Startup). `programs` / `startup` are the undocumented
+/// `REXPLORER_PROGRAMS_DIR` / `REXPLORER_STARTUP_DIR` overrides for tests. None under a test base without both:
+/// the real Start menu is left alone.
+fn shortcut_dirs(reg_base: &str, programs: Option<OsString>, startup: Option<OsString>) -> Result<Option<(PathBuf, PathBuf)>> {
+    match (programs, startup) {
+        (Some(p), Some(s)) => Ok(Some((p.into(), s.into()))),
+        _ if reg_base != REAL_REG_BASE => Ok(None),
+        (p, s) => {
+            let or_known = |o: Option<OsString>, id: &windows::core::GUID| o.map_or_else(|| known_folder(id), |d| Ok(d.into()));
+            Ok(Some((or_known(p, &FOLDERID_Programs)?, or_known(s, &FOLDERID_Startup)?)))
+        }
     }
 }
 
@@ -268,8 +286,14 @@ fn shortcut(target: &Path, args: &str, lnk: &Path) -> Result<()> {
 /// Refuses, changing nothing, when another program already overrides one of the entry points. On failure the
 /// `Failed` carries the rollback of what had changed by then.
 pub fn install(dir: &Path, reg_base: &str) -> std::result::Result<String, Failed> {
+    let links = shortcut_dirs(reg_base, std::env::var_os("REXPLORER_PROGRAMS_DIR"), std::env::var_os("REXPLORER_STARTUP_DIR"))
+        .map_err(|error| Failed { error, rollback: Rollback(vec![]) })?;
+    install_to(dir, reg_base, links.as_ref())
+}
+
+fn install_to(dir: &Path, reg_base: &str, links: Option<&(PathBuf, PathBuf)>) -> std::result::Result<String, Failed> {
     let mut journal = Rollback(vec![]);
-    match apply(dir, reg_base, &mut journal) {
+    match apply(dir, reg_base, links, &mut journal) {
         Ok(summary) => {
             journal.commit(dir);
             Ok(summary)
@@ -278,7 +302,7 @@ pub fn install(dir: &Path, reg_base: &str) -> std::result::Result<String, Failed
     }
 }
 
-fn apply(dir: &Path, reg_base: &str, journal: &mut Rollback) -> Result<String> {
+fn apply(dir: &Path, reg_base: &str, links: Option<&(PathBuf, PathBuf)>, journal: &mut Rollback) -> Result<String> {
     let classes = classes(reg_base);
     let ap = app_paths(reg_base);
     if let Some(k) = register::foreign_override(&classes) {
@@ -301,7 +325,10 @@ fn apply(dir: &Path, reg_base: &str, journal: &mut Rollback) -> Result<String> {
     let mut summary = vec![];
     let result = (|| -> Result<()> {
         if !dir.exists() {
-            push(&mut rec, format!("dir {}", dir.display()));
+            // Deepest first, the order uninstall removes them in (%LOCALAPPDATA%\Programs too, on a fresh profile).
+            for d in dir.ancestors().take_while(|d| !d.as_os_str().is_empty() && !d.exists()) {
+                push(&mut rec, format!("dir {}", d.display()));
+            }
             journal.create_dir(dir)?;
         }
         let src = std::env::current_exe().map_err(|e| fail(trf("inst.err.no_exe", &[("error", &e)])))?;
@@ -323,13 +350,12 @@ fn apply(dir: &Path, reg_base: &str, journal: &mut Rollback) -> Result<String> {
         journal.set(&ap, "", &target.display().to_string())?;
         journal.set(&ap, "Path", &dir.display().to_string())?;
         summary.push(trf("inst.sum.app_paths", &[("explorer", &"explorer.exe")]));
-        // Under a test base the real Start menu is left alone.
-        if reg_base == REAL_REG_BASE {
-            let lnk = known_folder(&FOLDERID_Programs)?.join("rexplorer.lnk");
+        if let Some((programs, startup)) = links {
+            let lnk = programs.join("rexplorer.lnk");
             push(&mut rec, format!("file {}", lnk.display()));
             journal.file(&lnk, || shortcut(&target, "", &lnk))?;
             summary.push(tr("inst.sum.start_menu").to_string());
-            let lnk = known_folder(&FOLDERID_Startup)?.join("rexplorer desktop menu.lnk");
+            let lnk = startup.join("rexplorer desktop menu.lnk");
             push(&mut rec, format!("file {}", lnk.display()));
             journal.file(&lnk, || shortcut(&target, "--desktop", &lnk))?;
             summary.push(tr("inst.sum.desktop").to_string());
@@ -376,11 +402,14 @@ pub fn uninstall(dir: &Path) -> Result<String> {
         let _ = std::fs::remove_file(f);
     }
     let _ = std::fs::remove_file(dir.join(RECORD));
-    if exe.exists() && std::fs::remove_file(&exe).is_err() {
-        // Running: it can still be moved out of the way; the next rexplorer start deletes it.
-        let aside = std::env::temp_dir().join(format!("rexplorer-{}.old", std::process::id()));
-        if std::fs::rename(&exe, &aside).is_err() {
-            summary.push(trf("inst.un.close", &[("path", &exe.display())]));
+    // The exe, and the previous one an update moved aside while it ran.
+    for (i, f) in [exe.clone(), dir.join(OLD)].iter().enumerate() {
+        if f.exists() && std::fs::remove_file(f).is_err() {
+            // Running: it can still be moved out of the way; the next rexplorer start deletes it.
+            let aside = std::env::temp_dir().join(format!("rexplorer-{}-{i}.old", std::process::id()));
+            if std::fs::rename(f, &aside).is_err() {
+                summary.push(trf("inst.un.close", &[("path", &f.display())]));
+            }
         }
     }
     for d in lines("dir") {
@@ -390,11 +419,23 @@ pub fn uninstall(dir: &Path) -> Result<String> {
     Ok(summary.join("\n"))
 }
 
+fn process_alive(pid: u32) -> bool {
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    // SAFETY: plain handle open and close; a pid that no longer exists fails the open.
+    unsafe {
+        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+            .map(|h| {
+                let _ = windows::Win32::Foundation::CloseHandle(h);
+            })
+            .is_ok()
+    }
+}
+
 /// Deletes copies moved aside by `install` (next to the exe) and `uninstall` (in %TEMP%). Touches the disk:
 /// call on a worker thread.
 pub fn cleanup_old() {
     if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) {
-        let _ = std::fs::remove_file(dir.join("rexplorer.old"));
+        let _ = std::fs::remove_file(dir.join(OLD));
     }
     // Same name as archive_view::extract_dir(): one subfolder per archive version. A day old is past any app that
     // still has one of its files open (another instance, or a scratch profile, may be using the recent ones).
@@ -409,6 +450,12 @@ pub fn cleanup_old() {
         let name = e.file_name().to_string_lossy().to_lowercase();
         if name.starts_with("rexplorer-") && name.ends_with(".old") {
             let _ = std::fs::remove_file(e.path());
+        }
+        // archive_view::session_dir() of an instance that crashed or was killed: its exit cleanup never ran.
+        if let Some(pid) = name.strip_prefix("rexplorer-show-").and_then(|p| p.parse::<u32>().ok())
+            && !process_alive(pid)
+        {
+            let _ = std::fs::remove_dir_all(e.path());
         }
     }
 }
@@ -490,7 +537,7 @@ mod tests {
         std::fs::write(s.dir.join(EXE), "previous exe").unwrap();
         std::fs::write(s.dir.join(RECORD), "previous record\n").unwrap();
         let ap = HSTRING::from(app_paths(&s.base));
-        set_sz(&ap, w!("Path"), r"C:\previous\rexplorer").unwrap();
+        set_sz(&ap, windows::core::w!("Path"), r"C:\previous\rexplorer").unwrap();
         let before = s.registry();
         // Fails at install.txt, the last step: the exe and every value are rewritten by then.
         let failed = s.failing_install(RECORD);
@@ -561,28 +608,73 @@ mod tests {
         assert_eq!(files(&s.dir), ["install.txt", "rexplorer.exe"]);
     }
 
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LoadLibraryExW(name: PCWSTR, file: isize, flags: u32) -> isize;
+        fn FreeLibrary(module: isize) -> i32;
+    }
+
+    /// Maps `exe` as an image, like a running exe: it can be renamed but not deleted until `FreeLibrary`.
+    fn run_image(exe: &Path) -> isize {
+        let image = unsafe { LoadLibraryExW(PCWSTR(HSTRING::from(exe.as_os_str()).as_ptr()), 0, 0x20) };
+        assert_ne!(image, 0);
+        image
+    }
+
     #[test]
     fn a_successful_update_over_a_running_exe_moves_it_to_old() {
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn LoadLibraryExW(name: PCWSTR, file: isize, flags: u32) -> isize;
-            fn FreeLibrary(module: isize) -> i32;
-        }
         let s = Scratch::new("running");
         install(&s.dir, &s.base).unwrap();
-        // Mapped as an image, like a running exe: it can be renamed but not deleted.
-        let image = unsafe { LoadLibraryExW(PCWSTR(HSTRING::from(s.dir.join(EXE).as_os_str()).as_ptr()), 0, 0x20) };
-        assert_ne!(image, 0);
+        let image = run_image(&s.dir.join(EXE));
         install(&s.dir, &s.base).unwrap();
         unsafe { FreeLibrary(image) };
         assert_eq!(files(&s.dir), ["install.txt", "rexplorer.exe", "rexplorer.old"]);
     }
 
     #[test]
+    fn shortcut_folders_come_from_the_overrides_or_stay_off_under_a_test_base() {
+        let (p, s) = (|| Some(OsString::from(r"C:\scratch\Programs")), || Some(OsString::from(r"C:\scratch\Startup")));
+        let both = Some((PathBuf::from(r"C:\scratch\Programs"), PathBuf::from(r"C:\scratch\Startup")));
+        assert_eq!(shortcut_dirs(r"Software\rexplorer-test", p(), s()).unwrap(), both);
+        assert_eq!(shortcut_dirs(REAL_REG_BASE, p(), s()).unwrap(), both);
+        assert_eq!(shortcut_dirs(r"Software\rexplorer-test", p(), None).unwrap(), None);
+        assert_eq!(shortcut_dirs(r"Software\rexplorer-test", None, s()).unwrap(), None);
+        assert_eq!(shortcut_dirs(r"Software\rexplorer-test", None, None).unwrap(), None);
+    }
+
+    /// #64 and #65 in a scratch folder: install with both shortcuts, update over a running copy, uninstall; every
+    /// key, value, shortcut and file the install created is gone.
+    #[test]
+    fn install_update_over_a_running_copy_and_uninstall_leave_nothing() {
+        let s = Scratch::new("lifecycle");
+        let scratch = s.dir.parent().unwrap().to_path_buf();
+        let links = (scratch.join("Programs"), scratch.join("Startup"));
+        std::fs::create_dir_all(&links.0).unwrap();
+        std::fs::create_dir_all(&links.1).unwrap();
+        let lnks = [links.0.join("rexplorer.lnk"), links.1.join("rexplorer desktop menu.lnk")];
+        install_to(&s.dir, &s.base, Some(&links)).unwrap();
+        let record = std::fs::read_to_string(s.dir.join(RECORD)).unwrap();
+        for l in &lnks {
+            assert!(l.is_file() && record.contains(&format!("file {}", l.display())), "{}\n{record}", l.display());
+        }
+        let image = run_image(&s.dir.join(EXE));
+        install_to(&s.dir, &s.base, Some(&links)).unwrap();
+        assert_eq!(files(&s.dir), ["install.txt", "rexplorer.exe", "rexplorer.old"], "the running copy is moved aside");
+        let me = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        assert!(std::fs::read(s.dir.join(EXE)).unwrap() == me, "the next launch runs the new copy");
+        unsafe { FreeLibrary(image) };
+        uninstall(&s.dir).unwrap();
+        assert!(lnks.iter().all(|l| !l.exists()), "both shortcuts are gone");
+        assert_eq!(s.registry(), Vec::<String>::new());
+        assert!(!key_exists(&s.root), "every key the install created is gone");
+        assert!(!s.dir.exists(), "the exe, the old copy, install.txt and the folder are gone");
+    }
+
+    #[test]
     fn install_then_uninstall_under_a_test_base() {
         let base = format!(r"Software\rexplorer-test\install-{}", std::process::id());
         let dir = std::env::temp_dir().join(format!("rexplorer-install-{}", std::process::id())).join("app");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
         install(&dir, &base).unwrap();
         assert!(dir.join(EXE).is_file() && is_installed(&dir));
         for (k, _) in register::command_keys(&classes(&base)) {
@@ -599,7 +691,7 @@ mod tests {
         assert_eq!(read_default(&drive).as_deref(), Some(r"C:\other.exe %1"));
         assert!(read_default(&HSTRING::from(app_paths(&base))).is_none());
         assert!(!key_exists(&format!(r"{}\CLSID", classes(&base))));
-        assert!(!dir.exists());
+        assert!(!dir.parent().unwrap().exists(), "the folder and the parent install created are gone");
         let _ = unsafe {
             windows::Win32::System::Registry::RegDeleteTreeW(
                 windows::Win32::System::Registry::HKEY_CURRENT_USER,

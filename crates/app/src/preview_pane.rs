@@ -10,12 +10,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::time::SystemTime;
 
+use rexplorer_core::access;
 use rexplorer_core::com::{ComInit, Pidl};
 use rexplorer_core::preview::{self, Kind, Preview};
 use rexplorer_core::{images, settings::Theme};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Accessibility::{ROLE_SYSTEM_PANE, ROLE_SYSTEM_STATICTEXT};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::Win32::Foundation::PROPERTYKEY;
@@ -101,11 +103,10 @@ fn cached_text(path: &Path) -> Option<String> {
 /// The premultiplied shell thumbnail; `key` is the file to cache it under (none for folders and non-filesystem items).
 fn cached_thumb(key: Option<&Path>, abs: &Pidl, size: i32) -> Option<Thumb> {
     let key = key.and_then(|p| Some((p, stamp(p)?)));
-    if let Some((p, st)) = key {
-        if let Some(t) = lookup(p, st, |e| e.thumb.as_ref().filter(|(sz, _)| *sz == size).map(|(_, t)| t.clone())) {
+    if let Some((p, st)) = key
+        && let Some(t) = lookup(p, st, |e| e.thumb.as_ref().filter(|(sz, _)| *sz == size).map(|(_, t)| t.clone())) {
             return Some(t);
         }
-    }
     let b = images::thumbnail(abs, size).ok()?;
     // Straight alpha from the shell; AlphaBlend expects premultiplied or the edges halo.
     images::premultiply(b);
@@ -204,6 +205,9 @@ struct State {
     stamp: Option<Stamp>,
     /// Details mode (Alt+Shift+P): drawn instead of the caption, never with the Edit or a handler.
     details: Option<DetailsText>,
+    acc: Option<access::Server>,
+    /// The lines last announced to screen readers (see `announce`).
+    said: Vec<String>,
 }
 
 /// Formats a byte count like "1.5 MB" (binary units, one decimal above 1 KB).
@@ -245,8 +249,13 @@ fn scale(hwnd: HWND, px: i32) -> i32 {
     px * if dpi == 0 { 96 } else { dpi as i32 } / 96
 }
 
+/// `px` at the window's DPI grown by the Windows text size: for the lines that hold text.
+fn text_scale(hwnd: HWND, px: i32) -> i32 {
+    scale(hwnd, px) * crate::theme::text_scale() as i32 / 100
+}
+
 fn caption_height(hwnd: HWND) -> i32 {
-    scale(hwnd, 44)
+    text_scale(hwnd, 44)
 }
 
 unsafe fn state(hwnd: HWND) -> *mut State {
@@ -289,6 +298,8 @@ pub fn create(parent: HWND, id: usize) -> Result<HWND> {
             subject: None,
             stamp: None,
             details: None,
+            acc: None,
+            said: Vec::new(),
         }));
         let r = CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -339,6 +350,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
+        WM_GETOBJECT if access::is_client(lparam) => (*s).acc.get_or_insert_with(|| access::Server::new(hwnd)).answer(wparam),
+        access::WM_ACC_ITEMS => {
+            acc_tree(hwnd, &*s, &mut *(lparam.0 as *mut access::Tree));
+            LRESULT(1)
+        }
         WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT => {
             let hdc = HDC(wparam.0 as *mut c_void);
             SetTextColor(hdc, COLORREF((*s).text));
@@ -362,6 +378,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if let Some(sub) = (*s).subject.take() {
                 if (*s).preview.is_none() && sub.path.as_ref() == Some(&*ready) {
                     present(hwnd, s, &sub, false);
+                    announce(hwnd, s);
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
                 (*s).subject = Some(sub);
@@ -371,12 +388,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         PV_DIMS => {
             let (path, text) = *Box::from_raw(lparam.0 as *mut (PathBuf, String));
             let shown = (*s).subject.as_ref().and_then(|sub| sub.path.as_ref()) == Some(&path);
-            if let (Some(d), true) = (&mut (*s).details, shown) {
-                if !d.rows.iter().any(|r| r.0 == tr("preview.dimensions")) {
+            if let (Some(d), true) = (&mut (*s).details, shown)
+                && !d.rows.iter().any(|r| r.0 == tr("preview.dimensions")) {
                     d.rows.push((tr("preview.dimensions"), text));
+                    announce(hwnd, s);
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
-            }
             LRESULT(0)
         }
         WM_DESTROY => {
@@ -512,7 +529,7 @@ unsafe fn paint_details(hwnd: HWND, s: *mut State, hdc: HDC, mem: HDC) {
         let mut t: Vec<u16> = text.encode_utf16().collect();
         DrawTextW(mem, &mut t, &mut r, fmt);
     };
-    let (h_head, h_row, gap) = (scale(hwnd, 24), scale(hwnd, 20), scale(hwnd, 8));
+    let (h_head, h_row, gap) = (text_scale(hwnd, 24), text_scale(hwnd, 20), scale(hwnd, 8));
     line(y, c.left, c.right, h_head, (*s).text, &d.heading);
     y += h_head;
     line(y, c.left, c.right, h_row, (*s).secondary, &d.sub);
@@ -584,7 +601,44 @@ pub fn show(hwnd: HWND, subject: Option<Subject>) {
             present(hwnd, s, &sub, true);
             (*s).subject = Some(sub);
         }
+        announce(hwnd, s);
         let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+}
+
+/// What a screen reader reads: in details mode the heading, the line under it and "label: value" rows, else the
+/// caption's name and detail line.
+fn spoken(s: &State) -> Vec<String> {
+    let lines: Vec<String> = match &s.details {
+        Some(d) => [d.heading.clone(), d.sub.clone()].into_iter().chain(d.rows.iter().map(|(l, v)| format!("{l}: {v}"))).collect(),
+        None => vec![s.name.clone(), s.detail.clone()],
+    };
+    lines.into_iter().filter(|t| !t.is_empty()).collect()
+}
+
+/// Raises NAMECHANGE for the pane (named by its first line) and for each line that changed since the last call.
+unsafe fn announce(hwnd: HWND, s: *mut State) {
+    let st = &mut *s;
+    let now = spoken(st);
+    if now == st.said {
+        return;
+    }
+    for (i, t) in now.iter().enumerate() {
+        if st.said.get(i) != Some(t) {
+            access::event(EVENT_OBJECT_NAMECHANGE, hwnd, Some(i));
+        }
+    }
+    st.said = now;
+    access::event(EVENT_OBJECT_NAMECHANGE, hwnd, None);
+}
+
+unsafe fn acc_tree(hwnd: HWND, s: &State, t: &mut access::Tree) {
+    let lines = spoken(s);
+    t.name = lines.first().cloned().unwrap_or_else(|| tr("preview.pane_name").into());
+    t.role = ROLE_SYSTEM_PANE;
+    let rect = client(hwnd);
+    for name in lines {
+        t.items.push(access::Item { name, role: ROLE_SYSTEM_STATICTEXT, state: STATE_SYSTEM_READONLY, rect, ..Default::default() });
     }
 }
 
@@ -627,6 +681,7 @@ pub fn show_details(hwnd: HWND, subject: Option<Subject>, text: DetailsText, dim
             }
             (*s).subject = Some(sub);
         }
+        announce(hwnd, s);
         let _ = InvalidateRect(Some(hwnd), None, false);
     }
 }
@@ -758,6 +813,45 @@ mod tests {
             let mut b = vec![0u16; n + 1];
             let got = GetWindowTextW(e, &mut b) as usize;
             String::from_utf16_lossy(&b[..got])
+        }
+    }
+
+    #[test]
+    fn accessible_pane_and_name_changes() {
+        use crate::acc_test::*;
+        use windows::Win32::UI::Accessibility::*;
+        let _com = ComInit::sta();
+        unsafe {
+            let parent = CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR::null(), WS_POPUP, 0, 0, 800, 600, None, None, None, None).unwrap();
+            let pane = create(parent, 7).unwrap();
+            set_rect(pane, RECT { left: 0, top: 0, right: 400, bottom: 500 });
+            let acc = object(pane);
+            assert_eq!(root(&acc).name, "Preview", "never an empty name");
+            assert_eq!(root(&acc).role, ROLE_SYSTEM_PANE);
+            assert_eq!(acc.accChildCount().unwrap(), 0);
+            let hk = hook();
+            // Caption mode: the file name and its detail line.
+            (*state(pane)).name = "a.txt".into();
+            (*state(pane)).detail = "Text, 1 KB".into();
+            announce(pane, state(pane));
+            let ev = hk.take();
+            assert!(ev.contains(&(EVENT_OBJECT_NAMECHANGE, pane, 0)) && ev.contains(&(EVENT_OBJECT_NAMECHANGE, pane, 1)) && ev.contains(&(EVENT_OBJECT_NAMECHANGE, pane, 2)), "{ev:?}");
+            assert_eq!(root(&acc).name, "a.txt");
+            let k = kids(&acc);
+            assert_eq!([k[0].name.as_str(), k[1].name.as_str()], ["a.txt", "Text, 1 KB"]);
+            assert!(k.iter().all(|k| k.role == ROLE_SYSTEM_STATICTEXT && k.state & STATE_SYSTEM_READONLY != 0));
+            announce(pane, state(pane));
+            assert!(hk.take().is_empty(), "nothing changed, nothing raised");
+            // Details mode: heading, sub line, rows.
+            show_details(pane, None, DetailsText { heading: "3 items selected".into(), sub: String::new(), rows: vec![("Size", "5 KB".into())] }, false);
+            assert!(hk.take().contains(&(EVENT_OBJECT_NAMECHANGE, pane, 0)));
+            assert_eq!(kids(&acc).iter().map(|k| k.name.clone()).collect::<Vec<_>>(), ["3 items selected", "Size: 5 KB"]);
+            show(pane, None);
+            assert!(hk.take().contains(&(EVENT_OBJECT_NAMECHANGE, pane, 0)));
+            assert_eq!(root(&acc).name, "Preview");
+            drop(hk);
+            let _ = DestroyWindow(parent);
+            pump();
         }
     }
 

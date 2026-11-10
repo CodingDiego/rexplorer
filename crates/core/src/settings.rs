@@ -8,6 +8,32 @@ use std::path::{Path, PathBuf};
 
 type Section = (String, Vec<(String, String)>);
 
+/// The format this build writes: `format=` in settings.ini's `[general]`, in a theme's `[theme]`, and a line of
+/// session.txt and folders.txt. A file without one is format 0 (0.1.x), which format 1 reads as is: 1 only added keys.
+/// A format only ever adds keys; one from a newer build is read for what this build knows and the rest is kept.
+pub const FORMAT: u32 = 1;
+
+/// The format of the data once loaded: the file's own when it is newer, else this build's (older ones are migrated).
+pub fn loaded_format(value: Option<&str>) -> u32 {
+    value.and_then(|v| v.trim().parse().ok()).unwrap_or(0).max(FORMAT)
+}
+
+/// Adds `format=` under the section's header (appending the section if it is missing) when the section has no
+/// format key yet; comments, order and line endings are kept. None when there is nothing to add.
+pub fn stamp_format(text: &str, section: &str) -> Option<String> {
+    if parse_ini(text).iter().any(|(n, k)| n == section && k.iter().any(|(k, _)| k == "format")) {
+        return None;
+    }
+    let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let (header, line) = (format!("[{section}]"), format!("format={FORMAT}"));
+    let mut lines: Vec<&str> = text.lines().collect();
+    match lines.iter().position(|l| l.trim_start_matches('\u{feff}').trim() == header) {
+        Some(i) => lines.insert(i + 1, &line),
+        None => lines.extend([header.as_str(), line.as_str()]),
+    }
+    Some(lines.join(eol) + eol)
+}
+
 /// Parses ini text into ordered sections; keys before any header go under `""`.
 /// Blank lines and lines starting with `;` or `#` are skipped.
 pub fn parse_ini(text: &str) -> Vec<Section> {
@@ -34,10 +60,10 @@ pub fn parse_ini(text: &str) -> Vec<Section> {
     out
 }
 
-/// Inverse of [`parse_ini`] (comments are not preserved).
+/// Inverse of [`parse_ini`] (comments are not preserved). Keys of the unnamed section go first, before any header.
 pub fn write_ini(sections: &[Section]) -> String {
     let mut s = String::new();
-    for (name, keys) in sections {
+    for (name, keys) in sections.iter().filter(|(n, _)| n.is_empty()).chain(sections.iter().filter(|(n, _)| !n.is_empty())) {
         if !name.is_empty() {
             s.push_str(&format!("[{name}]\n"));
         }
@@ -100,7 +126,14 @@ pub struct Theme {
     pub font_size: i32,
     /// Some only while a Windows contrast theme is on; never read from or written to a theme file.
     pub contrast: Option<Contrast>,
+    /// See [`loaded_format`].
+    pub format: u32,
+    /// What this build does not read, written back as read: unknown `[theme]` keys under `theme`, then other sections.
+    pub extra: Vec<Section>,
 }
+
+const THEME_KEYS: [&str; 13] =
+    ["format", "dark", "mica", "background", "surface", "text", "secondary_text", "accent", "selection", "border", "icon_theme", "font", "font_size"];
 
 /// Mix `a` toward `b` by `t` (0..1), per 0x00BBGGRR channel.
 fn mix(a: u32, b: u32, t: f32) -> u32 {
@@ -130,6 +163,8 @@ impl Theme {
             font: "Segoe UI Variable Text".into(),
             font_size: 10,
             contrast: None,
+            format: FORMAT,
+            extra: Vec::new(),
         }
     }
 
@@ -188,11 +223,18 @@ impl Theme {
         if let Some(n) = get("font_size").and_then(|v| v.parse().ok()) {
             t.font_size = n;
         }
+        t.format = loaded_format(get("format"));
+        let unknown: Vec<(String, String)> = keys.iter().filter(|(k, _)| !THEME_KEYS.contains(&k.as_str())).cloned().collect();
+        if !unknown.is_empty() {
+            t.extra.push(("theme".into(), unknown));
+        }
+        t.extra.extend(sections.iter().filter(|(n, _)| n != "theme").cloned());
         t
     }
 
     pub fn to_ini(&self) -> String {
         let mut k = vec![
+            ("format".to_string(), self.format.to_string()),
             ("dark".to_string(), self.dark.to_string()),
             ("mica".to_string(), self.mica.to_string()),
             ("background".to_string(), format_color(self.background)),
@@ -208,7 +250,10 @@ impl Theme {
         }
         k.push(("font".into(), self.font.clone()));
         k.push(("font_size".into(), self.font_size.to_string()));
-        write_ini(&[("theme".to_string(), k)])
+        k.extend(self.extra.iter().filter(|(n, _)| n == "theme").flat_map(|(_, k)| k.clone()));
+        let mut sections = vec![("theme".to_string(), k)];
+        sections.extend(self.extra.iter().filter(|(n, _)| n != "theme").cloned());
+        write_ini(&sections)
     }
 }
 
@@ -241,7 +286,11 @@ pub struct Profile {
     pub item_checkboxes: bool,
     pub search_system: bool,
     pub search_archives: bool,
+    /// Opt-in: once a day, ask GitHub for the latest release (see `update`).
+    pub check_updates: bool,
     pub bookmarks: Vec<(String, String)>,
+    /// Keys this build does not read, written back as read.
+    pub extra: Vec<(String, String)>,
 }
 
 impl Profile {
@@ -269,8 +318,10 @@ impl Profile {
             item_checkboxes: false,
             search_system: true,
             search_archives: false,
+            check_updates: false,
             // The sidebar's Favorites come from Quick Access with the shell's names; bookmarks are the user's own.
             bookmarks: Vec::new(),
+            extra: Vec::new(),
         }
     }
 
@@ -297,8 +348,10 @@ impl Profile {
             ("item_checkboxes".to_string(), self.item_checkboxes.to_string()),
             ("search_system".to_string(), self.search_system.to_string()),
             ("search_archives".to_string(), self.search_archives.to_string()),
+            ("check_updates".to_string(), self.check_updates.to_string()),
         ];
         k.extend(self.bookmarks.iter().map(|(l, t)| (format!("bookmark.{l}"), t.clone())));
+        k.extend(self.extra.iter().cloned());
         (format!("profile {}", self.name), k)
     }
 
@@ -328,11 +381,11 @@ impl Profile {
                 "item_checkboxes" => p.item_checkboxes = parse_bool(v).unwrap_or(p.item_checkboxes),
                 "search_system" => p.search_system = parse_bool(v).unwrap_or(p.search_system),
                 "search_archives" => p.search_archives = parse_bool(v).unwrap_or(p.search_archives),
-                _ => {
-                    if let Some(label) = k.strip_prefix("bookmark.") {
-                        p.bookmarks.push((label.to_string(), v.clone()));
-                    }
-                }
+                "check_updates" => p.check_updates = parse_bool(v).unwrap_or(p.check_updates),
+                _ => match k.strip_prefix("bookmark.") {
+                    Some(label) => p.bookmarks.push((label.to_string(), v.clone())),
+                    None => p.extra.push((k.clone(), v.clone())),
+                },
             }
         }
         p
@@ -348,11 +401,23 @@ pub struct Settings {
     pub keys: Vec<(String, String)>,
     /// `[general] language=`: `system`, or a code with a table (`en`, `es`, a `lang\<code>.ini`). Applies at the next start.
     pub language: String,
+    /// settings.ini's; see [`loaded_format`].
+    pub format: u32,
+    /// What this build does not read, written back as read: unknown `[general]` keys under `general`, then other sections.
+    pub extra: Vec<Section>,
 }
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { active: "default".into(), profiles: vec![Profile::default_profile()], themes: vec![Theme::light(), Theme::dark()], keys: Vec::new(), language: "system".into() }
+        Settings {
+            active: "default".into(),
+            profiles: vec![Profile::default_profile()],
+            themes: vec![Theme::light(), Theme::dark()],
+            keys: Vec::new(),
+            language: "system".into(),
+            format: FORMAT,
+            extra: Vec::new(),
+        }
     }
 }
 
@@ -385,26 +450,7 @@ impl Settings {
     /// Missing or unreadable files yield defaults; builtin themes are always present and
     /// replaced by same-named theme files.
     pub fn load_from(dir: &Path) -> Settings {
-        let mut s = Settings::default();
-        let sections = std::fs::read_to_string(dir.join("settings.ini")).map(|t| parse_ini(&t)).unwrap_or_default();
-        let profiles: Vec<Profile> = sections
-            .iter()
-            .filter_map(|(n, k)| n.strip_prefix("profile ").map(|name| Profile::from_section(name.trim(), k)))
-            .collect();
-        if !profiles.is_empty() {
-            s.profiles = profiles;
-        }
-        s.active = sections
-            .iter()
-            .find(|(n, _)| n == "general")
-            .and_then(|(_, k)| k.iter().find(|(k, _)| k == "profile"))
-            .map_or_else(|| s.profiles[0].name.clone(), |(_, v)| v.clone());
-
-        if let Some((_, v)) = sections.iter().filter(|(n, _)| n == "general").flat_map(|(_, k)| k).find(|(k, _)| k == "language") {
-            s.language = v.clone();
-        }
-        s.keys = sections.iter().filter(|(n, _)| n == "keys").flat_map(|(_, k)| k.clone()).collect();
-
+        let mut s = Settings::from_ini(&std::fs::read_to_string(dir.join("settings.ini")).unwrap_or_default());
         let mut files: Vec<PathBuf> = std::fs::read_dir(dir.join("themes"))
             .into_iter()
             .flatten()
@@ -424,28 +470,64 @@ impl Settings {
         s
     }
 
+    /// settings.ini's text, with the built-in themes. `[keys]` is kept whole, so unknown `cmd.*` keys survive.
+    fn from_ini(text: &str) -> Settings {
+        let mut s = Settings::default();
+        let sections = parse_ini(text);
+        let profiles: Vec<Profile> = sections
+            .iter()
+            .filter_map(|(n, k)| n.strip_prefix("profile ").map(|name| Profile::from_section(name.trim(), k)))
+            .collect();
+        if !profiles.is_empty() {
+            s.profiles = profiles;
+        }
+        let general: Vec<&(String, String)> = sections.iter().filter(|(n, _)| n == "general").flat_map(|(_, k)| k).collect();
+        let get = |key: &str| general.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
+        s.active = get("profile").map_or_else(|| s.profiles[0].name.clone(), str::to_string);
+        if let Some(v) = get("language") {
+            s.language = v.to_string();
+        }
+        s.format = loaded_format(get("format"));
+        s.keys = sections.iter().filter(|(n, _)| n == "keys").flat_map(|(_, k)| k.clone()).collect();
+
+        let unknown: Vec<(String, String)> =
+            general.iter().filter(|(k, _)| !matches!(k.as_str(), "profile" | "language" | "format")).map(|&kv| kv.clone()).collect();
+        if !unknown.is_empty() {
+            s.extra.push(("general".into(), unknown));
+        }
+        s.extra.extend(sections.iter().filter(|(n, _)| !matches!(n.as_str(), "general" | "keys") && !n.starts_with("profile ")).cloned());
+        s
+    }
+
     pub fn save(&self) {
         let _ = self.save_to(&dir());
     }
 
+    /// A file from a newer format is left as it is: this build cannot write back a value it could not read.
     pub fn save_to(&self, dir: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(dir.join("themes"))?;
-        std::fs::write(dir.join("settings.ini"), self.settings_text())?;
-        for t in &self.themes {
+        if self.format <= FORMAT {
+            std::fs::write(dir.join("settings.ini"), self.settings_text())?;
+        }
+        for t in self.themes.iter().filter(|t| t.format <= FORMAT) {
             std::fs::write(theme_path(dir, &t.name), t.to_ini())?;
         }
         Ok(())
     }
 
     fn settings_text(&self) -> String {
-        let mut sections = vec![(
-            "general".to_string(),
-            vec![("profile".to_string(), self.active.clone()), ("language".to_string(), self.language.clone())],
-        )];
+        let mut general = vec![
+            ("format".to_string(), self.format.to_string()),
+            ("profile".to_string(), self.active.clone()),
+            ("language".to_string(), self.language.clone()),
+        ];
+        general.extend(self.extra.iter().filter(|(n, _)| n == "general").flat_map(|(_, k)| k.clone()));
+        let mut sections = vec![("general".to_string(), general)];
         sections.extend(self.profiles.iter().map(Profile::to_section));
         if !self.keys.is_empty() {
             sections.push(("keys".to_string(), self.keys.clone()));
         }
+        sections.extend(self.extra.iter().filter(|(n, _)| n != "general").cloned());
         write_ini(&sections)
     }
 
@@ -461,7 +543,8 @@ impl Settings {
     }
 
     /// Writes the default files only where missing, so the user can edit them. A built-in theme file still
-    /// holding an earlier version's unedited defaults gets the current defaults.
+    /// holding an earlier version's unedited defaults gets the current defaults. settings.ini and theme files from
+    /// before formats (0.1.x) are migrated in place: they get `format=` and keep everything else.
     pub fn ensure_files(dir: &Path) {
         let d = Settings::default();
         let _ = std::fs::create_dir_all(dir.join("themes"));
@@ -481,6 +564,14 @@ impl Settings {
                 let _ = std::fs::write(&p, t.to_ini());
             }
             write_new(p, t.to_ini());
+        }
+        let themes = std::fs::read_dir(dir.join("themes")).into_iter().flatten().flatten().map(|e| e.path());
+        for (p, section) in std::iter::once((dir.join("settings.ini"), "general"))
+            .chain(themes.filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("ini"))).map(|p| (p, "theme")))
+        {
+            if let Some(text) = std::fs::read_to_string(&p).ok().and_then(|t| stamp_format(&t, section)) {
+                let _ = std::fs::write(&p, text);
+            }
         }
     }
 }
@@ -575,6 +666,7 @@ dark=false").contrast, None);
             item_checkboxes: true,
             search_system: false,
             search_archives: true,
+            check_updates: true,
             bookmarks: vec![("Repos".into(), r"C:\Users\x\My Repos".into())],
             ..Profile::default_profile()
         });
@@ -597,6 +689,8 @@ dark=false").contrast, None);
         assert_eq!(p.underline_titles, "hover");
         assert!(p.show_recent && p.show_frequent && p.show_status && p.preview_handlers && p.search_system);
         assert!(!p.item_checkboxes && !p.search_archives && !p.restore_tabs);
+        assert!(!p.check_updates, "the update check is opt-in");
+        assert!(!Profile::from_section("x", &[("check_updates".into(), "junk".into())]).check_updates);
         assert_eq!(Profile::from_section("x", &[("underline_titles".into(), "junk".into())]).underline_titles, "hover");
         let hover = |v: &str| Profile::from_section("x", &[("hover_preview_ms".into(), v.into())]).hover_preview_ms;
         assert_eq!((hover("5"), hover("1500"), hover("999999"), hover("junk")), (200, 1500, 10000, 2000));
@@ -632,8 +726,104 @@ dark=false").contrast, None);
         std::fs::write(d.join("themes/light.ini"), &edited).unwrap();
         Settings::ensure_files(&d);
         assert_eq!(Settings::load_from(&d).theme("dark"), &Theme::dark());
-        assert_eq!(std::fs::read_to_string(d.join("themes/light.ini")).unwrap(), edited);
+        // The edited one is only stamped with the format.
+        assert_eq!(std::fs::read_to_string(d.join("themes/light.ini")).unwrap(), edited.replace("[theme]\n", "[theme]\nformat=1\n"));
         cleanup("legacy");
+    }
+
+    /// settings.ini as 0.1.0 through 0.1.4 wrote it on a first run (their writers are identical).
+    const SETTINGS_0_1: &str = "[general]\nprofile=default\n\n[profile default]\nstart=shell:::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}\n\
+        theme=dark\nview=details\nshow_tree=false\nshow_preview=false\ntree_width=220\npreview_width=360\nshow_hidden=false\n\
+        show_extensions=true\nsingle_click=false\nsearch_delay_ms=250\nhover_preview_ms=2000\nunderline_titles=hover\nshow_recent=true\n\
+        show_frequent=true\nshow_status=true\npreview_handlers=true\nitem_checkboxes=false\nsearch_system=true\nsearch_archives=false\n\n";
+    /// A 0.1.x settings.ini after the user's own edits: a profile, a bookmark, a shortcut and a comment.
+    const SETTINGS_0_1_EDITED: &str = "[profile work]\n; mine\ntheme=sepia\nview=icons\nshow_hidden=true\nbookmark.Repos=C:\\Users\\x\\My Repos\n\n\
+        [keys]\ncmd.new_tab=Ctrl+Y\n";
+    const DARK_0_1: &str = "[theme]\ndark=true\nmica=true\nbackground=#1E1E1E\nsurface=#262626\ntext=#F2F2F7\nsecondary_text=#98989D\n\
+        accent=#0A84FF\nselection=#21374D\nborder=#2F2F2F\nfont=Segoe UI Variable Text\nfont_size=10\n\n";
+    const LIGHT_0_1: &str = "[theme]\ndark=false\nmica=true\nbackground=#F5F5F7\nsurface=#FFFFFF\ntext=#1D1D1F\nsecondary_text=#6E6E73\n\
+        accent=#0A84FF\nselection=#D3E9FF\nborder=#E4E4E6\nicon_theme=fluent\nfont=Segoe UI Variable Text\nfont_size=10\n\n";
+
+    #[test]
+    fn v0_1_files_migrate_and_round_trip() {
+        assert_eq!(Settings::from_ini(SETTINGS_0_1), Settings::default());
+        let s = Settings::from_ini(&format!("{SETTINGS_0_1}{SETTINGS_0_1_EDITED}").replace("profile=default", "profile=work"));
+        let work = s.active_profile();
+        assert_eq!((work.name.as_str(), work.theme.as_str(), work.view.as_str(), work.show_hidden), ("work", "sepia", "icons", true));
+        assert_eq!(work.bookmarks, vec![("Repos".to_string(), r"C:\Users\x\My Repos".to_string())]);
+        assert!(!work.restore_tabs && work.extra.is_empty(), "keys added after 0.1.x take their defaults");
+        assert_eq!((s.format, s.language.as_str(), s.keys.len(), s.extra.len()), (FORMAT, "system", 1, 0));
+        let text = s.settings_text();
+        assert!(text.starts_with("[general]\nformat=1\n"), "{text}");
+        assert_eq!(Settings::from_ini(&text), s);
+
+        assert_eq!(Theme::from_ini("dark", DARK_0_1), Theme::dark());
+        let light = Theme::from_ini("light", LIGHT_0_1);
+        assert_eq!(light, Theme { icon_theme: Some("fluent".into()), ..Theme::light() });
+        assert!(light.to_ini().starts_with("[theme]\nformat=1\n"));
+        assert_eq!(Theme::from_ini("light", &light.to_ini()), light);
+    }
+
+    #[test]
+    fn unknown_keys_and_sections_survive() {
+        let text = "[general]\nformat=1\nprofile=default\nlanguage=es\nwindow=max\n\n[profile default]\nview=list\nzoom=3\n\n\
+            [keys]\ncmd.future=Ctrl+J\n\n[plugins]\nx=1\n";
+        let s = Settings::from_ini(text);
+        assert_eq!(s.active_profile().extra, vec![("zoom".to_string(), "3".to_string())]);
+        assert_eq!(s.keys, vec![("cmd.future".to_string(), "Ctrl+J".to_string())]);
+        let out = s.settings_text();
+        for line in ["window=max", "zoom=3", "cmd.future=Ctrl+J", "[plugins]\nx=1"] {
+            assert!(out.contains(line), "{line} in {out}");
+        }
+        assert_eq!(Settings::from_ini(&out), s);
+
+        let t = Theme::from_ini("x", "top=1\n[theme]\naccent=#010203\nglass=0.5\n[extra]\nk=v\n");
+        let ini = t.to_ini();
+        assert!(ini.starts_with("top=1\n") && ini.contains("glass=0.5") && ini.contains("[extra]\nk=v"), "{ini}");
+        assert_eq!(Theme::from_ini("x", &ini), t);
+    }
+
+    #[test]
+    fn newer_formats_are_read_and_not_overwritten() {
+        assert_eq!((loaded_format(None), loaded_format(Some("junk")), loaded_format(Some("0")), loaded_format(Some(" 7 "))), (1, 1, 1, 7));
+        let d = tmp("newer");
+        std::fs::create_dir_all(d.join("themes")).unwrap();
+        let ini = "[general]\nformat=7\nprofile=default\n[profile default]\nview=list\nfont_size=10.5\n";
+        let theme = "[theme]\nformat=7\naccent=#010203\nfont_size=10.5\n";
+        std::fs::write(d.join("settings.ini"), ini).unwrap();
+        std::fs::write(d.join("themes/sepia.ini"), theme).unwrap();
+        let s = Settings::load_from(&d);
+        assert_eq!((s.format, s.active_profile().view.as_str(), s.theme("sepia").format), (7, "list", 7));
+        assert_eq!(s.theme("sepia").accent, 0x0003_0201);
+        s.save_to(&d).unwrap();
+        Settings::ensure_files(&d);
+        assert_eq!(std::fs::read_to_string(d.join("settings.ini")).unwrap(), ini);
+        assert_eq!(std::fs::read_to_string(d.join("themes/sepia.ini")).unwrap(), theme);
+        cleanup("newer");
+    }
+
+    #[test]
+    fn stamping_keeps_the_rest_of_the_file() {
+        assert_eq!(stamp_format("\u{feff}[general]\r\n; note\r\nprofile=a\r\n", "general").unwrap(), "\u{feff}[general]\r\nformat=1\r\n; note\r\nprofile=a\r\n");
+        assert_eq!(stamp_format("[profile a]\nview=list\n", "general").unwrap(), "[profile a]\nview=list\n[general]\nformat=1\n");
+        assert_eq!(stamp_format("", "theme").unwrap(), "[theme]\nformat=1\n");
+        assert_eq!(stamp_format("[theme]\nformat=2\n", "theme"), None);
+    }
+
+    #[test]
+    fn ensure_files_stamps_old_files_once() {
+        let d = tmp("stamp");
+        std::fs::create_dir_all(d.join("themes")).unwrap();
+        std::fs::write(d.join("settings.ini"), SETTINGS_0_1).unwrap();
+        std::fs::write(d.join("themes/sepia.ini"), LIGHT_0_1).unwrap();
+        Settings::ensure_files(&d);
+        let once = std::fs::read_to_string(d.join("settings.ini")).unwrap();
+        assert!(once.starts_with("[general]\nformat=1\nprofile=default\n"), "{once}");
+        assert!(std::fs::read_to_string(d.join("themes/sepia.ini")).unwrap().starts_with("[theme]\nformat=1\n"));
+        Settings::ensure_files(&d);
+        assert_eq!(std::fs::read_to_string(d.join("settings.ini")).unwrap(), once);
+        assert_eq!(Settings::load_from(&d).profiles, Settings::from_ini(SETTINGS_0_1).profiles);
+        cleanup("stamp");
     }
 
     #[test]
@@ -672,5 +862,45 @@ language=es
         Settings::ensure_files(&d);
         assert_eq!(Settings::load_from(&d).theme("dark").accent, 0x0003_0201);
         cleanup("ensure");
+    }
+
+    // Fuzz-style: seeded junk through the pure parsers. No panic, and the documented invariants hold.
+    #[test]
+    fn fuzz_parse_ini_trims_and_splits_on_the_first_equals() {
+        for seed in 0..400 {
+            let text = crate::fuzz::Rng::new(seed).text(crate::fuzz::TOKENS, 80);
+            for (name, keys) in parse_ini(&text) {
+                assert_eq!(name, name.trim(), "seed {seed}");
+                assert!(!name.contains('\n'), "seed {seed}");
+                for (k, v) in keys {
+                    assert!(k == k.trim() && v == v.trim() && !k.contains('='), "seed {seed}: {k:?}={v:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_colors() {
+        let mut r = crate::fuzz::Rng::new(7);
+        for _ in 0..500 {
+            let c = (r.step() & 0xFF_FFFF) as u32;
+            assert_eq!(parse_color(&format_color(c)), Some(c));
+            let s = r.text(crate::fuzz::TOKENS, 4);
+            assert!(parse_color(&s).is_none_or(|v| v <= 0xFF_FFFF), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn fuzz_settings_and_theme_files_keep_their_invariants() {
+        for seed in 0..300 {
+            let text = crate::fuzz::Rng::new(seed).text(crate::fuzz::TOKENS, 80);
+            let s = Settings::from_ini(&text);
+            assert!(!s.profiles.is_empty(), "seed {seed}");
+            let t = Theme::from_ini("fuzz", &text);
+            assert_eq!(t.name, "fuzz", "seed {seed}");
+            // Everything but the kept unknown keys round-trips (a kept `[a=]` line rereads as a section header).
+            let back = Theme::from_ini("fuzz", &t.to_ini());
+            assert_eq!(Theme { extra: Vec::new(), ..back }, Theme { extra: Vec::new(), ..t }, "seed {seed}");
+        }
     }
 }

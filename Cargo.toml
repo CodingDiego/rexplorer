@@ -2,6 +2,10 @@
 resolver = "2"
 members = ["crates/core", "crates/app"]
 
+[workspace.package]
+# 1.88: let-chains and slice::as_chunks, both used in the sources (edition 2024 alone needs 1.85).
+rust-version = "1.88"
+
 [workspace.dependencies]
 # Pinned on purpose: the windows crate breaks its API across minors. Upgrade deliberately.
 windows = "=0.62.2"

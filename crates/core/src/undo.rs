@@ -242,8 +242,7 @@ pub fn recycle(hwnd: HWND, paths: &[String], quiet: bool) -> Vec<(String, String
         Ok(())
     };
     let _ = go();
-    let done = got.borrow().iter().filter(|(o, _)| paths.iter().any(|p| p.eq_ignore_ascii_case(o))).cloned().collect();
-    done
+    got.borrow().iter().filter(|(o, _)| paths.iter().any(|p| p.eq_ignore_ascii_case(o))).cloned().collect()
 }
 
 /// Puts Recycle Bin items back with the bin's "undelete" verb; returns the originals invoked. Never onto a name that is taken.
@@ -485,6 +484,21 @@ mod tests {
         assert!(r.is_empty());
         assert_eq!(std::fs::read_to_string(&sx).unwrap(), "new");
         assert_eq!(std::fs::read_to_string(&dx).unwrap(), "other");
+    }
+
+    #[test]
+    fn transfer_whose_source_is_gone_moves_back() {
+        // A cut and paste: undo moves the file back instead of sending it to the bin.
+        let _c = ComInit::sta();
+        let fx = fixture("cutpaste");
+        std::fs::create_dir_all(fx.0.join("src")).unwrap();
+        std::fs::create_dir_all(fx.0.join("dst")).unwrap();
+        let (sx, dx) = (p(&fx.0, "src\\x.txt"), p(&fx.0, "dst\\x.txt"));
+        std::fs::write(&dx, "moved").unwrap();
+        let r = reverse_with(HWND::default(), vec![Op::Transfer(vec![(sx.clone(), dx.clone())])], true);
+        assert_eq!(r, vec![Op::Moved(vec![(dx.clone(), sx.clone())])]);
+        assert_eq!(std::fs::read_to_string(&sx).unwrap(), "moved");
+        assert!(!Path::new(&dx).exists());
     }
 
     #[test]

@@ -255,10 +255,10 @@ mod tests {
                 let group = k.rsplit_once('.').map_or("", |(g, _)| g).to_string();
                 let b: Vec<char> = v.chars().collect();
                 let at = (0..b.len()).find(|&i| b[i] == '&' && b.get(i + 1).is_some_and(|c| *c != '&') && (i == 0 || b[i - 1] != '&'));
-                if let Some(i) = at.filter(|_| k.starts_with("menu.") || k.starts_with("tabs.") || k.starts_with("desk.")) {
-                    if let Some(other) = seen.insert((group, b[i + 1].to_lowercase().next().unwrap()), k.clone()) {
-                        dup.push(format!("{lang}: {k} / {other}"));
-                    }
+                if let Some(i) = at.filter(|_| k.starts_with("menu.") || k.starts_with("tabs.") || k.starts_with("desk."))
+                    && let Some(other) = seen.insert((group, b[i + 1].to_lowercase().next().unwrap()), k.clone())
+                {
+                    dup.push(format!("{lang}: {k} / {other}"));
                 }
             }
             assert!(dup.is_empty(), "{dup:?}");
@@ -398,5 +398,19 @@ mod tests {
             .cloned()
             .collect();
         assert!(unused.is_empty(), "{unused:#?}");
+    }
+
+    #[test]
+    fn fuzz_language_files_never_drop_the_english_keys() {
+        let en = Table::parse(EN);
+        for seed in 0..300 {
+            let text = crate::fuzz::Rng::new(seed).text(crate::fuzz::TOKENS, 80);
+            let t = Table::new(Some(&text));
+            assert!(en.keys().all(|k| t.map.contains_key(k)), "seed {seed}");
+            // Placeholder substitution on junk templates must not panic either.
+            let mut junk = Table::new(None);
+            junk.map.insert("k".into(), text.clone());
+            let _ = junk.fmt("k", &[("a", &1), ("b", &"x")]);
+        }
     }
 }

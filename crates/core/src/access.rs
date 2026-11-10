@@ -191,7 +191,7 @@ impl IDispatch_Impl for Accessible_Impl {
     }
 }
 
-#[allow(non_snake_case)]
+#[allow(non_snake_case, clippy::not_unsafe_ptr_arg_deref)] // COM vtable method: the signature is fixed by IAccessible_Impl
 impl IAccessible_Impl for Accessible_Impl {
     fn accParent(&self) -> Result<IDispatch> {
         let (hwnd, _) = self.tree()?;

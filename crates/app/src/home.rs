@@ -87,6 +87,8 @@ pub struct Entry {
     pub subtitle: String,
     /// Rows: the text of `Content::columns[1..]`.
     pub cells: Vec<String>,
+    /// Rows: what each cell sorts by (dates and sizes as the shell's raw values).
+    pub sort_keys: Vec<String>,
     pub abs: Pidl,
     /// Tiles: pinned (else frequent). Rows: a favorite (pinned file).
     pub pinned: bool,
@@ -144,14 +146,30 @@ const HOME_KEYS: u128 = 0x30C8EEF4_A832_41E2_AB32_E3C3CA28FD29;
 /// System.Home.IsPinned: true for a pinned folder or a favorite file, false for a frequent folder or a recent file.
 pub const IS_PINNED: PROPERTYKEY = pkey(HOME_KEYS, 4);
 /// System.Home.Grouping: which part of Home lists the item; 5 is "shared with you" (OneDrive files of others).
+/// Undocumented: see `is_shared`.
 const GROUPING: PROPERTYKEY = pkey(HOME_KEYS, 2);
 const SHARED_GROUP: &str = "5";
+
+/// Whether an item's System.Home.Grouping text marks it shared with you. The value is undocumented, so anything
+/// else, an empty value or none at all (another Windows build) means not shared: the Shared pill just stays empty.
+fn is_shared(grouping: Option<&str>) -> bool {
+    grouping == Some(SHARED_GROUP)
+}
 /// System.ActivityInfo, Home's Activity column ("Ana edited this"): text only for cloud files.
 const ACTIVITY: PROPERTYKEY = pkey(HOME_KEYS, 17);
+/// System.StorageProviderUIStatus, Explorer's Status column: the cloud state ("Available on this device").
+const STATUS: PROPERTYKEY = pkey(0xE77E90DF_6271_4F5B_834F_2DD1F245DDA4, 2);
 /// The table: Name, then these. Home's own first columns (Size, Type, Date modified, Account, Activity) hold
 /// text only for cloud files, so local files take theirs from their own folder.
-const CELLS: [PROPERTYKEY; 4] = [MODIFIED, TYPE_KEY, SIZE_KEY, ACTIVITY];
-const FALLBACK: [&str; 5] = ["col.name", "col.date_modified", "col.type", "col.size", "home.col_activity"];
+const CELLS: [PROPERTYKEY; 5] = [MODIFIED, TYPE_KEY, SIZE_KEY, ACTIVITY, STATUS];
+const FALLBACK: [&str; 6] = ["col.name", "col.date_modified", "col.type", "col.size", "home.col_activity", "home.col_status"];
+/// Per column (`FALLBACK` order): whether a first sort on it is descending (newest, largest first), as Explorer's.
+const DESC_FIRST: [bool; 6] = [false, true, false, true, false, false];
+
+/// What a cell sorts by: the raw date (yyyy/mm/dd:hh:mm:ss, which sorts as text) and byte count, else its text.
+fn sort_key(it: &ShellItem, k: &PROPERTYKEY, text: &str) -> String {
+    if same(k, &MODIFIED) || same(k, &SIZE_KEY) { it.property_text(k).unwrap_or_default() } else { text.to_string() }
+}
 /// SFGAO_FOLDER and SFGAO_STREAM (a .zip is both: a file, not a tile).
 const SFGAO_FOLDER: u32 = 0x2000_0000;
 const SFGAO_STREAM: u32 = 0x0040_0000;
@@ -236,6 +254,7 @@ pub fn build(folder: &ShellFolder, items: &[ShellItem]) -> Content {
             name: item.display_name(),
             subtitle,
             cells: Vec::new(),
+            sort_keys: Vec::new(),
             abs: folder.child_pidl(item),
             key,
             pinned: pinned.unwrap_or(true),
@@ -249,7 +268,7 @@ pub fn build(folder: &ShellFolder, items: &[ShellItem]) -> Content {
             continue;
         }
         e.pinned = pinned == Some(true);
-        e.shared = item.property_text(&GROUPING).as_deref() == Some(SHARED_GROUP);
+        e.shared = is_shared(item.property_text(&GROUPING).as_deref());
         e.recent = !e.pinned && !e.shared;
         if e.recent && !SHOW_RECENT.load(Ordering::Relaxed) {
             continue;
@@ -263,13 +282,14 @@ pub fn build(folder: &ShellFolder, items: &[ShellItem]) -> Content {
         }
         // Home fills its columns for cloud files; a local file's own folder knows its details.
         let mut own: Option<Option<(String, ShellItem)>> = None;
-        e.cells = CELLS
+        (e.cells, e.sort_keys) = CELLS
             .iter()
             .map(|k| {
                 let text = find(&cols, k).map(|(c, _)| item.detail(c)).unwrap_or_default();
                 // A network file's cells stay empty, as Home's own do: binding its folder can block on the share.
                 if !text.is_empty() || !is_fs_path(&e.key) || e.key.starts_with("\\\\") {
-                    return text;
+                    let key = sort_key(item, k, &text);
+                    return (text, key);
                 }
                 let o = own.get_or_insert_with(|| {
                     let h = crate::source::hit_for_path(Path::new(&e.key))?;
@@ -277,9 +297,11 @@ pub fn build(folder: &ShellFolder, items: &[ShellItem]) -> Content {
                     by_dir.entry(dir.clone()).or_insert_with(|| columns_by_key(&h.item.parent));
                     Some((dir, h.item))
                 });
-                o.as_ref().and_then(|(d, it)| find(&by_dir[d], k).map(|(i, _)| it.detail(i))).unwrap_or_default()
+                o.as_ref()
+                    .and_then(|(d, it)| find(&by_dir[d], k).map(|(i, _)| it.detail(i)).map(|t| (t.clone(), sort_key(it, k, &t))))
+                    .unwrap_or_default()
             })
-            .collect();
+            .unzip();
         // The shell writes dates as yyyy/mm/dd:hh:mm:ss.fff, which sorts as text.
         rows.push((item.property_text(&ACCESSED).unwrap_or_default(), e));
     }
@@ -360,6 +382,35 @@ fn column_lefts(left: i32, right: i32, n: usize) -> Vec<i32> {
     (0..n).map(|i| if i == 0 { left } else { left + name + (i as i32 - 1) * rest }).collect()
 }
 
+/// The table column under x, from the columns' left edges (`column_lefts`); None left of the first.
+fn column_at(lefts: &[i32], x: i32) -> Option<usize> {
+    lefts.iter().rposition(|&l| l <= x)
+}
+
+/// A pick of column `col` (a header click, or the Sort menu with `flip` false) on sort `cur`: the sorted column
+/// again flips its direction on a click and keeps it from the menu; another column starts in its own direction.
+pub fn next_sort(cur: Option<(usize, bool)>, col: usize, flip: bool) -> (usize, bool) {
+    match cur {
+        Some((c, desc)) if c == col => (col, desc != flip),
+        _ => (col, DESC_FIRST.get(col).copied().unwrap_or(false)),
+    }
+}
+
+/// What row `e` sorts by in column `col`: the name, else `sort_keys[col - 1]`.
+fn sort_text(e: &Entry, col: usize) -> &str {
+    if col == 0 { &e.name } else { e.sort_keys.get(col - 1).map_or("", |k| k.as_str()) }
+}
+
+/// Orders `shown` (row indices) by `key(row, column)` in natural order (StrCmpLogicalW, as Explorer); ties keep their
+/// order. None keeps the shell's (newest opened first).
+fn order<'a>(shown: &mut [usize], sort: Option<(usize, bool)>, key: impl Fn(usize, usize) -> &'a str) {
+    let Some((col, desc)) = sort else { return };
+    shown.sort_by(|&a, &b| {
+        let o = unsafe { windows::Win32::UI::Shell::StrCmpLogicalW(&HSTRING::from(key(a, col)), &HSTRING::from(key(b, col))) }.cmp(&0);
+        if desc { o.reverse() } else { o }
+    });
+}
+
 /// Keyboard move over `n` entries (`tiles` tiles in rows of `per_row`, then the table's rows): Left/Right and
 /// Up/Down step one entry, except Up/Down over tiles, which move a whole row of them; Home, End.
 fn step(n: usize, tiles: usize, per_row: usize, focus: Option<usize>, key: VIRTUAL_KEY) -> Option<usize> {
@@ -430,7 +481,9 @@ impl Fonts {
 struct State {
     content: Content,
     filter: Filter,
-    /// The rows the filter shows, as indices into `content.rows`. Entries are the tiles, then these rows.
+    /// The table's sort (see `order`); kept across reloads.
+    sort: Option<(usize, bool)>,
+    /// The rows the filter shows, as indices into `content.rows`, in `sort` order. Entries are the tiles, then these rows.
     shown: Vec<usize>,
     /// Per slot (the tiles, then every row, shown or not); owned.
     icons: Vec<Option<HBITMAP>>,
@@ -489,10 +542,12 @@ impl State {
         self.slot(e).and_then(|i| self.icons.get(i).copied().flatten())
     }
 
-    /// Applies the filter: the rows it shows, nothing selected.
+    /// Applies the filter and the sort: the rows it shows, nothing selected.
     fn refilter(&mut self) {
         let f = self.filter;
         self.shown = (0..self.content.rows.len()).filter(|&r| f.shows(&self.content.rows[r])).collect();
+        let rows = &self.content.rows;
+        order(&mut self.shown, self.sort, |r, c| sort_text(&rows[r], c));
         self.selected = vec![false; self.count()];
         self.focus = None;
         self.anchor = None;
@@ -527,6 +582,7 @@ pub fn create(parent: HWND, id: usize) -> Result<HWND> {
         let st = Box::into_raw(Box::new(State {
             content: Content::default(),
             filter: Filter::Recent,
+            sort: None,
             shown: Vec::new(),
             icons: Vec::new(),
             icon_timer: false,
@@ -597,11 +653,10 @@ pub fn set_content(hwnd: HWND, mut content: Content) {
         let mut old: HashMap<(bool, String), HBITMAP> = HashMap::new();
         let n_old = s.content.tiles.len();
         for (slot, icon) in std::mem::take(&mut s.icons).into_iter().enumerate() {
-            if let (Some(bmp), Some(entry)) = (icon, s.slot_entry(slot)) {
-                if let Some(prev) = old.insert((slot < n_old, entry.key.clone()), bmp) {
+            if let (Some(bmp), Some(entry)) = (icon, s.slot_entry(slot))
+                && let Some(prev) = old.insert((slot < n_old, entry.key.clone()), bmp) {
                     let _ = DeleteObject(prev.into());
                 }
-            }
         }
         s.content = content;
         let n_tiles = s.content.tiles.len();
@@ -672,6 +727,35 @@ pub fn set_filter(hwnd: HWND, f: Filter) {
 
 pub fn filter(hwnd: HWND) -> Filter {
     unsafe { state(hwnd).map(|s| s.filter).unwrap_or_default() }
+}
+
+/// The table's column titles (name first) and its sort: column and descending; None is the shell's order.
+pub fn sort(hwnd: HWND) -> (Vec<String>, Option<(usize, bool)>) {
+    unsafe { state(hwnd).map(|s| (s.content.columns.clone(), s.sort)).unwrap_or_default() }
+}
+
+/// Sorts the table; the selection stays, no notification.
+pub fn set_sort(hwnd: HWND, sort: Option<(usize, bool)>) {
+    unsafe {
+        if let Some(s) = state(hwnd) {
+            s.sort = sort;
+            resort(hwnd, s);
+        }
+    }
+}
+
+/// Orders the rows again after a sort change, keeping the selected items and the focus.
+unsafe fn resort(hwnd: HWND, s: &mut State) {
+    let sel: Vec<usize> = (0..s.count()).filter(|&e| s.selected[e]).filter_map(|e| s.entry(e).map(|x| x.index)).collect();
+    let focus = s.focus.and_then(|e| s.entry(e)).map(|x| x.index);
+    s.refilter();
+    for e in 0..s.count() {
+        s.selected[e] = s.entry(e).is_some_and(|x| sel.contains(&x.index));
+    }
+    s.focus = focus.and_then(|i| s.by_index(i));
+    s.anchor = s.focus;
+    let _ = InvalidateRect(Some(hwnd), None, false);
+    access::event(EVENT_OBJECT_REORDER, hwnd, None);
 }
 
 /// The selected entries as listing indices, and the focused one.
@@ -811,12 +895,13 @@ unsafe fn ui_font(s: &State) -> HFONT {
 }
 
 unsafe fn ensure_fonts(s: &mut State, dpi: u32) {
-    if s.fonts.dpi == dpi {
+    // Keyed on the text DPI: a text size change rebuilds the fonts too.
+    if s.fonts.dpi == theme::text_dpi(dpi) {
         return;
     }
     s.fonts.delete();
     s.fonts = Fonts {
-        dpi,
+        dpi: theme::text_dpi(dpi),
         title: theme::header_font(&s.theme, dpi, s.theme.font_size + 3),
         bold: theme::header_font(&s.theme, dpi, s.theme.font_size),
         glyph: theme::icon_font(dpi, 12),
@@ -850,7 +935,8 @@ unsafe fn current_layout(hwnd: HWND, s: &State) -> Layout {
     let mut wr = RECT::default();
     let _ = GetWindowRect(hwnd, &mut wr);
     let width = wr.right - wr.left - GetSystemMetricsForDpi(SM_CXVSCROLL, dpi);
-    layout(width, s.content.tiles.len(), s.shown.len(), &pill_widths(hwnd, s), dpi)
+    // Every box on the page holds text: the whole layout follows the text size.
+    layout(width, s.content.tiles.len(), s.shown.len(), &pill_widths(hwnd, s), theme::text_dpi(dpi))
 }
 
 /// Content rectangle of entry `e`.
@@ -860,7 +946,7 @@ fn entry_rect(l: &Layout, n_tiles: usize, e: usize) -> RECT {
 
 /// Client rectangle of entry `e`'s name (where the rename edit goes).
 unsafe fn name_rect(hwnd: HWND, s: &State, e: usize) -> RECT {
-    let dpi = GetDpiForWindow(hwnd);
+    let dpi = theme::text_dpi(GetDpiForWindow(hwnd));
     let l = current_layout(hwnd, s);
     let n = s.content.tiles.len();
     let r = entry_rect(&l, n, e);
@@ -1039,6 +1125,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_ERASEBKGND => return LRESULT(1),
         WM_SETFONT => {
             s.font = HFONT(wparam.0 as *mut c_void);
+            // A new text size or DPI changes the page height without a WM_SIZE.
+            sync_scroll(hwnd, s);
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
         WM_PAINT => paint(hwnd, s),
@@ -1084,7 +1172,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         HM_RECT => {
             let l = current_layout(hwnd, s);
-            let dpi = GetDpiForWindow(hwnd);
+            let dpi = theme::text_dpi(GetDpiForWindow(hwnd));
             let r = if wparam.0 == 0xFFFF {
                 RECT { top: l.header.bottom, bottom: client(hwnd).bottom + s.scroll, ..l.header }
             } else if let Some(t) = l.tiles.get(wparam.0) {
@@ -1133,7 +1221,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             return LRESULT(s.edit_brush.0 as isize);
         }
         WM_VSCROLL => {
-            let dpi = GetDpiForWindow(hwnd);
+            let dpi = theme::text_dpi(GetDpiForWindow(hwnd));
             let page = client(hwnd).bottom;
             let mut si = SCROLLINFO { cbSize: size_of::<SCROLLINFO>() as u32, fMask: SIF_ALL, ..Default::default() };
             let _ = GetScrollInfo(hwnd, SB_VERT, &mut si);
@@ -1152,7 +1240,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_MOUSEWHEEL => {
             cancel_rename(hwnd, s);
             let delta = (wparam.0 >> 16) as i16 as i32;
-            let y = s.scroll - delta * 3 * scale(ROW_H, GetDpiForWindow(hwnd)) / 120;
+            let y = s.scroll - delta * 3 * scale(ROW_H, theme::text_dpi(GetDpiForWindow(hwnd))) / 120;
             scroll_to(hwnd, s, y);
         }
         WM_MOUSEMOVE => {
@@ -1191,6 +1279,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let l = current_layout(hwnd, s);
                 if let Some(i) = l.pills.iter().position(|p| x >= p.left && x < p.right && y >= p.top && y < p.bottom) {
                     pick_pill(hwnd, s, i);
+                    return LRESULT(0);
+                }
+                // A click on a column title sorts by it, as Explorer's header does.
+                let h = l.header;
+                if x >= h.left && x < h.right && y >= h.top && y < h.bottom {
+                    if let Some(c) = column_at(&column_lefts(h.left, h.right, s.content.columns.len().max(1)), x).filter(|&c| c < s.content.columns.len()) {
+                        s.sort = Some(next_sort(s.sort, c, true));
+                        resort(hwnd, s);
+                    }
                     return LRESULT(0);
                 }
             }
@@ -1395,7 +1492,8 @@ unsafe fn paint(hwnd: HWND, s: &mut State) {
     FillRect(dc, &rc, bg);
     let _ = DeleteObject(bg.into());
     SetBkMode(dc, TRANSPARENT);
-    let sc = |v: i32| scale(v, dpi);
+    // Positions inside the boxes follow the text size like `current_layout`; icons stay at the window's DPI.
+    let sc = |v: i32| scale(v, theme::text_dpi(dpi));
     let dy = |r: RECT| RECT { top: r.top - s.scroll, bottom: r.bottom - s.scroll, ..r };
     let one = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS;
     let ui = ui_font(s);
@@ -1442,11 +1540,12 @@ unsafe fn paint(hwnd: HWND, s: &mut State) {
         }
         hot(dc, i, &r, sc(8));
         let sel = |c: u32| if picked(i) { theme::on_selection(t, c) } else { c };
-        let (icon, x) = (sc(40), r.left + sc(12));
+        let (icon, x) = (scale(40, dpi), r.left + sc(12));
+        let iy = r.top + (r.bottom - r.top - icon) / 2;
         match s.icon(i) {
-            Some(b) => draw_bitmap(dc, b, x, r.top + (r.bottom - r.top - icon) / 2, icon),
+            Some(b) => draw_bitmap(dc, b, x, iy, icon),
             None => {
-                let ph = RECT { left: x, top: r.top + sc(16), right: x + icon, bottom: r.top + sc(56) };
+                let ph = RECT { left: x, top: iy, right: x + icon, bottom: iy + icon };
                 theme::fill_round(dc, &ph, theme::hover(t), sc(6));
                 if let Some(c) = t.contrast {
                     theme::outline_round(dc, &ph, c.gray, sc(6), 1);
@@ -1482,7 +1581,14 @@ unsafe fn paint(hwnd: HWND, s: &mut State) {
     SetTextColor(dc, COLORREF(t.secondary_text));
     for (c, title) in s.content.columns.iter().enumerate() {
         let left = cols[c] + if c == 0 { sc(12) } else { 0 };
-        text(dc, title, RECT { left, right: col_right(c), ..header }, one);
+        let sorted = s.sort.filter(|&(k, _)| k == c);
+        let arrow = if sorted.is_some() { sc(14) } else { 0 };
+        text(dc, title, RECT { left, right: col_right(c) - arrow, ..header }, one);
+        if let Some((_, desc)) = sorted {
+            SelectObject(dc, s.fonts.small_glyph.into());
+            text(dc, if desc { "\u{E70D}" } else { "\u{E70E}" }, RECT { left: col_right(c) - arrow, right: col_right(c), ..header }, one);
+            SelectObject(dc, ui.into());
+        }
     }
     if s.shown.is_empty() {
         let empty = PILLS.iter().find(|p| p.0 == s.filter).map_or("", |p| tr(p.2));
@@ -1499,7 +1605,7 @@ unsafe fn paint(hwnd: HWND, s: &mut State) {
         }
         hot(dc, n + i, &pill, sc(6));
         let sel = |c: u32| if picked(n + i) { theme::on_selection(t, c) } else { c };
-        let (icon, x) = (sc(20), r.left + sc(12));
+        let (icon, x) = (scale(20, dpi), r.left + sc(12));
         if let Some(b) = s.icon(n + i) {
             draw_bitmap(dc, b, x, r.top + (r.bottom - r.top - icon) / 2, icon);
         }
@@ -1536,6 +1642,7 @@ mod tests {
             name: String::new(),
             subtitle: String::new(),
             cells: Vec::new(),
+            sort_keys: Vec::new(),
             abs: abs.clone(),
             pinned,
             recent,
@@ -1558,6 +1665,35 @@ mod tests {
             assert_eq!(tile_key_at_screen(h, p.x, p.y), None);
             let _ = DestroyWindow(parent);
         }
+    }
+
+    #[test]
+    fn missing_grouping_is_not_shared() {
+        assert!(is_shared(Some("5")));
+        assert!(!is_shared(None), "no value on this Windows build");
+        assert!(!is_shared(Some("")) && !is_shared(Some("1")) && !is_shared(Some("05")));
+    }
+
+    #[test]
+    fn sort_picks_and_orders_rows() {
+        // Name ascending first, Date modified and Size descending first; a click on the same column flips, the menu keeps.
+        assert_eq!((next_sort(None, 0, true), next_sort(None, 1, true), next_sort(None, 3, false)), ((0, false), (1, true), (3, true)));
+        assert_eq!((next_sort(Some((1, true)), 1, true), next_sort(Some((1, true)), 1, false)), ((1, false), (1, true)));
+        assert_eq!(next_sort(Some((1, false)), 2, true), (2, false), "another column starts in its own direction");
+        assert_eq!(next_sort(None, 9, true), (9, false));
+        // Per row: the name, then the sort keys of Date modified, Type and Size.
+        let rows = [["b10.txt", "2026/01/02:10:00:00.000", "", "900"], ["B2.txt", "2025/12/31:23:00:00.000", "", "10000"], ["a.txt", "", "", "5"]];
+        let sorted = |sort| {
+            let mut shown = vec![0, 1, 2];
+            order(&mut shown, sort, |r, c| rows[r].get(c).copied().unwrap_or(""));
+            shown
+        };
+        assert_eq!(sorted(None), [0, 1, 2], "the shell's order");
+        assert_eq!(sorted(Some((0, false))), [2, 1, 0], "names in natural order, case-insensitive");
+        assert_eq!(sorted(Some((1, true))), [0, 1, 2], "newest first; no date last");
+        assert_eq!(sorted(Some((3, true))), [1, 0, 2], "sizes as numbers");
+        assert_eq!(sorted(Some((7, false))), [0, 1, 2], "a column past the keys keeps the order");
+        assert_eq!((column_at(&[0, 450, 633], 10), column_at(&[0, 450, 633], 500), column_at(&[0, 450, 633], 9999), column_at(&[5], 0)), (Some(0), Some(1), Some(2), None));
     }
 
     #[test]
@@ -1672,8 +1808,8 @@ mod tests {
         assert!(items.iter().filter(|i| i.is_folder()).all(|i| i.property_bool(&IS_PINNED).is_some()));
         let mut c = build(&home, &items);
         assert!(!c.tiles.is_empty(), "Home has pinned folders");
-        assert_eq!(c.columns.len(), 5, "Name, Date modified, Type, Size, Activity");
-        assert!(c.rows.iter().all(|r| r.cells.len() == 4));
+        assert_eq!(c.columns.len(), 6, "Name, Date modified, Type, Size, Activity, Status");
+        assert!(c.rows.iter().all(|r| r.cells.len() == 5 && r.sort_keys.len() == 5));
         for (i, e) in c.tiles.iter_mut().chain(c.rows.iter_mut()).enumerate() {
             e.index = 100 + i;
         }
@@ -1809,6 +1945,7 @@ mod tests {
             name: name.into(),
             subtitle: subtitle.into(),
             cells: if recent { vec!["x".into()] } else { Vec::new() },
+            sort_keys: Vec::new(),
             abs: abs.clone(),
             pinned: false,
             recent,

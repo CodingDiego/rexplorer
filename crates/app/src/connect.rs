@@ -130,6 +130,8 @@ const DC_HASDEFID: isize = 0x534B;
 struct State {
     theme: Theme,
     font: HFONT,
+    /// The font made for this dialog's monitor after a DPI change (`font` is the main window's until then).
+    own: HFONT,
     /// The dialog is one surface card; fields are rounded wells in the background color.
     bg: HBRUSH,
     field: HBRUSH,
@@ -154,6 +156,11 @@ struct Layout {
 /// Client size the dialog is laid out for, in 96-DPI pixels.
 const CLIENT: (i32, i32) = (440, 280);
 
+/// The DPI the dialog is laid out at: the window's, grown by the Windows text size (every control holds text).
+fn dpi_of(h: HWND) -> i32 {
+    theme::text_dpi(unsafe { GetDpiForWindow(h) }) as i32
+}
+
 /// Edit rects are the rounded fields; the Edit itself sits inset in its field.
 fn layout(cw: i32, ch: i32, dpi: i32) -> Layout {
     let s = |v: i32| v * dpi / 96;
@@ -177,7 +184,7 @@ fn register() {
         let wc = WNDCLASSW {
             hInstance: hinst,
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-            hIcon: LoadIconW(Some(hinst), PCWSTR(1 as *const u16)).unwrap_or_default(),
+            hIcon: LoadIconW(Some(hinst), PCWSTR(std::ptr::without_provenance(1))).unwrap_or_default(),
             lpfnWndProc: Some(wndproc),
             lpszClassName: w!("RexConnect"),
             ..Default::default()
@@ -220,6 +227,7 @@ unsafe fn create_children(hwnd: HWND, st: &mut State) {
         SendMessageW(h, WM_SETFONT, Some(WPARAM(st.font.0 as usize)), Some(LPARAM(1)));
         h
     };
+    #[allow(clippy::needless_range_loop)] // i also indexes st.labels and picks the password style
     for i in 0..5 {
         let label = HSTRING::from(tr(LABELS[i]));
         st.labels[i] = mk(w!("STATIC"), PCWSTR(label.as_ptr()), 0x200 /* SS_CENTERIMAGE */, WINDOW_EX_STYLE(0), -1);
@@ -237,12 +245,12 @@ unsafe fn create_children(hwnd: HWND, st: &mut State) {
 unsafe fn layout_of(hwnd: HWND) -> Layout {
     let mut rc = RECT::default();
     let _ = GetClientRect(hwnd, &mut rc);
-    layout(rc.right, rc.bottom, GetDpiForWindow(hwnd) as i32)
+    layout(rc.right, rc.bottom, dpi_of(hwnd))
 }
 
 unsafe fn place(hwnd: HWND, st: &State) {
     let l = layout_of(hwnd);
-    let dpi = GetDpiForWindow(hwnd) as i32;
+    let dpi = dpi_of(hwnd);
     // A single-line Edit draws its text at the top: one line high, centered in its field.
     let eh = st.theme.font_size * dpi / 72 * 4 / 3 + 4 * dpi / 96;
     let inset = 8 * dpi / 96;
@@ -274,7 +282,7 @@ unsafe fn draw_button(st: &State, di: &DRAWITEMSTRUCT) {
     let surface = CreateSolidBrush(COLORREF(t.surface));
     FillRect(dc, &di.rcItem, surface);
     let _ = DeleteObject(surface.into());
-    let dpi = GetDpiForWindow(di.hwndItem) as i32;
+    let dpi = dpi_of(di.hwndItem);
     let focus = di.itemState.0 & ODS_FOCUS.0 != 0;
     // One pixel in: the outline includes its right and bottom edge.
     let inner = RECT { right: di.rcItem.right - 1, bottom: di.rcItem.bottom - 1, ..di.rcItem };
@@ -309,12 +317,28 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        // Moved to a monitor of another scale: take the suggested rect (WM_SIZE lays the controls out again).
+        WM_DPICHANGED => {
+            // The borrowed UI font is sized for the main window's monitor: make one for this one.
+            let f = theme::ui_font(&st.theme, (wparam.0 & 0xFFFF) as u32);
+            for h in st.labels.into_iter().chain(st.edits).chain([st.ok, st.cancel]) {
+                SendMessageW(h, WM_SETFONT, Some(WPARAM(f.0 as usize)), Some(LPARAM(1)));
+            }
+            if !st.own.is_invalid() {
+                let _ = DeleteObject(st.own.into());
+            }
+            (st.own, st.font) = (f, f);
+            let r = &*(lparam.0 as *const RECT);
+            let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+            let _ = InvalidateRect(Some(hwnd), None, true);
+            LRESULT(0)
+        }
         WM_ERASEBKGND => {
             let dc = HDC(wparam.0 as *mut c_void);
             let mut rc = RECT::default();
             let _ = GetClientRect(hwnd, &mut rc);
             FillRect(dc, &rc, st.bg);
-            let radius = 8 * GetDpiForWindow(hwnd) as i32 / 96;
+            let radius = 8 * dpi_of(hwnd) / 96;
             for (x, y, w, h) in layout_of(hwnd).edits {
                 let field = RECT { left: x, top: y, right: x + w, bottom: y + h };
                 theme::fill_round(dc, &field, st.theme.background, radius);
@@ -367,6 +391,7 @@ pub fn dialog(parent: HWND, t: &Theme, font: HFONT) -> Option<String> {
         let mut st = Box::new(State {
             theme: t.clone(),
             font,
+            own: HFONT::default(),
             bg: CreateSolidBrush(COLORREF(t.surface)),
             field: CreateSolidBrush(COLORREF(t.background)),
             labels: [HWND::default(); 5],
@@ -377,10 +402,11 @@ pub fn dialog(parent: HWND, t: &Theme, font: HFONT) -> Option<String> {
             done: false,
         });
         let has_parent = !parent.0.is_null();
-        let dpi = if has_parent { GetDpiForWindow(parent) as i32 } else { 96 };
-        // The window size that gives a CLIENT-sized client area under a caption.
+        let frame_dpi = if has_parent { GetDpiForWindow(parent) } else { 96 };
+        let dpi = theme::text_dpi(frame_dpi) as i32;
+        // The window size that gives a CLIENT-sized client area under a caption (the frame follows the display scale only).
         let mut wr = RECT { left: 0, top: 0, right: CLIENT.0 * dpi / 96, bottom: CLIENT.1 * dpi / 96 };
-        let _ = AdjustWindowRectExForDpi(&mut wr, WS_POPUP | WS_CAPTION | WS_SYSMENU, false, WINDOW_EX_STYLE(0), dpi as u32);
+        let _ = AdjustWindowRectExForDpi(&mut wr, WS_POPUP | WS_CAPTION | WS_SYSMENU, false, WINDOW_EX_STYLE(0), frame_dpi);
         let (w, h) = (wr.right - wr.left, wr.bottom - wr.top);
         let mut pr = RECT::default();
         if !has_parent || GetWindowRect(parent, &mut pr).is_err() {
@@ -422,6 +448,7 @@ pub fn dialog(parent: HWND, t: &Theme, font: HFONT) -> Option<String> {
                 let _ = ShowWindow(hwnd, SW_SHOW);
                 let _ = SetFocus(Some(st.edits[0]));
                 let mut msg = MSG::default();
+                #[allow(clippy::while_immutable_condition)] // st.done is set by the window procedure during GetMessageW
                 while !st.done {
                     if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
                         PostQuitMessage(msg.wParam.0 as i32); // re-post WM_QUIT for the outer loop
@@ -442,6 +469,9 @@ pub fn dialog(parent: HWND, t: &Theme, font: HFONT) -> Option<String> {
         };
         let _ = DeleteObject(st.bg.into());
         let _ = DeleteObject(st.field.into());
+        if !st.own.is_invalid() {
+            let _ = DeleteObject(st.own.into());
+        }
         result
     }
 }

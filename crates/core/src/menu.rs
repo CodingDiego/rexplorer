@@ -6,7 +6,8 @@ use windows::Win32::UI::Shell::{
     CMF_CANRENAME, CMF_DEFAULTONLY, CMF_EXPLORE, CMF_EXTENDEDVERBS, CMF_NORMAL,
     CMF_OPTIMIZEFORINVOKE,
     CMIC_MASK_PTINVOKE, CMIC_MASK_SHIFT_DOWN, CMINVOKECOMMANDINFO, CMINVOKECOMMANDINFOEX,
-    FOLDERID_Desktop, GCS_VERBW, IContextMenu, IContextMenu2, IContextMenu3, KF_FLAG_DEFAULT, SEE_MASK_UNICODE, SHGetKnownFolderPath,
+    FOLDERID_Desktop, GCS_VERBW, IContextMenu, IContextMenu2, IContextMenu3, ILCombine, KF_FLAG_DEFAULT, SEE_MASK_UNICODE, SHGetDesktopFolder,
+    SHGetKnownFolderPath,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, DestroyMenu, GMDI_GOINTOPOPUPS, GetMenuDefaultItem, GetMenuItemCount, GetMenuItemID,
@@ -15,7 +16,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{HSTRING, Interface, PCSTR, PCWSTR, PSTR, PWSTR, Result};
 
-use crate::com::take_cotaskmem_string;
+use crate::com::{Pidl, take_cotaskmem_string};
 use crate::folder::ShellFolder;
 use crate::item::ShellItem;
 use crate::packaged::{self, Target};
@@ -36,6 +37,8 @@ pub enum Picked {
     Rename,
     /// Delete, not run yet: the view runs it (to record it for undo).
     Delete,
+    /// An entry of the New submenu, already run: the view renames and records what appears.
+    New,
     Cancelled,
     /// One of the caller's own entries of a `show_in` menu: its id minus `OWN_FIRST`.
     Own(usize),
@@ -62,6 +65,15 @@ impl ContextMenu {
         let pidls: Vec<_> = items.iter().map(|i| i.pidl.as_ptr()).collect();
         let menu: IContextMenu = unsafe { folder.folder.GetUIObjectOf(hwnd, &pidls, None)? };
         Self::new(menu, Built::Items(items.iter().map(|i| (*i).clone()).collect()))
+    }
+
+    /// Items of several folders, each with its folder's absolute PIDL (search results): the desktop folder builds
+    /// one menu over their absolute PIDLs, as no single parent folder holds them all.
+    pub fn for_scattered(items: &[(&Pidl, &ShellItem)], hwnd: HWND) -> Result<Self> {
+        let abs: Vec<Pidl> = items.iter().map(|(f, i)| unsafe { Pidl::from_raw(ILCombine(Some(f.as_ptr()), Some(i.pidl.as_ptr()))) }).collect();
+        let pidls: Vec<_> = abs.iter().map(Pidl::as_ptr).collect();
+        let menu: IContextMenu = unsafe { SHGetDesktopFolder()?.GetUIObjectOf(hwnd, &pidls, None)? };
+        Self::new(menu, Built::Items(items.iter().map(|(_, i)| (*i).clone()).collect()))
     }
 
     pub fn for_background(folder: &ShellFolder, hwnd: HWND) -> Result<Self> {
@@ -116,9 +128,25 @@ impl ContextMenu {
             if verb.eq_ignore_ascii_case("delete") {
                 return Ok(Picked::Delete);
             }
+            let new = self.in_new_menu(menu, picked);
             self.invoke_id(hwnd, id, Some(POINT { x, y }), false)?;
-            Ok(Picked::Invoked(verb))
+            Ok(if new { Picked::New } else { Picked::Invoked(verb) })
         }
+    }
+
+    /// Whether command `id` (as the menu holds it) sits in the New submenu of `menu`.
+    unsafe fn in_new_menu(&self, menu: HMENU, id: u32) -> bool {
+        unsafe {
+            (0..GetMenuItemCount(Some(menu))).map(|p| GetSubMenu(menu, p)).filter(|s| !s.is_invalid()).any(|sub| {
+                let ids: Vec<u32> = (0..GetMenuItemCount(Some(sub))).map(|i| GetMenuItemID(sub, i)).collect();
+                ids.contains(&id) && ids.iter().any(|&i| self.is_new_folder(i))
+            })
+        }
+    }
+
+    /// The New submenu is recognized by its folder entry, canonical verb "NewFolder": its title is localized.
+    fn is_new_folder(&self, id: u32) -> bool {
+        (ID_FIRST..=ID_LAST).contains(&id) && self.verb_of(id - ID_FIRST).eq_ignore_ascii_case("NewFolder")
     }
 
     /// What the packaged commands are asked about: a target per item and the file system paths. None for virtual
@@ -202,7 +230,7 @@ impl ContextMenu {
 
     /// Runs a canonical verb: "copy", "cut", "paste", "delete", "properties"...
     pub fn invoke_verb(&self, hwnd: HWND, verb: &str, shift: bool) -> Result<()> {
-        let narrow = std::ffi::CString::new(verb).expect("ascii verb");
+        let narrow = std::ffi::CString::new(verb).map_err(|_| windows::core::Error::from(windows::Win32::Foundation::E_INVALIDARG))?;
         let wide = HSTRING::from(verb);
         unsafe {
             // The built-in verbs need no extension handlers; pins and "New" items do.
@@ -232,7 +260,7 @@ impl ContextMenu {
                     if !(ID_FIRST..=ID_LAST).contains(&id) {
                         continue; // separators and nested submenus
                     }
-                    if self.verb_of(id - ID_FIRST).eq_ignore_ascii_case("NewFolder") {
+                    if self.is_new_folder(id) {
                         found = true;
                         continue;
                     }
@@ -347,5 +375,64 @@ mod tests {
         println!("new items: {items:?}");
         assert!(!items.is_empty(), "the New submenu lists file types");
         assert!(made.is_ok() && subdirs == 1, "NewFolder made {subdirs} folders: {made:?}");
+    }
+
+    #[test]
+    fn new_entries_are_told_from_the_rest() {
+        let _c = ComInit::sta();
+        let f = ShellFolder::parse(std::env::temp_dir().to_str().unwrap()).unwrap();
+        let m = ContextMenu::for_background(&f, HWND::default()).unwrap();
+        let items = m.new_items().unwrap();
+        unsafe {
+            assert!(!items.is_empty() && items.iter().all(|(id, _)| m.in_new_menu(m.hmenu, *id)), "{items:?}");
+            // A top-level command (Paste, Properties...) is not a New entry.
+            let top = (0..GetMenuItemCount(Some(m.hmenu))).map(|i| GetMenuItemID(m.hmenu, i)).find(|id| (ID_FIRST..=ID_LAST).contains(id));
+            assert!(top.is_some_and(|id| !m.in_new_menu(m.hmenu, id)));
+        }
+    }
+
+    #[test]
+    fn several_items_get_one_menu_with_properties() {
+        let _c = ComInit::sta();
+        let dir = std::env::temp_dir().join(format!("rexplorer-multimenu-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(dir.join(n), n).unwrap();
+        }
+        let (f, items) = list(dir.to_str().unwrap()).unwrap();
+        let all: Vec<&ShellItem> = items.iter().collect();
+        let m = ContextMenu::for_items(&f, &all, HWND::default()).unwrap();
+        let verbs: Vec<String> = unsafe {
+            m.menu.QueryContextMenu(m.hmenu, 0, ID_FIRST, ID_LAST, CMF_NORMAL).ok().unwrap();
+            (0..GetMenuItemCount(Some(m.hmenu))).map(|i| GetMenuItemID(m.hmenu, i)).filter(|id| (ID_FIRST..=ID_LAST).contains(id)).map(|id| m.verb_of(id - ID_FIRST)).collect()
+        };
+        // As Alt+Enter runs it: a fresh menu over the whole selection (the shell opens one sheet for all of them).
+        let ran = ContextMenu::for_items(&f, &all, HWND::default()).unwrap().invoke_verb(HWND::default(), "properties", false);
+        assert_eq!(all.len(), 3);
+        assert!(verbs.iter().any(|v| v.eq_ignore_ascii_case("properties")), "{verbs:?}");
+        assert!(ran.is_ok(), "{ran:?}");
+        // Not removed: the sheet reads the files on its own thread after the verb returns.
+    }
+
+    #[test]
+    fn items_of_two_folders_get_one_menu() {
+        let _c = ComInit::sta();
+        let dir = std::env::temp_dir().join(format!("rexplorer-scattered-{}", std::process::id()));
+        for sub in ["x", "y"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+            std::fs::write(dir.join(sub).join("a.txt"), sub).unwrap();
+        }
+        let (fx, ix) = list(dir.join("x").to_str().unwrap()).unwrap();
+        let (fy, iy) = list(dir.join("y").to_str().unwrap()).unwrap();
+        let m = ContextMenu::for_scattered(&[(&fx.pidl, &ix[0]), (&fy.pidl, &iy[0])], HWND::default()).unwrap();
+        let verbs: Vec<String> = unsafe {
+            m.menu.QueryContextMenu(m.hmenu, 0, ID_FIRST, ID_LAST, CMF_NORMAL).ok().unwrap();
+            (0..GetMenuItemCount(Some(m.hmenu))).map(|i| GetMenuItemID(m.hmenu, i)).filter(|id| (ID_FIRST..=ID_LAST).contains(id)).map(|id| m.verb_of(id - ID_FIRST)).collect()
+        };
+        drop(m);
+        std::fs::remove_dir_all(&dir).unwrap();
+        for v in ["copy", "cut", "delete", "properties"] {
+            assert!(verbs.iter().any(|x| x.eq_ignore_ascii_case(v)), "{v} missing: {verbs:?}");
+        }
     }
 }

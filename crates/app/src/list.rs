@@ -454,7 +454,7 @@ pub(crate) unsafe fn begin_drag(app: *mut App) {
             if items.is_empty() {
                 return;
             }
-            dragdrop::data_object(&l.folder, &items)
+            dragdrop::data_object(&l.folder, &items, (*app).hwnd)
         }
         // Rows come from many folders: by parsing name, through a shell item array.
         Some(Source::Search(s)) => {
@@ -466,12 +466,26 @@ pub(crate) unsafe fn begin_drag(app: *mut App) {
         }
         _ => return,
     };
-    match data {
-        // A refused or cancelled drop is not an error to report; Explorer shows nothing either.
-        Ok(d) => {
-            let _ = dragdrop::drag(&d, ui::view_hwnd(app));
+    let d = match data {
+        Ok(d) => d,
+        Err(e) => {
+            rexplorer_core::crash::log(&format!("drag data object failed: {e}"));
+            message((*app).hwnd, &trf("err.drag", &[("error", &e)]));
+            return;
         }
-        Err(e) => message((*app).hwnd, &trf("err.drag", &[("error", &e)])),
+    };
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON};
+    // Physical buttons: a button already up when the loop starts makes it drop at once where the pointer is.
+    let button_down = GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 || GetAsyncKeyState(VK_RBUTTON.0 as i32) < 0;
+    let start = std::time::Instant::now();
+    let r = dragdrop::drag(&d, ui::view_hwnd(app));
+    // Every drag that moved nothing is logged, so the next live run can say why a target never got it.
+    if let Some(note) = dragdrop::drag_note(&r, button_down, start.elapsed().as_millis()) {
+        rexplorer_core::crash::log(&note);
+    }
+    // A refused or cancelled drop is a success code (Ok, effect NONE) and shows nothing, as in Explorer.
+    if let Err(e) = r {
+        message((*app).hwnd, &trf("err.drag", &[("error", &e)]));
     }
 }
 
@@ -509,11 +523,10 @@ pub(crate) unsafe fn register_drop(app: *mut App) {
             let folder_item = usize::try_from(i).ok().and_then(|i| l.items.get(i)).filter(|it| it.is_folder());
             // By parsing name: a PIDL's address can be reused by a later folder's allocation.
             let key = (l.folder.parsing_name.clone(), if folder_item.is_some() { i } else { -1 });
-            if let Some((k, t)) = &*last.borrow() {
-                if *k == key {
+            if let Some((k, t)) = &*last.borrow()
+                && *k == key {
                     return Some(t.clone());
                 }
-            }
             let target = match folder_item {
                 Some(it) => dragdrop::item_drop_target(&l.folder, it, hwnd),
                 None => dragdrop::folder_drop_target(&l.folder, hwnd),
@@ -542,27 +555,38 @@ pub(crate) unsafe fn register_drop(app: *mut App) {
 pub(crate) unsafe fn register_folder_drop(app: *mut App, window: HWND, at: impl Fn(*mut App, POINTL) -> Option<(String, nav::Target)> + 'static) {
     let ptr = app as usize;
     // A key that does not resolve is cached too, or ShellFolder::parse would run on every DragOver.
-    let last: RefCell<Option<(String, Option<IDropTarget>)>> = RefCell::new(None);
+    #[allow(clippy::type_complexity)] // a local drop-target cache, named once here
+    let last: std::rc::Rc<RefCell<Option<(String, Option<IDropTarget>)>>> = Default::default();
+    let seen = last.clone();
     let pick = move |pt: POINTL| -> Option<IDropTarget> {
         let app = ptr as *mut App;
         let (key, target) = at(app, pt)?;
-        if let Some((k, t)) = &*last.borrow() {
-            if *k == key {
+        if let Some((k, t)) = &*last.borrow()
+            && *k == key {
                 return t.clone();
             }
-        }
         let pidl = match target {
-            nav::Target::Pidl(p) => Some(p),
+            nav::Target::Pidl(p) | nav::Target::Search(_, p) => Some(p),
             nav::Target::Name(n) => rexplorer_core::ShellFolder::parse(&n).ok().map(|f| f.pidl),
         };
         let t = pidl.and_then(|p| unsafe { dragdrop::pidl_drop_target(&p, (*app).hwnd) }.ok());
         *last.borrow_mut() = Some((key, t.clone()));
         t
     };
-    let _ = dragdrop::register(window, Box::new(pick), None);
+    // The forwarder calls this only while a target is current, which is the one picked for the last key.
+    let on_drop = move |_: POINTL, data: &IDataObject| unsafe {
+        let Some(dest) = seen.borrow().as_ref().map(|(k, _)| k.clone()) else { return };
+        // A Home tile can be a file: a drop on it opens the file with the dropped items and copies nothing.
+        if !std::path::Path::new(&dest).is_dir() {
+            return;
+        }
+        (*(ptr as *mut App)).undo.record(Op::Transfer(plan_transfer(&dragdrop::hdrop_paths(data), &dest)));
+    };
+    let _ = dragdrop::register(window, Box::new(pick), Some(Box::new(on_drop)));
 }
 
 /// Drop targets on the sidebar rows, the crumbs, the tabs and the Home tiles.
+#[allow(clippy::needless_borrow)] // the explicit borrow of a raw-pointer field silences rustc's dangerous_implicit_autorefs
 pub(crate) unsafe fn register_folder_drops(app: *mut App) {
     register_folder_drop(app, (*app).sidebar, |app, pt| unsafe {
         let s = (*app).sidebar;
@@ -615,6 +639,7 @@ unsafe fn menu_point(list: HWND, item: Option<usize>) -> POINT {
 /// On the Home page our own entry on folders is "Unpin from Home" (pinned) or "Pin to Home" (frequent); elsewhere
 /// "Pin to Home".
 pub(crate) unsafe fn show_menu(app: *mut App, on_item: bool, at: Option<POINT>) {
+    let _op = crate::watchdog::op("context menu");
     let hwnd = (*app).hwnd;
     let pt = at.unwrap_or_else(|| {
         let mut pt = POINT::default();
@@ -675,6 +700,7 @@ pub(crate) unsafe fn show_menu(app: *mut App, on_item: bool, at: Option<POINT>) 
     let at = GetMenuItemCount(Some(hmenu)).max(0) as u32;
     let extended = GetKeyState(VK_SHIFT.0 as i32) < 0;
     (*app).active_menu = Some(menu);
+    let generation = (*app).generation;
     let picked = (*app).active_menu.as_ref().unwrap().show_in(hwnd, hmenu, at, pt.x, pt.y, extended);
     (*app).active_menu = None;
     let _ = DestroyMenu(hmenu);
@@ -698,6 +724,8 @@ pub(crate) unsafe fn show_menu(app: *mut App, on_item: bool, at: Option<POINT>) 
                 SetTimer(Some(hwnd), TIMER_REFRESH, 300, None);
             }
         }
+        // No load started meanwhile: the listing is still the one without the new item.
+        Ok(Picked::New) if (*app).generation == generation => commands::new_item_made(app),
         // The shell's own entries can change Home (add to or remove from Favorites, remove from the list).
         Ok(Picked::Invoked(_)) if home => {
             SetTimer(Some(hwnd), TIMER_REFRESH, 300, None);
@@ -877,7 +905,7 @@ pub(crate) unsafe fn cancel_cut(app: *mut App) {
     }
 }
 
-/// The shell context menu for rows of the active tab: shell items, or search results from one folder.
+/// The shell context menu for rows of the active tab: shell items, or search results (from one folder or several).
 pub(crate) unsafe fn selection_menu(app: *mut App, rows: &[usize]) -> Option<ContextMenu> {
     match source(app)? {
         Source::Shell(l) => {
@@ -927,14 +955,13 @@ pub(crate) unsafe fn verb_on_selection(app: *mut App, verb: &str, shift: bool) {
         return;
     }
     // To the Recycle Bin through IFileOperation, so Ctrl+Z can restore it; Shift+Delete, Home and virtual items keep the shell's verb.
-    if verb == "delete" && !shift {
-        if let Some(paths) = selected_paths(app, &rows) {
+    if verb == "delete" && !shift
+        && let Some(paths) = selected_paths(app, &rows) {
             let done = undo::recycle(hwnd, &paths, false);
             (*app).undo.record(Op::Recycled(done));
             source::prune_search(app, &rows);
             return;
         }
-    }
     if let Some(menu) = selection_menu(app, &rows) {
         let _ = menu.invoke_verb(hwnd, verb, shift);
         // The verb has finished when it returns (no async flag); a no-op outside search results.
@@ -952,11 +979,10 @@ pub(crate) unsafe fn verb_on_background(app: *mut App, verb: &str) {
         let pairs = if verb == "paste" { plan_transfer(&dragdrop::clipboard_paths(), &l.folder.parsing_name) } else { Vec::new() };
         (ContextMenu::for_background(&l.folder, hwnd), pairs)
     };
-    if let Ok(menu) = menu {
-        if menu.invoke_verb(hwnd, verb, false).is_ok() {
+    if let Ok(menu) = menu
+        && menu.invoke_verb(hwnd, verb, false).is_ok() {
             (*app).undo.record(Op::Transfer(pairs));
         }
-    }
 }
 
 /// Ctrl+Z / Ctrl+Y: reverses the newest entry of the log; in the address bar and the search box Ctrl+Z undoes
@@ -1052,11 +1078,10 @@ pub(crate) unsafe fn rename_item(app: *mut App, index: usize, name: &str, cell: 
                 return;
             }
             // The row asks the shell for its text again instead of showing the old name from the cache.
-            if let Some(Source::Shell(l)) = &mut cur(app).source {
-                if let Some(row) = l.cells.get_mut(index) {
+            if let Some(Source::Shell(l)) = &mut cur(app).source
+                && let Some(row) = l.cells.get_mut(index) {
                     row.take();
                 }
-            }
             SetTimer(Some((*app).hwnd), TIMER_REFRESH, 150, None);
         }
     }
@@ -1574,7 +1599,7 @@ mod tests {
             assert!(TILE_COLUMN_ASKS.load(std::sync::atomic::Ordering::Relaxed) > 0, "the tile asked for its extra lines");
             let _ = DestroyWindow(parent);
             let _ = DeactivateActCtx(0, cookie);
-            let _ = ReleaseActCtx(ctx);
+            ReleaseActCtx(ctx);
         }
     }
 

@@ -352,6 +352,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             WM_KEYDOWN | WM_SYSKEYDOWN => {
                 let key = VIRTUAL_KEY(wparam.0 as u16);
                 match key {
+                    // Left past the first shown crumb, with crumbs hidden behind the "...", opens that overflow menu.
+                    VK_LEFT if msg == WM_KEYDOWN && st.layout.first_visible > 0 && st.focus <= st.layout.first_visible => {
+                        notify(hwnd, CN_DROPDOWN_KEY, 0)
+                    }
                     VK_LEFT | VK_RIGHT | VK_HOME | VK_END if msg == WM_KEYDOWN => {
                         // The layout is from the last paint: never step past the crumbs there are now.
                         let shown = st.layout.items.len().min(st.crumbs.len().saturating_sub(st.layout.first_visible));
@@ -488,9 +492,10 @@ unsafe fn paint(hwnd: HWND, st: &mut State) {
             st.focus = st.focus.clamp(st.layout.first_visible, st.layout.first_visible + st.layout.items.len() - 1);
         }
 
-        // Each crumb is its own 28 px pill: hover fill, the current folder (last crumb) in the selection color.
-        let top = (ch - s(28)) / 2;
-        let (bottom, origin) = (top + s(28), st.origin);
+        // Each crumb is its own pill, 28 px in the 32 px field (both grow with the text size): hover fill, the
+        // current folder (last crumb) in the selection color.
+        let top = (ch - ch * 28 / 32) / 2;
+        let (bottom, origin) = (top + ch * 28 / 32, st.origin);
         let at = |r: &RECT| RECT { left: r.left + origin, top, right: r.right + origin, bottom };
         let first = st.layout.first_visible;
         let last = st.crumbs.len().checked_sub(1);
@@ -512,14 +517,13 @@ unsafe fn paint(hwnd: HWND, st: &mut State) {
 
         let flags = DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX;
         let chevron_color = if st.contrast.is_some() { st.text } else { blend(st.secondary, st.background, 0.6) };
-        if first > 0 {
-            if let Some((c, _)) = st.layout.items.first() {
+        if first > 0
+            && let Some((c, _)) = st.layout.items.first() {
                 let mut r = at(&RECT { left: 0, top: 0, right: c.left, bottom: 0 });
                 SelectObject(mem, text_font.into());
                 SetTextColor(mem, COLORREF(st.text));
                 DrawTextW(mem, &mut wide("\u{2026}"), &mut r, flags);
             }
-        }
         for (k, (c, chev)) in st.layout.items.iter().enumerate() {
             let (mut cr, mut kr) = (at(c), at(chev));
             SelectObject(mem, text_font.into());
@@ -531,15 +535,14 @@ unsafe fn paint(hwnd: HWND, st: &mut State) {
             DrawTextW(mem, &mut wide("\u{E76C}"), &mut kr, flags);
         }
 
-        if st.focused {
-            if let Some((c, _)) = st.focus.checked_sub(first).and_then(|k| st.layout.items.get(k)) {
+        if st.focused
+            && let Some((c, _)) = st.focus.checked_sub(first).and_then(|k| st.layout.items.get(k)) {
                 let r = at(c);
                 let i = s(3);
                 SetTextColor(mem, COLORREF(st.text));
                 SetBkColor(mem, COLORREF(st.background));
                 let _ = DrawFocusRect(mem, &RECT { left: r.left + i, top: r.top + i, right: r.right - i, bottom: r.bottom - i });
             }
-        }
 
         SelectObject(mem, old_font);
         let _ = BitBlt(hdc, 0, 0, cw, ch, Some(mem), 0, 0, SRCCOPY);
@@ -709,6 +712,13 @@ mod tests {
             assert_eq!(NOTES.with(|n| n.borrow().clone()), [(CN_CRUMB, 1)], "Enter sends what a click on that crumb sends");
             set_crumbs(bc, &["a".to_string()]);
             assert_eq!(at(), 0, "clamped when the crumbs shrink");
+            NOTES.with(|n| n.borrow_mut().clear());
+            // Crumbs hidden behind the "...": Left from the first shown crumb opens the overflow dropdown (index 0, as a click does).
+            set_crumbs(bc, &["a".to_string(), "b".to_string(), "c".to_string()]);
+            state(bc).unwrap().layout.first_visible = 1;
+            state(bc).unwrap().focus = 1;
+            key(VK_LEFT);
+            assert_eq!(NOTES.with(|n| n.borrow().clone()), [(CN_DROPDOWN_KEY, 0)]);
             NOTES.with(|n| n.borrow_mut().clear());
             key(VK_ESCAPE);
             assert!(NOTES.with(|n| n.borrow().is_empty()), "Esc hands the focus back, notifying nothing");

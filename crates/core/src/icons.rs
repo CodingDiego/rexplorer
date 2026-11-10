@@ -137,10 +137,11 @@ pub fn registered_extensions() -> Vec<String> {
         }
         let name = String::from_utf16_lossy(&name[..len as usize]);
         // The extension becomes a file name (`txt.png`) and a theme key (the last extension only).
-        if let Some(ext) = name.strip_prefix('.') {
-            if !ext.is_empty() && !ext.contains(['\\', '/', ':', '*', '?', '"', '<', '>', '|', '.']) {
-                out.push(ext.to_lowercase());
-            }
+        if let Some(ext) = name.strip_prefix('.')
+            && !ext.is_empty()
+            && !ext.contains(['\\', '/', ':', '*', '?', '"', '<', '>', '|', '.'])
+        {
+            out.push(ext.to_lowercase());
         }
     }
     out
@@ -267,7 +268,7 @@ fn dib_pixels<'a>(bmp: HBITMAP) -> Option<(&'a mut [u8], u32, u32)> {
 /// keeps the contract of the shell's own images.
 fn straighten(bmp: HBITMAP) {
     let Some((px, _, _)) = dib_pixels(bmp) else { return };
-    for p in px.chunks_exact_mut(4) {
+    for p in px.as_chunks_mut::<4>().0 {
         let a = p[3] as u32;
         if 0 < a && a < 255 {
             for c in &mut p[..3] {
@@ -281,7 +282,7 @@ fn straighten(bmp: HBITMAP) {
 /// draws an icon that has no 256 px image unscaled there.
 fn confined_to_corner(bmp: HBITMAP, edge: u32) -> bool {
     let Some((px, w, _)) = dib_pixels(bmp) else { return false };
-    px.chunks_exact(4).enumerate().all(|(i, p)| p[3] == 0 || (i as u32 % w < edge && i as u32 / w < edge))
+    px.as_chunks::<4>().0.iter().enumerate().all(|(i, p)| p[3] == 0 || (i as u32 % w < edge && i as u32 / w < edge))
 }
 
 /// The shell's overlay for `abs` (shortcut arrow, sync state) as its own 48 px premultiplied image; None without one.
@@ -344,10 +345,10 @@ pub fn export_system_icons(dir: &Path) -> Vec<String> {
         let Some(index) = system_icon_index(&ext).map(|i| app_fallback(i, || format!("x.{ext}"))).filter(|i| Some(*i) != generic_index()) else { continue };
         let Some(bmp) = draw_system_icon(SHIL_EXTRALARGE, index) else { continue };
         straighten(bmp);
-        if let Some((px, w, h)) = dib_pixels(bmp) {
-            if save_png(px, w, h, &out).is_ok() {
-                written.push(ext);
-            }
+        if let Some((px, w, h)) = dib_pixels(bmp)
+            && save_png(px, w, h, &out).is_ok()
+        {
+            written.push(ext);
         }
         unsafe {
             let _ = DeleteObject(bmp.into());
@@ -524,11 +525,11 @@ mod tests {
         straighten(bmp);
         let (px, w, h) = dib_pixels(bmp).unwrap();
         assert_eq!((w, h, px.len()), (48, 48, 48 * 48 * 4));
-        let alphas = px.chunks_exact(4).map(|p| p[3]);
+        let alphas = px.as_chunks::<4>().0.iter().map(|p| p[3]);
         assert!(alphas.clone().any(|a| a == 255), "no opaque pixel");
         assert!(alphas.clone().any(|a| a == 0), "no transparent pixel");
         // Straight alpha: an anti-aliased edge keeps its color above its alpha.
-        assert!(px.chunks_exact(4).any(|p| 0 < p[3] && p[3] < 255 && p[..3].iter().any(|&c| c > p[3])));
+        assert!(px.as_chunks::<4>().0.iter().any(|p| 0 < p[3] && p[3] < 255 && p[..3].iter().any(|&c| c > p[3])));
         assert!(!confined_to_corner(bmp, 16));
         assert!(confined_to_corner(bmp, 48));
         unsafe {
@@ -570,7 +571,7 @@ mod tests {
             let bmp = app_icon_bitmap(&abs, 96).expect("opener icon");
             let (px, w, _) = dib_pixels(bmp).unwrap();
             assert!(w == 48 || w == 256, "w={w}");
-            assert!(px.chunks_exact(4).any(|p| p[3] == 255), "{ext}: no opaque pixel");
+            assert!(px.as_chunks::<4>().0.iter().any(|p| p[3] == 255), "{ext}: no opaque pixel");
             unsafe {
                 let _ = DeleteObject(bmp.into());
             }

@@ -62,6 +62,11 @@ fn scale(px: i32, dpi: u32) -> i32 {
     px * dpi as i32 / 96
 }
 
+/// The DPI the rows' heights (`layout`, scrolling) use: they hold text, so the Windows text size grows them.
+fn row_dpi(hwnd: HWND) -> u32 {
+    theme::text_dpi(unsafe { GetDpiForWindow(hwnd) })
+}
+
 /// Vertical extent of each row in content coordinates (left and right are 0: rows span the width).
 /// Each section starts with a header; sections are `GAP` apart.
 pub fn layout(rows: &[Row], dpi: u32) -> Vec<RECT> {
@@ -152,7 +157,7 @@ struct State {
 
 impl State {
     unsafe fn sync(&mut self, hwnd: HWND) {
-        let dpi = GetDpiForWindow(hwnd);
+        let dpi = row_dpi(hwnd);
         if self.rects_dpi != dpi || self.rects.len() != self.rows.len() {
             self.rects = layout(&self.rows, dpi);
             self.rects_dpi = dpi;
@@ -326,7 +331,7 @@ unsafe fn notify(hwnd: HWND, code: u32, index: usize) {
 unsafe fn reveal(hwnd: HWND, s: &mut State) {
     s.sync(hwnd);
     let Some((i, r)) = s.focus.and_then(|i| s.rects.get(i).map(|r| (i, *r))) else { return };
-    let dpi = GetDpiForWindow(hwnd);
+    let dpi = row_dpi(hwnd);
     let starts_section = (i == 0 || s.rows[i - 1].section != s.rows[i].section) && !s.rows[i].section.is_empty();
     let mut rc = RECT::default();
     let _ = GetClientRect(hwnd, &mut rc);
@@ -343,7 +348,7 @@ unsafe fn acc_tree(hwnd: HWND, s: &State, t: &mut access::Tree) {
     t.role = ROLE_SYSTEM_LIST;
     t.focusable = true;
     t.focus = s.focus;
-    for (r, row) in layout(&s.rows, dpi).iter().zip(&s.rows) {
+    for (r, row) in layout(&s.rows, row_dpi(hwnd)).iter().zip(&s.rows) {
         let i = t.items.len();
         t.items.push(access::Item {
             name: row.label.clone(),
@@ -413,7 +418,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_MOUSEWHEEL => {
             let delta = (wparam.0 >> 16) as i16 as i32;
-            s.scroll -= delta * 3 * scale(ROW, GetDpiForWindow(hwnd)) / 120;
+            s.scroll -= delta * 3 * scale(ROW, row_dpi(hwnd)) / 120;
             s.sync(hwnd);
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
@@ -468,7 +473,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             } else {
                 let mut rc = RECT::default();
                 let _ = GetClientRect(hwnd, &mut rc);
-                let page = (rc.bottom / scale(ROW, GetDpiForWindow(hwnd)).max(1)).max(1) as usize;
+                let page = (rc.bottom / scale(ROW, row_dpi(hwnd)).max(1)).max(1) as usize;
                 // Keys it does not handle (Shift+F10 among them) go on to DefWindowProc.
                 let Some(f) = step(s.rows.len(), s.focus, key, page) else { return DefWindowProcW(hwnd, msg, wparam, lparam) };
                 s.focus = Some(f);
@@ -510,13 +515,14 @@ unsafe fn paint(hwnd: HWND, s: &mut State) {
     let mut rc = RECT::default();
     let _ = GetClientRect(hwnd, &mut rc);
     let (cw, ch) = (rc.right.max(1), rc.bottom.max(1));
-    let dpi = GetDpiForWindow(hwnd);
-    if s.header_dpi != dpi {
+    let (dpi, tdpi) = (GetDpiForWindow(hwnd), row_dpi(hwnd));
+    // Keyed on the text DPI so a text size change rebuilds the font too.
+    if s.header_dpi != tdpi {
         if !s.header_font.is_invalid() {
             let _ = DeleteObject(s.header_font.into());
         }
         s.header_font = theme::header_font(&s.theme, dpi, 8);
-        s.header_dpi = dpi;
+        s.header_dpi = tdpi;
     }
     let dc = CreateCompatibleDC(Some(wdc));
     let bmp = CreateCompatibleBitmap(wdc, cw, ch);
@@ -534,13 +540,13 @@ unsafe fn paint(hwnd: HWND, s: &mut State) {
     for (i, row) in s.rows.iter().enumerate() {
         let Some(r) = s.rects.get(i) else { break };
         let (top, bottom) = (r.top - s.scroll, r.bottom - s.scroll);
-        if bottom < 0 || top - sc(HEADER) > ch {
+        if bottom < 0 || top - scale(HEADER, tdpi) > ch {
             continue;
         }
         if (i == 0 || s.rows[i - 1].section != row.section) && !row.section.is_empty() {
             SelectObject(dc, s.header_font.into());
             SetTextColor(dc, COLORREF(t.secondary_text));
-            let mut hr = RECT { left: 2 * inset, top: top - sc(HEADER), right: cw - inset, bottom: top - sc(4) };
+            let mut hr = RECT { left: 2 * inset, top: top - scale(HEADER, tdpi), right: cw - inset, bottom: top - scale(4, tdpi) };
             let mut text: Vec<u16> = row.section.encode_utf16().collect();
             DrawTextW(dc, &mut text, &mut hr, DT_SINGLELINE | DT_BOTTOM | DT_NOPREFIX | DT_END_ELLIPSIS);
             SelectObject(dc, font.into());
@@ -587,7 +593,7 @@ mod tests {
             let sb = create(parent, 7).unwrap();
             let _ = MoveWindow(sb, 0, 0, 220, 400, false);
             set_rows(sb, vec![row("Favorites", "C:/Users"), row("This PC", "C:\\")]);
-            let r = layout(&state(sb).unwrap().rows, GetDpiForWindow(sb));
+            let r = layout(&state(sb).unwrap().rows, row_dpi(sb));
             let screen = |x: i32, y: i32| {
                 let mut p = windows::Win32::Foundation::POINT { x, y };
                 let _ = ClientToScreen(sb, &mut p);
@@ -708,8 +714,7 @@ mod tests {
             assert_eq!(state(sb).unwrap().selected, Some(0));
             assert_eq!(target(sb, 1), "C:\\");
             assert_eq!(target(sb, 9), "");
-            let dpi = GetDpiForWindow(sb);
-            assert_eq!(SendMessageW(sb, SM_ROW_TOP, Some(WPARAM(0)), None).0 as i32, layout(&state(sb).unwrap().rows, dpi)[0].top);
+            assert_eq!(SendMessageW(sb, SM_ROW_TOP, Some(WPARAM(0)), None).0 as i32, layout(&state(sb).unwrap().rows, row_dpi(sb))[0].top);
             assert_eq!(SendMessageW(sb, SM_ROW_TOP, Some(WPARAM(5)), None).0, -1);
             assert_eq!(SendMessageW(sb, SM_ROW_TARGET, Some(WPARAM(1)), None).0, 3);
             let mut buf = [0u16; 8];
@@ -757,7 +762,7 @@ mod tests {
             assert_ne!(k[0].state & STATE_SYSTEM_SELECTED, 0);
             assert_eq!(k[1].state & STATE_SYSTEM_SELECTED, 0);
             let dpi = GetDpiForWindow(sb);
-            let r = layout(&state(sb).unwrap().rows, dpi);
+            let r = layout(&state(sb).unwrap().rows, row_dpi(sb));
             let want = screen(sb, RECT { left: scale(INSET, dpi), top: r[1].top, right: 220 - scale(INSET, dpi), bottom: r[1].bottom });
             assert_eq!((k[1].rect.left, k[1].rect.top, k[1].rect.right, k[1].rect.bottom), (want.left, want.top, want.right, want.bottom));
             let r0 = root(&acc);

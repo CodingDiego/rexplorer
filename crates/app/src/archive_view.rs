@@ -5,10 +5,14 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rexplorer_core::archive::{self, Entry};
+use rexplorer_core::com::Pidl;
 use rexplorer_core::i18n::{tr, trf};
-use windows::core::Result;
+use rexplorer_core::preview;
+use windows::Win32::UI::Shell::{SHParseDisplayName, SHSimpleIDListFromPath};
+use windows::core::{HSTRING, Result};
 
 pub struct ArchiveListing {
     pub archive: PathBuf,
@@ -121,12 +125,7 @@ impl ArchiveListing {
         let mut h = DefaultHasher::new();
         self.archive.hash(&mut h);
         mtime.hash(&mut h);
-        let dest = extract_dir().join(format!("{:016x}", h.finish())).join(&e.parent);
-        let target = dest.join(&e.name);
-        if std::fs::metadata(&target).is_ok_and(|m| m.len() == e.size) {
-            return Ok(target);
-        }
-        archive::extract(&self.archive, &e.path, &dest)
+        extract_into(&self.archive, e, &extract_dir().join(format!("{:016x}", h.finish())))
     }
 
     pub fn extract_all_to(&self, dest: &Path) -> Result<()> {
@@ -136,6 +135,65 @@ impl ArchiveListing {
 
 pub fn extract_dir() -> PathBuf {
     std::env::temp_dir().join("rexplorer-archive")
+}
+
+/// Extracts member `e` under `root` at its own directory and returns its path; a file already there with the
+/// member's size is reused. `e.parent` comes from `archive::list`, which drops entries that climb out.
+pub fn extract_into(archive: &Path, e: &Entry, root: &Path) -> Result<PathBuf> {
+    let dest = root.join(&e.parent);
+    let target = dest.join(&e.name);
+    let whole = || std::fs::metadata(&target).is_ok_and(|m| m.len() == e.size);
+    if whole() {
+        return Ok(target);
+    }
+    // unrar sizes a large file in full before writing it, so a file only gets `target`'s name once whole: the size
+    // check above, and other threads extracting the same member (thumbnail, preview), never see a partial one.
+    static PART: AtomicU64 = AtomicU64::new(0);
+    let part = dest.join(format!(".part-{}-{}", std::process::id(), PART.fetch_add(1, Ordering::Relaxed)));
+    let done = archive::extract(archive, &e.path, &part).and_then(|p| Ok(std::fs::rename(p, &target)?));
+    let _ = std::fs::remove_dir_all(&part);
+    match done {
+        // Another thread put the same member there first and the file is in use.
+        Err(_) if whole() => Ok(target),
+        r => r.map(|_| target),
+    }
+}
+
+/// Largest member extracted to show it (thumbnail, preview pane), by its header's unpacked size.
+pub const MEMBER_MAX: u64 = 32 << 20;
+
+/// Whether member `e` may be extracted to show it: a file within MEMBER_MAX that is a picture, or (with `text`)
+/// text the preview pane reads. By extension only.
+pub fn showable(e: &Entry, text: bool) -> bool {
+    let ext = Path::new(&e.name).extension().and_then(|x| x.to_str()).unwrap_or("");
+    !e.is_dir && e.size <= MEMBER_MAX && (preview::is_image(ext) || text && preview::kind(ext) == preview::Kind::Text)
+}
+
+/// This process's folder for members extracted to show them; removed on exit.
+pub fn session_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("rexplorer-show-{}", std::process::id()))
+}
+
+/// `archive`'s own folder under `session_dir`; removed when a tab showing it closes.
+pub fn show_dir(archive: &Path) -> PathBuf {
+    let mut h = DefaultHasher::new();
+    archive.hash(&mut h);
+    session_dir().join(format!("{:016x}", h.finish()))
+}
+
+/// A PIDL for a file named like member `e` (a folder for a directory) that touches no disk: the shell gives it
+/// its type's icon.
+pub fn member_pidl(e: &Entry) -> Option<Pidl> {
+    let path = if e.is_dir { std::env::temp_dir() } else { extract_dir().join(&e.name) };
+    let p = unsafe { SHSimpleIDListFromPath(&HSTRING::from(path.as_os_str())) };
+    (!p.is_null()).then(|| unsafe { Pidl::from_raw(p) })
+}
+
+/// The shell's PIDL of an existing file.
+pub fn path_pidl(path: &Path) -> Option<Pidl> {
+    let mut p = std::ptr::null_mut();
+    unsafe { SHParseDisplayName(&HSTRING::from(path.as_os_str()), None, &mut p, 0, None) }.ok()?;
+    (!p.is_null()).then(|| unsafe { Pidl::from_raw(p) })
 }
 
 #[cfg(test)]
@@ -227,6 +285,37 @@ mod tests {
         assert_eq!(ArchiveListing::detail(&d, 3), "");
         assert_eq!(ArchiveListing::detail(&entry("README", false, 10, 0), 2), "File");
         assert_eq!(ArchiveListing::detail(&entry("README", false, 10, 0), 3), "10 B");
+    }
+
+    #[test]
+    fn showable_members_and_their_folder() {
+        assert!(showable(&entry("a.JPG", false, 10, 0), false));
+        assert!(!showable(&entry("a.jpg", false, MEMBER_MAX + 1, 0), false), "over the cap");
+        assert!(!showable(&entry("a.jpg", true, 0, 0), false), "a directory");
+        assert!(!showable(&entry("a.txt", false, 10, 0), false), "text only for the preview");
+        assert!(showable(&entry("a.txt", false, 10, 0), true));
+        assert!(!showable(&entry("a.exe", false, 10, 0), true));
+        let (a, b) = (show_dir(Path::new("C:\\x\\a.rar")), show_dir(Path::new("C:\\x\\b.rar")));
+        assert!(a.starts_with(session_dir()) && b.starts_with(session_dir()) && a != b);
+        assert_eq!(a, show_dir(Path::new("C:\\x\\a.rar")));
+    }
+
+    #[test]
+    fn extract_into_reuses_and_stays_inside() {
+        let dir = std::env::temp_dir().join(format!("rexplorer-archive_view-into-{}", std::process::id()));
+        let rar = fixture(&dir);
+        let e = open(&rar, "").unwrap().entries.iter().find(|e| !e.is_dir).cloned().unwrap();
+        let root = dir.join("show");
+        let p1 = extract_into(&rar, &e, &root).unwrap();
+        let p2 = extract_into(&rar, &e, &root).unwrap();
+        let inside = p1.starts_with(&root);
+        let text = std::fs::read_to_string(&p1);
+        // The member alone: its scratch folder is gone.
+        let beside = p1.parent().and_then(|d| std::fs::read_dir(d).ok()).map_or(0, |d| d.count());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(inside && p1 == p2);
+        assert_eq!(beside, 1);
+        assert_eq!(text.unwrap(), "hello");
     }
 
     #[test]

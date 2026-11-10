@@ -17,7 +17,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Accessibility::{ROLE_SYSTEM_BUTTONMENU, ROLE_SYSTEM_PUSHBUTTON, ROLE_SYSTEM_TOOLBAR, STATE_SYSTEM_HASPOPUP};
 use windows::Win32::UI::Controls::*;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
+use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, PWSTR, Result, w};
 
@@ -74,6 +74,9 @@ struct State {
     ui_font: HFONT,
     tip: HWND,
     acc: Option<access::Server>,
+    /// Keyboard focus: the button (index into `buttons`) the arrow keys moved to, drawn while `focused`.
+    focus: usize,
+    focused: bool,
 }
 
 fn scale(px: i32, dpi: u32) -> i32 {
@@ -193,6 +196,8 @@ pub fn create(parent: HWND, id: usize, buttons: &[(u32, u16, &str)]) -> Result<H
             ui_font: HFONT::default(),
             tip: HWND::default(),
             acc: None,
+            focus: 0,
+            focused: false,
         }));
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -289,15 +294,37 @@ fn nth_button(buttons: &[Button], k: usize) -> Option<usize> {
     buttons.iter().enumerate().filter(|(_, b)| b.cmd != 0).nth(k).map(|(i, _)| i)
 }
 
+/// Accessible item index of the button at `i`.
+fn item_of(buttons: &[Button], i: usize) -> usize {
+    buttons[..i].iter().filter(|b| b.cmd != 0).count()
+}
+
 /// Raises STATECHANGE for the buttons at `indexes` (button indexes, mapped to item indexes), after the change is done.
 fn state_changed(hwnd: HWND, indexes: &[usize]) {
     let Some(s) = (unsafe { state(hwnd) }) else { return };
     for &i in indexes {
         if s.buttons[i].cmd != 0 {
-            let item = s.buttons[..i].iter().filter(|b| b.cmd != 0).count();
-            access::event(EVENT_OBJECT_STATECHANGE, hwnd, Some(item));
+            access::event(EVENT_OBJECT_STATECHANGE, hwnd, Some(item_of(&s.buttons, i)));
         }
     }
+}
+
+/// Where the keyboard focus goes from button `cur` on Left/Right/Home/End, among the buttons `ok` marks focusable
+/// (a command and enabled); nothing wraps.
+fn step_focus(ok: &[bool], cur: usize, key: VIRTUAL_KEY) -> usize {
+    let (Some(first), Some(last)) = (ok.iter().position(|&b| b), ok.iter().rposition(|&b| b)) else { return cur };
+    let cur = cur.min(ok.len());
+    match key {
+        VK_LEFT => ok[..cur].iter().rposition(|&b| b).unwrap_or(cur),
+        VK_RIGHT => ok.iter().skip(cur + 1).position(|&b| b).map_or(cur, |k| cur + 1 + k),
+        VK_HOME => first,
+        VK_END => last,
+        _ => cur,
+    }
+}
+
+fn focusable(buttons: &[Button]) -> Vec<bool> {
+    buttons.iter().map(|b| b.cmd != 0 && b.enabled).collect()
 }
 
 unsafe fn acc_tree(hwnd: HWND, s: &State, t: &mut access::Tree) {
@@ -305,6 +332,8 @@ unsafe fn acc_tree(hwnd: HWND, s: &State, t: &mut access::Tree) {
     let n = GetWindowTextW(hwnd, &mut buf) as usize;
     t.name = String::from_utf16_lossy(&buf[..n]);
     t.role = ROLE_SYSTEM_TOOLBAR;
+    t.focusable = true;
+    t.focus = (s.focused && s.focus < s.buttons.len() && s.buttons[s.focus].cmd != 0).then(|| item_of(&s.buttons, s.focus));
     for (i, b) in s.buttons.iter().enumerate().filter(|(_, b)| b.cmd != 0) {
         let tip = String::from_utf16_lossy(b.tip.split(|&c| c == 0).next().unwrap_or_default());
         // "Back (Alt+Left)": a reader says the name, and the key hint only as the shortcut.
@@ -489,6 +518,14 @@ unsafe fn paint(hwnd: HWND, s: &mut State) {
         }
         SelectObject(dc, s.font.into());
     }
+    if s.focused && s.focus < s.buttons.len() && s.buttons[s.focus].cmd != 0 {
+        // DrawFocusRect inverts what is under it, so it shows on every fill and in the contrast themes.
+        let r = rect(s.focus);
+        let i = scale(4, dpi);
+        SetTextColor(dc, COLORREF(t.text));
+        SetBkColor(dc, COLORREF(t.background));
+        let _ = DrawFocusRect(dc, &RECT { left: r.left + i, top: r.top + i, right: r.right - i, bottom: r.bottom - i });
+    }
     SelectObject(dc, old_font);
     let _ = BitBlt(wdc, 0, 0, cw, ch, Some(dc), 0, 0, SRCCOPY);
     SelectObject(dc, old_bmp);
@@ -539,6 +576,47 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
         }
         WM_PAINT => paint(hwnd, s),
+        WM_SETFOCUS | WM_KILLFOCUS => {
+            s.focused = msg == WM_SETFOCUS;
+            if s.focused
+                && let Some(i) = focusable(&s.buttons).iter().position(|&b| b) {
+                    s.focus = i;
+                    access::event(EVENT_OBJECT_FOCUS, hwnd, Some(item_of(&s.buttons, i)));
+                }
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+        WM_KEYDOWN | WM_SYSKEYDOWN => {
+            let key = VIRTUAL_KEY(wparam.0 as u16);
+            let cur = s.buttons.get(s.focus).filter(|b| b.cmd != 0 && b.enabled);
+            match key {
+                VK_LEFT | VK_RIGHT | VK_HOME | VK_END if msg == WM_KEYDOWN => {
+                    let to = step_focus(&focusable(&s.buttons), s.focus, key);
+                    if to != s.focus {
+                        s.focus = to;
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                        access::event(EVENT_OBJECT_FOCUS, hwnd, Some(item_of(&s.buttons, to)));
+                    }
+                }
+                // What a click sends; Down and Alt+Down (a system key) open a dropdown button's menu only.
+                VK_RETURN | VK_SPACE if msg == WM_KEYDOWN => {
+                    if let Some(cmd) = cur.map(|b| b.cmd) {
+                        command(hwnd, cmd);
+                    }
+                }
+                VK_DOWN => {
+                    if let Some(cmd) = cur.filter(|b| b.dropdown).map(|b| b.cmd) {
+                        command(hwnd, cmd);
+                    }
+                }
+                // The main window hands the focus on to the view.
+                VK_ESCAPE if msg == WM_KEYDOWN => {
+                    if let Ok(parent) = GetParent(hwnd) {
+                        let _ = SetFocus(Some(parent));
+                    }
+                }
+                _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
+            }
+        }
         WM_SETFONT => {
             s.ui_font = HFONT(wparam.0 as *mut c_void);
             update_tool_rects(hwnd, s);
@@ -817,6 +895,80 @@ mod tests {
             drop(hk);
             DestroyWindow(parent).unwrap();
             assert_eq!(acc.accChildCount().unwrap_err().code(), CO_E_OBJNOTCONNECTED);
+        }
+    }
+
+    #[test]
+    fn step_focus_skips_unfocusable_and_never_wraps() {
+        // [Back off] [sep] [Fwd] [Up] [spacer] [Menu]
+        let ok = [false, false, true, true, false, true];
+        assert_eq!(step_focus(&ok, 2, VK_LEFT), 2, "nothing before the first");
+        assert_eq!(step_focus(&ok, 2, VK_RIGHT), 3);
+        assert_eq!(step_focus(&ok, 3, VK_RIGHT), 5, "the spacer is skipped");
+        assert_eq!(step_focus(&ok, 5, VK_RIGHT), 5, "no wrap");
+        assert_eq!(step_focus(&ok, 5, VK_LEFT), 3);
+        assert_eq!((step_focus(&ok, 3, VK_HOME), step_focus(&ok, 3, VK_END)), (2, 5));
+        assert_eq!(step_focus(&[false; 3], 1, VK_END), 1, "nothing focusable");
+        assert_eq!(step_focus(&ok, 3, VK_UP), 3);
+    }
+
+    static KEY_CMD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    unsafe extern "system" fn key_parent_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        if msg == WM_COMMAND {
+            KEY_CMD.store(wparam.0, std::sync::atomic::Ordering::SeqCst);
+            return LRESULT(0);
+        }
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+
+    #[test]
+    fn keyboard_moves_presses_and_announces_focus() {
+        use crate::acc_test::*;
+        use rexplorer_core::com::ComInit;
+        use std::sync::atomic::Ordering::SeqCst;
+        let _com = ComInit::sta();
+        unsafe {
+            let hinst = GetModuleHandleW(None).unwrap().into();
+            let wc = WNDCLASSW { lpfnWndProc: Some(key_parent_proc), hInstance: hinst, lpszClassName: w!("RexToolbarKeyParent"), ..Default::default() };
+            RegisterClassW(&wc);
+            let parent = CreateWindowExW(WINDOW_EX_STYLE(0), w!("RexToolbarKeyParent"), PCWSTR::null(), WS_OVERLAPPEDWINDOW, 0, 0, 800, 200, None, None, Some(hinst), None).unwrap();
+            let tb = create(parent, 7, &[(1, 11, "Back"), SEPARATOR, (2, 12, "Forward"), (3, 13, "Sort")]).unwrap();
+            let _ = MoveWindow(tb, 0, 0, 600, 32, false);
+            set_label(tb, 13, "Sort", true);
+            set_enabled(tb, 11, false);
+            let key = |k: VIRTUAL_KEY, msg: u32| SendMessageW(tb, msg, Some(WPARAM(k.0 as usize)), None);
+            let at = || state(tb).unwrap().focus;
+            let hk = hook();
+            SendMessageW(tb, WM_SETFOCUS, None, None);
+            assert_eq!(at(), 2, "the first enabled button, not the disabled Back");
+            assert!(hk.take().contains(&(EVENT_OBJECT_FOCUS, tb, 2)));
+            assert_eq!(object(tb).accChildCount().unwrap(), 3);
+            key(VK_RIGHT, WM_KEYDOWN);
+            assert_eq!(at(), 3);
+            assert!(hk.take().contains(&(EVENT_OBJECT_FOCUS, tb, 3)));
+            key(VK_LEFT, WM_KEYDOWN);
+            assert_eq!(at(), 2);
+            KEY_CMD.store(0, SeqCst);
+            key(VK_DOWN, WM_KEYDOWN);
+            key(VK_DOWN, WM_SYSKEYDOWN);
+            assert_eq!(KEY_CMD.load(SeqCst), 0, "Down opens dropdown buttons only");
+            key(VK_RETURN, WM_KEYDOWN);
+            assert_eq!(KEY_CMD.load(SeqCst), 12);
+            key(VK_END, WM_KEYDOWN);
+            KEY_CMD.store(0, SeqCst);
+            key(VK_SPACE, WM_KEYDOWN);
+            assert_eq!(KEY_CMD.load(SeqCst), 13);
+            KEY_CMD.store(0, SeqCst);
+            key(VK_DOWN, WM_SYSKEYDOWN);
+            assert_eq!(KEY_CMD.load(SeqCst), 13, "Alt+Down opens the dropdown");
+            KEY_CMD.store(0, SeqCst);
+            key(VK_ESCAPE, WM_KEYDOWN);
+            assert_eq!(KEY_CMD.load(SeqCst), 0, "Esc presses nothing");
+            SendMessageW(tb, WM_KILLFOCUS, None, None);
+            assert!(!state(tb).unwrap().focused);
+            drop(hk);
+            DestroyWindow(parent).unwrap();
         }
     }
 

@@ -2,6 +2,7 @@
 name = "rexplorer"
 version = "0.1.4"
 edition = "2024"
+rust-version.workspace = true
 license = "MIT"
 repository = "https://github.com/CodingDiego/rexplorer"
 

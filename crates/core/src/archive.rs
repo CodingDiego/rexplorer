@@ -30,9 +30,16 @@ fn norm(p: &Path) -> String {
     p.to_string_lossy().replace('/', "\\").trim_matches('\\').to_string()
 }
 
-/// An entry that climbs out of the extraction directory.
+/// An entry that climbs out of the extraction directory: a ".." step, or a drive or stream colon (Path::join
+/// replaces the base with "C:x", and "a:s" writes a hidden stream).
 fn escapes(path: &str) -> bool {
-    path.split('\\').any(|c| c == "..")
+    path.contains(':') || path.split('\\').any(|c| c == "..")
+}
+
+/// The name unrar falls back to when Windows refuses the entry's own (its MakeNameUsable): without this check
+/// `report?.txt` would overwrite an existing `report_.txt`.
+fn usable(path: &str) -> String {
+    path.chars().map(|c| if matches!(c, '?' | '*' | '<' | '>' | '|' | '"') || c < ' ' { '_' } else { c }).collect()
 }
 
 /// Best-effort Mark-of-the-Web: the archive carries a Zone.Identifier stream only when it was downloaded.
@@ -123,10 +130,16 @@ pub fn extract(archive: &Path, entry_path: &str, dest_dir: &Path) -> Result<Path
 pub fn extract_all(archive: &Path, dest_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dest_dir).map_err(err)?;
     let mut cur = Archive::new(archive).open_for_processing().map_err(err)?;
-    let mut written = Vec::new();
+    let (mut written, mut kept) = (Vec::new(), 0usize);
     while let Some(h) = cur.read_header().map_err(err)? {
-        cur = if h.entry().is_file() {
-            written.push(norm(&h.entry().filename));
+        let path = norm(&h.entry().filename);
+        let refused = h.entry().is_file() && escapes(&path);
+        let file = h.entry().is_file() && !refused;
+        // unrar overwrites without asking; Explorer asks, and leaving the file there is the answer that loses nothing.
+        let taken = file && (dest_dir.join(&path).exists() || dest_dir.join(usable(&path)).exists());
+        kept += usize::from(taken || refused);
+        cur = if file && !taken {
+            written.push(path);
             h.extract_with_base(dest_dir).map_err(err)?
         } else {
             h.skip().map_err(err)?
@@ -135,6 +148,9 @@ pub fn extract_all(archive: &Path, dest_dir: &Path) -> Result<()> {
     // Only what this call wrote: "Extract here" lands next to files that were already there.
     for p in written {
         inherit_motw(archive, &dest_dir.join(p));
+    }
+    if kept > 0 {
+        return Err(err(crate::i18n::trf("err.extract_kept", &[("count", &kept)])));
     }
     Ok(())
 }
@@ -162,6 +178,12 @@ pub fn dos_time_to_systemtime(dos: u32) -> Option<SystemTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usable_matches_unrars_fallback_name() {
+        assert_eq!(usable("dir?\\re*port<>|\"\u{1}.txt"), "dir_\\re_port_____.txt");
+        assert_eq!(usable("plain name.txt"), "plain name.txt");
+    }
 
     fn crc32(data: &[u8]) -> u32 {
         let mut c = !0u32;
@@ -196,8 +218,13 @@ mod tests {
     }
 
     fn fixture(dir: &Path) -> PathBuf {
+        fixture_named(dir, "docs/a.txt")
+    }
+
+    /// A one-file RAR5 archive whose entry is `name` holding "hello".
+    fn fixture_named(dir: &Path, name: &str) -> PathBuf {
         std::fs::create_dir_all(dir).unwrap();
-        let name = b"docs/a.txt";
+        let name = name.as_bytes();
         let mut f = vec![2, 0x02];
         for v in [5, 0, 5, 0x20, 0, 0, name.len() as u64] {
             f.extend(vint(v));
@@ -247,7 +274,39 @@ mod tests {
     #[test]
     fn escaping_entries() {
         assert!(escapes("..\\..\\x") && escapes("a\\..\\b") && escapes(".."));
+        assert!(escapes("C:x") && escapes("C:\\Windows\\x") && escapes("a.txt:stream"));
         assert!(!escapes("a\\..b\\c") && !escapes("docs\\a.txt"));
+    }
+
+    #[test]
+    fn extract_all_never_replaces_or_escapes() {
+        let dir = tmp("conflict");
+        let out = dir.join("out");
+        // A file already at the target keeps its content, and the call says so.
+        std::fs::create_dir_all(out.join("docs")).unwrap();
+        std::fs::write(out.join("docs").join("a.txt"), "mine").unwrap();
+        let kept = extract_all(&fixture(&dir), &out);
+        let mine = std::fs::read_to_string(out.join("docs").join("a.txt"));
+        // An entry that climbs out of the target is not written anywhere, and the call says so.
+        let evil = fixture_named(&dir.join("evil"), "../escaped.txt");
+        let escaped = extract_all(&evil, &out.join("deep"));
+        let outside = out.join("escaped.txt").exists() || dir.join("evil").join("escaped.txt").exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(kept.is_err());
+        assert_eq!(mine.unwrap(), "mine");
+        assert!(escaped.is_err() && !outside);
+    }
+
+    #[test]
+    fn extract_one_never_escapes() {
+        // The thumbnail and preview path extracts single members: an entry that climbs out is never found, so never written.
+        let dir = tmp("one-evil");
+        let evil = fixture_named(&dir.join("evil"), "../escaped.txt");
+        let out = dir.join("evil").join("out");
+        let refused = extract(&evil, "../escaped.txt", &out).is_err() && extract(&evil, "..\\escaped.txt", &out).is_err();
+        let outside = dir.join("evil").join("escaped.txt").exists() || out.join("escaped.txt").exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(refused && !outside);
     }
 
     #[test]
@@ -277,5 +336,23 @@ mod tests {
     fn is_rar_case_insensitive() {
         assert!(is_rar(Path::new("a.RAR")));
         assert!(!is_rar(Path::new("a.zip")));
+    }
+
+    #[test]
+    fn fuzz_member_paths_never_escape_the_destination() {
+        let dest = Path::new("C:\\dest");
+        for seed in 0..500 {
+            let raw = crate::fuzz::Rng::new(seed).text(crate::fuzz::TOKENS, 20);
+            let n = norm(Path::new(&raw));
+            assert!(!n.contains('/') && !n.starts_with('\\') && !n.ends_with('\\'), "seed {seed}: {n:?}");
+            let (dir, name) = split(&n);
+            assert!(!name.contains('\\'), "seed {seed}");
+            assert_eq!(if dir.is_empty() { name.to_string() } else { format!("{dir}\\{name}") }, n, "seed {seed}");
+            if !escapes(&n) {
+                let p = dest.join(&n);
+                assert!(p.starts_with(dest), "seed {seed}: {p:?}");
+                assert!(!p.components().any(|c| matches!(c, std::path::Component::ParentDir)), "seed {seed}: {p:?}");
+            }
+        }
     }
 }

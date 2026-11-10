@@ -126,6 +126,7 @@ fn current(p: &Profile, key: &str) -> String {
 
 /// Splits the mapped values into those to write and those to skip with the reason (an i18n key). A key is written when the
 /// profile still has the default value for it (or `overwrite`) and the value would change it.
+#[allow(clippy::type_complexity)] // a pair of (key, value) and (key, reason) lists; a named type adds nothing
 pub fn decide(p: &Profile, mapped: Vec<(&'static str, String)>, overwrite: bool) -> (Vec<(&'static str, String)>, Vec<(&'static str, &'static str)>) {
     let default = Profile::default_profile();
     let (mut write, mut skip) = (Vec::new(), Vec::new());

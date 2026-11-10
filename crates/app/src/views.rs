@@ -255,7 +255,8 @@ pub(crate) unsafe fn rebuild_tall(app: *mut App) {
     }
     let (mut w, mut h) = (0, 0);
     let _ = ImageList_GetIconSize(a.views.small, Some(&mut w), Some(&mut h));
-    let tall = ImageList_Create(w, (ROW * GetDpiForWindow(a.hwnd) as i32 / 96 - ROW_PAD).max(h), ILC_COLOR32, 64, 64);
+    // The row holds a line of text, so its height follows the text size.
+    let tall = ImageList_Create(w, (ROW * theme::text_dpi(GetDpiForWindow(a.hwnd)) as i32 / 96 - ROW_PAD).max(h), ILC_COLOR32, 64, 64);
     let old = std::mem::replace(&mut a.views.tall, tall);
     a.views.tall_index.clear();
     SendMessageW(a.list, LVM_SETIMAGELIST, Some(WPARAM(LVSIL_SMALL as usize)), Some(LPARAM(tall.0)));
@@ -337,7 +338,7 @@ fn start_icon_export(hwnd: HWND, t: &Theme) {
 pub(crate) unsafe fn on_icons_exported(app: *mut App) {
     let Some(t) = (*app).views.icon_theme.as_mut() else { return };
     t.theme.forget_missing();
-    for t in (&mut (*app).tabs).iter_mut() {
+    for t in (*app).tabs.iter_mut() {
         match &mut t.source {
             Some(Source::Shell(l)) => l.icons.fill(ICON_UNKNOWN),
             Some(Source::Archive(a)) => a.icons.fill(ICON_UNKNOWN),
@@ -441,7 +442,8 @@ pub(crate) unsafe fn apply(app: *mut App) {
             SendMessageW(list, LVM_SETVIEW, Some(WPARAM(LV_VIEW_TILE as usize)), None);
         } else {
             // Distance between tile origins: image plus room for two lines of label.
-            let (cx, cy) = (size + 40 * dpi / 96, size + 44 * dpi / 96);
+            let tdpi = theme::text_dpi(dpi as u32) as i32;
+            let (cx, cy) = (size + 40 * tdpi / 96, size + 44 * tdpi / 96);
             SendMessageW(list, LVM_SETICONSPACING, Some(WPARAM(0)), Some(LPARAM(((cy as isize) << 16) | cx as isize)));
             SendMessageW(list, LVM_SETVIEW, Some(WPARAM(LV_VIEW_ICON as usize)), None);
         }
@@ -471,6 +473,7 @@ pub(crate) unsafe fn reset(app: *mut App, count: usize) {
 }
 
 /// LVN_GETDISPINFO in an icon view: the item's image, requesting it when unknown.
+#[allow(clippy::needless_borrow)] // the explicit borrow of a raw-pointer field silences rustc's dangerous_implicit_autorefs
 pub(crate) unsafe fn image(app: *mut App, i: usize) -> i32 {
     match (&(*app).views.slots).get(i) {
         Some(&UNKNOWN) => request(app, i),
@@ -514,7 +517,7 @@ pub(crate) unsafe fn on_cache_hint(app: *mut App, from: i32, to: i32) {
     // The lookahead preloads pictures only: no off-screen PDF, Office or video rendering.
     for i in thumbs::visible_range(from, to - from + 1, count, LOOKAHEAD) {
         // shortcut: the extension comes from a parsing name asked per lookahead row; keep it per item if the hint gets hot
-        if (&(*app).views.slots)[i] == UNKNOWN && listing(app).and_then(|l| l.items.get(i)).is_some_and(|it| is_picture(&it.parsing_name())) {
+        if (&(*app).views.slots)[i] == UNKNOWN && row_key(app, i).is_some_and(|p| is_picture(&p)) {
             request(app, i);
         }
     }
@@ -561,12 +564,19 @@ fn is_picture(parsing: &str) -> bool {
     rexplorer_core::preview::is_image(std::path::Path::new(parsing).extension().and_then(|e| e.to_str()).unwrap_or(""))
 }
 
+/// Row `i`'s name for the image cache: its parsing name, or an archive member's path inside its archive.
+unsafe fn row_key(app: *mut App, i: usize) -> Option<String> {
+    match nav::source(app)? {
+        Source::Shell(l) => l.items.get(i).map(|it| it.parsing_name()),
+        Source::Archive(a) => a.rows.get(i).map(|e| format!("{}\\{}", a.listing.archive.display(), e.path)),
+        _ => None,
+    }
+}
+
 /// From the cache when possible (image index), else queued on the worker (placeholder until it lands).
 unsafe fn request(app: *mut App, i: usize) -> i32 {
-    let Some(l) = listing(app) else { return 0 };
-    let Some(item) = l.items.get(i) else { return 0 };
+    let Some(parsing) = row_key(app, i) else { return 0 };
     let v = &mut (*app).views;
-    let parsing = item.parsing_name();
     let key = cache_key(v.view, v.size, &parsing);
     if let Some(bmp) = v.cache.get(&key) {
         let index = ImageList_Add(v.normal, bmp, None).max(0);
@@ -578,9 +588,25 @@ unsafe fn request(app: *mut App, i: usize) -> i32 {
     if !t.in_window(i) {
         return 0;
     }
-    // These views show pictures as thumbnails and everything else as its icon.
-    let icon_only = matches!(v.view, View::Icons | View::Medium | View::Tiles | View::Content) && !is_picture(&parsing);
-    t.request((v.token << 32) | i, l.folder.child_pidl(item), v.size, icon_only);
+    let id = (v.token << 32) | i;
+    match nav::source(app) {
+        Some(Source::Shell(l)) => {
+            // These views show pictures as thumbnails and everything else as its icon.
+            let icon_only = matches!(v.view, View::Icons | View::Medium | View::Tiles | View::Content) && !is_picture(&parsing);
+            t.request(id, l.folder.child_pidl(&l.items[i]), v.size, icon_only);
+        }
+        // A member is extracted (on the worker) only when it is a picture worth a thumbnail; the rest get their type's icon.
+        Some(Source::Archive(a)) => {
+            let e = &a.rows[i];
+            let Some(abs) = archive_view::member_pidl(e) else { return 0 };
+            if archive_view::showable(e, false) {
+                t.request_member(id, abs, v.size, a.listing.archive.clone(), e.clone());
+            } else {
+                t.request(id, abs, v.size, true);
+            }
+        }
+        _ => return 0,
+    }
     v.slots[i] = REQUESTED;
     0
 }
@@ -601,7 +627,7 @@ pub(crate) unsafe fn on_thumb_done(app: *mut App, wparam: WPARAM, lparam: LPARAM
     if shown {
         v.slots[i] = ImageList_Add(v.normal, bmp, None).max(0);
     }
-    let parsing = listing(app).and_then(|l| l.items.get(i)).map(|it| it.parsing_name());
+    let parsing = row_key(app, i);
     let v = &mut (*app).views;
     match parsing {
         Some(p) => v.cache.insert(cache_key(v.view, v.size, &p), bmp),
@@ -702,7 +728,7 @@ pub(crate) unsafe fn fit(src: HBITMAP, size: i32) -> Option<HBITMAP> {
     let _ = GdiFlush();
     let px = std::slice::from_raw_parts_mut(bits, (size * size * 4) as usize);
     // A source without alpha (all zero) blends to nothing: copy it opaque instead.
-    if !blended || px.chunks_exact(4).all(|p| p[3] == 0) {
+    if !blended || px.as_chunks::<4>().0.iter().all(|p| p[3] == 0) {
         SetStretchBltMode(dc, HALFTONE);
         let _ = StretchBlt(dc, x, y, dw, dh, Some(sdc), 0, 0, w, h, SRCCOPY);
         let _ = GdiFlush();

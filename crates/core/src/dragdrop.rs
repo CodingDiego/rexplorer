@@ -19,10 +19,11 @@ use crate::com::Pidl;
 use crate::folder::ShellFolder;
 use crate::item::ShellItem;
 
-/// The shell's IDataObject (CF_HDROP, shell ID list...) for items of `folder`.
-pub fn data_object(folder: &ShellFolder, items: &[&ShellItem]) -> Result<IDataObject> {
+/// The shell's IDataObject (CF_HDROP, shell ID list...) for items of `folder`. `owner` parents any UI the object
+/// shows while a target reads it (a zip folder's extraction progress or prompts).
+pub fn data_object(folder: &ShellFolder, items: &[&ShellItem], owner: HWND) -> Result<IDataObject> {
     let pidls: Vec<_> = items.iter().map(|i| i.pidl.as_ptr()).collect();
-    unsafe { folder.folder.GetUIObjectOf(HWND::default(), &pidls, None) }
+    unsafe { folder.folder.GetUIObjectOf(owner, &pidls, None) }
 }
 
 /// Drop target for the folder background (dropping into the folder itself).
@@ -160,6 +161,18 @@ pub fn drag(data: &IDataObject, hwnd: HWND) -> Result<DROPEFFECT> {
     unsafe { SHDoDragDrop(Some(hwnd), data, None::<&IDropSource>, DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK) }
 }
 
+/// The log line for a drag that changed nothing, so a later run can tell why: `Ok(NONE)` is a drop nowhere, a
+/// refusal or a cancel (the loop's DRAGDROP_S_* success codes); `Err` is a failure of the loop itself. None when a
+/// target applied an effect. `button_down`: whether a mouse button was still down when the loop started.
+pub fn drag_note(r: &Result<DROPEFFECT>, button_down: bool, ms: u128) -> Option<String> {
+    let what = match r {
+        Ok(e) if *e != DROPEFFECT_NONE => return None,
+        Ok(_) => "no effect".to_string(),
+        Err(e) => format!("failed: {e}"),
+    };
+    Some(format!("drag {what}; button down at start: {button_down}; {ms} ms"))
+}
+
 type Pick = Box<dyn Fn(POINTL) -> Option<IDropTarget>>;
 /// Called with the dropped data just before the target runs the drop.
 pub type OnDrop = Box<dyn Fn(POINTL, &IDataObject)>;
@@ -184,6 +197,7 @@ impl DropForwarder {
     }
 }
 
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // COM vtable methods: signatures fixed by IDropTarget_Impl
 impl IDropTarget_Impl for DropForwarder_Impl {
     fn DragEnter(&self, pdataobj: Ref<IDataObject>, grfkeystate: MODIFIERKEYS_FLAGS, pt: &POINTL, pdweffect: *mut DROPEFFECT) -> Result<()> {
         // No RefCell borrow is held across a call out: a target's Drop may pump messages and bring another drag here.
@@ -272,6 +286,7 @@ impl IDropTarget_Impl for DropForwarder_Impl {
 #[implement(IDropTarget)]
 struct PositionTarget(Box<dyn Fn(POINTL)>);
 
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // COM vtable methods: signatures fixed by IDropTarget_Impl
 impl IDropTarget_Impl for PositionTarget_Impl {
     fn DragEnter(&self, _: Ref<IDataObject>, _: MODIFIERKEYS_FLAGS, _: &POINTL, pdweffect: *mut DROPEFFECT) -> Result<()> {
         unsafe { *pdweffect = DROPEFFECT_MOVE };
@@ -370,7 +385,7 @@ mod tests {
         let fx = fixture("reenter");
         let f = ShellFolder::parse(fx.0.to_str().unwrap()).unwrap();
         let items = f.enumerate().unwrap();
-        let data = data_object(&f, &[items.iter().find(|i| !i.is_folder()).unwrap()]).unwrap();
+        let data = data_object(&f, &[items.iter().find(|i| !i.is_folder()).unwrap()], HWND::default()).unwrap();
         let slot = std::rc::Rc::new(RefCell::new(None));
         let inner: IDropTarget = Pumping(slot.clone()).into();
         let fwd: IDropTarget = DropForwarder::new(HWND::default(), Box::new(move |p| (p.x < 100).then(|| inner.clone()))).into();
@@ -411,7 +426,7 @@ mod tests {
         let fx = fixture("onDrop");
         let f = ShellFolder::parse(fx.0.to_str().unwrap()).unwrap();
         let items = f.enumerate().unwrap();
-        let data = data_object(&f, &[items.iter().find(|i| !i.is_folder()).unwrap()]).unwrap();
+        let data = data_object(&f, &[items.iter().find(|i| !i.is_folder()).unwrap()], HWND::default()).unwrap();
         let log = std::rc::Rc::new(RefCell::new(Vec::new()));
         let inner: IDropTarget = Recorder(log.clone()).into();
         let log2 = log.clone();
@@ -442,7 +457,7 @@ mod tests {
         let f = ShellFolder::parse(fx.0.to_str().unwrap()).unwrap();
         let items = f.enumerate().unwrap();
         let file = items.iter().find(|i| !i.is_folder()).unwrap();
-        let data = data_object(&f, &[file]).unwrap();
+        let data = data_object(&f, &[file], HWND::default()).unwrap();
         let fmt = FORMATETC {
             cfFormat: CF_HDROP.0,
             ptd: std::ptr::null_mut(),
@@ -469,13 +484,21 @@ mod tests {
     }
 
     #[test]
+    fn drag_note_skips_applied_drops() {
+        assert_eq!(drag_note(&Ok(DROPEFFECT_COPY), true, 5), None);
+        assert_eq!(drag_note(&Ok(DROPEFFECT_NONE), false, 3).as_deref(), Some("drag no effect; button down at start: false; 3 ms"));
+        let n = drag_note(&Err(windows::Win32::Foundation::E_UNEXPECTED.into()), true, 9).unwrap();
+        assert!(n.starts_with("drag failed: ") && n.contains("0x8000FFFF") && n.ends_with("; button down at start: true; 9 ms"), "{n}");
+    }
+
+    #[test]
     fn cut_paths_reads_a_move_data_object() {
         let _c = ComInit::ole();
         let fx = fixture("cut");
         let f = ShellFolder::parse(fx.0.to_str().unwrap()).unwrap();
         let items = f.enumerate().unwrap();
         let file = items.iter().find(|i| !i.is_folder()).unwrap();
-        let data = data_object(&f, &[file]).unwrap();
+        let data = data_object(&f, &[file], HWND::default()).unwrap();
         assert!(cut_paths(&data).is_empty(), "no effect means not a cut");
         let fmt = FORMATETC {
             cfFormat: unsafe { RegisterClipboardFormatW(w!("Preferred DropEffect")) } as u16,
@@ -514,7 +537,7 @@ mod tests {
         let sub = ShellFolder::parse(fx.0.join("sub").to_str().unwrap()).unwrap();
         let items = f.enumerate().unwrap();
         let file = items.iter().find(|i| !i.is_folder()).unwrap();
-        let data = data_object(&f, &[file]).unwrap();
+        let data = data_object(&f, &[file], HWND::default()).unwrap();
         let t = pidl_drop_target(&sub.pidl, HWND::default()).unwrap();
         let mut effect = DROPEFFECT_COPY | DROPEFFECT_MOVE;
         unsafe {
@@ -543,7 +566,7 @@ mod tests {
         let f = ShellFolder::parse(fx.0.to_str().unwrap()).unwrap();
         let items = f.enumerate().unwrap();
         let file = items.iter().find(|i| !i.is_folder()).unwrap();
-        let data = data_object(&f, &[file]).unwrap();
+        let data = data_object(&f, &[file], HWND::default()).unwrap();
         let target = folder_drop_target(&f, HWND::default()).unwrap();
         let fwd: IDropTarget = DropForwarder::new(HWND::default(), Box::new(move |p| (p.x < 100).then(|| target.clone()))).into();
         let keys = MODIFIERKEYS_FLAGS(MK_LBUTTON.0);

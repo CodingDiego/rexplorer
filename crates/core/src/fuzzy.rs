@@ -20,20 +20,20 @@ pub fn score(candidate: &str, query: &str) -> Option<i32> {
     let mut prev: Option<usize> = None; // index of previous match
     let mut prev_char: Option<char> = None;
     for (i, c) in candidate.chars().enumerate() {
-        if let Some(&want) = q.peek() {
-            if lower(c) == want {
-                q.next();
-                total += 16;
-                if prev_char.map_or(true, is_sep) {
-                    total += 8;
-                }
-                match prev {
-                    Some(p) if p + 1 == i => total += 8,
-                    Some(p) => total -= (i - p - 1) as i32,
-                    None => {}
-                }
-                prev = Some(i);
+        if let Some(&want) = q.peek()
+            && lower(c) == want
+        {
+            q.next();
+            total += 16;
+            if prev_char.is_none_or(is_sep) {
+                total += 8;
             }
+            match prev {
+                Some(p) if p + 1 == i => total += 8,
+                Some(p) => total -= (i - p - 1) as i32,
+                None => {}
+            }
+            prev = Some(i);
         }
         prev_char = Some(c);
     }

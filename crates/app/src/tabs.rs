@@ -320,7 +320,7 @@ unsafe fn notify(hwnd: HWND, code: u32, index: usize, to: usize) {
 unsafe fn acc_tree(hwnd: HWND, s: &State, t: &mut access::Tree) {
     let mut rc = RECT::default();
     let _ = GetClientRect(hwnd, &mut rc);
-    let lay = layout(s.titles.len(), rc.right, GetDpiForWindow(hwnd));
+    let lay = layout(s.titles.len(), rc.right, theme::text_dpi(GetDpiForWindow(hwnd)));
     t.name = tr("tabs.name").into();
     t.role = ROLE_SYSTEM_PAGETABLIST;
     t.focusable = true;
@@ -343,7 +343,7 @@ pub fn menu_point(hwnd: HWND, index: usize) -> POINT {
     unsafe {
         let mut rc = RECT::default();
         let _ = GetClientRect(hwnd, &mut rc);
-        let r = layout(count(hwnd), rc.right, GetDpiForWindow(hwnd)).rect(index);
+        let r = layout(count(hwnd), rc.right, theme::text_dpi(GetDpiForWindow(hwnd))).rect(index);
         let mut p = POINT { x: r.left, y: r.bottom };
         let _ = ClientToScreen(hwnd, &mut p);
         p
@@ -357,7 +357,7 @@ unsafe fn hit_at(hwnd: HWND, lparam: LPARAM) -> Hit {
     if s.is_null() || GetClientRect(hwnd, &mut rc).is_err() {
         return Hit::None;
     }
-    layout((*s).titles.len(), rc.right, GetDpiForWindow(hwnd)).hit(x, y)
+    layout((*s).titles.len(), rc.right, theme::text_dpi(GetDpiForWindow(hwnd))).hit(x, y)
 }
 
 /// The tab a drag-hover timer switches to: the one it was armed for, still under the cursor with a button
@@ -375,7 +375,7 @@ pub fn tab_at_screen(hwnd: HWND, x: i32, y: i32) -> Option<usize> {
         if s.is_null() || GetClientRect(hwnd, &mut rc).is_err() || !ScreenToClient(hwnd, &mut p).as_bool() {
             return None;
         }
-        match layout((*s).titles.len(), rc.right, GetDpiForWindow(hwnd)).hit(p.x, p.y) {
+        match layout((*s).titles.len(), rc.right, theme::text_dpi(GetDpiForWindow(hwnd))).hit(p.x, p.y) {
             Hit::Tab(i) | Hit::Close(i) => Some(i),
             _ => None,
         }
@@ -462,7 +462,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let mut rc = RECT::default();
                     if (*s).dragging && GetClientRect(hwnd, &mut rc).is_ok() {
                         let len = (*s).titles.len();
-                        let to = layout(len, rc.right, GetDpiForWindow(hwnd)).slot(x);
+                        let to = layout(len, rc.right, theme::text_dpi(GetDpiForWindow(hwnd))).slot(x);
                         if from < len && to != from {
                             move_tab(hwnd, from, to);
                             (*s).press = Some((to, px, py));
@@ -501,11 +501,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let mut pt = POINT { x: lparam.0 as i16 as i32, y: (lparam.0 >> 16) as i16 as i32 };
                 let mut wr = RECT::default();
                 // The parent is the main window, not the strip: a reorder ending just under the strip stays put.
-                if let Ok(parent) = GetParent(hwnd) {
-                    if ClientToScreen(hwnd, &mut pt).as_bool() && GetWindowRect(parent, &mut wr).is_ok() && torn_out(wr, pt.x, pt.y) {
+                if let Ok(parent) = GetParent(hwnd)
+                    && ClientToScreen(hwnd, &mut pt).as_bool() && GetWindowRect(parent, &mut wr).is_ok() && torn_out(wr, pt.x, pt.y) {
                         notify(hwnd, TN_TEAR, i, 0);
                     }
-                }
             }
         }
         WM_CAPTURECHANGED => with(hwnd, |s| {
@@ -618,7 +617,8 @@ unsafe fn paint(hwnd: HWND) {
         let dc = CreateCompatibleDC(Some(wdc));
         let bmp = CreateCompatibleBitmap(wdc, cw, ch);
         let old_bmp = SelectObject(dc, bmp.into());
-        draw(dc, s, &layout(s.titles.len(), cw, dpi), dpi, cw, ch);
+        // The tabs hold titles: their size follows the text size, the glyphs only the DPI.
+        draw(dc, s, &layout(s.titles.len(), cw, theme::text_dpi(dpi)), dpi, cw, ch);
         let _ = BitBlt(wdc, 0, 0, cw, ch, Some(dc), 0, 0, SRCCOPY);
         SelectObject(dc, old_bmp);
         let _ = DeleteObject(bmp.into());
@@ -715,7 +715,7 @@ mod tests {
             add(tabs, "a");
             add(tabs, "b");
             let _ = MoveWindow(tabs, 0, 0, 600, 36, false);
-            let l = layout(2, 600, GetDpiForWindow(tabs));
+            let l = layout(2, 600, theme::text_dpi(GetDpiForWindow(tabs)));
             let center = |r: RECT| {
                 let mut p = windows::Win32::Foundation::POINT { x: (r.left + r.right) / 2, y: (r.top + r.bottom) / 2 };
                 let _ = ClientToScreen(tabs, &mut p);
@@ -765,7 +765,7 @@ mod tests {
             add(tabs, t);
         }
         let _ = MoveWindow(tabs, 0, 0, 600, 36, false);
-        (parent, tabs, layout(3, 600, GetDpiForWindow(tabs)))
+        (parent, tabs, layout(3, 600, theme::text_dpi(GetDpiForWindow(tabs))))
     }
 
     fn center(r: RECT) -> (i32, i32) {
@@ -988,6 +988,7 @@ mod tests {
             assert_eq!(k.iter().map(|k| k.name.as_str()).collect::<Vec<_>>(), ["a", "b", "c", "New tab"]);
             assert_eq!(k.iter().map(|k| k.role).collect::<Vec<_>>(), [ROLE_SYSTEM_PAGETAB, ROLE_SYSTEM_PAGETAB, ROLE_SYSTEM_PAGETAB, ROLE_SYSTEM_PUSHBUTTON]);
             assert_eq!(k.iter().map(|k| k.state & STATE_SYSTEM_SELECTED != 0).collect::<Vec<_>>(), [true, false, false, false]);
+            #[allow(clippy::needless_range_loop)] // i also indexes l.rect(i), not only k
             for i in 0..3 {
                 let r = screen(tabs, l.rect(i));
                 assert_eq!((k[i].rect.left, k[i].rect.top, k[i].rect.right, k[i].rect.bottom), (r.left, r.top, r.right, r.bottom));

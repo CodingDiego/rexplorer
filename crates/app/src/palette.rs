@@ -143,10 +143,11 @@ pub fn open(parent: HWND, id: usize, candidates: Vec<Candidate>, t: &Theme, font
             };
             RegisterClassW(&wc);
         });
-        let dpi = match GetDpiForWindow(parent) {
+        // The popup is all text: its whole geometry follows the Windows text size.
+        let dpi = theme::text_dpi(match GetDpiForWindow(parent) {
             0 => 96,
             d => d,
-        };
+        });
         let model = Model::new(candidates);
         let (wd, ht) = (sc(WIDTH, dpi), height_for(model.results().len(), dpi));
         let mut pr = RECT::default();
@@ -597,7 +598,7 @@ mod tests {
             assert_eq!(k[1].state & STATE_SYSTEM_SELECTED, 0);
             let mut rc = RECT::default();
             let _ = GetClientRect(p, &mut rc);
-            let r = screen(p, row_rect(1, rc.right, GetDpiForWindow(parent).max(96)));
+            let r = screen(p, row_rect(1, rc.right, theme::text_dpi(GetDpiForWindow(parent).max(96))));
             assert_eq!((k[1].rect.left, k[1].rect.top, k[1].rect.right, k[1].rect.bottom), (r.left, r.top, r.right, r.bottom));
             let r0 = root(&acc);
             assert_eq!((r0.name.as_str(), r0.role), ("Command palette", ROLE_SYSTEM_LIST));

@@ -10,6 +10,8 @@ pub mod desktop;
 pub mod elevation;
 pub mod fallback;
 pub mod folder;
+#[cfg(test)]
+pub(crate) mod fuzz;
 pub mod fuzzy;
 pub mod i18n;
 pub mod icons;
@@ -26,7 +28,9 @@ pub mod search;
 pub mod settings;
 pub mod tree;
 pub mod undo;
+pub mod update;
 pub mod usn;
+pub mod wsearch;
 
 pub use folder::{Column, ShellFolder};
 pub use item::ShellItem;

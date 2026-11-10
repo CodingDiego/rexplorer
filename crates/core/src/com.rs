@@ -12,6 +12,8 @@ use windows::core::PWSTR;
 /// Initializes COM for the current thread and uninitializes it on drop.
 pub struct ComInit {
     ole: bool,
+    /// False when initialization failed: the guard then does not uninitialize.
+    ok: bool,
 }
 
 impl ComInit {
@@ -27,24 +29,30 @@ impl ComInit {
 
     /// STA plus OLE (drag and drop, clipboard); needed before RegisterDragDrop or DoDragDrop.
     pub fn ole() -> Self {
-        unsafe { OleInitialize(None).expect("OleInitialize") };
-        ComInit { ole: true }
+        let ok = unsafe { OleInitialize(None) }.is_ok();
+        ComInit { ole: true, ok }
     }
 
     fn init(kind: COINIT) -> Self {
-        // S_FALSE (already initialized) is fine; a real failure here is unrecoverable.
-        unsafe { CoInitializeEx(None, kind).ok().expect("CoInitializeEx") };
-        ComInit { ole: false }
+        // S_FALSE (already initialized) is fine; on failure COM calls degrade to errors.
+        let ok = unsafe { CoInitializeEx(None, kind) }.is_ok();
+        ComInit { ole: false, ok }
     }
 }
 
 impl Drop for ComInit {
     fn drop(&mut self) {
+        if !self.ok {
+            return;
+        }
         unsafe { if self.ole { OleUninitialize() } else { CoUninitialize() } };
     }
 }
 
 /// Copies a shell-allocated wide string into a `String` and frees the original.
+///
+/// # Safety
+/// `pw` is null or a valid NUL-terminated string allocated with CoTaskMemAlloc that nothing else frees.
 pub unsafe fn take_cotaskmem_string(pw: PWSTR) -> String {
     if pw.is_null() {
         return String::new();
@@ -55,6 +63,9 @@ pub unsafe fn take_cotaskmem_string(pw: PWSTR) -> String {
 }
 
 /// Converts a `STRRET` produced for `pidl` into a `String`.
+///
+/// # Safety
+/// `ret` was filled by the shell for `pidl`, which is valid for the call.
 pub unsafe fn strret_to_string(ret: &mut STRRET, pidl: *const ITEMIDLIST) -> String {
     let mut pw = PWSTR::null();
     if unsafe { StrRetToStrW(ret, Some(pidl), &mut pw) }.is_err() {
@@ -68,6 +79,9 @@ pub struct Pidl(*mut ITEMIDLIST);
 
 impl Pidl {
     /// Takes ownership of a PIDL allocated by the shell.
+    ///
+    /// # Safety
+    /// `p` is non-null and was allocated by the shell; nothing else frees it.
     pub unsafe fn from_raw(p: *mut ITEMIDLIST) -> Self {
         assert!(!p.is_null(), "null PIDL");
         Pidl(p)

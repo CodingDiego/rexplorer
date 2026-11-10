@@ -215,6 +215,8 @@ thread_local! {
     static PLACING: Cell<bool> = const { Cell::new(false) };
     static DRAG: RefCell<Option<DragStart>> = const { RefCell::new(None) };
     static FONT: Cell<isize> = const { Cell::new(0) };
+    /// Ctrl+Z / Ctrl+Y here: this process has no file list, so it keeps its own log.
+    static UNDO: RefCell<undo::Log> = RefCell::new(undo::Log::default());
 }
 
 /// Runs `f` on the state; None while it is borrowed or not set up yet. Never hold it across a call that can pump
@@ -280,13 +282,13 @@ pub(crate) fn run() -> Result<()> {
         crate::folder_options::sync(Settings::load().active_profile());
         let hinst = GetModuleHandleW(None)?.into();
         RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(wndproc), hInstance: hinst, lpszClassName: CLASS, ..Default::default() });
-        let hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, CLASS, w!("rexplorer desktop icons"), WS_POPUP | WS_CLIPCHILDREN, 0, 0, 0, 0, None, None, Some(hinst), None)?;
-        let style = WS_CHILD | WS_VISIBLE | WINDOW_STYLE((LVS_ICON | LVS_EDITLABELS | LVS_SHOWSELALWAYS | LVS_SHAREIMAGELISTS) as u32);
+        let hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, CLASS, &windows::core::HSTRING::from(tr("desk.icons_name")), WS_POPUP | WS_CLIPCHILDREN, 0, 0, 0, 0, None, None, Some(hinst), None)?;
+        let style = WS_CHILD | WS_VISIBLE | WINDOW_STYLE(LVS_ICON | LVS_EDITLABELS | LVS_SHOWSELALWAYS | LVS_SHAREIMAGELISTS);
         let list = CreateWindowExW(WINDOW_EX_STYLE(0), WC_LISTVIEWW, PCWSTR::null(), style, 0, 0, 0, 0, Some(hwnd), None, Some(hinst), None)?;
         let _ = windows::Win32::UI::Controls::SetWindowTheme(list, w!("Explorer"), PCWSTR::null());
         SendMessageW(list, LVM_SETEXTENDEDLISTVIEWSTYLE, Some(WPARAM(LVS_EX_TRANSPARENTSHADOWTEXT as usize)), Some(LPARAM(LVS_EX_TRANSPARENTSHADOWTEXT as isize)));
-        SendMessageW(list, LVM_SETBKCOLOR, None, Some(LPARAM(CLR_NONE as i32 as isize)));
-        SendMessageW(list, LVM_SETTEXTBKCOLOR, None, Some(LPARAM(CLR_NONE as i32 as isize)));
+        SendMessageW(list, LVM_SETBKCOLOR, None, Some(LPARAM(CLR_NONE as isize)));
+        SendMessageW(list, LVM_SETTEXTBKCOLOR, None, Some(LPARAM(CLR_NONE as isize)));
         set_text_color(list);
         // The shell's shared 48 px system image list: the control never destroys it (LVS_SHAREIMAGELISTS), and its
         // reference is kept for the life of the process.
@@ -511,7 +513,8 @@ unsafe fn delete_selection(hwnd: HWND, shift: bool) {
     let items = selected_items();
     let paths: Vec<String> = items.iter().map(|i| i.parsing_name()).filter(|p| ui::is_fs_path(p)).collect();
     if !shift && !items.is_empty() && paths.len() == items.len() {
-        let _ = undo::recycle(hwnd, &paths, false);
+        let done = undo::recycle(hwnd, &paths, false);
+        UNDO.with(|u| u.borrow_mut().record(undo::Op::Recycled(done)));
     } else {
         verb_on_selection(hwnd, "delete", shift);
     }
@@ -594,8 +597,21 @@ unsafe fn on_key(hwnd: HWND, list: HWND, vk: VIRTUAL_KEY) {
         _ if ctrl && vk.0 == b'C' as u16 => verb_on_selection(hwnd, "copy", false),
         _ if ctrl && vk.0 == b'X' as u16 => verb_on_selection(hwnd, "cut", false),
         _ if ctrl && vk.0 == b'V' as u16 => paste(hwnd),
+        _ if ctrl && (vk.0 == b'Z' as u16 || vk.0 == b'Y' as u16) => undo_step(hwnd, vk.0 == b'Y' as u16),
         _ => {}
     }
+}
+
+/// Reverses the newest entry, as the file list's Ctrl+Z / Ctrl+Y do.
+unsafe fn undo_step(hwnd: HWND, redo: bool) {
+    let Some(entry) = UNDO.with(|u| u.borrow_mut().take(redo)) else {
+        let _ = windows::Win32::System::Diagnostics::Debug::MessageBeep(MB_OK);
+        return;
+    };
+    // No borrow of the log across the shell's UI, which pumps messages.
+    let done = undo::reverse(hwnd, entry);
+    UNDO.with(|u| u.borrow_mut().put(redo, done));
+    SetTimer(Some(hwnd), TIMER_RELOAD, 150, None);
 }
 
 /// The edit box's text becomes the item's name, by the same rule as the file list (`name_cell`'s extension suffix);
@@ -607,6 +623,7 @@ unsafe fn end_edit(hwnd: HWND, index: i32, name: &str) {
     if name.is_empty() || name == shown {
         return;
     }
+    let before = target.parsing_name();
     // The shell's rename UI pumps messages; no reload may renumber the items under index `i` meanwhile.
     let was_busy = BUSY.replace(true);
     let done = match suffix {
@@ -615,6 +632,7 @@ unsafe fn end_edit(hwnd: HWND, index: i32, name: &str) {
     };
     BUSY.set(was_busy);
     if done.is_ok() {
+        UNDO.with(|u| u.borrow_mut().record(undo::Op::Rename { from: before, to: target.parsing_name() }));
         // The renamed item keeps its cell: the reload finds it under its new key.
         let new_key = target.parsing_name().to_lowercase();
         desk(|d| {
@@ -634,7 +652,7 @@ unsafe fn begin_drag(list: HWND, nm: &NMLISTVIEW) {
     let items = selected_items();
     let Ok(root) = ShellFolder::desktop() else { return };
     let refs: Vec<&ShellItem> = items.iter().collect();
-    let Ok(data) = dragdrop::data_object(&root, &refs) else { return };
+    let Ok(data) = dragdrop::data_object(&root, &refs, list) else { return };
     DRAG.with(|d| *d.borrow_mut() = Some(DragStart { start: nm.ptAction, anchor, moving }));
     // Modal. The returned effect is ignored: a rearrange ends with NONE, and nothing the drag does deletes sources.
     let _ = dragdrop::drag(&data, list);
@@ -677,11 +695,10 @@ unsafe fn register_drop(list: HWND) {
             return Some(position.clone());
         }
         let key = folder_item.as_ref().map_or(String::new(), |it| it.parsing_name());
-        if let Some((k, t)) = &*last.borrow() {
-            if *k == key {
+        if let Some((k, t)) = &*last.borrow()
+            && *k == key {
                 return Some(t.clone());
             }
-        }
         let root = ShellFolder::desktop().ok()?;
         let target = match &folder_item {
             Some(it) => dragdrop::item_drop_target(&root, it, list),

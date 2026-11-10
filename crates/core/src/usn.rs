@@ -97,7 +97,8 @@ fn enumerate(h: HANDLE, drive: char) -> Result<VolumeIndex> {
         if n < 8 {
             break;
         }
-        med.StartFileReferenceNumber = u64::from_le_bytes(buf[..8].try_into().unwrap());
+        let Ok(cursor) = <[u8; 8]>::try_from(&buf[..8]) else { break };
+        med.StartFileReferenceNumber = u64::from_le_bytes(cursor);
         parse_records(&buf[8..n], &mut entries);
     }
     Ok(VolumeIndex { drive, entries })
@@ -118,7 +119,9 @@ fn parse_records(buf: &[u8], into: &mut HashMap<u64, Entry>) {
         let (name_len, name_off) = (rd16(56) as usize, rd16(58) as usize);
         if rd16(4) == 2 && name_off + name_len <= len {
             let name: Vec<u16> = rec[name_off..name_off + name_len]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
             into.insert(
@@ -163,6 +166,10 @@ impl VolumeIndex {
     /// Number of indexed entries.
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
