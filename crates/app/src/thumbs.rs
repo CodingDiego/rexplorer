@@ -61,6 +61,13 @@ pub fn start(hwnd: HWND, msg: u32) -> Thumbs {
             let fitted = unsafe { views::fit(bmp, r.size) };
             let _ = unsafe { DeleteObject(HGDIOBJ(bmp.0)) };
             let Some(bmp) = fitted else { continue };
+            // The shell's overlay (shortcut arrow, sync state) goes on the tile as it does on the list's icons.
+            if let Some(o) = rexplorer_core::icons::overlay_bitmap(&r.abs) {
+                unsafe {
+                    views::blend_over(bmp, r.size, o);
+                    let _ = DeleteObject(HGDIOBJ(o.0));
+                }
+            }
             let posted = unsafe {
                 PostMessageW(Some(HWND(hwnd as *mut _)), msg, WPARAM(r.id), LPARAM(bmp.0 as isize))
             };

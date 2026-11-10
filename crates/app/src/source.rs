@@ -13,7 +13,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
-use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+use windows::Win32::UI::Shell::Common::{ITEMIDLIST, SHCOLSTATE_TYPE_STR};
 use windows::Win32::UI::Shell::{
     BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS, BROWSEINFOW, ILClone, ILIsEqual, ILRemoveLastID, IShellFolder,
     SHBindToParent, SHBrowseForFolderW, SHGFI_USEFILEATTRIBUTES, SHGetPathFromIDListW, SHParseDisplayName,
@@ -55,6 +55,11 @@ pub(crate) struct SearchRow {
     pub kind: String,
     pub size: String,
     pub is_folder: bool,
+    /// Packed system icon index of the file itself (see `ShellItem::icon_index`).
+    pub icon: i32,
+    pub bytes: Option<u64>,
+    /// The containing folder's absolute PIDL, to parse it again on the UI thread.
+    pub folder_pidl: Pidl,
 }
 
 pub(crate) struct SearchListing {
@@ -65,6 +70,8 @@ pub(crate) struct SearchListing {
     pub root_crumbs: Vec<Crumb>,
     pub rows: Vec<SearchRow>,
     pub icons: Vec<i32>,
+    /// Sorted column and whether descending; None is arrival order.
+    pub sort: Option<(usize, bool)>,
     pub generation: u64,
     pub running: bool,
     cancel: Arc<AtomicBool>,
@@ -103,7 +110,7 @@ pub(crate) struct SearchBatch {
 }
 
 fn col(index: u32, title: &str, width_chars: i32, right_align: bool) -> Column {
-    Column { index, title: title.to_string(), width_chars, right_align }
+    Column { index, title: title.to_string(), width_chars, right_align, kind: SHCOLSTATE_TYPE_STR }
 }
 
 fn parent_pidl(p: &Pidl) -> Option<Pidl> {
@@ -130,10 +137,7 @@ fn strip_ext(name: &str) -> &str {
 pub(crate) fn name_cell(e: &ShellItem) -> (String, Option<String>) {
     thread_local!(static NEVER: std::cell::RefCell<HashMap<String, bool>> = Default::default());
     let shown = e.display_name();
-    // Archives (.zip) are folders to the shell but files by name.
-    let (folder, stream) = (windows::Win32::System::SystemServices::SFGAO_FOLDER.0, windows::Win32::System::SystemServices::SFGAO_STREAM.0);
-    let attrs = e.attributes(folder | stream);
-    if attrs & folder != 0 && attrs & stream == 0 {
+    if named_folder(e) {
         return (shown, None);
     }
     let never = |ext: &str| NEVER.with_borrow_mut(|m| *m.entry(ext.to_lowercase()).or_insert_with(|| rexplorer_core::item::never_shows_ext(ext)));
@@ -152,6 +156,29 @@ fn file_name_cell(shown: String, file: &str, show: bool, never_shown: impl FnOnc
     } else {
         (shown, None)
     }
+}
+
+/// A folder by name: archives (.zip) are folders to the shell but files by name.
+fn named_folder(e: &ShellItem) -> bool {
+    let (folder, stream) = (windows::Win32::System::SystemServices::SFGAO_FOLDER.0, windows::Win32::System::SystemServices::SFGAO_STREAM.0);
+    let attrs = e.attributes(folder | stream);
+    attrs & folder != 0 && attrs & stream == 0
+}
+
+/// Where a rename's selection of `e`'s Name cell ends: before the extension the cell shows, None for all of it.
+pub(crate) fn rename_stem(e: &ShellItem) -> Option<usize> {
+    if named_folder(e) {
+        return None;
+    }
+    stem_len(&name_cell(e).0, &e.file_name())
+}
+
+/// UTF-16 length of `shown` before the extension of `file` (its file name), when `shown` ends with it: rename
+/// selects only that, as Explorer does.
+pub(crate) fn stem_len(shown: &str, file: &str) -> Option<usize> {
+    let ext = &file[strip_ext(file).len()..];
+    let stem = shown.strip_suffix(ext).filter(|s| !ext.is_empty() && !s.is_empty())?;
+    Some(stem.encode_utf16().count())
 }
 
 impl Source {
@@ -181,7 +208,7 @@ impl Source {
                 .rows
                 .get(i)
                 .map(|r| match sub {
-                    0 if !SHOW_EXT.load(Ordering::Relaxed) => name_cell(&r.item).0,
+                    // shortcut: names follow Show file extensions as of the search; F5 runs it again after a change
                     0 => r.name.clone(),
                     1 => r.folder.clone(),
                     2 => r.kind.clone(),
@@ -317,18 +344,18 @@ unsafe fn name_icon(app: *mut App, name: &str, dir: bool) -> i32 {
 
 /// Details-view small icon of row `i` of the active tab, cached per row.
 pub(crate) unsafe fn small_icon(app: *mut App, i: usize) -> i32 {
-    let (cache, name, dir, shell): (&mut Vec<i32>, String, bool, Option<(&ShellItem, &Pidl)>) = match &mut cur(app).source {
+    let (cache, name, dir, shell, own): (&mut Vec<i32>, String, bool, Option<(&ShellItem, &Pidl)>, Option<i32>) = match &mut cur(app).source {
         Some(Source::Shell(l)) => {
             let Some(item) = l.items.get(i) else { return 0 };
-            (&mut l.icons, String::new(), false, Some((item, &l.folder.pidl)))
+            (&mut l.icons, String::new(), false, Some((item, &l.folder.pidl)), None)
         }
         Some(Source::Archive(a)) => {
             let Some(e) = a.rows.get(i) else { return 0 };
-            (&mut a.icons, e.name.clone(), e.is_dir, None)
+            (&mut a.icons, e.name.clone(), e.is_dir, None, None)
         }
         Some(Source::Search(s)) => {
             let Some(r) = s.rows.get(i) else { return 0 };
-            (&mut s.icons, r.name.clone(), r.is_folder, None)
+            (&mut s.icons, r.name.clone(), r.is_folder, None, Some(r.icon))
         }
         _ => return 0,
     };
@@ -337,7 +364,16 @@ pub(crate) unsafe fn small_icon(app: *mut App, i: usize) -> i32 {
         *slot = match shell {
             // shortcut: icon lookup runs on the UI thread, move it to a worker when a slow folder visibly stutters
             Some((item, folder)) => views::theme_icon(app, item).unwrap_or_else(|| item.icon_index(folder).1),
-            None => name_icon(app, &name, dir),
+            // A search row has its file's own system icon already; the name only decides on a theme or on the list source.
+            None => match own {
+                Some(icon) => views::theme_icon_for(app, &name, dir).unwrap_or_else(|| {
+                    if !(*app).image_list_set {
+                        name_icon(app, &name, dir);
+                    }
+                    icon
+                }),
+                None => name_icon(app, &name, dir),
+            },
         };
     }
     *slot
@@ -480,7 +516,7 @@ pub(crate) unsafe fn start_search(app: *mut App, t: usize, needle: &str, push: b
     tab.watch = None;
     let old = tab.source.take();
     if let (true, Some(o)) = (push, &old) {
-        tab.back.push(o.location());
+        tab.back.push((o.location(), nav::history_label(o)));
         tab.forward.clear();
     }
     drop(old); // stops a previous search
@@ -497,6 +533,7 @@ pub(crate) unsafe fn start_search(app: *mut App, t: usize, needle: &str, push: b
         root_crumbs,
         rows: Vec::new(),
         icons: Vec::new(),
+        sort: None,
         generation,
         running: true,
         cancel: cancel.clone(),
@@ -583,7 +620,7 @@ pub(crate) fn hit_for_path(path: &Path) -> Option<Hit> {
         if child.is_null() {
             return None;
         }
-        Some(Hit { item: ShellItem { parent, pidl: Pidl::from_raw(child) }, folder: path.parent()?.display().to_string() })
+        Some(Hit { item: ShellItem { parent, pidl: Pidl::from_raw(child) }, folder: path.parent()?.display().to_string(), pidl: parent_pidl(&abs)? })
     }
 }
 
@@ -603,12 +640,16 @@ fn rows_of(hits: Vec<Hit>) -> Vec<SearchRow> {
                 }
             };
             let detail = |c: Option<u32>| c.map(|c| h.item.detail(c)).unwrap_or_default();
+            let is_folder = h.item.is_folder();
             SearchRow {
-                name: h.item.display_name(),
+                name: name_cell(&h.item).0,
                 kind: detail(type_col),
                 size: detail(size_col),
-                is_folder: h.item.is_folder(),
+                is_folder,
+                icon: h.item.icon_index(&h.pidl).1,
+                bytes: if is_folder { None } else { h.item.size() },
                 folder: h.folder,
+                folder_pidl: h.pidl,
                 item: h.item,
             }
         })
@@ -629,6 +670,9 @@ pub(crate) unsafe fn on_search_batch(app: *mut App, batch: Box<SearchBatch>) {
     }
     let count = s.rows.len();
     if t != (*app).active {
+        if let Some((c, d)) = s.sort {
+            sort_rows(s, c, d);
+        }
         return;
     }
     let list = (*app).list;
@@ -640,8 +684,105 @@ pub(crate) unsafe fn on_search_batch(app: *mut App, batch: Box<SearchBatch>) {
         if before == 0 {
             list::set_item_state(list, 0, LVIS_FOCUSED, LVIS_FOCUSED);
         }
+        if let Some(Source::Search(s)) = source(app) {
+            if let Some((c, d)) = s.sort {
+                sort_search(app, c, d);
+            }
+        }
     }
     ui::update_status(app);
+}
+
+/// Search rows by column `col` (0 name, 1 folder, 2 type, 3 size): folders first, then the column, then the name, natural order (StrCmpLogicalW, as Explorer).
+fn cells_cmp(col: usize, a: (&str, &str, &str, Option<u64>, bool), b: (&str, &str, &str, Option<u64>, bool)) -> std::cmp::Ordering {
+    let nat = |x: &str, y: &str| unsafe { windows::Win32::UI::Shell::StrCmpLogicalW(&HSTRING::from(x), &HSTRING::from(y)) }.cmp(&0);
+    b.4.cmp(&a.4).then_with(|| match col {
+        1 => nat(a.1, b.1),
+        2 => nat(a.2, b.2),
+        3 => a.3.cmp(&b.3),
+        _ => std::cmp::Ordering::Equal,
+    })
+    .then_with(|| nat(a.0, b.0))
+}
+
+pub(crate) fn search_cmp(col: usize, a: &SearchRow, b: &SearchRow) -> std::cmp::Ordering {
+    cells_cmp(col, (&a.name, &a.folder, &a.kind, a.bytes, a.is_folder), (&b.name, &b.folder, &b.kind, b.bytes, b.is_folder))
+}
+
+/// Stable, so batches arriving later do not flip equal rows; the icon cache goes with the order.
+fn sort_rows(s: &mut SearchListing, col: usize, desc: bool) {
+    s.rows.sort_by(|a, b| {
+        let o = search_cmp(col, a, b);
+        if desc { o.reverse() } else { o }
+    });
+    s.sort = Some((col, desc));
+    s.icons.fill(ICON_UNKNOWN);
+}
+
+/// Header click on the search results: sorts the active tab's rows and keeps selection and focus on the same items.
+pub(crate) unsafe fn sort_search(app: *mut App, col: usize, desc: bool) {
+    let list = (*app).list;
+    // A rename names its row by position until LVN_ENDLABELEDIT is done, and the edit survives a row count change:
+    // a sort now would put the new name on another file.
+    // shortcut: rows that arrive during a rename stay unsorted at the end until the next batch or header click.
+    if SendMessageW(list, LVM_GETEDITCONTROL, None, None).0 != 0 {
+        return;
+    }
+    let Some(Source::Search(s)) = &mut cur(app).source else { return };
+    // The sort moves the rows but not their PIDLs, so a PIDL's address is the row's identity.
+    let key = |r: &SearchRow| r.item.pidl.as_ptr() as usize;
+    let carry = list::snapshot(list, s.rows.len(), |i| s.rows.get(i).map(key));
+    sort_rows(s, col, desc);
+    views::reset(app, s.rows.len());
+    list::restore(list, &carry, s.rows.iter().map(key));
+    let _ = InvalidateRect(Some(list), None, true);
+    list::set_sort_arrow(app);
+}
+
+fn remove_indices<T>(v: &mut Vec<T>, gone: &[usize]) {
+    let mut gone = gone.to_vec();
+    gone.sort_unstable_by(|a, b| b.cmp(a));
+    gone.dedup();
+    let len = v.len();
+    for i in gone.into_iter().filter(|&i| i < len) {
+        v.remove(i);
+    }
+}
+
+/// After a delete: drops the `rows` whose file is gone (a cancelled delete keeps them). Only file system rows are
+/// stat'ed, so no pass over network paths. A delete made outside rexplorer shows up after F5.
+pub(crate) unsafe fn prune_search(app: *mut App, rows: &[usize]) {
+    let list = (*app).list;
+    let Some(Source::Search(s)) = &mut cur(app).source else { return };
+    let gone: Vec<usize> = rows
+        .iter()
+        .copied()
+        .filter(|&i| {
+            s.rows.get(i).is_some_and(|r| {
+                let p = r.item.parsing_name();
+                ui::is_fs_path(&p) && !Path::new(&p).exists()
+            })
+        })
+        .collect();
+    let Some(&first) = gone.iter().min() else { return };
+    remove_indices(&mut s.rows, &gone);
+    let len = s.rows.len();
+    s.icons = vec![ICON_UNKNOWN; len];
+    SendMessageW(list, LVM_SETITEMCOUNT, Some(WPARAM(len)), Some(LPARAM(LVSICF_NOSCROLL as isize)));
+    list::set_item_state(list, usize::MAX, LIST_VIEW_ITEM_STATE_FLAGS(0), LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0));
+    if len > 0 {
+        list::set_item_state(list, first.min(len - 1), LVIS_FOCUSED, LVIS_FOCUSED);
+    }
+    views::reset(app, len);
+    ui::update_status(app);
+}
+
+/// Search row `i` as an item of its folder parsed again on this thread (the walk's folder objects belong to a worker apartment).
+pub(crate) unsafe fn search_item(app: *mut App, i: usize) -> Option<ShellItem> {
+    let Some(Source::Search(s)) = source(app) else { return None };
+    let r = s.rows.get(i)?;
+    let f = ShellFolder::from_pidl(&r.folder_pidl).ok()?;
+    Some(ShellItem { parent: f.folder.clone(), pidl: r.item.pidl.clone() })
 }
 
 /// Escape: stop the active tab's search, keeping what it found.
@@ -789,6 +930,31 @@ mod tests {
     }
 
     #[test]
+    fn search_rows_sort_folders_first_then_column() {
+        let rows = [
+            ("a10.txt", "C:\\x", "Text", Some(10), false),
+            ("a2.txt", "C:\\y", "Text", Some(30), false),
+            ("sub", "C:\\x", "File folder", None, true),
+            ("B.txt", "C:\\a", "Text", Some(20), false),
+        ];
+        let order = |col: usize| {
+            let mut idx = [0usize, 1, 2, 3];
+            idx.sort_by(|&i, &j| cells_cmp(col, rows[i], rows[j]));
+            idx.map(|i| ["a", "b", "c", "d"][i]).join("")
+        };
+        assert_eq!(order(0), "cbad");
+        assert_eq!(order(3), "cadb");
+        assert_eq!(order(1), "cdab");
+    }
+
+    #[test]
+    fn remove_indices_drops_each_once() {
+        let mut v = vec!["a", "b", "c", "d"];
+        remove_indices(&mut v, &[3, 1, 3, 9]);
+        assert_eq!(v, ["a", "c"]);
+    }
+
+    #[test]
     fn name_cell_follows_show_extensions() {
         let cell = |shown: &str, file: &str, show: bool| file_name_cell(shown.to_string(), file, show, |e| e == ".lnk");
         let own = |t: &str, s: Option<&str>| (t.to_string(), s.map(str::to_string));
@@ -802,6 +968,19 @@ mod tests {
         assert_eq!(cell("Recycled name", "$R1X2.txt", true), own("Recycled name", None));
         assert_eq!(cell(".gitignore", ".gitignore", false), own(".gitignore", None));
         assert!(rexplorer_core::item::never_shows_ext(".lnk") && !rexplorer_core::item::never_shows_ext(".txt"));
+    }
+
+    #[test]
+    fn rename_selects_the_stem() {
+        assert_eq!(stem_len("a.txt", "a.txt"), Some(1));
+        assert_eq!(stem_len("archive.tar.gz", "archive.tar.gz"), Some(11));
+        assert_eq!(stem_len("ñandú.txt", "ñandú.txt"), Some(5));
+        assert_eq!((stem_len(".gitignore", ".gitignore"), stem_len("noext", "noext")), (None, None));
+        // Extensions hidden: the text is all name, its dots included.
+        assert_eq!((stem_len("report v1.2", "report v1.2.txt"), stem_len("Chrome", "Chrome.lnk")), (None, None));
+        // The shell hides them and Show file extensions puts them back: the cell carries the extension.
+        let (shown, _) = file_name_cell("report v1.2".into(), "report v1.2.txt", true, |_| false);
+        assert_eq!(stem_len(&shown, "report v1.2.txt"), Some(11));
     }
 
     #[test]

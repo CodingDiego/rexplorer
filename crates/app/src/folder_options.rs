@@ -32,6 +32,7 @@ const ID_UL_HOVER: i32 = 105;
 const ID_RECENT: i32 = 106;
 const ID_FREQ: i32 = 107;
 const ID_CLEAR: i32 = 108;
+const ID_RESTORE_TABS: i32 = 109;
 const ID_RESTORE: i32 = 110; // + page
 const ID_LIST: i32 = 120;
 const ID_HIDDEN_SHOW: i32 = 121;
@@ -82,7 +83,7 @@ const fn c(page: usize, kind: Kind, id: i32, text: &'static str, x: i32, y: i32,
 
 const RESTORE: (i32, i32, i32, i32) = (324, 352, 120, 26);
 
-const CTLS: [Ctl; 28] = [
+const CTLS: [Ctl; 30] = [
     c(0, Kind::Label, -1, "Open rexplorer to:", 12, 12, 180, 26),
     c(0, Kind::Combo, ID_START, "", 200, 12, 232, 26),
     c(0, Kind::Header, -1, "Click items as follows", 12, 52, 432, 20),
@@ -95,6 +96,8 @@ const CTLS: [Ctl; 28] = [
     c(0, Kind::Check, ID_FREQ, "Show frequently used folders on Home", 24, 236, 408, ROW),
     c(0, Kind::Label, -1, "Clear the recent folders list (Ctrl+P)", 24, 268, 300, 26),
     c(0, Kind::Push, ID_CLEAR, "Clear", 344, 268, 88, 26),
+    c(0, Kind::Header, -1, "Startup", 12, 304, 432, 20),
+    c(0, Kind::Check, ID_RESTORE_TABS, "Reopen the last tabs at startup", 24, 328, 296, ROW),
     c(0, Kind::Push, ID_RESTORE, "Restore defaults", RESTORE.0, RESTORE.1, RESTORE.2, RESTORE.3),
     c(1, Kind::Header, -1, "Advanced settings", 12, 12, 432, 20),
     c(1, Kind::List, ID_LIST, "", 12, 36, 432, 200),
@@ -612,6 +615,7 @@ unsafe fn load(st: &mut State, p: &Profile, page: Option<usize>) {
             (ID_UL_HOVER, !always),
             (ID_RECENT, p.show_recent),
             (ID_FREQ, p.show_frequent),
+            (ID_RESTORE_TABS, p.restore_tabs),
         ] {
             set_on(st, id, on);
         }
@@ -660,6 +664,7 @@ unsafe fn profile_of(st: &State, base: &Profile) -> Profile {
         underline_titles: if get_on(st, ID_UL_ALWAYS) { "always" } else { "hover" }.into(),
         show_recent: get_on(st, ID_RECENT),
         show_frequent: get_on(st, ID_FREQ),
+        restore_tabs: get_on(st, ID_RESTORE_TABS),
         show_hidden: get_on(st, ID_HIDDEN_SHOW),
         show_extensions: !get_on(st, ID_EXT),
         show_status: get_on(st, ID_STATUS),
@@ -1102,6 +1107,7 @@ unsafe fn apply_profile(app: *mut App, new: Profile) {
         ("underline_titles", old.underline_titles.clone(), new.underline_titles.clone()),
         ("show_recent", b(old.show_recent), b(new.show_recent)),
         ("show_frequent", b(old.show_frequent), b(new.show_frequent)),
+        ("restore_tabs", b(old.restore_tabs), b(new.restore_tabs)),
         ("show_status", b(old.show_status), b(new.show_status)),
         ("preview_handlers", b(old.preview_handlers), b(new.preview_handlers)),
         ("item_checkboxes", b(old.item_checkboxes), b(new.item_checkboxes)),

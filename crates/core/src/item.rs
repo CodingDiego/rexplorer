@@ -1,12 +1,12 @@
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
-use windows::Win32::Foundation::PROPERTYKEY;
+use windows::Win32::Foundation::{FILETIME, PROPERTYKEY};
 use windows::Win32::System::Registry::{RRF_RT_ANY, RegCloseKey, RegGetValueW};
 use windows::Win32::System::SystemServices::{SFGAO_FOLDER, SFGAO_HIDDEN};
-use windows::Win32::System::Variant::{VariantToBoolean, VariantToStringAlloc, VariantToUInt64};
+use windows::Win32::System::Variant::{PSTF_UTC, VariantToBoolean, VariantToFileTime, VariantToStringAlloc, VariantToUInt64};
 use windows::Win32::UI::Shell::Common::{SHELLDETAILS, STRRET};
 use windows::Win32::UI::Shell::{
-    ASSOCF_NONE, ASSOCKEY_CLASS, AssocQueryKeyW, ILCombine, IShellFolder, IShellFolder2, SHFILEINFOW, SHGDN_FORPARSING, SHGDN_INFOLDER,
+    ASSOCF_NONE, ASSOCKEY_CLASS, AssocQueryKeyW, ILCombine, IShellFolder, IShellFolder2, IShellIconOverlay, SHFILEINFOW, SHGDN_FORPARSING, SHGDN_INFOLDER,
     SHGDN_NORMAL, SHGDNF, SHGFI_PIDL, SHGFI_SMALLICON, SHGFI_SYSICONINDEX, SHGetFileInfoW,
 };
 use windows::core::{GUID, HSTRING, Interface, PCWSTR, Result, w};
@@ -18,6 +18,34 @@ use crate::com::{Pidl, strret_to_string};
 pub struct ShellItem {
     pub parent: IShellFolder,
     pub pidl: Pidl,
+}
+
+/// System image list index and the shell's overlay (0 none, 1-15) from one packed value; bit 31 stays clear, so ICON_UNKNOWN (i32::MIN) never collides.
+pub fn split_icon(packed: i32) -> (i32, u32) {
+    (packed & 0x00FF_FFFF, (packed as u32 >> 24) & 0xF)
+}
+
+/// The shell's overlay slot (1-15; 0 none) for `child` of `parent`: shortcut arrow, sync state, shared.
+// shortcut: asks the overlay handlers synchronously on the calling thread; OI_ASYNC (cache only, E_PENDING on a miss) if a big OneDrive folder stutters.
+pub fn overlay_slot(parent: &IShellFolder, child: *const windows::Win32::UI::Shell::Common::ITEMIDLIST) -> u32 {
+    let Ok(o) = parent.cast::<IShellIconOverlay>() else { return 0 };
+    let mut i = 0i32;
+    match unsafe { o.GetOverlayIndex(child, &mut i) } {
+        Ok(()) if (1..=15).contains(&i) => i as u32,
+        _ => 0,
+    }
+}
+
+/// A shortcut to `target` at `lnk` (tests only).
+#[cfg(test)]
+pub(crate) fn make_shortcut(target: &std::path::Path, lnk: &std::path::Path) {
+    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, IPersistFile};
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+    unsafe {
+        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).unwrap();
+        link.SetPath(&HSTRING::from(target.as_os_str())).unwrap();
+        link.cast::<IPersistFile>().unwrap().Save(&HSTRING::from(lnk.as_os_str()), true).unwrap();
+    }
 }
 
 impl ShellItem {
@@ -90,6 +118,15 @@ impl ShellItem {
         }
     }
 
+    /// A date property in UTC (`GetDetailsEx` + `VariantToFileTime`); None when the item has no value for it.
+    pub fn property_time(&self, key: &PROPERTYKEY) -> Option<FILETIME> {
+        let f2 = self.parent.cast::<IShellFolder2>().ok()?;
+        unsafe {
+            let v = f2.GetDetailsEx(self.pidl.as_ptr(), key).ok()?;
+            VariantToFileTime(&v, PSTF_UTC).ok()
+        }
+    }
+
     /// Attributes masked by `mask` (SFGAO_* flags).
     pub fn attributes(&self, mask: u32) -> u32 {
         let mut flags = mask;
@@ -109,7 +146,8 @@ impl ShellItem {
         self.attributes(SFGAO_HIDDEN.0) & SFGAO_HIDDEN.0 != 0
     }
 
-    /// Index into the system small image list, the opening app's icon in place of the shell's blank page.
+    /// Index into the system small image list, the opening app's icon in place of the shell's blank page, with the
+    /// shell's overlay (shortcut arrow, sync state) packed in bits 24-27 (see `split_icon`).
     /// Returns the image list handle too (same for every call).
     pub fn icon_index(&self, folder_pidl: &Pidl) -> (usize, i32) {
         unsafe {
@@ -123,7 +161,7 @@ impl ShellItem {
                 SHGFI_PIDL | SHGFI_SYSICONINDEX | SHGFI_SMALLICON,
             );
             // The parsing name keeps the extension that "hide extensions" strips from the display name.
-            (himl, crate::icons::app_fallback(info.iIcon, || self.name(SHGDNF(SHGDN_INFOLDER.0 | SHGDN_FORPARSING.0))))
+            (himl, crate::icons::app_fallback(info.iIcon, || self.name(SHGDNF(SHGDN_INFOLDER.0 | SHGDN_FORPARSING.0))) | (overlay_slot(&self.parent, self.pidl.as_ptr()) << 24) as i32)
         }
     }
 
@@ -155,5 +193,36 @@ pub fn never_shows_ext(ext: &str) -> bool {
         let found = RegGetValueW(key, PCWSTR::null(), w!("NeverShowExt"), RRF_RT_ANY, None, None, None).is_ok();
         let _ = RegCloseKey(key);
         found
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::com::ComInit;
+    use crate::folder::ShellFolder;
+
+    #[test]
+    fn split_icon_round_trip() {
+        assert_eq!(split_icon(5 | (2 << 24)), (5, 2));
+        assert_eq!(split_icon(0x00FF_FFFF), (0xFF_FFFF, 0));
+        assert!((15u32 << 24) as i32 > 0);
+    }
+
+    #[test]
+    fn shortcut_has_an_overlay_and_a_text_file_not() {
+        let _c = ComInit::sta();
+        let dir = std::env::temp_dir().join(format!("rexplorer-overlay-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("t.txt"), b"x").unwrap();
+        make_shortcut(&dir.join("t.txt"), &dir.join("t.lnk"));
+        let f = ShellFolder::parse(dir.to_str().unwrap()).unwrap();
+        let items = f.enumerate().unwrap();
+        let overlay = |name: &str| items.iter().find(|i| i.file_name() == name).map(|i| split_icon(i.icon_index(&f.pidl).1).1);
+        let (lnk, txt) = (overlay("t.lnk"), overlay("t.txt"));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(lnk.unwrap() > 0, "the shortcut arrow overlay (absent if the Shell Icons 29 override removed it)");
+        assert_eq!(txt, Some(0));
     }
 }

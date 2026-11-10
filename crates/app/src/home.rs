@@ -8,7 +8,8 @@
 //! from the listing's point of view with `selection`), HN_ACTIVATE (double-click or Enter on `index`),
 //! HN_CONTEXT (right-click; `index` usize::MAX on the background), HN_KEYDOWN (a key the page does not handle
 //! itself; `index` is the virtual key), HN_RENAME (an in-place rename of `index` was committed; the new name is
-//! `rename_text`).
+//! `rename_text`), HN_DRAG (the selection should be dragged; sent once the pointer moves past the system drag size
+//! with the left button down on a selected entry).
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -20,14 +21,14 @@ use std::sync::{Arc, Once};
 use rexplorer_core::com::{ComInit, Pidl, strret_to_string};
 use rexplorer_core::settings::Theme;
 use rexplorer_core::{ShellFolder, ShellItem, images};
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, PROPERTYKEY, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, PROPERTYKEY, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{NMHDR, SetScrollInfo, WC_EDITW, WM_MOUSELEAVE};
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, GetKeyState, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VIRTUAL_KEY, VK_A, VK_CONTROL, VK_DOWN, VK_END,
-    VK_ESCAPE, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_UP,
+    GetDoubleClickTime, GetFocus, GetKeyState, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VIRTUAL_KEY, VK_A, VK_CONTROL, VK_DOWN, VK_END,
+    VK_ESCAPE, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::Shell::Common::SHELLDETAILS;
 use windows::Win32::UI::Shell::{DefSubclassProc, IShellFolder, IShellFolder2, SetWindowSubclass};
@@ -45,6 +46,7 @@ pub const HN_RENAME: u32 = 0x9055;
 pub const HN_FILTER: u32 = 0x9056;
 /// Shift+F10 or the Menu key: as HN_CONTEXT, shown at `menu_point` instead of the cursor.
 pub const HN_CONTEXT_KEY: u32 = 0x9057;
+pub const HN_DRAG: u32 = 0x9058;
 /// Test hook: returns tiles << 16 | rows shown.
 pub const HM_COUNTS: u32 = WM_APP + 0x52;
 /// Test hook (the smoke test opens a recent file): selects and focuses the entry whose name or parsing name is
@@ -58,6 +60,8 @@ pub const HM_RECT: u32 = WM_APP + 0x54;
 const HM_ICON: u32 = WM_APP + 0x50;
 /// Coalesces the repaints HM_ICON asks for.
 const ICON_TIMER: usize = 1;
+/// Click-again rename: fires one double-click time after the release.
+const RENAME_TIMER: usize = 2;
 /// wparam: 0 cancels the rename edit, 1 commits it (a key), 2 commits it (the edit lost the focus).
 const HM_END_EDIT: u32 = WM_APP + 0x51;
 
@@ -417,6 +421,12 @@ struct State {
     selected: Vec<bool>,
     focus: Option<usize>,
     hover: Option<usize>,
+    /// Client point of a left press on an entry (no Ctrl); a drag starts when the pointer leaves it.
+    press: Option<(i32, i32)>,
+    /// The already-selected entry whose name the current press landed on: a rename candidate.
+    again: Option<usize>,
+    /// The entry RENAME_TIMER will rename.
+    rename_at: Option<usize>,
     tracking: bool,
     scroll: i32,
     theme: Theme,
@@ -498,6 +508,9 @@ pub fn create(parent: HWND, id: usize) -> Result<HWND> {
             selected: Vec::new(),
             focus: None,
             hover: None,
+            press: None,
+            again: None,
+            rename_at: None,
             tracking: false,
             scroll: 0,
             theme: Theme::light(),
@@ -549,6 +562,9 @@ pub fn set_content(hwnd: HWND, mut content: Content) {
         content.tiles.retain(|e| e.index != usize::MAX);
         content.rows.retain(|e| e.index != usize::MAX);
         end_edit(hwnd, s, 0);
+        // A press or a pending rename names an entry position, which may now hold another item.
+        s.press = None;
+        cancel_rename(hwnd, s);
         let mut old: HashMap<(bool, String), HBITMAP> = HashMap::new();
         let n_old = s.content.tiles.len();
         for (slot, icon) in std::mem::take(&mut s.icons).into_iter().enumerate() {
@@ -635,6 +651,17 @@ pub fn selection(hwnd: HWND) -> (Vec<usize>, Option<usize>) {
     }
 }
 
+/// Parsing name of the tile (a folder) under screen point (x, y); rows and the background give None.
+pub fn tile_key_at_screen(hwnd: HWND, x: i32, y: i32) -> Option<String> {
+    unsafe {
+        let s = state(hwnd)?;
+        let mut p = POINT { x, y };
+        let _ = ScreenToClient(hwnd, &mut p);
+        let e = entry_at(hwnd, s, LPARAM(((p.y as isize) << 16) | (p.x as isize & 0xFFFF)))?;
+        s.content.tiles.get(e).map(|t| t.key.clone())
+    }
+}
+
 /// Starts an in-place rename of the listing item `index`'s name; false when the page does not show it.
 pub fn begin_rename(hwnd: HWND, index: usize) -> bool {
     unsafe {
@@ -643,7 +670,7 @@ pub fn begin_rename(hwnd: HWND, index: usize) -> bool {
         end_edit(hwnd, s, 0);
         ensure_visible(hwnd, s, e);
         let r = name_rect(hwnd, s, e);
-        let name = s.entry(e).map(|x| x.name.clone()).unwrap_or_default();
+        let (name, key) = s.entry(e).map(|x| (x.name.clone(), x.key.clone())).unwrap_or_default();
         let text = HSTRING::from(name.as_str());
         let style = WS_CHILD | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32);
         let Ok(edit) = CreateWindowExW(WINDOW_EX_STYLE(0), WC_EDITW, PCWSTR(text.as_ptr()), style, r.left, r.top, r.right - r.left, r.bottom - r.top, Some(hwnd), None, None, None) else {
@@ -652,10 +679,11 @@ pub fn begin_rename(hwnd: HWND, index: usize) -> bool {
         s.edit = edit;
         s.edit_entry = e;
         SendMessageW(edit, WM_SETFONT, Some(WPARAM(s.font.0 as usize)), Some(LPARAM(1)));
-        // A file's name is selected without its extension, as Explorer does.
-        let end = if e >= s.content.tiles.len() { name.rfind('.').filter(|&k| k > 0).unwrap_or(name.len()) } else { name.len() };
-        let end = name[..end].encode_utf16().count();
-        SendMessageW(edit, windows::Win32::UI::Controls::EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(end as isize)));
+        // A file's name is selected without the extension it shows (none when the shell hides it), as Explorer does.
+        let file = key.rsplit('\\').next().unwrap_or_default();
+        let stem = (e >= s.content.tiles.len()).then(|| crate::source::stem_len(&name, file)).flatten();
+        let end = stem.map_or(-1, |n| n as isize);
+        SendMessageW(edit, windows::Win32::UI::Controls::EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(end)));
         let _ = SetWindowSubclass(edit, Some(edit_subclass), 1, hwnd.0 as usize);
         crate::edit::attach(edit);
         let _ = SetFocus(Some(edit));
@@ -722,6 +750,13 @@ unsafe fn end_edit(hwnd: HWND, s: &mut State, how: usize) {
     }
     s.rename_text = text;
     notify(hwnd, HN_RENAME, index);
+}
+
+/// Drops a pending click-again rename.
+unsafe fn cancel_rename(hwnd: HWND, s: &mut State) {
+    let _ = KillTimer(Some(hwnd), RENAME_TIMER);
+    s.rename_at = None;
+    s.again = None;
 }
 
 unsafe fn notify(hwnd: HWND, code: u32, index: usize) {
@@ -979,11 +1014,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             scroll_to(hwnd, s, y);
         }
         WM_MOUSEWHEEL => {
+            cancel_rename(hwnd, s);
             let delta = (wparam.0 >> 16) as i16 as i32;
             let y = s.scroll - delta * 3 * scale(ROW_H, GetDpiForWindow(hwnd)) / 120;
             scroll_to(hwnd, s, y);
         }
         WM_MOUSEMOVE => {
+            if let Some((px, py)) = s.press {
+                let (x, y) = (lparam.0 as i16 as i32, (lparam.0 >> 16) as i16 as i32);
+                // MK_LBUTTON: the button is still down.
+                if wparam.0 & 1 != 0 && ((x - px).abs() > GetSystemMetrics(SM_CXDRAG) || (y - py).abs() > GetSystemMetrics(SM_CYDRAG)) {
+                    s.press = None;
+                    cancel_rename(hwnd, s);
+                    notify(hwnd, HN_DRAG, 0);
+                    return LRESULT(0);
+                }
+            }
             if !s.tracking {
                 let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
                 s.tracking = TrackMouseEvent(&mut tme).is_ok();
@@ -996,10 +1042,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_MOUSELEAVE => {
             s.tracking = false;
+            s.press = None;
             s.hover = None;
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
         WM_LBUTTONDOWN | WM_RBUTTONDOWN => {
+            cancel_rename(hwnd, s);
+            s.press = None;
             let _ = SetFocus(Some(hwnd));
             if msg == WM_LBUTTONDOWN {
                 let (x, y) = (lparam.0 as i16 as i32, (lparam.0 >> 16) as i16 as i32 + s.scroll);
@@ -1016,6 +1065,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             let hit = entry_at(hwnd, s, lparam);
             let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
+            let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
+            // Clicking the name of the only selected entry again renames it (when the release is not a drag or a double-click).
+            let (cx, cy) = (lparam.0 as i16 as i32, (lparam.0 >> 16) as i16 as i32);
+            s.again = hit.filter(|&e| {
+                msg == WM_LBUTTONDOWN && !ctrl && !shift && s.selected[e] && s.selected.iter().filter(|&&b| b).count() == 1 && s.edit.is_invalid() && {
+                    let r = name_rect(hwnd, s, e);
+                    cx >= r.left && cx < r.right && cy >= r.top && cy < r.bottom
+                }
+            });
             match hit {
                 Some(e) if msg == WM_LBUTTONDOWN && ctrl => {
                     s.selected[e] = !s.selected[e];
@@ -1026,10 +1084,30 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 _ if ctrl => {}
                 _ => select_only(s, hit),
             }
+            if msg == WM_LBUTTONDOWN && !ctrl && hit.is_some() {
+                s.press = Some((cx, cy));
+            }
             let _ = InvalidateRect(Some(hwnd), None, false);
             notify(hwnd, HN_SELCHANGE, 0);
         }
+        WM_LBUTTONUP => {
+            let again = s.again.take();
+            if s.press.take().is_some() && let Some(e) = again.filter(|&e| entry_at(hwnd, s, lparam) == Some(e)) {
+                let _ = SetTimer(Some(hwnd), RENAME_TIMER, GetDoubleClickTime(), None);
+                s.rename_at = Some(e);
+            }
+        }
+        WM_TIMER if wparam.0 == RENAME_TIMER => {
+            let _ = KillTimer(Some(hwnd), RENAME_TIMER);
+            let index = s.rename_at.take().filter(|&e| s.selected.get(e) == Some(&true) && GetFocus() == hwnd).and_then(|e| s.entry(e)).map(|x| x.index);
+            // begin_rename reads the state itself: `s` is not used after it.
+            if let Some(index) = index {
+                let _ = begin_rename(hwnd, index);
+            }
+        }
         WM_LBUTTONDBLCLK => {
+            cancel_rename(hwnd, s);
+            s.press = None;
             if let Some(index) = entry_at(hwnd, s, lparam).and_then(|e| s.entry(e)).map(|x| x.index) {
                 notify(hwnd, HN_ACTIVATE, index);
             }
@@ -1044,6 +1122,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             notify(hwnd, HN_CONTEXT, index);
         }
         WM_KEYDOWN => {
+            cancel_rename(hwnd, s);
             let key = VIRTUAL_KEY(wparam.0 as u16);
             let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
             match key {
@@ -1089,6 +1168,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
         }
         WM_SETFOCUS | WM_KILLFOCUS => {
+            if msg == WM_KILLFOCUS {
+                cancel_rename(hwnd, s);
+            }
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
         _ => {
@@ -1252,6 +1334,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tile_key_at_screen_tiles_only() {
+        let _c = ComInit::sta();
+        let abs = ShellFolder::parse(std::env::temp_dir().to_str().unwrap()).unwrap().pidl;
+        let entry = |index: usize, key: &str, recent: bool, pinned: bool| Entry {
+            index,
+            key: key.into(),
+            name: String::new(),
+            subtitle: String::new(),
+            cells: Vec::new(),
+            abs: abs.clone(),
+            pinned,
+            recent,
+            shared: false,
+        };
+        unsafe {
+            let parent = CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR::null(), WS_OVERLAPPEDWINDOW, 0, 0, 1000, 700, None, None, None, None).unwrap();
+            let h = create(parent, 9).unwrap();
+            let _ = MoveWindow(h, 0, 0, 956, 600, false);
+            set_content(h, Content { columns: vec!["Name".into()], tiles: vec![entry(0, "C:/t", false, true)], rows: vec![entry(1, "C:/r.txt", true, false)] });
+            let l = current_layout(h, state(h).unwrap());
+            let screen = |r: RECT| {
+                let mut p = windows::Win32::Foundation::POINT { x: r.left + 10, y: r.top + 10 };
+                let _ = ClientToScreen(h, &mut p);
+                p
+            };
+            let p = screen(l.tiles[0]);
+            assert_eq!(tile_key_at_screen(h, p.x, p.y), Some("C:/t".to_string()));
+            let p = screen(l.rows[0]);
+            assert_eq!(tile_key_at_screen(h, p.x, p.y), None);
+            let _ = DestroyWindow(parent);
+        }
+    }
+
+    #[test]
     fn subtitles_relative_to_the_profile() {
         let p = r"C:\Users\v";
         assert_eq!(parent_label(r"C:\Users\v\Escritorio\project\dist", p), r"Escritorio\project");
@@ -1360,6 +1476,7 @@ mod tests {
             let h = create(parent, 9).unwrap();
             let _ = MoveWindow(h, 0, 0, 956, 600, false);
             set_theme(h, &Theme::dark());
+            let reload = c.clone();
             set_content(h, c);
             assert_eq!(SendMessageW(h, HM_COUNTS, None, None).0 as usize, (nt << 16) | recent.len());
             set_selection(h, &[100], Some(100));
@@ -1402,6 +1519,29 @@ mod tests {
             let _ = SetWindowTextW(h, PCWSTR(name.as_ptr()));
             assert_eq!(SendMessageW(h, HM_SELECT_NAMED, None, None).0, 0);
             assert_eq!(selection(h).0, vec![100]);
+            // A press on an entry, then the pointer moving past the drag size with the button down, starts a drag.
+            let drag = |dx: i32, keys: usize| {
+                let l = current_layout(h, state(h).unwrap());
+                let r = l.tiles[0];
+                let (x, y) = (r.left + 10, r.top + 10);
+                SendMessageW(h, WM_LBUTTONDOWN, Some(WPARAM(1)), Some(LPARAM(((y as isize) << 16) | x as isize)));
+                LAST.lock().unwrap().clear();
+                SendMessageW(h, WM_MOUSEMOVE, Some(WPARAM(keys)), Some(LPARAM(((y as isize) << 16) | (x + dx) as isize)));
+                SendMessageW(h, WM_LBUTTONUP, None, None);
+                LAST.lock().unwrap().contains(&(HN_DRAG, 0))
+            };
+            assert!(drag(40, 1), "far with the button down");
+            assert!(!drag(1, 1), "within the drag size");
+            assert!(!drag(40, 0), "button up");
+            // A reload between the press and the move drops the press: the entry under it may be another item now.
+            let r = current_layout(h, state(h).unwrap()).tiles[0];
+            let (x, y) = (r.left + 10, r.top + 10);
+            SendMessageW(h, WM_LBUTTONDOWN, Some(WPARAM(1)), Some(LPARAM(((y as isize) << 16) | x as isize)));
+            set_content(h, reload);
+            LAST.lock().unwrap().clear();
+            SendMessageW(h, WM_MOUSEMOVE, Some(WPARAM(1)), Some(LPARAM(((y as isize) << 16) | (x + 40) as isize)));
+            assert!(!LAST.lock().unwrap().contains(&(HN_DRAG, 0)));
+            assert!(state(h).unwrap().again.is_none() && state(h).unwrap().rename_at.is_none());
             DestroyWindow(parent).unwrap();
         }
     }

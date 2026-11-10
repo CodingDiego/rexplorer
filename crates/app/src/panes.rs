@@ -376,7 +376,7 @@ fn small_icon(pidl: &Pidl) -> Option<HICON> {
     (!fi.hIcon.is_invalid()).then_some(fi.hIcon)
 }
 
-fn known_folder(id: &GUID) -> Option<String> {
+pub(crate) fn known_folder(id: &GUID) -> Option<String> {
     unsafe {
         let p = SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None).ok()?;
         let s = p.to_string().ok();
@@ -421,6 +421,10 @@ fn sidebar_rows(bookmarks: &[(String, String)]) -> SidebarRows {
             b.add("Favorites", item.display_name(), item.parsing_name(), &qa.child_pidl(item), kind, true);
         }
     }
+    // The Recycle Bin is always a Favorites row; the dedupe skips it when Quick Access pinned it.
+    if let Ok(f) = ShellFolder::parse("shell:RecycleBinFolder") {
+        b.add("Favorites", f.name.clone(), f.parsing_name.clone(), &f.pidl, Kind::Place, true);
+    }
     let cloud = ui::cloud_roots();
     if let Ok(pc) = ShellFolder::parse("shell:MyComputerFolder") {
         // Drives, phones and other devices; not the user folders This PC shows too.
@@ -452,6 +456,12 @@ fn sidebar_rows(bookmarks: &[(String, String)]) -> SidebarRows {
     for (label, path) in cloud {
         if let Ok(f) = ShellFolder::parse(path) {
             b.add("Cloud", label.clone(), f.parsing_name.clone(), &f.pidl, Kind::Place, false);
+        }
+    }
+    // Libraries, as one row, when the shell has any (Explorer's nav pane option is not read).
+    if let Ok(f) = ShellFolder::parse("shell:Libraries") {
+        if f.enumerate().is_ok_and(|v| !v.is_empty()) {
+            b.add("", f.name.clone(), f.parsing_name.clone(), &f.pidl, Kind::Place, false);
         }
     }
     if let Ok(f) = ShellFolder::parse("shell:NetworkPlacesFolder") {
@@ -639,12 +649,13 @@ mod tests {
         let downloads = rows[1].target.to_lowercase();
         assert_eq!(rows.iter().filter(|r| r.target.to_lowercase() == downloads).count(), 1, "Quick Access does not repeat it");
         let recycle = "::{645FF040-5081-101B-9F08-00AA002F954E}";
-        // The Recycle Bin is listed once: under Favorites when Quick Access pins it (a per-user choice), else elsewhere.
+        // The Recycle Bin is listed once, under Favorites: pinned by Quick Access (a per-user choice) or added after it.
         let bins: Vec<usize> = rows.iter().enumerate().filter(|(_, r)| r.target.eq_ignore_ascii_case(recycle)).map(|(i, _)| i).collect();
         assert_eq!(bins.len(), 1, "Recycle Bin once: {names:?}");
-        if rows[bins[0]].section == "Favorites" {
-            assert_eq!(kinds[bins[0]], Kind::Pinned);
-        }
+        assert_eq!(rows[bins[0]].section, "Favorites");
+        assert!(matches!(kinds[bins[0]], Kind::Pinned | Kind::Place));
+        let libs = ShellFolder::parse("shell:Libraries").and_then(|f| f.enumerate()).is_ok_and(|v| !v.is_empty());
+        assert_eq!(rows.iter().any(|r| r.target.eq_ignore_ascii_case("::{031E4825-7B94-4DC3-B131-E946B44C8DD5}")), libs, "Libraries row iff the shell has libraries");
         assert!(rows.iter().any(|r| r.section == "This PC" && r.target == "C:\\"), "drives: {names:?}");
         assert!(!rows.iter().any(|r| r.section == "This PC" && r.target.len() > 3 && ui::is_fs_path(&r.target)), "no user folders under This PC");
         assert!(rows.iter().filter(|r| r.section == "Devices").all(|r| !NOT_DEVICES.contains(&r.target.as_str())));

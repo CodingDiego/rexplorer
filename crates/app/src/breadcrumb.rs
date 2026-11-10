@@ -7,7 +7,7 @@ use std::mem::size_of;
 use std::sync::Once;
 
 use rexplorer_core::settings::Theme;
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::*;
@@ -209,6 +209,19 @@ pub fn set_icon(hwnd: HWND, icon: Option<HICON>) {
     }
 }
 
+/// Crumb under screen point (x, y); not a chevron, the overflow or the empty field.
+pub fn crumb_at_screen(hwnd: HWND, x: i32, y: i32) -> Option<usize> {
+    unsafe {
+        let st = state(hwnd)?;
+        let mut p = POINT { x, y };
+        let _ = ScreenToClient(hwnd, &mut p);
+        match st.layout.hit(p.x - st.origin) {
+            Hit::Crumb(i) => Some(i),
+            _ => None,
+        }
+    }
+}
+
 unsafe fn notify(hwnd: HWND, code: u32, index: usize) {
     unsafe {
         let id = GetWindowLongPtrW(hwnd, GWLP_ID) as usize;
@@ -401,6 +414,29 @@ unsafe fn paint(hwnd: HWND, st: &mut State) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crumb_at_screen_only_crumbs() {
+        unsafe {
+            let parent = CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), windows::core::PCWSTR::null(), WS_OVERLAPPEDWINDOW, 0, 0, 800, 600, None, None, None, None).unwrap();
+            let h = create(parent, 7).unwrap();
+            let _ = MoveWindow(h, 0, 0, 600, 32, false);
+            let l = layout(&[40, 50], 10, 8, 500);
+            let (c1, chevron0) = (l.items[1].0, l.items[0].1);
+            state(h).unwrap().layout = l;
+            state(h).unwrap().origin = 30;
+            let screen = |x: i32| {
+                let mut p = windows::Win32::Foundation::POINT { x, y: 5 };
+                let _ = ClientToScreen(h, &mut p);
+                p
+            };
+            let p = screen(30 + c1.left + 1);
+            assert_eq!(crumb_at_screen(h, p.x, p.y), Some(1));
+            let p = screen(30 + chevron0.left + 1);
+            assert_eq!(crumb_at_screen(h, p.x, p.y), None, "a chevron");
+            let _ = DestroyWindow(parent);
+        }
+    }
 
     #[test]
     fn layout_all_fit() {

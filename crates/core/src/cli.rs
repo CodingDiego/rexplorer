@@ -30,6 +30,8 @@ pub struct Args {
     pub desktop: bool,
     /// Not ours to handle: pass the whole command line to Windows Explorer and exit.
     pub forward: bool,
+    /// A separate window that leaves the running one, and its session, alone.
+    pub new_window: bool,
 }
 
 /// Explorer's comma-chained switches in one argument (`/n,/e,/select,C:\x`). False when something in it is not
@@ -159,6 +161,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> std::result::Result<Arg
             "--overwrite" => out.overwrite = true,
             "--elevated" => out.elevated = true,
             "--desktop" => out.desktop = true,
+            "--new-window" => out.new_window = true,
             "-h" | "--help" => out.help = true,
             _ if a.starts_with('-') => return Err(format!("unknown option: {a}")),
             _ if a.starts_with('/') && !explorer_switches(&a, &mut it, &mut out) => {
@@ -191,6 +194,7 @@ pub fn usage() -> String {
      \x20 --overwrite         with --import-explorer: also replace values you changed in rexplorer\n\
      \x20 --recover           restore the previous session after a crash\n\
      \x20 --desktop           run the helper that shows rexplorer's context menu on the desktop\n\
+     \x20 --new-window        open a separate window (does not hand off; saves no session)\n\
      \x20 --elevated          when started elevated, stay so (drive-wide indexed search) instead of restarting unelevated\n\
      \x20 -h, --help          show this help\n"
         .to_string()
@@ -358,10 +362,17 @@ mod tests {
     }
 
     #[test]
+    fn new_window_flag() {
+        let a = p(&["--new-window", "C:\\x"]).unwrap();
+        assert!(a.new_window && a.paths == ["C:\\x"]);
+        assert!(!parse_payload(&payload(&Args { new_window: true, ..Default::default() })).new_window);
+    }
+
+    #[test]
     fn usage_mentions_every_option() {
         let u = usage();
         assert!(u.starts_with("rexplorer [options] [folder...]\n"));
-        for o in ["--select", "/select,", "--profile", "--new-tab", "-t", "--register", "--unregister", "--install", "--uninstall", "--import-explorer", "--overwrite", "--recover", "--elevated", "--desktop", "--search", "-h", "--help"] {
+        for o in ["--select", "/select,", "--profile", "--new-tab", "-t", "--register", "--unregister", "--install", "--uninstall", "--import-explorer", "--overwrite", "--recover", "--elevated", "--desktop", "--new-window", "--search", "-h", "--help"] {
             assert!(u.contains(o), "{o}");
         }
     }

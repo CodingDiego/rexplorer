@@ -8,7 +8,7 @@ use std::mem::size_of;
 use std::sync::Once;
 
 use rexplorer_core::settings::Theme;
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{NMHDR, WM_MOUSELEAVE};
@@ -232,6 +232,17 @@ pub fn target(hwnd: HWND, index: usize) -> String {
     unsafe { state(hwnd).and_then(|s| s.rows.get(index)).map(|r| r.target.clone()).unwrap_or_default() }
 }
 
+/// Row under screen point (x, y).
+pub fn row_at_screen(hwnd: HWND, x: i32, y: i32) -> Option<usize> {
+    unsafe {
+        let s = state(hwnd)?;
+        let mut p = POINT { x, y };
+        let _ = ScreenToClient(hwnd, &mut p);
+        s.sync(hwnd);
+        hit(&s.rects, p.y + s.scroll)
+    }
+}
+
 unsafe fn row_at(hwnd: HWND, s: &mut State, lparam: LPARAM) -> Option<usize> {
     s.sync(hwnd);
     hit(&s.rects, (lparam.0 >> 16) as i16 as i32 + s.scroll)
@@ -383,6 +394,28 @@ unsafe fn paint(hwnd: HWND, s: &mut State) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_at_screen_maps_screen_points() {
+        use windows::Win32::Graphics::Gdi::ClientToScreen;
+        unsafe {
+            let parent = CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR::null(), WS_OVERLAPPEDWINDOW, 0, 0, 800, 600, None, None, None, None).unwrap();
+            let sb = create(parent, 7).unwrap();
+            let _ = MoveWindow(sb, 0, 0, 220, 400, false);
+            set_rows(sb, vec![row("Favorites", "C:/Users"), row("This PC", "C:\\")]);
+            let r = layout(&state(sb).unwrap().rows, GetDpiForWindow(sb));
+            let screen = |x: i32, y: i32| {
+                let mut p = windows::Win32::Foundation::POINT { x, y };
+                let _ = ClientToScreen(sb, &mut p);
+                (p.x, p.y)
+            };
+            let (x, y) = screen(10, r[1].top + 2);
+            assert_eq!(row_at_screen(sb, x, y), Some(1));
+            let (x, y) = screen(10, 2);
+            assert_eq!(row_at_screen(sb, x, y), None, "the first header");
+            let _ = DestroyWindow(parent);
+        }
+    }
 
     fn row(section: &'static str, target: &str) -> Row {
         Row { section, label: target.to_string(), target: target.to_string(), icon: None }

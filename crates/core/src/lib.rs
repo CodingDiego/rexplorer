@@ -17,11 +17,13 @@ pub mod images;
 pub mod item;
 pub mod menu;
 pub mod notify;
+pub mod packaged;
 pub mod preview;
 pub mod register;
 pub mod search;
 pub mod settings;
 pub mod tree;
+pub mod undo;
 pub mod usn;
 
 pub use folder::{Column, ShellFolder};

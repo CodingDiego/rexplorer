@@ -10,7 +10,7 @@ use crate::nav::{Target, cur, go, listing, source};
 use windows::Win32::Foundation::COLORREF;
 use windows::Win32::Graphics::Gdi::{COLOR_MENUTEXT, CreateCompatibleDC, DT_NOCLIP, DeleteDC, GdiFlush, GetSysColor, HBITMAP};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DrawTextW, EndPaint, FillRect, PAINTSTRUCT, SelectObject,
+    BeginPaint, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DrawTextW, EndPaint, FillRect, PAINTSTRUCT, SelectObject,
     SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::Storage::FileSystem::GetDriveTypeW;
@@ -104,6 +104,7 @@ pub(crate) unsafe fn create_children(app: *mut App) -> Result<()> {
     SendMessageW((*app).search, EM_SETCUEBANNER, Some(WPARAM(1)), Some(LPARAM(w!("Search").as_ptr() as isize)));
     let _ = SetWindowSubclass((*app).search, Some(source::search_subclass), 2, app as usize);
     edit::attach((*app).search);
+    let _ = edit::autocomplete((*app).addr); // before attach: the word-delete subclass must stay outermost
     edit::attach((*app).addr);
     (*app).tools = toolbar::create(
         hwnd,
@@ -136,9 +137,12 @@ pub(crate) unsafe fn create_children(app: *mut App) -> Result<()> {
     SendMessageW((*app).list, LVM_SETEXTENDEDLISTVIEWSTYLE, Some(WPARAM(0)), Some(LPARAM(ex as isize)));
     let _ = SetWindowSubclass((*app).list, Some(list::subclass), 1, app as usize);
     let header = HWND(SendMessageW((*app).list, LVM_GETHEADER, None, None).0 as *mut c_void);
+    // The header only reports a hot column (draw_header's hover fill) with HDS_HOTTRACK, which the ListView leaves off.
+    SetWindowLongPtrW(header, GWL_STYLE, GetWindowLongPtrW(header, GWL_STYLE) | HDS_HOTTRACK as isize);
     let _ = SetWindowSubclass(header, Some(list::header_subclass), 1, 0);
     list::register_drop(app);
     (*app).home = home::create(hwnd, ID_HOME)?;
+    list::register_folder_drops(app);
     panes::create_preview(app)?;
     if (*app).session.show_preview {
         let _ = ShowWindow((*app).panes.preview, SW_SHOW);
@@ -149,6 +153,8 @@ pub(crate) unsafe fn create_children(app: *mut App) -> Result<()> {
     apply_font(app);
     views::init(app);
     panes::refresh_sidebar(app);
+    // A cut made before launch fades too.
+    list::refresh_cut(app);
     Ok(())
 }
 
@@ -168,7 +174,8 @@ pub(crate) unsafe fn sync_list_style(app: *mut App) {
     // The control owns the state image list it holds even with LVS_SHAREIMAGELISTS: it destroys it when the check
     // box style is cleared or the theme changes. So each list we hand it is a fresh one, never kept on our side.
     SendMessageW(list, LVM_SETEXTENDEDLISTVIEWSTYLE, Some(WPARAM(LIST_EX_PROFILE as usize)), Some(LPARAM(list_ex(p) as isize)));
-    SendMessageW(list, LVM_SETCALLBACKMASK, Some(WPARAM(if p.item_checkboxes { LVIS_STATEIMAGEMASK.0 as usize } else { 0 })), None);
+    // LVIS_CUT: cut files show a faded icon (fill_dispinfo).
+    SendMessageW(list, LVM_SETCALLBACKMASK, Some(WPARAM((LVIS_CUT.0 | if p.item_checkboxes { LVIS_STATEIMAGEMASK.0 } else { 0 }) as usize)), None);
     if p.item_checkboxes {
         let checks = check_images(&(*app).theme, GetDpiForWindow((*app).hwnd) as i32);
         let auto = HIMAGELIST(SendMessageW(list, LVM_SETIMAGELIST, Some(WPARAM(LVSIL_STATE as usize)), Some(LPARAM(checks.0))).0);
@@ -244,6 +251,30 @@ pub(crate) unsafe fn apply_theme(app: *mut App) {
     panes::theme_tree(app);
 }
 
+/// ImmersiveColorSet: with `theme = system`, swaps to the light or dark theme when Windows' app mode changed.
+// shortcut: the icon theme stays what startup loaded and open modal dialogs keep their colours; a restart picks both up.
+pub(crate) unsafe fn follow_system_theme(app: *mut App) {
+    use windows::Win32::Graphics::Gdi::{RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE, RedrawWindow};
+    if !(*app).profile.theme.eq_ignore_ascii_case(settings::SYSTEM_THEME) {
+        return;
+    }
+    let name = settings::resolve_theme_name(settings::SYSTEM_THEME, rexplorer_core::import_explorer::apps_use_dark());
+    if (*app).theme.name == name {
+        return;
+    }
+    let theme = Settings::load().theme(name).clone();
+    let brushes = theme::Brushes::new(&theme);
+    // The class brush first: the old brushes are deleted when they are replaced below.
+    SetClassLongPtrW((*app).hwnd, GCLP_HBRBACKGROUND, brushes.background.0 as isize);
+    (*app).theme = theme;
+    (*app).brushes = brushes;
+    apply_theme(app);
+    sync_list_style(app);
+    apply_font(app);
+    layout(app);
+    let _ = RedrawWindow(Some((*app).hwnd), None, None, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME);
+}
+
 /// (Re)creates the UI font for the window's current DPI.
 pub(crate) unsafe fn apply_font(app: *mut App) {
     let font = theme::ui_font(&(*app).theme, GetDpiForWindow((*app).hwnd));
@@ -306,6 +337,33 @@ pub(crate) unsafe fn layout(app: *mut App) {
 /// The window keyboard focus goes to for the active tab: the Home page when it shows, else the list.
 pub(crate) unsafe fn view_hwnd(app: *mut App) -> HWND {
     if IsWindowVisible((*app).home).as_bool() { (*app).home } else { (*app).list }
+}
+
+/// F6 / Shift+F6: the pane after (before) `at` among `n`; the first when focus is in none of them.
+fn next_pane(at: Option<usize>, n: usize, back: bool) -> usize {
+    match at {
+        Some(i) if back => (i + n - 1) % n,
+        Some(i) => (i + 1) % n,
+        None => 0,
+    }
+}
+
+/// Moves the keyboard focus around the view, the address bar, the search box and the folder tree (when shown).
+pub(crate) unsafe fn cycle_focus(app: *mut App, back: bool) {
+    let view = source::browser_hwnd(app).unwrap_or_else(|| view_hwnd(app));
+    let tree = (*app).panes.tree.as_ref().filter(|_| (*app).session.show_tree).map(|t| t.hwnd());
+    let panes: Vec<HWND> = [Some(view), Some((*app).addr), Some((*app).search), tree].into_iter().flatten().collect();
+    let focus = GetFocus();
+    let at = panes.iter().position(|&h| h == focus || IsChild(h, focus).as_bool());
+    let h = panes[next_pane(at, panes.len(), back)];
+    if h == (*app).addr {
+        show_edit(app);
+    } else {
+        let _ = SetFocus(Some(h));
+        if h == (*app).search {
+            SendMessageW(h, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
+        }
+    }
 }
 
 /// WM_PAINT of the main window: the frame color everywhere the children leave, and the search field.
@@ -831,6 +889,27 @@ pub(crate) unsafe fn open_terminal(app: *mut App) {
     });
 }
 
+/// F11: the window covers its monitor without borders, or returns to its placement.
+pub(crate) unsafe fn toggle_fullscreen(app: *mut App) {
+    let hwnd = (*app).hwnd;
+    if let Some((placement, style)) = (*app).fullscreen.take() {
+        SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+        let _ = SetWindowPlacement(hwnd, &placement);
+        let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+        return;
+    }
+    let mut placement = WINDOWPLACEMENT { length: size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+    let mut mi = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+    if GetWindowPlacement(hwnd, &mut placement).is_err() || !GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi).as_bool() {
+        return;
+    }
+    let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    (*app).fullscreen = Some((placement, style));
+    SetWindowLongPtrW(hwnd, GWL_STYLE, style & !(WS_OVERLAPPEDWINDOW.0 as isize));
+    let r = mi.rcMonitor;
+    let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+}
+
 /// The status bar and the command bar's enabled states.
 pub(crate) unsafe fn update_status(app: *mut App) {
     commands::update(app);
@@ -839,8 +918,15 @@ pub(crate) unsafe fn update_status(app: *mut App) {
     }
     let count = source(app).map_or(0, |s| s.len());
     let selected = SendMessageW((*app).list, LVM_GETSELECTEDCOUNT, None, None).0 as usize;
-    // Selected bytes are omitted: the size column is shell-formatted text, not a number.
-    let mut left = statusbar::summary(count, selected, None);
+    // Remote folders are skipped: sizing up to 500 rows would stall on the network.
+    let bytes = match source(app) {
+        Some(Source::Shell(l)) if (1..=500).contains(&selected) && !is_remote(&l.folder.parsing_name) => {
+            let sizes: Vec<u64> = list::selected_indices((*app).list).iter().filter_map(|&i| l.items.get(i)).filter(|it| !it.is_folder()).filter_map(|it| it.size()).collect();
+            (!sizes.is_empty()).then(|| sizes.iter().sum())
+        }
+        _ => None,
+    };
+    let mut left = statusbar::summary(count, selected, bytes);
     if let Some(Source::Shell(l)) = source(app) {
         if let Some(e) = &l.denied {
             left = format!("Access denied: {e} (Ctrl+Shift+E opens it in Explorer)");
@@ -858,7 +944,7 @@ pub(crate) unsafe fn update_status(app: *mut App) {
 
 #[cfg(test)]
 mod tests {
-    use super::is_fs_path;
+    use super::{is_fs_path, next_pane};
 
     #[test]
     fn fs_paths() {
@@ -868,5 +954,14 @@ mod tests {
         assert!(!is_fs_path("::{20D04FE0-3AEA-1069-A2D8-08002B30309D}"));
         assert!(!is_fs_path("shell:Desktop"));
         assert!(!is_fs_path("C"));
+    }
+
+    #[test]
+    fn f6_cycles_panes() {
+        assert_eq!(next_pane(Some(0), 4, false), 1);
+        assert_eq!(next_pane(Some(3), 4, false), 0);
+        assert_eq!(next_pane(Some(0), 4, true), 3);
+        assert_eq!(next_pane(Some(2), 3, true), 1);
+        assert_eq!((next_pane(None, 3, false), next_pane(None, 3, true)), (0, 0));
     }
 }

@@ -587,7 +587,13 @@ mod tests {
 
     static LAST_CMD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+    static LAST_CONTEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
     unsafe extern "system" fn parent_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        if msg == WM_CONTEXTMENU {
+            LAST_CONTEXT.store(wparam.0, std::sync::atomic::Ordering::SeqCst);
+            return LRESULT(0);
+        }
         if msg == WM_COMMAND {
             LAST_CMD.store(wparam.0, std::sync::atomic::Ordering::SeqCst);
             return LRESULT(0);
@@ -619,6 +625,23 @@ mod tests {
             SendMessageW(tb, WM_LBUTTONDOWN, Some(WPARAM(1)), Some(first));
             SendMessageW(tb, WM_LBUTTONUP, Some(WPARAM(0)), Some(first));
             assert_eq!(LAST_CMD.load(std::sync::atomic::Ordering::SeqCst), 0, "disabled button must not fire");
+            DestroyWindow(parent).unwrap();
+        }
+    }
+
+    #[test]
+    fn right_click_reaches_the_parent_as_a_context_menu() {
+        unsafe {
+            let hinst = GetModuleHandleW(None).unwrap().into();
+            let wc = WNDCLASSW { lpfnWndProc: Some(parent_proc), hInstance: hinst, lpszClassName: w!("RexToolbarTestParent"), ..Default::default() };
+            RegisterClassW(&wc);
+            let parent = CreateWindowExW(WINDOW_EX_STYLE(0), w!("RexToolbarTestParent"), PCWSTR::null(), WS_OVERLAPPEDWINDOW, 0, 0, 400, 200, None, None, Some(hinst), None).unwrap();
+            let tb = create(parent, 7, &[(0xE72B, 11, "Back"), (0xE72A, 12, "Forward")]).unwrap();
+            let _ = MoveWindow(tb, 0, 0, 200, 32, false);
+            let at = LPARAM(10 + (10 << 16));
+            SendMessageW(tb, WM_RBUTTONDOWN, Some(WPARAM(2)), Some(at));
+            SendMessageW(tb, WM_RBUTTONUP, Some(WPARAM(0)), Some(at));
+            assert_eq!(LAST_CONTEXT.load(std::sync::atomic::Ordering::SeqCst), tb.0 as usize);
             DestroyWindow(parent).unwrap();
         }
     }

@@ -16,6 +16,80 @@ pub struct Session {
     pub show_preview: bool,
     pub tree_width: i32,
     pub preview_width: i32,
+    /// What each folder remembers, most recent first; kept in folders.txt beside session.txt.
+    pub folders: Vec<(String, FolderView)>,
+}
+
+/// One folder's remembered view, sort, grouping and columns.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FolderView {
+    pub view: String,
+    /// Shell column and descending.
+    pub sort: (u32, bool),
+    pub group: Option<u32>,
+    /// The shown columns in display order: shell index and width in 96-DPI pixels (0 = the shell's default). Empty
+    /// means the folder's default columns.
+    pub cols: Vec<(u32, i32)>,
+}
+
+const MAX_FOLDERS: usize = 500;
+const MAX_COLS: usize = 32;
+const MAX_LINE: usize = 2048;
+
+impl Session {
+    /// Stores `fv` for the folder as the most recent, dropping the oldest past the cap.
+    pub fn remember(&mut self, key: &str, fv: FolderView) {
+        self.folders.retain(|(k, _)| !k.eq_ignore_ascii_case(key));
+        self.folders.insert(0, (key.to_string(), fv));
+        self.folders.truncate(MAX_FOLDERS);
+    }
+}
+
+/// One folder per line, tab-separated, the name last (paths may hold anything but a tab or newline):
+/// `view sort-col desc(0|1) group-col(or -) idx:width,idx:width,... name`. An FTP password never goes in.
+pub fn format_folders(f: &[(String, FolderView)]) -> String {
+    let mut out = String::new();
+    let clean = |t: &str| !t.contains(['\t', '\r', '\n']);
+    for (key, v) in f.iter().filter(|(k, v)| !k.is_empty() && clean(k) && clean(&v.view) && crate::connect::redact(k) == *k).take(MAX_FOLDERS) {
+        let cols: Vec<String> = v.cols.iter().take(MAX_COLS).map(|(i, w)| format!("{i}:{w}")).collect();
+        let group = v.group.map_or("-".to_string(), |g| g.to_string());
+        out.push_str(&format!("{}\t{}\t{}\t{}\t{}\t{}\n", v.view, v.sort.0, v.sort.1 as u8, group, cols.join(","), key));
+    }
+    out
+}
+
+/// Reads `format_folders` text; a line that is too long, short or has a bad number is skipped.
+pub fn parse_folders(text: &str) -> Vec<(String, FolderView)> {
+    let mut out: Vec<(String, FolderView)> = Vec::new();
+    for line in text.lines().filter(|l| l.len() <= MAX_LINE) {
+        if out.len() >= MAX_FOLDERS {
+            break;
+        }
+        let f: Vec<&str> = line.splitn(6, '\t').collect();
+        let [view, col, desc, group, cols, key] = f[..] else { continue };
+        let (Ok(col), true) = (col.parse::<u32>(), matches!(desc, "0" | "1")) else { continue };
+        let group = match group {
+            "-" => Some(None),
+            g => g.parse().ok().map(Some),
+        };
+        let cols: Option<Vec<(u32, i32)>> = cols
+            .split(',')
+            .filter(|c| !c.is_empty())
+            .map(|c| c.split_once(':').and_then(|(i, w)| Some((i.parse().ok()?, w.parse::<i32>().ok()?.clamp(0, 4000)))))
+            .collect();
+        let (Some(group), Some(mut cols)) = (group, cols) else { continue };
+        if key.is_empty() || out.iter().any(|(k, _)| k.eq_ignore_ascii_case(key)) {
+            continue;
+        }
+        cols.truncate(MAX_COLS);
+        out.push((key.to_string(), FolderView { view: view.to_string(), sort: (col, desc == "1"), group, cols }));
+    }
+    out.truncate(MAX_FOLDERS);
+    out
+}
+
+pub fn folders_path() -> PathBuf {
+    path().with_file_name("folders.txt")
 }
 
 impl Default for Session {
@@ -29,6 +103,7 @@ impl Default for Session {
             show_preview: false,
             tree_width: 220,
             preview_width: 360,
+            folders: Vec::new(),
         }
     }
 }
@@ -75,13 +150,20 @@ pub fn format(s: &Session) -> String {
     out
 }
 
+/// Whether startup reopens the saved tabs: always after a crash; with restore_tabs only for a plain launch of the first window.
+pub fn restores(recover: bool, restore_tabs: bool, new_window: bool, names_something: bool) -> bool {
+    recover || (restore_tabs && !new_window && !names_something)
+}
+
 pub fn path() -> PathBuf {
     let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
     base.join("rexplorer").join("session.txt")
 }
 
 pub fn load() -> Session {
-    load_from(&path())
+    let mut s = load_from(&path());
+    s.folders = std::fs::read_to_string(folders_path()).map(|t| parse_folders(&t)).unwrap_or_default();
+    s
 }
 
 pub fn save(s: &Session) {
@@ -90,6 +172,7 @@ pub fn save(s: &Session) {
         let _ = std::fs::create_dir_all(dir);
     }
     let _ = save_to(&p, s);
+    let _ = std::fs::write(folders_path(), format_folders(&s.folders));
 }
 
 pub fn load_from(p: &Path) -> Session {
@@ -139,7 +222,18 @@ mod tests {
             show_preview: true,
             tree_width: 300,
             preview_width: 500,
+            folders: Vec::new(),
         }
+    }
+
+    #[test]
+    fn restores_rules() {
+        assert!(restores(true, false, false, false));
+        assert!(restores(true, false, false, true), "recover is unchanged");
+        assert!(restores(false, true, false, false));
+        assert!(!restores(false, true, true, false), "new window");
+        assert!(!restores(false, true, false, true), "paths given");
+        assert!(!restores(false, false, false, false));
     }
 
     #[test]
@@ -181,6 +275,52 @@ mod tests {
         assert_eq!(load_from(&p), Session::default());
         save_to(&p, &sample()).unwrap();
         assert_eq!(load_from(&p), sample());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn fv(view: &str, sort: (u32, bool), group: Option<u32>, cols: &[(u32, i32)]) -> FolderView {
+        FolderView { view: view.into(), sort, group, cols: cols.to_vec() }
+    }
+
+    #[test]
+    fn folders_round_trip() {
+        let f = vec![
+            ("C:\\a=b".to_string(), fv("icons", (3, true), Some(3), &[(0, 300), (3, 120)])),
+            ("::{20D04FE0-3AEA-1069-A2D8-08002B30309D}\\x".to_string(), fv("details", (0, false), None, &[])),
+        ];
+        assert_eq!(parse_folders(&format_folders(&f)), f);
+    }
+
+    #[test]
+    fn folders_bounded_and_bad_lines_skipped() {
+        let mut s = Session::default();
+        for i in 0..600 {
+            s.remember(&format!("C:\\f{i}"), fv("details", (0, false), None, &[]));
+        }
+        assert_eq!((s.folders.len(), s.folders[0].0.as_str()), (500, "C:\\f599"));
+        s.remember("C:\\A", fv("icons", (0, false), None, &[]));
+        s.remember("c:\\a", fv("details", (0, false), None, &[]));
+        assert_eq!(s.folders.iter().filter(|(k, _)| k.eq_ignore_ascii_case("C:\\a")).count(), 1);
+        assert_eq!(s.folders[0].1.view, "details");
+        assert!(parse_folders("junk\nicons\tx\t1\t-\t\tC:\\a\n").is_empty());
+        let cols = (0..40).map(|i| format!("{i}:99999")).collect::<Vec<_>>().join(",");
+        let p = parse_folders(&format!("icons\t0\t0\t-\t{cols}\tC:\\a\n"));
+        assert_eq!((p[0].1.cols.len(), p[0].1.cols[0].1), (32, 4000));
+        assert!(parse_folders(&format!("icons\t0\t0\t-\t\tC:\\{}\n", "x".repeat(3000))).is_empty());
+        let ftp = [("ftp://u:pw@h/x".to_string(), fv("icons", (0, false), None, &[]))];
+        assert!(!format_folders(&ftp).contains("pw"));
+    }
+
+    #[test]
+    fn folders_file_round_trip() {
+        let dir = std::env::temp_dir().join(format!("rexplorer-folders-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("folders.txt");
+        let read = || std::fs::read_to_string(&p).map(|t| parse_folders(&t)).unwrap_or_default();
+        assert!(read().is_empty());
+        let f = vec![("C:\\a".to_string(), fv("small", (2, true), Some(2), &[(0, 280), (2, 90)]))];
+        std::fs::write(&p, format_folders(&f)).unwrap();
+        assert_eq!(read(), f);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

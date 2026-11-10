@@ -92,6 +92,7 @@ pub(crate) fn run() -> Result<()> {
         let hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, CLASS, w!("rexplorer desktop menu"), WS_POPUP, 0, 0, 0, 0, None, None, Some(hinst), None)?;
         TARGET.store(hwnd.0 as isize, Ordering::SeqCst);
         std::thread::spawn(hook_thread);
+        rexplorer_core::packaged::warm();
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
@@ -394,6 +395,7 @@ unsafe fn menu_for(hwnd: HWND, list: HWND, at: At) {
         Some(Ok(Picked::Rename)) => index.map_or(Ok(()), |i| view.rename(i)),
         Some(Ok(Picked::Own(REFRESH))) => view.refresh(),
         Some(Ok(Picked::Own(PASTE))) => menu.map_or(Ok(()), |m| m.invoke_verb(hwnd, "paste", false)),
+        Some(Ok(Picked::Delete)) => menu.map_or(Ok(()), |m| m.invoke_verb(hwnd, "delete", false)),
         Some(Ok(Picked::Own(id))) if id >= SORT => SORT_KEYS.get(id - SORT).map_or(Ok(()), |(_, k)| view.sort_by(*k)),
         Some(Ok(Picked::Own(id))) if id >= ARRANGE_ID => ARRANGE.get(id - ARRANGE_ID).map_or(Ok(()), |(_, f)| view.toggle_flag(*f)),
         Some(Ok(Picked::Own(id))) if id >= ICON => ICON_SIZES.get(id - ICON).map_or(Ok(()), |(_, s)| view.set_icon_size(*s)),

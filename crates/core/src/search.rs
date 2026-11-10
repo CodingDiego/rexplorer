@@ -13,6 +13,8 @@ use crate::item::ShellItem;
 pub struct Hit {
     pub item: ShellItem,
     pub folder: String,
+    /// The containing folder's absolute PIDL.
+    pub pidl: Pidl,
 }
 
 /// Case-insensitive substring match; an empty needle matches nothing.
@@ -78,7 +80,7 @@ pub fn walk(
                 queue.push_back(folder.child_pidl(&item));
             }
             if matches(&item.display_name(), needle) {
-                hits.push(Hit { item, folder: folder.editing_name.clone() });
+                hits.push(Hit { item, folder: folder.editing_name.clone(), pidl: folder.pidl.clone() });
             }
         }
         if !hits.is_empty() {
@@ -116,6 +118,7 @@ mod tests {
             std::fs::write(dir.join(p), b"x").unwrap();
         }
         let root = ShellFolder::parse(dir.to_str().unwrap()).map(|f| f.pidl);
+        let want = ShellFolder::parse(dir.join("a").join("b").to_str().unwrap()).unwrap().pidl;
         let mut hits = Vec::new();
         let res = root.and_then(|r| {
             walk(&r, "needle", Scope::default(), &AtomicBool::new(false), &mut |h| hits.extend(h))
@@ -129,6 +132,7 @@ mod tests {
         assert_eq!(names, ["needle-x", "needle-y"]);
         let x = hits.iter().find(|h| bare(h.item.display_name()) == "needle-x").unwrap();
         assert!(x.folder.ends_with('b'), "{}", x.folder);
+        assert!(unsafe { windows::Win32::UI::Shell::ILIsEqual(want.as_ptr(), x.pidl.as_ptr()) }.as_bool(), "the hit carries its folder's PIDL");
     }
 
     #[test]
