@@ -1,47 +1,61 @@
-Lower CPU use and quicker responses: rexplorer no longer reloads a folder on every change notification, preloads
-less, and keeps slow shell work off the window's thread.
+Draft for the next release (the v1 release-candidate work). Not tagged yet; the 0.1.4 notes are in `CHANGELOG.md`.
 
-**Install.** Download the zip, extract it, and run `rexplorer.exe` to try it. `rexplorer.exe --install` makes it
-the default file manager for your user; it needs no administrator rights. Already installed? Run the new
-`rexplorer.exe --install` to replace the old copy. Undo with
+**Download.** Two zips: `rexplorer-<version>-x64.zip` and `rexplorer-<version>-arm64.zip`. The arm64 build is
+cross-compiled and has not been tested on ARM hardware yet. `SHA256SUMS.txt` lists both zips and both exes, the exes
+with their folder (`rexplorer-<version>-x64/rexplorer.exe`); check a download with `Get-FileHash` against it.
+
+**Install.** Extract the zip and run `rexplorer.exe` to try it. `rexplorer.exe --install` makes it the default file
+manager for your user, with no administrator rights; `--install --quiet` does it without a dialog. Already
+installed? Run the new `rexplorer.exe --install` to replace the old copy. Undo with
 `%LOCALAPPDATA%\Programs\rexplorer\rexplorer.exe --uninstall`.
 
-**CPU and latency.** Measured on the developer's machine against 0.1.1.
-- Change notifications (#11): a folder whose files keep changing reloads at most once a second, and not at all while
-  the window is minimized; restoring it catches up once. A folder under constant writes costs about a third of the
-  CPU it did, and about none while minimized. Idle CPU is about 7x lower.
-- Sidebar (#12): it is rebuilt every 30 seconds while shown instead of every 5, and right away when a drive is added
-  or removed.
-- Hover preview (#9): only text files and light images (png, jpg, gif, bmp, webp, ico) are loaded ahead when the
-  pointer rests on them, only once it has stopped moving for the hover delay, and only while rexplorer is the
-  active window. PDFs and other heavy types are previewed only when selected.
-- Preview pane (#10): showing the same file again keeps its preview handler instead of starting a new one.
-- Home (#13): it is built faster at startup, and its icons repaint in batches.
-- First launch (#14): Windows' system icons are exported only when the theme uses them (`icon_theme=default`).
-  First-launch CPU went from about 4.5 s to 0.5 s.
-- Icons view (#15): heavy types (PDF, video, documents) show icons instead of rendered thumbnails; pictures keep
-  thumbnails, and only pictures are loaded ahead of the scroll.
-- Open terminal (#16): it starts in the background, so the window no longer waits for it.
-- From the #17 backlog:
-  - Sorting runs on the load thread. Cell text and icons are cached, so repaints and type-to-select no longer ask
-    the shell again.
-  - Switching tabs reloads a folder only if it changed while the tab was in the background.
-  - Thumbnails of rows scrolled past are skipped, and thumbnails are scaled off the window's thread.
-  - Copy, Cut, Paste, Delete and Properties no longer load every shell extension (Copy: about 350 ms down to 80 ms).
-  - A navigation that is superseded stops early. Search stops at its result cap, and the elevated index search can
-    be cancelled.
-  - The breadcrumb chevron no longer lists network folders, the hidden folder tree is not kept in sync, and the
-    text preview reads up to 64 KB.
-  - A second launch waits for a busy first window instead of opening its own window after 3 s.
+**Added.**
+- Keyboard: F6 and Tab now reach the navigation toolbar, the tools bar and the command bar; arrows, Enter, Space,
+  Down and Esc work inside them. Left on the first crumb opens the breadcrumb's "..." menu.
+- Screen readers: the preview and details pane has an accessible name and reads its lines; the desktop icons
+  window is named "Desktop".
+- Text size: Windows' Accessibility > Text size (up to 225%) grows rexplorer's text and the bars and rows around
+  it, live.
+- Search: unelevated searches use the Windows Search index where it covers the folder, and walk what it leaves
+  out. The context menu works on results from several folders, and Back returns to the results.
+- Home: a Status column (cloud state) and sorting by column.
+- Archives (.rar): member icons in every view, picture thumbnails, and a preview of pictures and text.
+- Undo now also covers drops on the sidebar, crumbs, tabs and Home, the context menu's New submenu, and Delete and
+  rename in `--desktop-icons`. A new item from the context menu starts its rename at once.
+- An opt-in update check (Folder options > General, off by default): at most once a day, no telemetry, nothing
+  downloaded.
+- Crash reports stay on your PC in `%LOCALAPPDATA%\rexplorer\crashes` (a minidump, and a text report for a panic).
+  A UI thread blocked for 5 s is logged to `%APPDATA%\rexplorer\rexplorer.log`.
+- rexplorer's own icon and a version resource that names rexplorer only.
+- Paths over 260 characters, where Windows' LongPathsEnabled policy is on.
 
 **Fixes.**
-- Sorting keeps the selection on the same files. Before, it stayed on the same row positions, so a Delete right
-  after a sort could act on a file you had not picked.
-- Sorting in the Icons and Thumbnails views no longer leaves thumbnails on the wrong files.
-- Open terminal finds Windows Terminal installed outside the Store (scoop, the zip) on PATH, and never runs a
-  `wt.exe` found through the browsed folder.
+- Extract here / Extract all to never replace a file already in the target, and never write outside it.
+- A drag the target refused or you cancelled no longer shows an error box.
+- A second launch of another version no longer loses the folder it was asked to open: the hand-off is versioned.
+- A failed COM start no longer crashes the app.
+- Uninstall also removes `rexplorer.old` and the empty folders install created.
+
+**Settings format.** Settings files now carry `format=1`. The first start adds that one line to `settings.ini` and
+each theme and changes nothing else; unknown keys are kept. Files from 0.1.x load as they are.
+
+**Known gaps.** Copied from the Known gaps in the README at release time; the full checklist is
+`docs/EXPLORER-PARITY.md`.
+- Dragging files to other programs is unreliable (#75). Each failed drag is now logged to find the cause.
+- Most mouse- and keyboard-driven features added since 0.1.4, and everything in this release, are UNVERIFIED: built
+  and unit-tested, not tried with a real mouse, keyboard or screen reader.
+- The exe is not code-signed, so SmartScreen may warn.
+- A few internal window messages carry a pointer; another program at the same integrity level can crash
+  rexplorer with a bad value. This is a robustness gap, not a privilege boundary.
+- The address and search boxes have no accessible name. The breadcrumb's hidden crumbs are not keyboard stops.
+- Search results have no thumbnails or preview.
+- Archive members cannot be dragged, sorted by column or renamed; encrypted .rar has no password prompt,
+  multi-volume .rar is untested, and only .rar gets the archive view.
+- Undo does not cover pastes staged in %TEMP%, Keep-both copies, or paste and drop on `--desktop-icons`.
+- Fixed widths (sidebar, panes, search field) do not grow with Text size.
+- Not part of 1.0: merging a tab into another window, right-to-left layout, and FTP is present but unverified.
 
 **Roadmap.** `VERSION-1-X.md` lists what a stable 1.0 needs; each item has an issue in the v1.0 milestone (#71).
 
-The binary is built by GitHub Actions from the tagged commit; `SHA256SUMS.txt` lists the checksums. It is not
-code-signed, so SmartScreen may warn on first run.
+The binary is built by GitHub Actions from the tagged commit, twice, and the job fails if the two builds differ.
+It is not code-signed, so SmartScreen may warn on first run.

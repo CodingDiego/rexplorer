@@ -1,0 +1,25 @@
+# Draft for microsoft/winget-pkgs, not submitted yet.
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.10.0.schema.json
+
+PackageIdentifier: CodingDiego.rexplorer
+PackageVersion: 0.2.0
+PackageLocale: en-US
+Publisher: CodingDiego
+PublisherUrl: https://github.com/CodingDiego
+PublisherSupportUrl: https://github.com/CodingDiego/rexplorer/issues
+PackageName: rexplorer
+PackageUrl: https://github.com/CodingDiego/rexplorer
+License: MIT
+LicenseUrl: https://github.com/CodingDiego/rexplorer/blob/master/LICENSE
+ShortDescription: A fast Windows file manager that can replace Windows Explorer.
+Description: |-
+  A Windows file manager written in Rust. It shows the Windows shell namespace with plain Win32 controls and hands
+  everything it does not handle itself to the shell. Installing it makes it the default file manager for the current
+  user; no administrator rights are needed. Undo with rexplorer.exe --uninstall.
+Tags:
+  - explorer
+  - file-manager
+  - files
+ReleaseNotesUrl: https://github.com/CodingDiego/rexplorer/releases/tag/v0.2.0
+ManifestType: defaultLocale
+ManifestVersion: 1.10.0

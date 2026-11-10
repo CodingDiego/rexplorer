@@ -1,9 +1,21 @@
-# rexplorer smoke test. Windows PowerShell 5.1. Prints one PASS/FAIL/SKIP line per check, always exits 0.
-# -Screenshots also writes docs\screenshots\dark.png, light.png and home.png (rendered with PrintWindow).
-# -Only <regex> runs just the checks whose names match.
-param([switch]$Screenshots, [string]$Only)
+# rexplorer smoke test. Windows PowerShell 5.1. Prints one PASS/FAIL/SKIP line per check; exits 1 on any FAIL
+# (and, with -NoSkip, on any SKIP), else 0.
+#   -Exe <path>    the rexplorer.exe to test (default target\release\rexplorer.exe)
+#   -Only <regex>  runs just the checks whose names match
+#   -NoSkip        a SKIP counts as a failure (the release run)
+#   -UserState     lets 'pin' and 'home-open' change this user's Quick Access, Recent list and an HKCU file class
+#                  (each restored afterwards); without it they SKIP. Use it on CI or a test account.
+#   -Screenshots   also writes docs\screenshots\dark.png, light.png and home.png (rendered with PrintWindow)
+# Safety: the app runs on a scratch %APPDATA% and %LOCALAPPDATA% (so the crash check's minidump lands there),
+# scratch install folder and scratch registry base, all removed and the environment restored at the end; it is
+# driven by window messages to its own windows. The scratch profiles say language=en, since the checks read English
+# text. The one real input (the dnd check's mouse drag) is sent only while the foreground window belongs to the
+# process this script started, and the button is pressed and released only over that process's window. The
+# clipboard is restored after the checks that use it, only Explorer windows showing a folder this script created
+# are closed, and the share check closes only a sheet that rexplorer or the share host owns.
+param([switch]$Screenshots, [string]$Only, [string]$Exe = (Join-Path (Split-Path $PSScriptRoot -Parent) 'target\release\rexplorer.exe'),
+  [switch]$NoSkip, [switch]$UserState)
 $ErrorActionPreference = 'Stop'
-$Exe = Join-Path (Split-Path $PSScriptRoot -Parent) 'target\release\rexplorer.exe'
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing, Microsoft.VisualBasic, UIAutomationClient, UIAutomationTypes
 Add-Type @'
 using System; using System.Text; using System.Runtime.InteropServices; using System.Collections.Generic;
@@ -101,14 +113,49 @@ public static class W {
     var i = new INPUT { type = 0, mi = new MOUSEINPUT { dx = (int)((x - vx) * 65535L / (vw - 1)), dy = (int)((y - vy) * 65535L / (vh - 1)), flags = flags | 0x8000 | 0x4000 | 0x0001 } };
     SendInput(1, new[] { i }, Marshal.SizeOf(typeof(INPUT)));
   }
-  // A real mouse drag (SendInput): press at (x1, y1), `steps` moves over `ms` to (x2, y2), release.
-  public static void Drag(int x1, int y1, int x2, int y2, int steps, int ms) {
-    Mouse(0, x1, y1); System.Threading.Thread.Sleep(50);
-    Mouse(0x0002, x1, y1);
-    for (int k = 1; k <= steps; k++) { System.Threading.Thread.Sleep(ms / steps); Mouse(0, x1 + (x2 - x1) * k / steps, y1 + (y2 - y1) * k / steps); }
-    System.Threading.Thread.Sleep(100);
-    Mouse(0x0004, x2, y2);
+  // True when the foreground window belongs to process `pid`.
+  public static bool OwnsForeground(uint pid) { uint p; GetWindowThreadProcessId(GetForegroundWindow(), out p); return p == pid; }
+  [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT p);
+  [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr h, uint flags);
+  [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
+  // True when the top-level window (GA_ROOT) under screen point (x, y) belongs to process `pid`.
+  public static bool Ours(uint pid, int x, int y) {
+    IntPtr h = GetAncestor(WindowFromPoint(new POINT { X = x, Y = y }), 2);
+    uint p = 0; if (h != IntPtr.Zero) GetWindowThreadProcessId(h, out p);
+    return h != IntPtr.Zero && p == pid;
   }
+  // Set by Drag when it was cut short and had nowhere of `pid`'s to release: the button is still down.
+  public static bool Stuck;
+  // A real mouse drag (SendInput): press at (x1, y1), `steps` moves over `ms` to (x2, y2), release. Every event is
+  // sent only while process `pid` owns the foreground, and the press and every release only where Ours is true;
+  // false when that stopped. A drag cut short is released at the last point it passed that was over `pid`'s window
+  // (re-checked there), so a drop lands only in rexplorer; if that point is no longer ours it is not released at
+  // all and Stuck is set.
+  public static bool Drag(uint pid, int x1, int y1, int x2, int y2, int steps, int ms) {
+    Stuck = false;
+    if (!OwnsForeground(pid) || !Ours(pid, x1, y1)) return false;
+    Mouse(0, x1, y1); System.Threading.Thread.Sleep(50);
+    if (!OwnsForeground(pid) || !Ours(pid, x1, y1)) return false;
+    Mouse(0x0002, x1, y1);
+    int lx = x1, ly = y1;
+    for (int k = 1; k <= steps; k++) {
+      System.Threading.Thread.Sleep(ms / steps);
+      if (!OwnsForeground(pid)) return Abort(pid, lx, ly);
+      int x = x1 + (x2 - x1) * k / steps, y = y1 + (y2 - y1) * k / steps;
+      Mouse(0, x, y);
+      if (Ours(pid, x, y)) { lx = x; ly = y; }
+    }
+    System.Threading.Thread.Sleep(100);
+    if (!OwnsForeground(pid) || !Ours(pid, x2, y2)) return Abort(pid, lx, ly);
+    Mouse(0x0004, x2, y2);
+    return true;
+  }
+  static bool Abort(uint pid, int x, int y) {
+    Mouse(0, x, y);
+    if (Ours(pid, x, y)) Mouse(0x0004, x, y); else Stuck = true;
+    return false;
+  }
+  [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr h, int id);
   [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
   [DllImport("kernel32.dll")] static extern IntPtr VirtualAllocEx(IntPtr p, IntPtr a, UIntPtr size, uint type, uint protect);
   [DllImport("kernel32.dll")] static extern bool VirtualFreeEx(IntPtr p, IntPtr a, UIntPtr size, uint type);
@@ -145,12 +192,51 @@ public static class W {
 
 # Window rects in physical pixels, like the app's own layout.
 $null = [W]::SetProcessDPIAware()
+if (-not (Test-Path $Exe)) { Write-Output "FAIL startup exe missing: $Exe"; exit 1 }
+$Exe = (Resolve-Path $Exe).Path
+# Every variable this script sets, as found, put back in the finally at the end.
+$SavedEnv = @{}
+foreach ($n in 'APPDATA', 'LOCALAPPDATA', 'REXPLORER_INSTALL_DIR', 'REXPLORER_REG_BASE', 'REXPLORER_CRASH_AFTER_MS') { $SavedEnv[$n] = [Environment]::GetEnvironmentVariable($n) }
+$RealLocalAppData = $env:LOCALAPPDATA
+# A settings folder for a run: `rexplorer\settings.ini` with language=en, since the checks match English text.
+function New-Profile($path) {
+  Remove-Item $path -Recurse -Force -ErrorAction SilentlyContinue
+  New-Item -ItemType Directory -Path (Join-Path $path 'rexplorer') -Force | Out-Null
+  Set-Content -Path (Join-Path $path 'rexplorer\settings.ini') -Value "[general]`r`nlanguage=en`r`n"
+}
 # Every launch runs on a scratch %APPDATA%: the user's settings and window.txt stay untouched, and the single-instance
-# hand-off (one instance per settings folder) never reaches a rexplorer the user has open.
-$RealAppData = $env:APPDATA
-$env:APPDATA = Join-Path $env:TEMP "rexplorer-smoke-profile-$PID"
-New-Item -ItemType Directory -Path $env:APPDATA -Force | Out-Null
-function Out-Check($status, $name, $detail) { Write-Output ("{0} {1} {2}" -f $status, $name, ($detail -replace '\s+', ' ')) }
+# hand-off (one instance per settings folder) never reaches a rexplorer the user has open. A scratch %LOCALAPPDATA%
+# takes the crash check's minidump. Each scratch path holds 'rexplorer-smoke-', which the cleanup requires.
+$ScratchAppData = Join-Path $env:TEMP "rexplorer-smoke-profile-$PID"
+$ScratchLocal = Join-Path $env:TEMP "rexplorer-smoke-local-$PID"
+# Any install or register flow a launch reaches writes here, never to the real install folder or HKCU\Software.
+$ScratchInstall = Join-Path $env:TEMP "rexplorer-smoke-install-$PID"
+$ScratchReg = "Software\rexplorer-test\$PID"
+$TestRootExisted = Test-Path 'HKCU:\Software\rexplorer-test'
+$script:fails = 0; $script:skips = 0
+try {
+# The whole run, unindented: the finally at the end restores the environment and removes the scratch state.
+New-Profile $ScratchAppData
+New-Item -ItemType Directory -Path $ScratchLocal -Force | Out-Null
+$env:APPDATA = $ScratchAppData; $env:LOCALAPPDATA = $ScratchLocal
+$env:REXPLORER_INSTALL_DIR = Join-Path $ScratchInstall 'app'; $env:REXPLORER_REG_BASE = $ScratchReg
+function Out-Check($status, $name, $detail) {
+  if ($status -eq 'FAIL') { $script:fails++ } elseif ($status -eq 'SKIP') { $script:skips++ }
+  Write-Output ("{0} {1} {2}" -f $status, $name, ($detail -replace '\s+', ' '))
+}
+# The clipboard's formats as a detached copy (Windows PowerShell runs STA, as the clipboard needs).
+# shortcut: formats .NET cannot read back (some private ones) are lost; fine for a test session's clipboard.
+function Save-Clipboard {
+  $d = New-Object System.Windows.Forms.DataObject
+  try {
+    $src = [System.Windows.Forms.Clipboard]::GetDataObject()
+    if ($src) { foreach ($f in $src.GetFormats($false)) { try { $v = $src.GetData($f, $false); if ($null -ne $v) { $d.SetData($f, $false, $v) } } catch {} } }
+  } catch {}
+  $d
+}
+function Restore-Clipboard($d) {
+  try { if (@($d.GetFormats()).Count) { [System.Windows.Forms.Clipboard]::SetDataObject($d, $true) } else { [System.Windows.Forms.Clipboard]::Clear() } } catch {}
+}
 function Start-App($arg) {
   if ($arg) { $p = Start-Process -FilePath $Exe -ArgumentList ('"{0}"' -f $arg) -PassThru } else { $p = Start-Process -FilePath $Exe -PassThru }
   $null = $p.Handle  # cache handle so ExitCode works after exit
@@ -202,7 +288,13 @@ function Get-RelativeRect($child, $parent) {
 }
 function Stop-App($p) { if ($p) { try { if (-not $p.HasExited) { $p.Kill(); $p.WaitForExit(2000) | Out-Null } } catch {} } }
 function Get-Explorers { $r = @{}; foreach ($w in (New-Object -ComObject Shell.Application).Windows()) { try { $r[[int64]$w.HWND] = $w } catch {} }; $r }
-function Close-NewExplorers($before) { foreach ($k in (Get-Explorers).GetEnumerator()) { if (-not $before.ContainsKey($k.Key)) { try { $k.Value.Quit() } catch {} } } }
+# Explorer windows new since `before` that show `path`, a folder this script created: no other window is ours to close.
+# Compared by the folder's own name, unique to this run ($PID), since %TEMP% may be spelled with 8.3 names.
+function Get-NewExplorersAt($before, $path) {
+  $leaf = Split-Path $path.TrimEnd('\') -Leaf
+  @((Get-Explorers).GetEnumerator() | Where-Object { -not $before.ContainsKey($_.Key) -and $(try { (Split-Path $_.Value.Document.Folder.Self.Path.TrimEnd('\') -Leaf) -eq $leaf } catch { $false }) })
+}
+function Close-NewExplorers($before, $path) { foreach ($k in (Get-NewExplorersAt $before $path)) { try { $k.Value.Quit() } catch {} } }
 
 # Runs one check: $body returns @(status, detail). Process in $script:cur is always killed.
 function Run-Check($name, [scriptblock]$body) {
@@ -218,11 +310,11 @@ function Launch($arg) {
   $script:main -ne [IntPtr]::Zero
 }
 
-# Launches with APPDATA pointed at a fresh scratch folder: a first run on profile defaults, real settings untouched.
+# Launches with APPDATA pointed at a fresh scratch folder: a first run on profile defaults (settings.ini holds only
+# language=en), real settings untouched. %LOCALAPPDATA% stays the run's scratch one.
 function Launch-Fresh($arg) {
   $script:fake = Join-Path $env:TEMP "rexplorer-smoke-appdata-$PID"
-  Remove-Item $script:fake -Recurse -Force -ErrorAction SilentlyContinue
-  New-Item -ItemType Directory -Path $script:fake -Force | Out-Null
+  New-Profile $script:fake
   $appdata = $env:APPDATA
   try { $env:APPDATA = $script:fake; Launch $arg } finally { $env:APPDATA = $appdata }
 }
@@ -230,8 +322,7 @@ function Remove-Fresh { Stop-App $script:cur; Start-Sleep -Milliseconds 200; Rem
 # Like Launch-Fresh, with a raw argument string (several arguments).
 function Launch-FreshArgs($argline) {
   $script:fake = Join-Path $env:TEMP "rexplorer-smoke-appdata-$PID"
-  Remove-Item $script:fake -Recurse -Force -ErrorAction SilentlyContinue
-  New-Item -ItemType Directory -Path $script:fake -Force | Out-Null
+  New-Profile $script:fake
   $appdata = $env:APPDATA
   try {
     $env:APPDATA = $script:fake
@@ -267,13 +358,21 @@ function Get-Status { Get-Title ([W]::FindWindowEx($script:main, [IntPtr]::Zero,
 $QuickAccess = 'shell:::{679f85cb-0220-4080-b29b-5540cc05aab6}'
 function Get-QuickAccess { @((New-Object -ComObject Shell.Application).NameSpace($QuickAccess).Items() | ForEach-Object { $_.Path }) }
 
-# Keys when the window can be activated, else the same command as WM_COMMAND. Returns how it was sent.
-function Send-KeysOrCommand($keys, $cmd) {
-  if (Set-Foreground $script:main) { [System.Windows.Forms.SendKeys]::SendWait($keys); 'keys' }
-  else { $null = [W]::PostMessage($script:main, 0x111, [IntPtr]$cmd, [IntPtr]::Zero); 'WM_COMMAND' }
+# The command a shortcut sends (main.rs CMD_*), posted as WM_COMMAND: no real keys, no foreground needed.
+function Send-Command($cmd) { $null = [W]::PostMessage($script:main, 0x111, [IntPtr]$cmd, [IntPtr]::Zero); 'WM_COMMAND' }
+# Ctrl+L, the path into the address Edit (ID_ADDR 100) and Enter, as the commands they send.
+function Go-Address($path) {
+  $null = Send-Command 5; Start-Sleep -Milliseconds 300
+  $null = [W]::SendText([W]::GetDlgItem($script:main, 100), 0x0C, [IntPtr]::Zero, $path)
+  $null = Send-Command 7
 }
 
-if (-not (Test-Path $Exe)) { Out-Check 'FAIL' 'startup' "exe missing: $Exe"; exit 0 }
+# perf, preview and search list this folder of 100,000 empty files; made once if missing.
+$Bench = Join-Path $env:TEMP 'rexplorer-bench'
+if (-not (Test-Path $Bench)) {
+  New-Item -ItemType Directory -Path $Bench -Force | Out-Null
+  for ($i = 0; $i -lt 100000; $i++) { [IO.File]::WriteAllText((Join-Path $Bench ('file{0:D6}.txt' -f $i)), '') }
+}
 
 Run-Check 'startup' {
   if (-not (Launch $null)) { return @('FAIL', 'no main window within 5 s') }
@@ -310,14 +409,13 @@ Run-Check 'keyboard-nav' {
   if (-not (Launch 'C:\Windows')) { return @('FAIL', 'no main window within 5 s') }
   Wait-Until { (Get-Count $script:main) -ge 1 } 3000 | Out-Null
   $orig = Get-Title $script:main
-  if (-not (Set-Foreground $script:main)) { return @('SKIP', 'could not activate') }
-  [System.Windows.Forms.SendKeys]::SendWait('{BACKSPACE}')
+  # Backspace and Alt+Left, as the commands they send (CMD_UP, CMD_BACK).
+  $null = Send-Command 3
   $a = Wait-Until { (Get-Title $script:main) -ne $orig } 2000
   $up = Get-Title $script:main
-  [System.Windows.Forms.SendKeys]::SendWait('%{LEFT}')
+  $null = Send-Command 1
   $b = Wait-Until { (Get-Title $script:main) -eq $orig } 2000
-  if ($a -and $b) { @('PASS', "'$orig' -> '$up' -> back") }
-  elseif ([W]::GetForegroundWindow() -ne $script:main) { @('SKIP', 'could not activate (focus lost)') }
+  if ($a -and $b) { @('PASS', "'$orig' -> up '$up' -> back") }
   else { @('FAIL', "A(up)=$a B(back)=$b orig='$orig' now='$(Get-Title $script:main)'") }
 }
 
@@ -325,23 +423,11 @@ Run-Check 'address-nav' {
   if (-not (Launch 'C:\Windows')) { return @('FAIL', 'no main window within 5 s') }
   Wait-Until { (Get-Count $script:main) -ge 1 } 3000 | Out-Null
   $orig = Get-Title $script:main
-  if (-not (Set-Foreground $script:main)) { return @('SKIP', 'could not activate') }
   # The address Edit stays hidden behind the breadcrumb until Ctrl+L.
-  [System.Windows.Forms.SendKeys]::SendWait('^l'); Start-Sleep -Milliseconds 300
-  $root = [Windows.Automation.AutomationElement]::FromHandle($script:main)
-  # rexplorer's Edit is exposed to UIA as ControlType.Pane, so match by class name instead
-  $cond = New-Object Windows.Automation.PropertyCondition ([Windows.Automation.AutomationElement]::ClassNameProperty), 'Edit'
-  $ed = $root.FindFirst([Windows.Automation.TreeScope]::Descendants, $cond)
-  if (-not $ed) { return @('FAIL', 'Edit control not found via UIA') }
-  $vp = $null
-  if (-not $ed.TryGetCurrentPattern([Windows.Automation.ValuePattern]::Pattern, [ref]$vp)) { return @('SKIP', 'Edit exposes no UIA ValuePattern, cannot set text via UIA') }
-  $ed.SetFocus()
-  $vp.SetValue('C:\Users')
-  [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+  Go-Address 'C:\Users'
   $ok = Wait-Until { (Get-Title $script:main) -ne $orig -and (Get-Count $script:main) -ge 1 } 2000
   $t = Get-Title $script:main; $c = Get-Count $script:main
-  if ($ok) { @('PASS', "'$orig' -> '$t' count=$c") }
-  elseif ([W]::GetForegroundWindow() -ne $script:main) { @('SKIP', 'could not activate (focus lost)') }
+  if ($ok) { @('PASS', "Ctrl+L, 'C:\Users', Enter: '$orig' -> '$t' count=$c") }
   else { @('FAIL', "title='$t' count=$c") }
 }
 
@@ -372,22 +458,23 @@ Run-Check 'fallback-embedded' {
     if ($dlg -ne [IntPtr]::Zero) { $null = [W]::PostMessage($dlg, 0x10, [IntPtr]::Zero, [IntPtr]::Zero) }
     $d = "explorer windows new=$newExp; rexplorer dialog appeared=$($dlg -ne [IntPtr]::Zero)"
     if ($alive -and $newExp -eq 0) { @('PASS', "alive after 3 s; $d") } else { @('FAIL', "alive=$alive; $d") }
-  } finally { Close-NewExplorers $before; Remove-Fresh }
+  } finally { Remove-Fresh }
 }
 
 Run-Check 'explorer-hotkey' {
-  if (-not (Launch 'C:\Windows')) { return @('FAIL', 'no main window within 5 s') }
-  Wait-Until { (Get-Count $script:main) -ge 1 } 3000 | Out-Null
-  if (-not (Set-Foreground $script:main)) { return @('SKIP', 'could not activate') }
+  # A folder of its own, so the Explorer window it opens is known to be this check's.
+  $dir = Join-Path $env:TEMP "rexplorer-smoke-hotkey-$PID"
+  New-Item -ItemType Directory -Path $dir -Force | Out-Null
   $before = Get-Explorers
   try {
-    [System.Windows.Forms.SendKeys]::SendWait('^+e')
-    $ok = Wait-Until { (Get-Explorers).Count -gt $before.Count } 4000
-    $n = (Get-Explorers).Count
-  } finally { Close-NewExplorers $before }
-  if ($ok) { @('PASS', "explorer windows $($before.Count) -> $n") }
-  elseif ([W]::GetForegroundWindow() -ne $script:main) { @('SKIP', 'could not activate (focus lost)') }
-  else { @('FAIL', "explorer windows stayed at $($before.Count)") }
+    if (-not (Launch $dir)) { return @('FAIL', 'no main window within 5 s') }
+    Start-Sleep -Milliseconds 500
+    # Ctrl+Shift+E, as the command it sends (CMD_EXPLORER).
+    $null = Send-Command 6
+    $ok = Wait-Until { @(Get-NewExplorersAt $before $dir).Count -gt 0 } 4000
+  } finally { Close-NewExplorers $before $dir; Stop-App $script:cur; Start-Sleep -Milliseconds 200; Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+  if ($ok) { @('PASS', "Ctrl+Shift+E opened an Explorer window on $dir") }
+  else { @('FAIL', "no new Explorer window on $dir within 4 s") }
 }
 
 Run-Check 'tabs' {
@@ -396,16 +483,14 @@ Run-Check 'tabs' {
   $orig = Get-Title $script:main; $c0 = Get-Count $script:main
   $strip = [W]::FindWindowEx($script:main, [IntPtr]::Zero, 'RexTabs', $null)
   if ($strip -eq [IntPtr]::Zero) { return @('FAIL', 'no RexTabs child window') }
-  if (-not (Set-Foreground $script:main)) { return @('SKIP', 'could not activate') }
-  # Ctrl+T opens the start place (Home on a scratch profile; its name is localized: ask the shell), not a copy.
+  # Ctrl+T (CMD_NEW_TAB) opens the start place (Home on a scratch profile; its name is localized: ask the shell), not a copy.
   $want = (New-Object -ComObject Shell.Application).NameSpace('shell:::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}').Self.Name
-  [System.Windows.Forms.SendKeys]::SendWait('^t')
+  $null = Send-Command 10
   Start-Sleep -Milliseconds 300
   $ok = Wait-Until { (Get-Title $script:main) -eq "$want - rexplorer" -and (Get-Count $script:main) -gt 0 } 2000
   $t = Get-Title $script:main; $c = Get-Count $script:main
   $alive = -not $script:cur.HasExited
   if ($alive -and $ok) { @('PASS', "RexTabs present; after Ctrl+T title '$orig' -> '$t' (want '$want - rexplorer') count=$c") }
-  elseif ([W]::GetForegroundWindow() -ne $script:main) { @('SKIP', 'could not activate (focus lost)') }
   else { @('FAIL', "alive=$alive title '$orig' -> '$t' count $c0 -> $c") }
 }
 
@@ -495,7 +580,7 @@ Run-Check 'tree' {
     $null = [W]::PostMessage($script:main, 0x202, [IntPtr]0, (& $lp ($x0 + 98)))
     Start-Sleep -Milliseconds 300
     $moved = ([W]::Left($list) - [W]::Left($script:nstc)) - $x0
-    $how = Send-KeysOrCommand '^b' 23
+    $how = Send-Command 23
     $hidden = Wait-Until { -not [W]::IsWindowVisible($script:nstc) } 2000
     $drop = [W]::GetProp($list, 'OleDropTargetInterface') -ne [IntPtr]::Zero
     $d = "More > Folder tree showed it; splitter drag moved the list $moved px; Ctrl+B ($how) hid it=$hidden; list drop target registered=$drop"
@@ -511,7 +596,7 @@ Run-Check 'preview' {
   try {
     if (-not (Launch-Fresh $bench)) { return @('FAIL', 'no main window within 5 s') }
     if (-not (Wait-Until { (Get-Count $script:main) -eq 100000 } 5000)) { return @('FAIL', "count=$(Get-Count $script:main)") }
-    $how = Send-KeysOrCommand '%p' 24
+    $how = Send-Command 24
     $pane = [W]::FindWindowEx($script:main, [IntPtr]::Zero, 'RexPreview', $null)
     $shown = Wait-Until { $pane -ne [IntPtr]::Zero -and [W]::IsWindowVisible($pane) } 2000
     if (-not $shown) { return @('FAIL', "Alt+P ($how): RexPreview present=$($pane -ne [IntPtr]::Zero) visible=$shown") }
@@ -532,11 +617,11 @@ Run-Check 'views' {
     $list = Get-List $script:main
     $view = { [int][W]::SendMessage($list, 0x108F, [IntPtr]::Zero, [IntPtr]::Zero) }  # LVM_GETVIEW
     $v0 = & $view
-    $how = Send-KeysOrCommand '^+2' 26
+    $how = Send-Command 26
     $icon = Wait-Until { (& $view) -eq 0 } 2000
     $ini = Get-Content (Join-Path $script:fake 'rexplorer\settings.ini') -Raw
     $saved = $ini -match '(?m)^view=icons\s*$'
-    $null = Send-KeysOrCommand '^+6' 25
+    $null = Send-Command 25
     $details = Wait-Until { (& $view) -eq 1 } 2000
     $d = "LVM_GETVIEW $v0 -> Ctrl+Shift+2 ($how) icon=$icon (profile view=icons saved=$saved) -> Ctrl+Shift+6 details=$details"
     if ($v0 -eq 1 -and $icon -and $saved -and $details) { @('PASS', $d) } else { @('FAIL', $d) }
@@ -615,7 +700,7 @@ Run-Check 'look' {
     $top = Click-Row $sb $i
     $went = Wait-Until { (Get-Title $script:main) -eq "$want - rexplorer" } 3000
     $t = Get-Title $script:main
-    $how = Send-KeysOrCommand '^b' 23
+    $how = Send-Command 23
     $hidden = Wait-Until { -not [W]::IsWindowVisible($sb) } 2000
     $d = "RexSidebar shown; list $rgn; click on Downloads row $i (y=$top) -> '$t' (want '$want'); Ctrl+B ($how) hid the sidebar=$hidden"
     if ($round -and $went -and $hidden) { @('PASS', $d) } else { @('FAIL', $d) }
@@ -680,13 +765,15 @@ Run-Check 'loading' {
 }
 
 Run-Check 'pin' {
+  # Quick Access is the user's own store (the shell ignores the scratch %APPDATA%).
+  if (-not $UserState) { return @('SKIP', "changes this user's Quick Access; run with -UserState") }
   $dir = Join-Path $env:TEMP "rexplorer-smoke-pin-$PID"
   New-Item -ItemType Directory -Path $dir -Force | Out-Null
   try {
     if (-not (Launch-FreshArgs "--select `"$dir`"")) { return @('FAIL', 'no main window within 5 s') }
     $selected = Wait-Until { [int][W]::SendMessage((Get-List $script:main), 0x1032, [IntPtr]::Zero, [IntPtr]::Zero) -ge 1 } 4000
     if (-not $selected) { return @('FAIL', "--select did not select $dir") }
-    $how = Send-KeysOrCommand '^d' 40
+    $how = Send-Command 40
     $pinned = Wait-Until { (Get-QuickAccess) -contains $dir } 4000
     if (-not $pinned) { return @('FAIL', "Ctrl+D ($how): $dir not in Quick Access") }
     # Unpin through the sidebar: right-click the folder's Favorites row, pick the popup's only entry.
@@ -724,6 +811,8 @@ Run-Check 'commandbar' {
   $dir = Join-Path $env:TEMP "rexplorer-smoke-cmd-$PID"
   New-Item -ItemType Directory -Path $dir -Force | Out-Null
   Set-Content -Path (Join-Path $dir 'file000000.txt') -Value 'x'
+  # Copy puts the file on the clipboard: put back what was there.
+  $clip = Save-Clipboard
   try {
     if (-not (Launch-Fresh $dir)) { return @('FAIL', 'no main window within 5 s') }
     if (-not (Wait-Until { (Get-Count $script:main) -eq 1 } 4000)) { return @('FAIL', "count=$(Get-Count $script:main)") }
@@ -739,7 +828,7 @@ Run-Check 'commandbar' {
     $copied = Wait-Until { (Get-Count $script:main) -eq 2 } 3000
     $d = "Cut with no selection=$cut0 (0 = disabled); after Home Cut/Copy/Rename/Delete enabled=$on; Copy click -> Paste enabled=$paste; Paste click -> count $(Get-Count $script:main) (want 2)"
     if ($cut0 -eq 0 -and $on -and $paste -and $copied) { @('PASS', $d) } else { @('FAIL', $d) }
-  } finally { Remove-Fresh; Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+  } finally { Remove-Fresh; Restore-Clipboard $clip; Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
 Run-Check 'home-page' {
@@ -793,8 +882,10 @@ function Get-HomeRect($hp, $i) {
 
 Run-Check 'home-open' {
   # A recent file Home lists, opened with Enter. Its extension is registered for this check only (HKCU) with an open
-  # command that writes a marker, so nothing visible opens. Under %LOCALAPPDATA%: Recent ignores %TEMP%.
-  $dir = Join-Path $env:LOCALAPPDATA 'rexplorer-smoke'
+  # command that writes a marker, so nothing visible opens. Under the real %LOCALAPPDATA% (the run's scratch one is
+  # in %TEMP%): Recent ignores %TEMP%.
+  if (-not $UserState) { return @('SKIP', "changes this user's Recent list and HKCU file classes; run with -UserState") }
+  $dir = Join-Path $RealLocalAppData 'rexplorer-smoke'
   New-Item -ItemType Directory -Path $dir -Force | Out-Null
   $file = Join-Path $dir "home-open-$PID.rexsmoke"; $marker = Join-Path $dir "home-open-$PID.opened"
   Set-Content -Path $file -Value 'x'; Remove-Item $marker -ErrorAction SilentlyContinue
@@ -837,7 +928,7 @@ Run-Check 'remove-bookmark' {
     Remove-Item $script:fake -Recurse -Force -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Path (Join-Path $script:fake 'rexplorer') -Force | Out-Null
     $ini = Join-Path $script:fake 'rexplorer\settings.ini'
-    Set-Content -Path $ini -Value "[general]`r`nprofile=default`r`n[profile default]`r`nbookmark.Repo=$dir`r`n"
+    Set-Content -Path $ini -Value "[general]`r`nprofile=default`r`nlanguage=en`r`n[profile default]`r`nbookmark.Repo=$dir`r`n"
     $appdata = $env:APPDATA
     try { $env:APPDATA = $script:fake; $up = Launch 'C:\Windows' } finally { $env:APPDATA = $appdata }
     if (-not $up) { return @('FAIL', 'no main window within 5 s') }
@@ -882,13 +973,21 @@ Run-Check 'share' {
       return @('FAIL', 'Share click: no new window came to the foreground within 4 s')
     }
     $cls = New-Object System.Text.StringBuilder 128; $null = [W]::GetClassName($sheet, $cls, 128)
-    [uint32]$owner = 0; $null = [W]::GetWindowThreadProcessId($sheet, [ref]$owner)
-    $title = "$(Get-Title $sheet)' class $cls of $((Get-Process -Id $owner -ErrorAction SilentlyContinue).ProcessName)"
-    [System.Windows.Forms.SendKeys]::SendWait('{ESC}')
+    [uint32]$spid = 0; $null = [W]::GetWindowThreadProcessId($sheet, [ref]$spid)
+    $sproc = (Get-Process -Id $spid -ErrorAction SilentlyContinue).ProcessName
+    $title = "$(Get-Title $sheet)' class $cls of $sproc"
+    # Only the sheet is closed: a window rexplorer owns (GW_OWNER), one of its process, or the share host's
+    # (SharePickerUI lives in ShellExperienceHost). Any other new window is left as it is.
+    if ([W]::GetWindow($sheet, 4) -ne $script:main -and $spid -ne $script:cur.Id -and $sproc -ne 'ShellExperienceHost') {
+      $sheet = [IntPtr]::Zero
+      return @('SKIP', "Share click: the new foreground window '$title' is not rexplorer's or the share host's; left open")
+    }
+    # WM_CLOSE to that one window (the sheet this click opened), not a key to whatever is in front.
+    $null = [W]::PostMessage($sheet, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)
     $closed = Wait-Until { [W]::GetForegroundWindow() -ne $sheet } 2000
-    @('PASS', "Share enabled with a file selected; click -> share sheet '$title' in the foreground; Escape closed it=$closed")
+    @('PASS', "Share enabled with a file selected; click -> share sheet '$title' in the foreground; WM_CLOSE closed it=$closed")
   } finally {
-    if ($sheet -ne [IntPtr]::Zero -and [W]::GetForegroundWindow() -eq $sheet) { [System.Windows.Forms.SendKeys]::SendWait('{ESC}') }
+    if ($sheet -ne [IntPtr]::Zero) { $null = [W]::PostMessage($sheet, 0x10, [IntPtr]::Zero, [IntPtr]::Zero) }
     Remove-Fresh; Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
   }
 }
@@ -910,9 +1009,10 @@ Run-Check 'crash-recovery' {
     try { $up = Launch-Fresh 'C:\Windows' } finally { Remove-Item Env:REXPLORER_CRASH_AFTER_MS -ErrorAction SilentlyContinue }
     if (-not $up) { return @('FAIL', 'no main window within 5 s') }
     $first = $script:cur.Id
-    # The crash handler relaunches the exe with --recover on the folder it was showing.
+    # The crash handler relaunches the exe with --recover on the folder it was showing: a child of the crashed pid,
+    # from this exe, so a rexplorer the user runs is never picked (or stopped).
     $null = Wait-Until {
-      $p = Get-CimInstance Win32_Process -Filter "Name='rexplorer.exe'" | Where-Object { $_.ProcessId -ne $first -and $_.CommandLine -like '*--recover*' } | Select-Object -First 1
+      $p = Get-CimInstance Win32_Process -Filter "ParentProcessId=$first" | Where-Object { $_.ExecutablePath -eq $Exe -and $_.CommandLine -like '*--recover*' } | Select-Object -First 1
       if ($p) { $script:rec = Get-Process -Id $p.ProcessId -ErrorAction SilentlyContinue }
       $null -ne $script:rec
     } 6000
@@ -941,15 +1041,19 @@ Run-Check 'dnd' {
     $dst = [W]::ItemRect($list, 0); $src = [W]::ItemRect($list, 1)
     if ($src.B -le $src.T -or $dst.B -le $dst.T) { return @('FAIL', 'LVM_GETITEMRECT gave no row rects') }
     $x1 = $src.L + 40; $y1 = [int](($src.T + $src.B) / 2); $x2 = $dst.L + 40; $y2 = [int](($dst.T + $dst.B) / 2)
-    [W]::Drag($x1, $y1, $x2, $y2, 8, 400)
+    # The only real input in the script: sent event by event while this process owns the foreground, pressed and
+    # released only over its window.
+    if (-not [W]::Drag([uint32]$script:cur.Id, $x1, $y1, $x2, $y2, 8, 400)) {
+      if ([W]::Stuck) { return @('FAIL', 'DRAG CUT SHORT WITH THE MOUSE BUTTON STILL DOWN: no point of the drag is over rexplorer any more, so it was not released anywhere; rexplorer is closed to end the drag, then click once to release the button') }
+      return @('SKIP', 'foreground or the window under the cursor left rexplorer; the drag stopped and, if pressed, was released over rexplorer')
+    }
     $ok = Wait-Until { (Test-Path $moved) -and -not (Test-Path $file) } 3000
     $at = New-Object W+POINT; $null = [W]::GetCursorPos([ref]$at)
-    $d = "SendInput drag of drag-me.txt ($x1,$y1) onto the folder row target ($x2,$y2): moved into it=$ok (cursor ended at $($at.X),$($at.Y), selected rows $([int][W]::SendMessage($list, 0x1032, [IntPtr]::Zero, [IntPtr]::Zero)), foreground ours=$([W]::GetForegroundWindow() -eq $script:main))"
-    if ($ok) { @('PASS', $d) }
-    elseif ([W]::GetForegroundWindow() -ne $script:main) { @('SKIP', "focus lost during the drag; $d") }
-    else { @('FAIL', $d) }
+    $d = "SendInput drag of drag-me.txt ($x1,$y1) onto the folder row target ($x2,$y2): moved into it=$ok (cursor ended at $($at.X),$($at.Y), selected rows $([int][W]::SendMessage($list, 0x1032, [IntPtr]::Zero, [IntPtr]::Zero)))"
+    if ($ok) { @('PASS', $d) } else { @('FAIL', $d) }
   } finally {
-    $null = [W]::SetCursorPos($cursor.X, $cursor.Y)
+    # With the button still down, moving the cursor back would carry the drag to wherever the user's cursor was.
+    if (-not [W]::Stuck) { $null = [W]::SetCursorPos($cursor.X, $cursor.Y) }
     Remove-Fresh
     if (Test-Path $moved) { Move-Item $moved $file -Force -ErrorAction SilentlyContinue }
     Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
@@ -1019,31 +1123,30 @@ function Run-WithBox($arg, $confirm) {
 Run-Check 'install-scratch' {
   # --install / --uninstall against a scratch install folder and a scratch registry base (never the real HKCU
   # Classes, App Paths or Start menu): the undocumented REXPLORER_INSTALL_DIR / REXPLORER_REG_BASE overrides.
-  $root = Join-Path $env:TEMP "rexplorer-smoke-install-$PID"
-  $dir = Join-Path $root 'app'
-  $base = "Software\rexplorer-test\$PID"
-  $hk = "HKCU:\$base"
-  $testRootExisted = Test-Path 'HKCU:\Software\rexplorer-test'
+  # The overrides are set for the whole run (top of the script); an exe that does not know them would write the
+  # real ones, so it is not run at all.
+  if (-not [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($Exe)).Contains('REXPLORER_REG_BASE')) { return @('FAIL', "$Exe has no REXPLORER_REG_BASE override; not run against the real registry") }
+  $root = $ScratchInstall
+  $dir = $env:REXPLORER_INSTALL_DIR
+  $hk = "HKCU:\$ScratchReg"
   $clsid = '{52205fd8-5dfb-447d-801a-d0b52f2e83e1}'
   $keys = @('Classes\Folder\shell\open\command', 'Classes\Directory\shell\open\command', 'Classes\Drive\shell\open\command',
     "Classes\CLSID\$clsid\shell\open\command", "Classes\CLSID\$clsid\shell\opennewwindow\command",
     'Microsoft\Windows\CurrentVersion\App Paths\explorer.exe')
   Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
-  $env:REXPLORER_INSTALL_DIR = $dir; $env:REXPLORER_REG_BASE = $base
   try {
     $r = Run-WithBox '--install' 'the running copy is replaced'
     $missing = @($keys | Where-Object { -not ((Get-ItemProperty -LiteralPath "$hk\$_" -ErrorAction SilentlyContinue).'(default)' -like "*$dir*") })
     $files = (Test-Path (Join-Path $dir 'rexplorer.exe')) -and (Test-Path (Join-Path $dir 'install.txt'))
     $u = Run-WithBox '--uninstall'
     $left = @(@($hk, $dir) | Where-Object { Test-Path -LiteralPath $_ })
-    if (-not $testRootExisted -and (Test-Path 'HKCU:\Software\rexplorer-test')) { $left += 'HKCU:\Software\rexplorer-test' }
+    if (-not $TestRootExisted -and (Test-Path 'HKCU:\Software\rexplorer-test')) { $left += 'HKCU:\Software\rexplorer-test' }
     $d = "install exit=$($r[0]) files=$files missing keys=[$($missing -join ', ')]; uninstall exit=$($u[0]) left=[$($left -join ', ')]"
     if ($r[0] -eq 0 -and $files -and $missing.Count -eq 0 -and $u[0] -eq 0 -and $left.Count -eq 0) { @('PASS', "6 keys + exe + install.txt, all gone after --uninstall; $d") }
     else { @('FAIL', "$d; install box: $($r[1]); uninstall box: $($u[1])") }
   } finally {
-    Remove-Item Env:REXPLORER_INSTALL_DIR, Env:REXPLORER_REG_BASE -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $hk -Recurse -Force -ErrorAction SilentlyContinue
-    if (-not $testRootExisted) { Remove-Item 'HKCU:\Software\rexplorer-test' -Recurse -Force -ErrorAction SilentlyContinue }
+    if (-not $TestRootExisted) { Remove-Item 'HKCU:\Software\rexplorer-test' -Recurse -Force -ErrorAction SilentlyContinue }
     Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
   }
 }
@@ -1069,20 +1172,76 @@ Run-Check 'explorer-args' {
     }
     # Unsupported: the command line goes to the real Explorer and the process exits. Explorer itself opens no
     # window for a malformed /idlist, so the window count is checked with an unknown switch, which Explorer
-    # answers with a window of its own.
+    # answers with a window of its own. The switch carries this check's folder: only a window on it is closed.
     $before = Get-Explorers
     $script:cur = Start-Process -FilePath $Exe -ArgumentList '/idlist,x' -PassThru; $null = $script:cur.Handle
     $exited = $script:cur.WaitForExit(2000)
-    $script:cur = Start-Process -FilePath $Exe -ArgumentList '/zzz' -PassThru; $null = $script:cur.Handle
+    $script:cur = Start-Process -FilePath $Exe -ArgumentList ('"/zzz,{0}"' -f $dir) -PassThru; $null = $script:cur.Handle
     $exited2 = $script:cur.WaitForExit(2000)
     $rose = Wait-Until { (Get-Explorers).Count -eq $before.Count + 1 } 4000
-    $out += "'/idlist,x' exited within 2 s=$exited; '/zzz' exited=$exited2, explorer windows $($before.Count) -> $((Get-Explorers).Count)"
+    $ours = Wait-Until { @(Get-NewExplorersAt $before $dir).Count -gt 0 } 1000
+    $out += "'/idlist,x' exited within 2 s=$exited; '/zzz,<dir>' exited=$exited2, explorer windows $($before.Count) -> $((Get-Explorers).Count)"
+    if ($rose -and -not $ours) { $out += 'the new Explorer window is not on this check''s folder, so it is left open' }
     if (-not ($exited -and $exited2 -and $rose)) { $ok = $false }
     if ($ok) { @('PASS', ($out -join '; ')) } else { @('FAIL', ($out -join '; ')) }
   } finally {
-    if ($before) { Close-NewExplorers $before }
+    if ($before) { Close-NewExplorers $before $dir }
     Stop-App $script:cur; Start-Sleep -Milliseconds 200; Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
   }
+}
+
+# UI Automation walk (#25): every focusable or interactive element must have a name. The custom controls reach UIA
+# through their MSAA objects. Excluded, by class name or control type, with the reason:
+$A11yExclude = @{
+  'ScrollBar'        = 'native scroll bars: Windows names their parts, not the bar'
+  'TitleBar'         = 'the window caption and its buttons belong to Windows'
+  'SHELLDLL_DefView' = 'the embedded Explorer view, for folders rexplorer cannot list'
+  'DirectUIHWND'     = 'the inside of that Explorer view'
+}
+$a11yConds = @(New-Object Windows.Automation.PropertyCondition ([Windows.Automation.AutomationElement]::IsKeyboardFocusableProperty), $true)
+foreach ($t in 'Button', 'SplitButton', 'TabItem', 'ListItem', 'MenuItem', 'TreeItem', 'Edit', 'Hyperlink', 'CheckBox', 'RadioButton', 'ComboBox') {
+  $a11yConds += New-Object Windows.Automation.PropertyCondition ([Windows.Automation.AutomationElement]::ControlTypeProperty), ([Windows.Automation.ControlType]::$t)
+}
+$A11yCondition = New-Object Windows.Automation.OrCondition -ArgumentList (, [Windows.Automation.Condition[]]$a11yConds)
+# The unnamed, on-screen, not excluded elements under window `h`, one description each.
+function Get-Unnamed($h) {
+  $walk = [Windows.Automation.TreeWalker]::ControlViewWalker
+  $bad = @()
+  foreach ($e in [Windows.Automation.AutomationElement]::FromHandle($h).FindAll([Windows.Automation.TreeScope]::Descendants, $A11yCondition)) {
+    try {
+      $c = $e.Current
+      if ($c.IsOffscreen -or -not [string]::IsNullOrWhiteSpace($c.Name)) { continue }
+      $skip = $false
+      for ($a = $e; $a -and -not $skip; $a = $walk.GetParent($a)) {
+        $skip = $A11yExclude.ContainsKey($a.Current.ClassName) -or $A11yExclude.ContainsKey(($a.Current.ControlType.ProgrammaticName -replace '^ControlType\.'))
+      }
+      if (-not $skip) { $bad += '{0} class={1} id={2}' -f ($c.ControlType.ProgrammaticName -replace '^ControlType\.'), $c.ClassName, $c.AutomationId }
+    } catch {}  # an element that went away during the walk
+  }
+  , $bad
+}
+
+Run-Check 'accessibility' {
+  $dir = Join-Path $env:TEMP "rexplorer-smoke-a11y-$PID"
+  New-Item -ItemType Directory -Path (Join-Path $dir 'sub') -Force | Out-Null
+  Set-Content -Path (Join-Path $dir 'a.txt') -Value 'rexplorer accessibility smoke'
+  try {
+    # Home: tiles, recent rows, sidebar, tabs, toolbars.
+    if (-not (Launch-Fresh $null)) { return @('FAIL', 'no main window within 5 s (Home)') }
+    $null = Wait-Until { $hp = Get-HomePage; $hp -ne [IntPtr]::Zero -and [W]::IsWindowVisible($hp) } 4000
+    Start-Sleep -Milliseconds 500
+    $bad = @(Get-Unnamed $script:main | ForEach-Object { "Home: $_" })
+    Remove-Fresh
+    # A folder: rows, crumbs, and the preview pane (CMD_TOGGLE_PREVIEW) showing a.txt, selected with End.
+    if (-not (Launch-Fresh $dir)) { return @('FAIL', 'no main window within 5 s (folder)') }
+    $null = Wait-Until { (Get-Count $script:main) -eq 2 } 4000
+    $null = Send-Command 24
+    $null = [W]::PostMessage((Get-List $script:main), 0x100, [IntPtr]0x23, [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 800
+    $bad += @(Get-Unnamed $script:main | ForEach-Object { "folder: $_" })
+    if ($bad.Count -eq 0) { @('PASS', 'every on-screen focusable or interactive UIA element has a name (Home; a folder with the preview pane)') }
+    else { @('FAIL', "$($bad.Count) unnamed: $($bad -join '; ')") }
+  } finally { Remove-Fresh; Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
 # Window screenshots for the README: dark on C:\Windows (details, a row selected), light on the wallpapers with
@@ -1113,7 +1272,7 @@ function Save-Shot($theme, $folder, $preview, $file, $place) {
   $script:fake = Join-Path $env:TEMP "rexplorer-smoke-appdata-$PID"
   Remove-Item $script:fake -Recurse -Force -ErrorAction SilentlyContinue
   New-Item -ItemType Directory -Path (Join-Path $script:fake 'rexplorer') -Force | Out-Null
-  $ini = "[general]`r`nprofile=default`r`n[profile default]`r`ntheme=$theme`r`nshow_preview=$preview`r`n"
+  $ini = "[general]`r`nprofile=default`r`nlanguage=en`r`n[profile default]`r`ntheme=$theme`r`nshow_preview=$preview`r`n"
   Set-Content -Path (Join-Path $script:fake 'rexplorer\settings.ini') -Value $ini
   if ($place) { Set-Content -Path (Join-Path $script:fake 'rexplorer\window.txt') -Value $place }
   $appdata = $env:APPDATA
@@ -1136,6 +1295,18 @@ if ($Screenshots) {
   Run-Check 'screenshot-light' { try { Save-Shot 'light' 'C:\Windows\Web\Wallpaper\Windows' 'true' (Join-Path $shots 'light.png') } finally { Remove-Fresh } }
   Run-Check 'screenshot-home' { try { Save-Shot 'dark' $null 'false' (Join-Path $shots 'home.png') '1 40 40 1480 1040' } finally { Remove-Fresh } }
 }
-$scratch = $env:APPDATA; $env:APPDATA = $RealAppData
-Remove-Item $scratch -Recurse -Force -ErrorAction SilentlyContinue
+} finally {
+  foreach ($n in $SavedEnv.Keys) {
+    if ($null -eq $SavedEnv[$n]) { Remove-Item "Env:$n" -ErrorAction SilentlyContinue } else { Set-Item "Env:$n" $SavedEnv[$n] }
+  }
+  # Only the scratch paths this script named, never whatever %APPDATA% or %LOCALAPPDATA% hold now.
+  foreach ($p in $ScratchAppData, $ScratchLocal, $ScratchInstall) {
+    if ($p -like '*rexplorer-smoke-*') { Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue }
+    else { Write-Output "not removed (no 'rexplorer-smoke-' in the path): $p" }
+  }
+  Remove-Item -LiteralPath "HKCU:\$ScratchReg" -Recurse -Force -ErrorAction SilentlyContinue
+  if (-not $TestRootExisted) { Remove-Item 'HKCU:\Software\rexplorer-test' -Recurse -Force -ErrorAction SilentlyContinue }
+}
+Write-Output ("{0} FAIL, {1} SKIP" -f $script:fails, $script:skips)
+if ($script:fails -or ($NoSkip -and $script:skips)) { exit 1 }
 exit 0

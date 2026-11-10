@@ -22,6 +22,32 @@ jobs:
           RUSTFLAGS: -D warnings
       - run: cargo test --release --locked
 
+  clippy:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The release toolchain (release.yml), so a new Rust release cannot add lints and turn CI red on its own.
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: clippy
+          targets: aarch64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      # Releases also ship an arm64 exe (cross-compiled); this catches arm64-only errors before a tag.
+      - run: cargo clippy --locked --target aarch64-pc-windows-msvc -- -D warnings
+
+  notices:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - name: THIRD-PARTY-NOTICES.md lists exactly the crates in the exe
+        run: |
+          diff <(cargo tree --locked -e normal,no-proc-macro --prefix none --format '{p}' \
+                   --target x86_64-pc-windows-msvc --target aarch64-pc-windows-msvc |
+                 sed 's/ (\*)$//' | grep -v -e ' (' -e '^$' | sed 's/ v/ /' | sort -u) \
+               <(sed -nE 's/^\| `([^`]+)` \| ([^ |]+) \|.*/\1 \2/p' THIRD-PARTY-NOTICES.md | sort -u)
+
   audit:
     runs-on: ubuntu-latest
     steps:

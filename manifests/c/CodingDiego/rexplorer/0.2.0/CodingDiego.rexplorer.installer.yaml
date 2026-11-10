@@ -1,0 +1,29 @@
+# Draft for microsoft/winget-pkgs, not submitted yet. Before submitting, replace both InstallerSha256 values with
+# the zip hashes from the release's SHA256SUMS.txt.
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.10.0.schema.json
+
+PackageIdentifier: CodingDiego.rexplorer
+PackageVersion: 0.2.0
+MinimumOSVersion: 10.0.19045.0
+InstallerType: zip
+NestedInstallerType: exe
+Scope: user
+InstallModes:
+  - silent
+InstallerSwitches:
+  Silent: --install --quiet
+  SilentWithProgress: --install --quiet
+UpgradeBehavior: install
+Installers:
+  - Architecture: x64
+    NestedInstallerFiles:
+      - RelativeFilePath: rexplorer-0.2.0-x64\rexplorer.exe
+    InstallerUrl: https://github.com/CodingDiego/rexplorer/releases/download/v0.2.0/rexplorer-0.2.0-x64.zip
+    InstallerSha256: <SHA256 of rexplorer-0.2.0-x64.zip>
+  - Architecture: arm64
+    NestedInstallerFiles:
+      - RelativeFilePath: rexplorer-0.2.0-arm64\rexplorer.exe
+    InstallerUrl: https://github.com/CodingDiego/rexplorer/releases/download/v0.2.0/rexplorer-0.2.0-arm64.zip
+    InstallerSha256: <SHA256 of rexplorer-0.2.0-arm64.zip>
+ManifestType: installer
+ManifestVersion: 1.10.0
