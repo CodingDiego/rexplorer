@@ -28,7 +28,7 @@ pub struct Raw {
     pub shell_state: Option<Vec<u8>>,
 }
 
-fn dword(key: &str, name: &str) -> Option<u32> {
+pub fn dword(key: &str, name: &str) -> Option<u32> {
     let mut v = 0u32;
     let mut cb = 4u32;
     unsafe {
@@ -124,7 +124,7 @@ fn current(p: &Profile, key: &str) -> String {
     }
 }
 
-/// Splits the mapped values into those to write and those to skip with the reason. A key is written when the
+/// Splits the mapped values into those to write and those to skip with the reason (an i18n key). A key is written when the
 /// profile still has the default value for it (or `overwrite`) and the value would change it.
 pub fn decide(p: &Profile, mapped: Vec<(&'static str, String)>, overwrite: bool) -> (Vec<(&'static str, String)>, Vec<(&'static str, &'static str)>) {
     let default = Profile::default_profile();
@@ -132,9 +132,9 @@ pub fn decide(p: &Profile, mapped: Vec<(&'static str, String)>, overwrite: bool)
     for (k, v) in mapped {
         let cur = current(p, k);
         if cur.eq_ignore_ascii_case(&v) {
-            skip.push((k, "already the same"));
+            skip.push((k, "dlg.import.same"));
         } else if !overwrite && cur != current(&default, k) {
-            skip.push((k, "changed in rexplorer (use --overwrite)"));
+            skip.push((k, "dlg.import.changed"));
         } else {
             write.push((k, v));
         }

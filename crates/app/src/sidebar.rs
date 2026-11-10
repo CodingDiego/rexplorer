@@ -7,13 +7,18 @@ use std::ffi::c_void;
 use std::mem::size_of;
 use std::sync::Once;
 
+use rexplorer_core::access;
+use rexplorer_core::i18n::tr;
 use rexplorer_core::settings::Theme;
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Accessibility::{ROLE_SYSTEM_LIST, ROLE_SYSTEM_LISTITEM};
 use windows::Win32::UI::Controls::{NMHDR, WM_MOUSELEAVE};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetFocus, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VIRTUAL_KEY, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_NEXT, VK_PRIOR, VK_RETURN, VK_UP,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, Result, w};
 
@@ -21,6 +26,8 @@ use crate::theme;
 
 pub const SN_PICK: u32 = 0x9031;
 pub const SN_CONTEXT: u32 = 0x9032;
+/// A context menu asked by keyboard (Shift+F10, Menu key) for the focused row; place it with `menu_point`.
+pub const SN_CONTEXT_KEY: u32 = 0x9033;
 /// Test hook (the smoke test clicks rows): returns the client-space top of row `wparam`, or -1.
 pub const SM_ROW_TOP: u32 = WM_APP + 0x40;
 /// Test hook: sets the window text to row `wparam`'s target (WM_GETTEXT reads it from another process) and
@@ -70,6 +77,37 @@ pub fn layout(rows: &[Row], dpi: u32) -> Vec<RECT> {
     out
 }
 
+/// The keyboard row after `key`: Up / Down by one, Home / End, PageUp / PageDown by `page` rows, all clamped (no
+/// wrap). With no row yet any of them lands on the first. None for other keys or no rows.
+pub fn step(n: usize, focus: Option<usize>, key: VIRTUAL_KEY, page: usize) -> Option<usize> {
+    if n == 0 || !matches!(key, VK_UP | VK_DOWN | VK_HOME | VK_END | VK_PRIOR | VK_NEXT) {
+        return None;
+    }
+    let Some(f) = focus else { return Some(0) };
+    Some(
+        match key {
+            VK_UP => f.saturating_sub(1),
+            VK_DOWN => f + 1,
+            VK_HOME => 0,
+            VK_END => n - 1,
+            VK_PRIOR => f.saturating_sub(page),
+            _ => f + page,
+        }
+        .min(n - 1),
+    )
+}
+
+/// The scroll that shows rows spanning `top..bottom` in a client `page` px tall, moving as little as it can.
+pub fn shown(scroll: i32, top: i32, bottom: i32, page: i32) -> i32 {
+    if top < scroll {
+        top
+    } else if bottom > scroll + page {
+        bottom - page
+    } else {
+        scroll
+    }
+}
+
 /// Row under content-space `y`.
 pub fn hit(rects: &[RECT], y: i32) -> Option<usize> {
     rects.iter().position(|r| y >= r.top && y < r.bottom)
@@ -97,6 +135,10 @@ struct State {
     rects_dpi: u32,
     current: String,
     selected: Option<usize>,
+    /// The keyboard row (the dotted outline), while the sidebar has the focus.
+    focus: Option<usize>,
+    typed: String,
+    typed_at: u32,
     hover: Option<usize>,
     pressed: Option<usize>,
     tracking: bool,
@@ -105,6 +147,7 @@ struct State {
     font: HFONT,
     header_font: HFONT,
     header_dpi: u32,
+    acc: Option<access::Server>,
 }
 
 impl State {
@@ -158,6 +201,9 @@ pub fn create(parent: HWND, id: usize) -> Result<HWND> {
             rects_dpi: 0,
             current: String::new(),
             selected: None,
+            focus: None,
+            typed: String::new(),
+            typed_at: 0,
             hover: None,
             pressed: None,
             tracking: false,
@@ -166,6 +212,7 @@ pub fn create(parent: HWND, id: usize) -> Result<HWND> {
             font: HFONT::default(),
             header_font: HFONT::default(),
             header_dpi: 0,
+            acc: None,
         }));
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -206,10 +253,12 @@ pub fn set_rows(hwnd: HWND, rows: Vec<Row>) {
         destroy_icons(&s.rows);
         s.rows = rows;
         s.rects.clear();
+        s.focus = s.focus.filter(|&f| f < s.rows.len());
         s.hover = None;
         s.pressed = None;
         s.reselect();
         let _ = InvalidateRect(Some(hwnd), None, false);
+        access::event(EVENT_OBJECT_REORDER, hwnd, None);
     }
 }
 
@@ -222,6 +271,9 @@ pub fn select(hwnd: HWND, current: &str) {
             s.reselect();
             if s.selected != before {
                 let _ = InvalidateRect(Some(hwnd), None, false);
+                if let Some(i) = s.selected {
+                    access::event(EVENT_OBJECT_SELECTION, hwnd, Some(i));
+                }
             }
         }
     }
@@ -230,6 +282,79 @@ pub fn select(hwnd: HWND, current: &str) {
 /// The parsing name behind row `index`, empty when there is no such row.
 pub fn target(hwnd: HWND, index: usize) -> String {
     unsafe { state(hwnd).and_then(|s| s.rows.get(index)).map(|r| r.target.clone()).unwrap_or_default() }
+}
+
+/// Row under screen point (x, y).
+pub fn row_at_screen(hwnd: HWND, x: i32, y: i32) -> Option<usize> {
+    unsafe {
+        let s = state(hwnd)?;
+        let mut p = POINT { x, y };
+        let _ = ScreenToClient(hwnd, &mut p);
+        s.sync(hwnd);
+        hit(&s.rects, p.y + s.scroll)
+    }
+}
+
+/// Row `index`'s place on screen for a keyboard-opened menu: its bottom-left, or the client's top-left when it is
+/// scrolled out.
+pub fn menu_point(hwnd: HWND, index: usize) -> POINT {
+    unsafe {
+        let mut p = POINT::default();
+        if let Some(s) = state(hwnd) {
+            s.sync(hwnd);
+            let mut rc = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rc);
+            if let Some(r) = s.rects.get(index).filter(|r| r.bottom - s.scroll > 0 && r.top - s.scroll < rc.bottom) {
+                p = POINT { x: scale(INSET, GetDpiForWindow(hwnd)), y: r.bottom - s.scroll };
+            }
+        }
+        let _ = ClientToScreen(hwnd, &mut p);
+        p
+    }
+}
+
+/// Tells the parent about row `index`. Nothing may use the sidebar's state afterwards: the parent can destroy us.
+unsafe fn notify(hwnd: HWND, code: u32, index: usize) {
+    if let Ok(parent) = GetParent(hwnd) {
+        let id = GetDlgCtrlID(hwnd) as usize;
+        let nm = NmSidebar { hdr: NMHDR { hwndFrom: hwnd, idFrom: id, code }, index };
+        SendMessageW(parent, WM_NOTIFY, Some(WPARAM(id)), Some(LPARAM(&nm as *const _ as isize)));
+    }
+}
+
+/// Scrolls the keyboard row into view.
+unsafe fn reveal(hwnd: HWND, s: &mut State) {
+    s.sync(hwnd);
+    let Some((i, r)) = s.focus.and_then(|i| s.rects.get(i).map(|r| (i, *r))) else { return };
+    let dpi = GetDpiForWindow(hwnd);
+    let starts_section = (i == 0 || s.rows[i - 1].section != s.rows[i].section) && !s.rows[i].section.is_empty();
+    let mut rc = RECT::default();
+    let _ = GetClientRect(hwnd, &mut rc);
+    s.scroll = shown(s.scroll, r.top - if starts_section { scale(HEADER, dpi) } else { 0 }, r.bottom, rc.bottom);
+    s.sync(hwnd);
+}
+
+/// Reads only: a client may ask while the sidebar is in the middle of anything, so no `sync`.
+unsafe fn acc_tree(hwnd: HWND, s: &State, t: &mut access::Tree) {
+    let dpi = GetDpiForWindow(hwnd);
+    let mut rc = RECT::default();
+    let _ = GetClientRect(hwnd, &mut rc);
+    t.name = tr("side.name").into();
+    t.role = ROLE_SYSTEM_LIST;
+    t.focusable = true;
+    t.focus = s.focus;
+    for (r, row) in layout(&s.rows, dpi).iter().zip(&s.rows) {
+        let i = t.items.len();
+        t.items.push(access::Item {
+            name: row.label.clone(),
+            description: row.section.to_string(),
+            role: ROLE_SYSTEM_LISTITEM,
+            state: STATE_SYSTEM_SELECTABLE | if s.selected == Some(i) { STATE_SYSTEM_SELECTED } else { 0 },
+            rect: RECT { left: scale(INSET, dpi), top: r.top - s.scroll, right: rc.right - scale(INSET, dpi), bottom: r.bottom - s.scroll },
+            action: tr("tb.action_open"),
+            ..Default::default()
+        });
+    }
 }
 
 unsafe fn row_at(hwnd: HWND, s: &mut State, lparam: LPARAM) -> Option<usize> {
@@ -262,6 +387,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
         WM_PAINT => paint(hwnd, s),
+        WM_GETOBJECT if access::is_client(lparam) => return s.acc.get_or_insert_with(|| access::Server::new(hwnd)).answer(wparam),
+        access::WM_ACC_ITEMS => {
+            acc_tree(hwnd, s, &mut *(lparam.0 as *mut access::Tree));
+            return LRESULT(1);
+        }
+        access::WM_ACC_INVOKE => {
+            if wparam.0 < s.rows.len() {
+                notify(hwnd, SN_PICK, wparam.0);
+            }
+        }
         WM_SIZE => {
             s.sync(hwnd);
             let _ = InvalidateRect(Some(hwnd), None, false);
@@ -305,11 +440,62 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             } else {
                 (row_at(hwnd, s, lparam), SN_CONTEXT)
             };
-            // No state reference is used after notifying: the parent may do anything, including destroying us.
-            if let (Some(index), Ok(parent)) = (picked, GetParent(hwnd)) {
-                let id = GetDlgCtrlID(hwnd) as usize;
-                let nm = NmSidebar { hdr: NMHDR { hwndFrom: hwnd, idFrom: id, code }, index };
-                SendMessageW(parent, WM_NOTIFY, Some(WPARAM(id)), Some(LPARAM(&nm as *const _ as isize)));
+            if let Some(index) = picked {
+                notify(hwnd, code, index);
+            }
+        }
+        WM_SETFOCUS => {
+            s.focus = s.focus.or(s.selected).or(if s.rows.is_empty() { None } else { Some(0) });
+            let _ = InvalidateRect(Some(hwnd), None, false);
+            if let Some(i) = s.focus {
+                access::event(EVENT_OBJECT_FOCUS, hwnd, Some(i));
+            }
+        }
+        WM_KILLFOCUS => {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+        WM_KEYDOWN => {
+            let key = VIRTUAL_KEY(wparam.0 as u16);
+            if key == VK_RETURN {
+                if let Some(i) = s.focus {
+                    notify(hwnd, SN_PICK, i);
+                }
+            } else if key == VK_ESCAPE {
+                // The main window hands the focus on to the view.
+                if let Ok(parent) = GetParent(hwnd) {
+                    let _ = SetFocus(Some(parent));
+                }
+            } else {
+                let mut rc = RECT::default();
+                let _ = GetClientRect(hwnd, &mut rc);
+                let page = (rc.bottom / scale(ROW, GetDpiForWindow(hwnd)).max(1)).max(1) as usize;
+                // Keys it does not handle (Shift+F10 among them) go on to DefWindowProc.
+                let Some(f) = step(s.rows.len(), s.focus, key, page) else { return DefWindowProcW(hwnd, msg, wparam, lparam) };
+                s.focus = Some(f);
+                reveal(hwnd, s);
+                let _ = InvalidateRect(Some(hwnd), None, false);
+                access::event(EVENT_OBJECT_FOCUS, hwnd, Some(f));
+            }
+        }
+        // The keyboard's menu comes with (-1, -1) in the low 32 bits only.
+        WM_CONTEXTMENU if lparam.0 as i32 == -1 && s.focus.is_some() => {
+            if let Some(i) = s.focus {
+                notify(hwnd, SN_CONTEXT_KEY, i);
+            }
+        }
+        WM_CHAR => {
+            let now = GetMessageTime() as u32;
+            let (typed, needle) = crate::list::type_ahead(&s.typed, s.typed_at, now, char::from_u32(wparam.0 as u32).unwrap_or('\0'));
+            if !needle.is_empty() {
+                s.typed = typed;
+                s.typed_at = now;
+                let start = if needle.chars().count() == 1 { s.focus.map_or(0, |f| f + 1) } else { s.focus.unwrap_or(0) };
+                if let Some(i) = crate::list::find_prefix(s.rows.len(), start, true, &needle, |i| s.rows[i].label.clone()) {
+                    s.focus = Some(i);
+                    reveal(hwnd, s);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                    access::event(EVENT_OBJECT_FOCUS, hwnd, Some(i));
+                }
             }
         }
         _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -344,6 +530,7 @@ unsafe fn paint(hwnd: HWND, s: &mut State) {
     let old_font = SelectObject(dc, font.into());
     let sc = |v: i32| scale(v, dpi);
     let (inset, icon) = (sc(INSET), sc(16));
+    let focused = GetFocus() == hwnd;
     for (i, row) in s.rows.iter().enumerate() {
         let Some(r) = s.rects.get(i) else { break };
         let (top, bottom) = (r.top - s.scroll, r.bottom - s.scroll);
@@ -363,14 +550,21 @@ unsafe fn paint(hwnd: HWND, s: &mut State) {
             theme::fill_round(dc, &pill, t.selection, sc(6));
         } else if s.hover == Some(i) {
             theme::fill_round(dc, &pill, theme::hover(t), sc(6));
+            theme::hot_outline(dc, &pill, t, sc(6), dpi);
         }
         if let Some(h) = row.icon {
             let _ = DrawIconEx(dc, pill.left + inset, top + (bottom - top - icon) / 2, h, icon, icon, 0, None, DI_NORMAL);
         }
-        SetTextColor(dc, COLORREF(t.text));
+        SetTextColor(dc, COLORREF(if s.selected == Some(i) { theme::on_selection(t, t.text) } else { t.text }));
         let mut lr = RECT { left: pill.left + inset + icon + inset, top, right: pill.right - inset, bottom };
         let mut text: Vec<u16> = row.label.encode_utf16().collect();
         DrawTextW(dc, &mut text, &mut lr, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+        if focused && s.focus == Some(i) {
+            // The system's XOR rectangle shows on any fill, in a contrast theme too (as the folder options list does).
+            SetTextColor(dc, COLORREF(t.text));
+            SetBkColor(dc, COLORREF(t.background));
+            let _ = DrawFocusRect(dc, &RECT { left: pill.left + 1, top: pill.top + 1, right: pill.right - 1, bottom: pill.bottom - 1 });
+        }
     }
     SelectObject(dc, old_font);
     let _ = BitBlt(wdc, 0, 0, cw, ch, Some(dc), 0, 0, SRCCOPY);
@@ -383,9 +577,91 @@ unsafe fn paint(hwnd: HWND, s: &mut State) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::UI::Input::KeyboardAndMouse::VK_A;
+
+    #[test]
+    fn row_at_screen_maps_screen_points() {
+        use windows::Win32::Graphics::Gdi::ClientToScreen;
+        unsafe {
+            let parent = CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR::null(), WS_OVERLAPPEDWINDOW, 0, 0, 800, 600, None, None, None, None).unwrap();
+            let sb = create(parent, 7).unwrap();
+            let _ = MoveWindow(sb, 0, 0, 220, 400, false);
+            set_rows(sb, vec![row("Favorites", "C:/Users"), row("This PC", "C:\\")]);
+            let r = layout(&state(sb).unwrap().rows, GetDpiForWindow(sb));
+            let screen = |x: i32, y: i32| {
+                let mut p = windows::Win32::Foundation::POINT { x, y };
+                let _ = ClientToScreen(sb, &mut p);
+                (p.x, p.y)
+            };
+            let (x, y) = screen(10, r[1].top + 2);
+            assert_eq!(row_at_screen(sb, x, y), Some(1));
+            let (x, y) = screen(10, 2);
+            assert_eq!(row_at_screen(sb, x, y), None, "the first header");
+            let _ = DestroyWindow(parent);
+        }
+    }
 
     fn row(section: &'static str, target: &str) -> Row {
         Row { section, label: target.to_string(), target: target.to_string(), icon: None }
+    }
+
+    #[test]
+    fn step_rules() {
+        let k = |n, f, key: u16, page| step(n, f, VIRTUAL_KEY(key), page);
+        assert_eq!(k(5, None, VK_DOWN.0, 3), Some(0));
+        assert_eq!(k(5, Some(0), VK_UP.0, 3), Some(0));
+        assert_eq!(k(5, Some(4), VK_DOWN.0, 3), Some(4));
+        assert_eq!(k(5, Some(2), VK_HOME.0, 3), Some(0));
+        assert_eq!(k(5, Some(2), VK_END.0, 3), Some(4));
+        assert_eq!(k(5, Some(1), VK_NEXT.0, 3), Some(4));
+        assert_eq!(k(5, Some(4), VK_PRIOR.0, 3), Some(1));
+        assert_eq!(k(0, None, VK_DOWN.0, 3), None);
+        assert_eq!(k(5, Some(1), VK_A.0, 3), None);
+    }
+
+    #[test]
+    fn shown_rules() {
+        assert_eq!(shown(0, 100, 128, 80), 48);
+        assert_eq!(shown(200, 100, 128, 80), 100);
+        assert_eq!(shown(90, 100, 128, 80), 90);
+    }
+
+    thread_local!(static NOTES: std::cell::RefCell<Vec<(u32, usize)>> = Default::default());
+
+    unsafe extern "system" fn record(h: HWND, m: u32, w: WPARAM, l: LPARAM, _: usize, _: usize) -> LRESULT {
+        if m == WM_NOTIFY {
+            NOTES.with_borrow_mut(|c| c.push(((*(l.0 as *const NMHDR)).code, (*(l.0 as *const NmSidebar)).index)));
+        }
+        windows::Win32::UI::Shell::DefSubclassProc(h, m, w, l)
+    }
+
+    #[test]
+    fn keyboard_moves_picks_and_menus() {
+        unsafe {
+            let parent = CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR::null(), WS_OVERLAPPEDWINDOW, 0, 0, 800, 600, None, None, None, None).unwrap();
+            let sb = create(parent, 7).unwrap();
+            let _ = MoveWindow(sb, 0, 0, 220, 400, false);
+            let _ = windows::Win32::UI::Shell::SetWindowSubclass(parent, Some(record), 1, 0);
+            set_rows(sb, vec![row("", "Alpha"), row("", "Beta"), row("", "Bravo")]);
+            let key = |k: VIRTUAL_KEY| SendMessageW(sb, WM_KEYDOWN, Some(WPARAM(k.0 as usize)), None);
+            key(VK_DOWN);
+            key(VK_DOWN);
+            assert_eq!(state(sb).unwrap().focus, Some(1));
+            key(VK_RETURN);
+            SendMessageW(sb, WM_CONTEXTMENU, Some(WPARAM(0)), Some(LPARAM(-1)));
+            SendMessageW(sb, WM_CONTEXTMENU, Some(WPARAM(0)), Some(LPARAM(((5i32 as isize) << 16) | 5)));
+            assert_eq!(NOTES.with_borrow(|c| c.clone()), vec![(SN_PICK, 1), (SN_CONTEXT_KEY, 1)]);
+            // MAKELPARAM(-1, -1) zero-extended, as a 64-bit lparam can carry it, is the keyboard's too.
+            SendMessageW(sb, WM_CONTEXTMENU, Some(WPARAM(0)), Some(LPARAM(0xFFFF_FFFF)));
+            assert_eq!(NOTES.with_borrow(|c| c.len()), 3, "(-1, -1) in the low 32 bits is a keyboard menu");
+            SendMessageW(sb, WM_CHAR, Some(WPARAM('b' as usize)), None);
+            assert_eq!(state(sb).unwrap().focus, Some(2));
+            SendMessageW(sb, WM_CHAR, Some(WPARAM('b' as usize)), None);
+            assert_eq!(state(sb).unwrap().focus, Some(1));
+            set_rows(sb, vec![row("", "Alpha")]);
+            assert_eq!(state(sb).unwrap().focus, None);
+            let _ = DestroyWindow(parent);
+        }
     }
 
     #[test]
@@ -443,6 +719,63 @@ mod tests {
             set_rows(sb, vec![row("Favorites", "C:\\Users"), row("This PC", "C:\\")]);
             assert_eq!(state(sb).unwrap().rows.len(), 2);
             let _ = DestroyWindow(parent);
+        }
+    }
+
+    thread_local! {
+        static ACC_NOTES: std::cell::RefCell<Vec<(u32, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    unsafe extern "system" fn rec_parent(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        if msg == WM_NOTIFY {
+            let nm = &*(lparam.0 as *const NmSidebar);
+            ACC_NOTES.with(|n| n.borrow_mut().push((nm.hdr.code, nm.index)));
+            return LRESULT(0);
+        }
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+
+    #[test]
+    fn accessible_rows() {
+        use crate::acc_test::*;
+        use rexplorer_core::com::ComInit;
+        let _com = ComInit::sta();
+        unsafe {
+            let hinst = GetModuleHandleW(None).unwrap().into();
+            let wc = WNDCLASSW { lpfnWndProc: Some(rec_parent), hInstance: hinst, lpszClassName: w!("RexSidebarAccParent"), ..Default::default() };
+            RegisterClassW(&wc);
+            let parent = CreateWindowExW(WINDOW_EX_STYLE(0), w!("RexSidebarAccParent"), PCWSTR::null(), WS_OVERLAPPEDWINDOW, 0, 0, 800, 600, None, None, Some(hinst), None).unwrap();
+            let sb = create(parent, 7).unwrap();
+            let _ = MoveWindow(sb, 0, 0, 220, 400, false);
+            set_rows(sb, vec![row("Favorites", "C:\\Users"), row("This PC", "C:\\")]);
+            select(sb, "C:\\Users\\x");
+            let acc = object(sb);
+            let k = kids(&acc);
+            assert_eq!(k.iter().map(|k| k.name.as_str()).collect::<Vec<_>>(), ["C:\\Users", "C:\\"]);
+            assert_eq!(k.iter().map(|k| k.description.as_str()).collect::<Vec<_>>(), ["Favorites", "This PC"]);
+            assert!(k.iter().all(|k| k.role == ROLE_SYSTEM_LISTITEM));
+            assert_ne!(k[0].state & STATE_SYSTEM_SELECTED, 0);
+            assert_eq!(k[1].state & STATE_SYSTEM_SELECTED, 0);
+            let dpi = GetDpiForWindow(sb);
+            let r = layout(&state(sb).unwrap().rows, dpi);
+            let want = screen(sb, RECT { left: scale(INSET, dpi), top: r[1].top, right: 220 - scale(INSET, dpi), bottom: r[1].bottom });
+            assert_eq!((k[1].rect.left, k[1].rect.top, k[1].rect.right, k[1].rect.bottom), (want.left, want.top, want.right, want.bottom));
+            let r0 = root(&acc);
+            assert_eq!((r0.name.as_str(), r0.role), ("Navigation pane", ROLE_SYSTEM_LIST));
+            ACC_NOTES.with(|n| n.borrow_mut().clear());
+            invoke(&acc, 2).unwrap();
+            assert_eq!(ACC_NOTES.with(|n| n.borrow().clone()), [(SN_PICK, 1)]);
+            ACC_NOTES.with(|n| n.borrow_mut().clear());
+            let y = SendMessageW(sb, SM_ROW_TOP, Some(WPARAM(1)), None).0 as isize + 2;
+            SendMessageW(sb, WM_LBUTTONDOWN, Some(WPARAM(1)), Some(LPARAM(10 | (y << 16))));
+            SendMessageW(sb, WM_LBUTTONUP, Some(WPARAM(0)), Some(LPARAM(10 | (y << 16))));
+            assert_eq!(ACC_NOTES.with(|n| n.borrow().clone()), [(SN_PICK, 1)], "the same record as a click");
+            let hk = hook();
+            select(sb, "C:\\");
+            assert!(hk.take().contains(&(EVENT_OBJECT_SELECTION, sb, 2)));
+            drop(hk);
+            let _ = DestroyWindow(parent);
+            assert_eq!(acc.accChildCount().unwrap_err().code(), windows::Win32::Foundation::CO_E_OBJNOTCONNECTED);
         }
     }
 }

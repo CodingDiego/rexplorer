@@ -1,11 +1,11 @@
 use std::collections::HashSet;
 use std::ptr;
 
-use windows::Win32::Foundation::{HWND, LPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, PROPERTYKEY};
 use windows::Win32::System::Registry::{
     HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegEnumKeyExW, RegOpenKeyExW,
 };
-use windows::Win32::UI::Shell::Common::{ITEMIDLIST, SHCOLSTATE_ONBYDEFAULT, SHELLDETAILS};
+use windows::Win32::UI::Shell::Common::{ITEMIDLIST, SHCOLSTATE, SHCOLSTATE_HIDDEN, SHCOLSTATE_ONBYDEFAULT, SHCOLSTATE_SECONDARYUI, SHCOLSTATE_TYPEMASK, SHCOLSTATE_TYPE_DATE, SHCOLSTATE_TYPE_INT, SHELLDETAILS};
 use windows::Win32::UI::Shell::{
     BHID_SFObject, CSIDL_DESKTOP, IEnumIDList, SHGetFolderLocation, ILClone, ILCombine, ILFindLastID, ILRemoveLastID, IShellFolder,
     IShellFolder2, IShellItem, SHCONTF_FOLDERS, SHCONTF_INCLUDEHIDDEN, SHCONTF_NONFOLDERS,
@@ -33,12 +33,22 @@ pub struct ShellFolder {
 }
 
 /// One detail column the folder shows by default.
+#[derive(Clone)]
 pub struct Column {
     /// The shell's column index; gaps are normal because off-by-default columns are skipped.
     pub index: u32,
     pub title: String,
     pub width_chars: i32,
     pub right_align: bool,
+    /// The shell's value type (`SHCOLSTATE_TYPE_*`), masked.
+    pub kind: SHCOLSTATE,
+}
+
+impl Column {
+    /// Sizes and dates start with the biggest/newest on the first sort, as Explorer does.
+    pub fn descending_first(&self) -> bool {
+        self.kind == SHCOLSTATE_TYPE_INT || self.kind == SHCOLSTATE_TYPE_DATE
+    }
 }
 
 impl ShellFolder {
@@ -169,6 +179,16 @@ impl ShellFolder {
 
     /// The columns this folder shows by default (Name, Date modified, Type, Size for filesystem folders).
     pub fn columns(&self) -> Vec<Column> {
+        self.columns_where(|state, index| index == 0 || state.is_some_and(|s| s.0 & SHCOLSTATE_ONBYDEFAULT.0 != 0))
+    }
+
+    /// The columns a header right-click offers: the defaults plus the other ones Explorer lists (not those it keeps
+    /// for its "More..." dialog).
+    pub fn menu_columns(&self) -> Vec<Column> {
+        self.columns_where(in_menu)
+    }
+
+    fn columns_where(&self, keep: impl Fn(Option<SHCOLSTATE>, u32) -> bool) -> Vec<Column> {
         let mut cols = Vec::new();
         let Ok(f2) = self.folder.cast::<IShellFolder2>() else { return cols };
         for index in 0..64 {
@@ -176,19 +196,24 @@ impl ShellFolder {
             if unsafe { f2.GetDetailsOf(ptr::null(), index, &mut sd) }.is_err() {
                 break;
             }
-            let on = unsafe { f2.GetDefaultColumnState(index) }
-                .map(|s| s.0 & SHCOLSTATE_ONBYDEFAULT.0 != 0)
-                .unwrap_or(index == 0);
-            if !on && index != 0 {
+            let state = unsafe { f2.GetDefaultColumnState(index) }.ok();
+            let kind = SHCOLSTATE(state.map_or(0, |s| s.0 & SHCOLSTATE_TYPEMASK.0));
+            if !keep(state, index) {
                 continue;
             }
             // SHELLDETAILS is packed: copy the STRRET out before taking a reference.
             let mut ret = { sd.str };
             let title = unsafe { strret_to_string(&mut ret, ptr::null()) };
             // fmt 1 is LVCFMT_RIGHT (sizes, counts).
-            cols.push(Column { index, title, width_chars: sd.cxChar, right_align: sd.fmt == 1 });
+            cols.push(Column { index, title, width_chars: sd.cxChar, right_align: sd.fmt == 1, kind });
         }
         cols
+    }
+
+    /// The property behind a shell column (what `ShellItem::property_time` reads for a date column).
+    pub fn column_key(&self, column: u32) -> Option<PROPERTYKEY> {
+        let mut key = PROPERTYKEY::default();
+        unsafe { self.folder.cast::<IShellFolder2>().ok()?.MapColumnToSCID(column, &mut key) }.ok().map(|_| key)
     }
 
     /// Shell-correct ordering by a column (folders first, locale-aware names, real dates and sizes).
@@ -203,6 +228,11 @@ impl ShellFolder {
     }
 }
 
+/// Whether the header menu offers a column: Name, the defaults, and any not hidden or kept for the "More..." dialog.
+fn in_menu(state: Option<SHCOLSTATE>, index: u32) -> bool {
+    index == 0 || state.is_some_and(|s| s.0 & SHCOLSTATE_ONBYDEFAULT.0 != 0 || s.0 & (SHCOLSTATE_HIDDEN.0 | SHCOLSTATE_SECONDARYUI.0) == 0)
+}
+
 /// Convenience for the UI: open then list.
 pub fn list(name: &str) -> Result<(ShellFolder, Vec<ShellItem>)> {
     let f = ShellFolder::parse(name)?;
@@ -214,6 +244,39 @@ pub fn list(name: &str) -> Result<(ShellFolder, Vec<ShellItem>)> {
 mod tests {
     use super::*;
     use crate::com::ComInit;
+    use windows::Win32::UI::Shell::Common::SHCOLSTATE_TYPE_STR;
+
+    #[test]
+    fn descending_first_by_type() {
+        let c = |kind| Column { index: 0, title: String::new(), width_chars: 0, right_align: false, kind };
+        assert!(c(SHCOLSTATE_TYPE_INT).descending_first() && c(SHCOLSTATE_TYPE_DATE).descending_first());
+        assert!(!c(SHCOLSTATE_TYPE_STR).descending_first());
+    }
+
+    #[test]
+    fn in_menu_rule() {
+        let st = |s: SHCOLSTATE| Some(s);
+        assert!(in_menu(st(SHCOLSTATE_ONBYDEFAULT), 3));
+        assert!(in_menu(st(SHCOLSTATE(0)), 3));
+        assert!(!in_menu(st(SHCOLSTATE_SECONDARYUI), 3));
+        assert!(!in_menu(st(SHCOLSTATE_HIDDEN), 3));
+        assert!(in_menu(st(SHCOLSTATE(SHCOLSTATE_ONBYDEFAULT.0 | SHCOLSTATE_SECONDARYUI.0)), 3));
+        assert!(in_menu(None, 0));
+        assert!(!in_menu(None, 5));
+    }
+
+    #[test]
+    fn menu_columns_extend_the_defaults() {
+        let _c = ComInit::sta();
+        let dir = std::env::temp_dir().join(format!("rexplorer-test-menucols-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = ShellFolder::parse(dir.to_str().unwrap()).unwrap();
+        let (defaults, menu) = (f.columns(), f.menu_columns());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(defaults.iter().all(|d| menu.iter().any(|m| m.index == d.index)));
+        assert!(menu.len() > defaults.len());
+        assert_eq!(menu[0].index, 0);
+    }
 
     #[test]
     fn parses_windows_dir() {
@@ -256,8 +319,29 @@ mod tests {
                 ("c".into(), false)
             ]
         );
+        assert_eq!(cols[0].kind, SHCOLSTATE_TYPE_STR, "Name");
+        assert!(cols.iter().any(|c| c.kind == SHCOLSTATE_TYPE_DATE), "a date column");
         assert!(size_of_a.starts_with("1 "), "size text: {size_of_a:?}");
         assert_eq!(sizes, (Some(1), Some(0)), "the shell reports 0 for folders");
+    }
+
+    #[test]
+    fn file_time_matches_fs() {
+        let _c = ComInit::sta();
+        let dir = std::env::temp_dir().join(format!("rexplorer-time-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86_400);
+        std::fs::File::options().write(true).open(&file).unwrap().set_modified(old).unwrap();
+        let (f, items) = list(dir.to_str().unwrap()).unwrap();
+        let date = f.columns().into_iter().find(|c| c.kind == SHCOLSTATE_TYPE_DATE).expect("a date column");
+        let key = f.column_key(date.index).expect("its property");
+        let ft = items[0].property_time(&key).expect("a date");
+        let unix = ((ft.dwHighDateTime as u64) << 32 | ft.dwLowDateTime as u64) / 10_000_000 - 11_644_473_600;
+        let fs = std::fs::metadata(&file).unwrap().modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(unix.abs_diff(fs) <= 2, "shell {unix} vs fs {fs}");
     }
 
     #[test]
@@ -292,5 +376,23 @@ mod tests {
         assert_eq!(drive.parent().unwrap().parsing_name, pc.parsing_name);
         // Root of the namespace: This PC's parent is the desktop, whose parent is None.
         assert!(pc.parent().unwrap().parent().is_none());
+    }
+
+    /// Read only: the shell's desktop root shows what is in the user's and in the public Desktop folder.
+    #[test]
+    fn desktop_root_merges_user_and_public_desktops() {
+        use windows::Win32::UI::Shell::{FOLDERID_Desktop, FOLDERID_PublicDesktop};
+        let _c = ComInit::sta();
+        let shown: Vec<String> = ShellFolder::desktop().unwrap().enumerate().unwrap().iter().map(|i| i.parsing_name().to_lowercase()).collect();
+        for id in [&FOLDERID_Desktop, &FOLDERID_PublicDesktop] {
+            let dir = crate::install::known_folder(id).unwrap();
+            for e in std::fs::read_dir(&dir).unwrap().flatten() {
+                let attrs = std::os::windows::fs::MetadataExt::file_attributes(&e.metadata().unwrap());
+                if attrs & (2 | 4) == 0 {
+                    let p = e.path().display().to_string().to_lowercase();
+                    assert!(shown.contains(&p), "{p} missing from the desktop root: {shown:?}");
+                }
+            }
+        }
     }
 }

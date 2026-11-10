@@ -4,35 +4,41 @@
 
 use super::*;
 use crate::nav::{cur, listing};
+use crate::ui::tip;
+use rexplorer_core::i18n::{tr, trf};
+use rexplorer_core::undo::Op;
 use std::collections::HashSet;
 use windows::Win32::System::DataExchange::{IsClipboardFormatAvailable, RegisterClipboardFormatW};
 
 pub(crate) unsafe fn create(hwnd: HWND) -> Result<HWND> {
+    let (cut, copy, paste, rename, delete, preview) =
+        (tip("tb.cut", "Ctrl+X"), tip("tb.copy", "Ctrl+C"), tip("tb.paste", "Ctrl+V"), tip("tb.rename", "F2"), tip("tb.delete", "Del"), tip("tb.preview", "Alt+P"));
     let bar = toolbar::create(
         hwnd,
         ID_CMDBAR,
         &[
-            (0xE710, CMD_NEW, "New folder or file"),
+            (0xE710, CMD_NEW, tr("tb.new")),
             toolbar::SEPARATOR,
-            (0xE8C6, CMD_CUT, "Cut (Ctrl+X)"),
-            (0xE8C8, CMD_COPY, "Copy (Ctrl+C)"),
-            (0xE77F, CMD_PASTE, "Paste (Ctrl+V)"),
-            (0xE8AC, CMD_RENAME, "Rename (F2)"),
-            (0xE72D, CMD_SHARE, "Share"),
-            (0xE74D, CMD_DELETE, "Delete (Del)"),
+            (0xE8C6, CMD_CUT, &cut),
+            (0xE8C8, CMD_COPY, &copy),
+            (0xE77F, CMD_PASTE, &paste),
+            (0xE8AC, CMD_RENAME, &rename),
+            (0xE72D, CMD_SHARE, tr("tb.share")),
+            (0xE74D, CMD_DELETE, &delete),
             toolbar::SEPARATOR,
-            (0xE8CB, CMD_SORT, "Sort"),
-            (0xE8A9, CMD_VIEW_MENU, "View and panes"),
+            (0xE8CB, CMD_SORT, tr("tb.sort")),
+            (0xE8A9, CMD_VIEW_MENU, tr("tb.view")),
             toolbar::SEPARATOR,
-            (0xE712, CMD_MORE, "More"),
+            (0xE712, CMD_MORE, tr("tb.more")),
             toolbar::SPACER,
-            (0xE7B3, CMD_TOGGLE_PREVIEW, "Preview pane (Alt+P)"),
+            (0xE7B3, CMD_TOGGLE_PREVIEW, &preview),
         ],
     )?;
-    toolbar::set_label(bar, CMD_NEW, "New", true);
-    toolbar::set_label(bar, CMD_SORT, "Sort", true);
-    toolbar::set_label(bar, CMD_VIEW_MENU, "View", true);
-    toolbar::set_label(bar, CMD_TOGGLE_PREVIEW, "Preview", false);
+    let _ = SetWindowTextW(bar, &HSTRING::from(tr("tb.cmdbar_name"))); // the accessible name
+    toolbar::set_label(bar, CMD_NEW, tr("tb.new_label"), true);
+    toolbar::set_label(bar, CMD_SORT, tr("tb.sort_label"), true);
+    toolbar::set_label(bar, CMD_VIEW_MENU, tr("tb.view_label"), true);
+    toolbar::set_label(bar, CMD_TOGGLE_PREVIEW, tr("tb.preview_label"), false);
     Ok(bar)
 }
 
@@ -75,7 +81,7 @@ pub(crate) unsafe fn update(app: *mut App) {
         (CMD_CUT, shell && sel > 0),
         (CMD_COPY, (shell || search) && sel > 0),
         (CMD_PASTE, shell && clipboard_has_files()),
-        (CMD_RENAME, shell && sel == 1),
+        (CMD_RENAME, (shell || search) && sel == 1),
         (CMD_SHARE, shell && sel > 0),
         (CMD_DELETE, (shell || search) && sel > 0 && list::can_delete(app, &list::selected_indices(a.list))),
         (CMD_SORT, shell && !home),
@@ -116,7 +122,7 @@ unsafe fn share_files(hwnd: HWND, paths: Vec<String>) -> windows::core::Result<(
         let data = args.ok()?.Request()?.Data()?;
         let title = match &paths[..] {
             [one] => std::path::Path::new(one).file_name().map_or(one.clone(), |n| n.to_string_lossy().into_owned()),
-            many => format!("{} items", many.len()),
+            many => rexplorer_core::i18n::trn("status.items", many.len() as u64),
         };
         data.Properties()?.SetTitle(&HSTRING::from(title))?;
         let mut items = Vec::new();
@@ -142,7 +148,7 @@ pub(crate) unsafe fn new_menu(app: *mut App) {
     let Some(menu) = listing(app).and_then(|l| ContextMenu::for_background(&l.folder, hwnd).ok()) else { return };
     // shortcut: an empty list when the New submenu cannot be found; "Folder" still works through the verb
     let types = menu.new_items().unwrap_or_default();
-    let mut entries = vec![(1, "Folder".to_string())];
+    let mut entries = vec![(1, tr("menu.new.folder").to_string())];
     if !types.is_empty() {
         entries.push((0, String::new()));
     }
@@ -152,15 +158,27 @@ pub(crate) unsafe fn new_menu(app: *mut App) {
     if picked == 0 {
         return;
     }
+    add_item(app, &menu, |m| match picked {
+        1 => m.invoke_verb(hwnd, "NewFolder", false),
+        n => m.invoke_command(hwnd, types[n - 2].0),
+    });
+}
+
+/// Ctrl+Shift+N: a new folder without the menu.
+pub(crate) unsafe fn new_folder(app: *mut App) {
+    let hwnd = (*app).hwnd;
+    let Some(menu) = listing(app).and_then(|l| ContextMenu::for_background(&l.folder, hwnd).ok()) else { return };
+    add_item(app, &menu, |m| m.invoke_verb(hwnd, "NewFolder", false));
+}
+
+/// Runs `invoke` and arms the rename of the item it adds.
+unsafe fn add_item(app: *mut App, menu: &ContextMenu, invoke: impl FnOnce(&ContextMenu) -> Result<()>) {
+    let hwnd = (*app).hwnd;
     // The popup pumps messages: a refresh may have replaced the listing meanwhile.
     let Some(l) = listing(app) else { return };
     let before: HashSet<String> = l.items.iter().map(|i| i.parsing_name()).collect();
     let folder = l.folder.parsing_name.clone();
-    let done = match picked {
-        1 => menu.invoke_verb(hwnd, "NewFolder", false),
-        n => menu.invoke_command(hwnd, types[n - 2].0),
-    };
-    match done {
+    match invoke(menu) {
         Ok(()) => {
             (*app).new_item = Some((folder, before));
             // The change watch may reload first; whichever reload starts cancels the other.
@@ -179,7 +197,12 @@ pub(crate) unsafe fn rename_new_item(app: *mut App) {
     if !l.folder.parsing_name.eq_ignore_ascii_case(folder) {
         return;
     }
-    let Some(i) = l.items.iter().position(|it| !before.contains(&it.parsing_name())) else { return };
+    let mut added = l.items.iter().enumerate().filter(|(_, it)| !before.contains(&it.parsing_name()));
+    let Some((i, _)) = added.next() else { return };
+    // Two new items: one is somebody else's (a download landing now), so undo must not claim either.
+    if added.next().is_none() {
+        (*app).undo.record(Op::Created(vec![l.items[i].parsing_name()]));
+    }
     (*app).new_item = None;
     let list = (*app).list;
     let both = LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0);
@@ -191,29 +214,104 @@ pub(crate) unsafe fn rename_new_item(app: *mut App) {
 
 const SORT_ASC: usize = 0x100;
 const SORT_DESC: usize = 0x101;
+const GROUP_NONE: usize = 0x103;
+/// Group by the column at position `id - GROUP_BASE`.
+const GROUP_BASE: usize = 0x200;
 
-/// Sort entries: the listing's columns (id = position + 1, the active one checked), then the direction.
+/// Sort entries: the listing's columns (id = position + 1, the active one checked), then the direction, then
+/// the grouping (none, or by a column; the sort stays).
 /// (entries, checked); empty off a shell listing.
 pub(crate) unsafe fn sort_entries(app: *mut App) -> (Vec<(usize, String)>, Vec<usize>) {
     let Some(l) = listing(app) else { return (Vec::new(), Vec::new()) };
     let mut entries: Vec<(usize, String)> = l.columns.iter().enumerate().map(|(i, c)| (i + 1, c.title.clone())).collect();
-    entries.extend([(0, String::new()), (SORT_ASC, "Ascending".to_string()), (SORT_DESC, "Descending".to_string())]);
+    entries.extend([(0, String::new()), (SORT_ASC, tr("menu.sort.ascending").to_string()), (SORT_DESC, tr("menu.sort.descending").to_string())]);
+    entries.extend([(0, String::new()), (GROUP_NONE, tr("menu.sort.no_groups").to_string())]);
+    entries.extend(l.columns.iter().enumerate().map(|(p, c)| (GROUP_BASE + p, trf("menu.sort.group_by", &[("column", &c.title)]))));
     let active = l.columns.iter().position(|c| c.index == l.sort_col).map(|i| i + 1);
-    let checked = active.into_iter().chain([if l.sort_desc { SORT_DESC } else { SORT_ASC }]).collect();
+    let checked = active
+        .into_iter()
+        .chain([
+            if l.sort_desc { SORT_DESC } else { SORT_ASC },
+            l.group.and_then(|g| l.columns.iter().position(|c| c.index == g)).map_or(GROUP_NONE, |p| GROUP_BASE + p),
+        ])
+        .collect();
     (entries, checked)
+}
+
+/// Header right-click: the columns the folder offers, the shown ones checked; a pick shows or hides that column.
+pub(crate) unsafe fn column_menu(app: *mut App, x: i32, y: i32) {
+    if cur(app).loading.is_some() {
+        return;
+    }
+    let Some(l) = nav::listing(app) else { return };
+    let all = l.folder.menu_columns();
+    let entries: Vec<(usize, String)> = all.iter().filter(|c| !c.title.is_empty()).map(|c| (1 + c.index as usize, c.title.clone())).collect();
+    let checked: Vec<usize> = l.columns.iter().map(|c| 1 + c.index as usize).collect();
+    let folder = l.folder.parsing_name.clone();
+    let picked = ui::popup(app, &entries, &checked, x, y);
+    // The popup pumps messages: a navigation that finished meanwhile shows another folder, whose columns differ.
+    if picked != 0 && nav::listing(app).is_some_and(|l| l.folder.parsing_name == folder) {
+        toggle_column(app, &all, picked as u32 - 1);
+    }
+}
+
+/// Shows or hides shell column `index` on the active listing, keeping the widths and order the header has now.
+unsafe fn toggle_column(app: *mut App, all: &[Column], index: u32) {
+    let Some(l) = nav::listing(app) else { return };
+    let mut base = nav::header_layout(app);
+    if base.is_empty() {
+        base = l.columns.iter().map(|c| (c.index, 0)).collect();
+    }
+    let new = nav::toggled(&base, index);
+    let available: Vec<u32> = all.iter().map(|c| c.index).collect();
+    let cols: Vec<Column> = nav::chosen_columns(&available, &new).into_iter().filter_map(|i| all.iter().find(|c| c.index == i).cloned()).collect();
+    let mut resort = false;
+    if let Some(source::Source::Shell(l)) = &mut cur(app).source {
+        l.columns = cols;
+        l.layout = new;
+        // Rows hold cells sized for the old columns.
+        l.cells.fill(Default::default());
+        let shown = |i: u32| l.columns.iter().any(|c| c.index == i);
+        if !shown(l.sort_col) {
+            (l.sort_col, l.sort_desc) = (0, false);
+            resort = true;
+        }
+        if l.group.is_some_and(|g| !shown(g)) {
+            l.group = None;
+            resort = true;
+        }
+    }
+    if let Some(s) = nav::source(app) {
+        nav::set_columns(app, &s.columns());
+    }
+    nav::apply_layout(app);
+    if resort {
+        if let Some(l) = nav::listing(app) {
+            list::sort_by(app, l.sort_col, l.sort_desc);
+        }
+    }
+    let _ = InvalidateRect(Some((*app).list), None, true);
+    nav::remember_folder(app);
 }
 
 /// Applies a pick from `sort_entries`.
 pub(crate) unsafe fn pick_sort(app: *mut App, id: usize) {
     let Some(l) = listing(app) else { return };
-    let (cols, col, desc): (Vec<u32>, u32, bool) = (l.columns.iter().map(|c| c.index).collect(), l.sort_col, l.sort_desc);
+    let (cols, col, desc): (Vec<(u32, bool)>, u32, bool) = (l.columns.iter().map(|c| (c.index, c.descending_first())).collect(), l.sort_col, l.sort_desc);
     match id {
         0 => {}
         SORT_ASC => list::sort_by(app, col, false),
         SORT_DESC => list::sort_by(app, col, true),
+        id if id == GROUP_NONE || id >= GROUP_BASE => {
+            let Some(group) = (if id == GROUP_NONE { Some(None) } else { cols.get(id - GROUP_BASE).map(|c| Some(c.0)) }) else { return };
+            if let Some(source::Source::Shell(l)) = &mut cur(app).source {
+                l.group = group;
+            }
+            list::sort_by(app, col, desc);
+        }
         n => {
-            if let Some(&c) = cols.get(n - 1) {
-                list::sort_by(app, c, desc);
+            if let Some(&(c, first)) = cols.get(n - 1) {
+                list::sort_by(app, c, if c == col { desc } else { first });
             }
         }
     }
@@ -229,26 +327,33 @@ pub(crate) unsafe fn sort_menu(app: *mut App) {
     pick_sort(app, ui::popup(app, &entries, &checked, x, y));
 }
 
-/// View entries: the three list views, then the panes, each checked when it is on. (entries, checked).
+/// The View menu's list views, in Explorer's order, then Thumbnails (ours). The chords are the default ACCELS.
+/// (command, name key, key hint); the hint is code so it survives translation.
+const VIEW_MENU: [(u16, &str, &str); 9] = [
+    (CMD_VIEW_XL, "menu.view.extra_large", "Ctrl+Shift+1"),
+    (CMD_VIEW1 + 1, "menu.view.large", "Ctrl+Shift+2"),
+    (CMD_VIEW_MEDIUM, "menu.view.medium", "Ctrl+Shift+3"),
+    (CMD_VIEW_SMALL, "menu.view.small", "Ctrl+Shift+4"),
+    (CMD_VIEW_LIST, "menu.view.list", "Ctrl+Shift+5"),
+    (CMD_VIEW1, "menu.view.details", "Ctrl+Shift+6"),
+    (CMD_VIEW_TILES, "menu.view.tiles", "Ctrl+Shift+7"),
+    (CMD_VIEW_CONTENT, "menu.view.content", "Ctrl+Shift+8"),
+    (CMD_VIEW1 + 2, "menu.view.thumbnails", ""),
+];
+
+/// View entries: the list views, then the panes, each checked when it is on. (entries, checked).
 pub(crate) unsafe fn view_entries(app: *mut App) -> (Vec<(usize, String)>, Vec<usize>) {
     let s = &(*app).session;
-    let view = CMD_VIEW1 as usize
-        + match (*app).views.view {
-            views::View::Details => 0,
-            views::View::Icons => 1,
-            views::View::Thumbnails => 2,
-        };
-    let entries = vec![
-        (CMD_VIEW1 as usize, "Details\tCtrl+Shift+1".to_string()),
-        (CMD_VIEW1 as usize + 1, "Icons\tCtrl+Shift+2".to_string()),
-        (CMD_VIEW1 as usize + 2, "Thumbnails\tCtrl+Shift+3".to_string()),
+    let mut entries: Vec<(usize, String)> = VIEW_MENU.iter().map(|&(id, key, hint)| (id as usize, if hint.is_empty() { tr(key).to_string() } else { ui::hinted(key, hint) })).collect();
+    entries.extend([
         (0, String::new()),
-        (CMD_TOGGLE_SIDEBAR as usize, "Sidebar\tCtrl+B".to_string()),
-        (CMD_FOLDER_TREE as usize, "Folder tree".to_string()),
-        (CMD_TOGGLE_PREVIEW as usize, "Preview pane\tAlt+P".to_string()),
-    ];
-    let mut checked = vec![view];
-    for (on, cmd) in [(s.show_sidebar && !s.show_tree, CMD_TOGGLE_SIDEBAR), (s.show_tree, CMD_FOLDER_TREE), (s.show_preview, CMD_TOGGLE_PREVIEW)] {
+        (CMD_TOGGLE_SIDEBAR as usize, ui::hinted("menu.view.sidebar", "Ctrl+B")),
+        (CMD_FOLDER_TREE as usize, tr("menu.view.folder_tree").to_string()),
+        (CMD_TOGGLE_PREVIEW as usize, ui::hinted("menu.view.preview_pane", "Alt+P")),
+        (CMD_TOGGLE_DETAILS as usize, ui::hinted("menu.view.details_pane", "Alt+Shift+P")),
+    ]);
+    let mut checked = vec![(*app).views.view.command() as usize];
+    for (on, cmd) in [(s.show_sidebar && !s.show_tree, CMD_TOGGLE_SIDEBAR), (s.show_tree, CMD_FOLDER_TREE), (s.show_preview, CMD_TOGGLE_PREVIEW), (s.show_details, CMD_TOGGLE_DETAILS)] {
         if on {
             checked.push(cmd as usize);
         }
@@ -271,4 +376,24 @@ pub(crate) unsafe fn view_menu(app: *mut App) {
     let (entries, checked) = view_entries(app);
     let (x, y) = anchor(app, CMD_VIEW_MENU);
     pick_view(app, ui::popup(app, &entries, &checked, x, y));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn view_menu_chords_match_accels() {
+        let ids: Vec<u16> = VIEW_MENU.iter().map(|e| e.0).collect();
+        assert_eq!(ids, [CMD_VIEW_XL, CMD_VIEW1 + 1, CMD_VIEW_MEDIUM, CMD_VIEW_SMALL, CMD_VIEW_LIST, CMD_VIEW1, CMD_VIEW_TILES, CMD_VIEW_CONTENT, CMD_VIEW1 + 2]);
+        for (id, label, hint) in VIEW_MENU {
+            match hint.strip_prefix("Ctrl+Shift+") {
+                Some(n) => {
+                    let key = VK_0.0 + n.parse::<u16>().unwrap();
+                    assert!(ACCELS.iter().any(|a| a.fVirt.0 == FVIRTKEY.0 | FCONTROL.0 | FSHIFT.0 && a.key == key && a.cmd == id), "{label}");
+                }
+                None => assert!(hint.is_empty() && label == "menu.view.thumbnails", "{label}"),
+            }
+        }
+    }
 }

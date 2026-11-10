@@ -72,6 +72,16 @@ fn parse_bool(s: &str) -> Option<bool> {
     }
 }
 
+/// System colors a Windows contrast theme needs beyond the `Theme` palette (COLORREFs).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Contrast {
+    pub highlight_text: u32,
+    pub hot: u32,
+    pub gray: u32,
+    pub button_face: u32,
+    pub button_text: u32,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Theme {
     pub name: String,
@@ -88,6 +98,8 @@ pub struct Theme {
     pub icon_theme: Option<String>,
     pub font: String,
     pub font_size: i32,
+    /// Some only while a Windows contrast theme is on; never read from or written to a theme file.
+    pub contrast: Option<Contrast>,
 }
 
 /// Mix `a` toward `b` by `t` (0..1), per 0x00BBGGRR channel.
@@ -117,6 +129,7 @@ impl Theme {
             icon_theme: None,
             font: "Segoe UI Variable Text".into(),
             font_size: 10,
+            contrast: None,
         }
     }
 
@@ -215,6 +228,8 @@ pub struct Profile {
     pub show_hidden: bool,
     pub show_extensions: bool,
     pub single_click: bool,
+    /// Reopen the last session's tabs at a plain launch.
+    pub restore_tabs: bool,
     pub search_delay_ms: u32,
     pub hover_preview_ms: u32,
     /// "hover" or "always": when single-click mode underlines item names.
@@ -243,6 +258,7 @@ impl Profile {
             show_hidden: false,
             show_extensions: true,
             single_click: false,
+            restore_tabs: false,
             search_delay_ms: 250,
             hover_preview_ms: 2000,
             underline_titles: "hover".into(),
@@ -270,6 +286,7 @@ impl Profile {
             ("show_hidden".to_string(), self.show_hidden.to_string()),
             ("show_extensions".to_string(), self.show_extensions.to_string()),
             ("single_click".to_string(), self.single_click.to_string()),
+            ("restore_tabs".to_string(), self.restore_tabs.to_string()),
             ("search_delay_ms".to_string(), self.search_delay_ms.to_string()),
             ("hover_preview_ms".to_string(), self.hover_preview_ms.to_string()),
             ("underline_titles".to_string(), self.underline_titles.clone()),
@@ -300,6 +317,7 @@ impl Profile {
                 "show_hidden" => p.show_hidden = parse_bool(v).unwrap_or(p.show_hidden),
                 "show_extensions" => p.show_extensions = parse_bool(v).unwrap_or(p.show_extensions),
                 "single_click" => p.single_click = parse_bool(v).unwrap_or(p.single_click),
+                "restore_tabs" => p.restore_tabs = parse_bool(v).unwrap_or(p.restore_tabs),
                 "search_delay_ms" => p.search_delay_ms = v.parse().unwrap_or(p.search_delay_ms),
                 "hover_preview_ms" => p.hover_preview_ms = v.parse().map_or(p.hover_preview_ms, |n: u32| n.clamp(200, 10000)),
                 "underline_titles" => p.underline_titles = if v.trim().eq_ignore_ascii_case("always") { "always" } else { "hover" }.into(),
@@ -328,11 +346,13 @@ pub struct Settings {
     pub themes: Vec<Theme>,
     /// The `[keys]` section: `cmd.name=Ctrl+T` accelerator overrides, kept as written.
     pub keys: Vec<(String, String)>,
+    /// `[general] language=`: `system`, or a code with a table (`en`, `es`, a `lang\<code>.ini`). Applies at the next start.
+    pub language: String,
 }
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { active: "default".into(), profiles: vec![Profile::default_profile()], themes: vec![Theme::light(), Theme::dark()], keys: Vec::new() }
+        Settings { active: "default".into(), profiles: vec![Profile::default_profile()], themes: vec![Theme::light(), Theme::dark()], keys: Vec::new(), language: "system".into() }
     }
 }
 
@@ -343,6 +363,18 @@ pub fn dir() -> PathBuf {
 
 fn theme_path(dir: &Path, name: &str) -> PathBuf {
     dir.join("themes").join(format!("{name}.ini"))
+}
+
+/// The profile theme name that follows Windows' app mode.
+pub const SYSTEM_THEME: &str = "system";
+
+/// `system` follows Windows' app mode; any other name is a theme of its own.
+pub fn resolve_theme_name(name: &str, apps_dark: bool) -> &str {
+    if name.eq_ignore_ascii_case(SYSTEM_THEME) {
+        if apps_dark { "dark" } else { "light" }
+    } else {
+        name
+    }
 }
 
 impl Settings {
@@ -368,6 +400,9 @@ impl Settings {
             .and_then(|(_, k)| k.iter().find(|(k, _)| k == "profile"))
             .map_or_else(|| s.profiles[0].name.clone(), |(_, v)| v.clone());
 
+        if let Some((_, v)) = sections.iter().filter(|(n, _)| n == "general").flat_map(|(_, k)| k).find(|(k, _)| k == "language") {
+            s.language = v.clone();
+        }
         s.keys = sections.iter().filter(|(n, _)| n == "keys").flat_map(|(_, k)| k.clone()).collect();
 
         let mut files: Vec<PathBuf> = std::fs::read_dir(dir.join("themes"))
@@ -403,7 +438,10 @@ impl Settings {
     }
 
     fn settings_text(&self) -> String {
-        let mut sections = vec![("general".to_string(), vec![("profile".to_string(), self.active.clone())])];
+        let mut sections = vec![(
+            "general".to_string(),
+            vec![("profile".to_string(), self.active.clone()), ("language".to_string(), self.language.clone())],
+        )];
         sections.extend(self.profiles.iter().map(Profile::to_section));
         if !self.keys.is_empty() {
             sections.push(("keys".to_string(), self.keys.clone()));
@@ -435,6 +473,8 @@ impl Settings {
                 .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()));
         };
         write_new(dir.join("settings.ini"), d.settings_text());
+        // Only the folder: a copy of a built-in language here would shadow the text of every later version.
+        let _ = std::fs::create_dir_all(dir.join("lang"));
         for t in &d.themes {
             let p = theme_path(dir, &t.name);
             if std::fs::read_to_string(&p).is_ok_and(|text| Theme::is_legacy_default(&text)) {
@@ -458,6 +498,25 @@ mod tests {
 
     fn cleanup(tag: &str) {
         let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("rexplorer-settings-{}", std::process::id())).join(tag));
+    }
+
+    #[test]
+    fn contrast_never_read_or_written() {
+        assert_eq!(Theme::light().contrast, None);
+        assert_eq!(Theme::from_ini("x", "[theme]
+dark=false").contrast, None);
+        let c = Contrast { highlight_text: 1, hot: 2, gray: 3, button_face: 4, button_text: 5 };
+        let ini = Theme { contrast: Some(c), ..Theme::light() }.to_ini();
+        assert!(!ini.contains("hot") && !ini.contains("contrast"), "{ini}");
+        assert_eq!(Theme::from_ini("x", &ini).contrast, None);
+    }
+
+    #[test]
+    fn system_theme_follows_the_app_mode() {
+        assert_eq!(resolve_theme_name("system", true), "dark");
+        assert_eq!(resolve_theme_name("System", false), "light");
+        assert_eq!(resolve_theme_name("sepia", true), "sepia");
+        assert_eq!(Settings::default().theme(resolve_theme_name("system", false)).name, "light");
     }
 
     #[test]
@@ -505,6 +564,7 @@ mod tests {
             show_hidden: true,
             show_extensions: false,
             single_click: true,
+            restore_tabs: true,
             search_delay_ms: 400,
             hover_preview_ms: 1500,
             underline_titles: "always".into(),
@@ -520,6 +580,7 @@ mod tests {
         });
         s.active = "work".into();
         s.keys = vec![("cmd.new_tab".into(), "Ctrl+Y".into())];
+        s.language = "es".into();
         s.save_to(&d).unwrap();
         let back = Settings::load_from(&d);
         assert_eq!(back, s);
@@ -535,7 +596,7 @@ mod tests {
         assert_eq!((p.search_delay_ms, p.hover_preview_ms), (250, 2000));
         assert_eq!(p.underline_titles, "hover");
         assert!(p.show_recent && p.show_frequent && p.show_status && p.preview_handlers && p.search_system);
-        assert!(!p.item_checkboxes && !p.search_archives);
+        assert!(!p.item_checkboxes && !p.search_archives && !p.restore_tabs);
         assert_eq!(Profile::from_section("x", &[("underline_titles".into(), "junk".into())]).underline_titles, "hover");
         let hover = |v: &str| Profile::from_section("x", &[("hover_preview_ms".into(), v.into())]).hover_preview_ms;
         assert_eq!((hover("5"), hover("1500"), hover("999999"), hover("junk")), (200, 1500, 10000, 2000));
@@ -573,6 +634,31 @@ mod tests {
         assert_eq!(Settings::load_from(&d).theme("dark"), &Theme::dark());
         assert_eq!(std::fs::read_to_string(d.join("themes/light.ini")).unwrap(), edited);
         cleanup("legacy");
+    }
+
+    #[test]
+    fn language_defaults_to_system() {
+        let d = tmp("lang");
+        assert_eq!(Settings::default().language, "system");
+        assert_eq!(Settings::load_from(&d).language, "system");
+        std::fs::write(d.join("settings.ini"), "[general]
+language=es
+").unwrap();
+        assert_eq!(Settings::load_from(&d).language, "es");
+        cleanup("lang");
+    }
+
+    #[test]
+    fn ensure_files_leaves_languages_to_the_user() {
+        let d = tmp("langfiles");
+        Settings::ensure_files(&d);
+        // A copy written here would shadow the built-in text of every later version.
+        assert!(d.join("lang").is_dir());
+        assert!(!d.join("lang/en.ini").exists() && !d.join("lang/es.ini").exists());
+        std::fs::write(d.join("lang/es.ini"), "x").unwrap();
+        Settings::ensure_files(&d);
+        assert_eq!(std::fs::read_to_string(d.join("lang/es.ini")).unwrap(), "x");
+        cleanup("langfiles");
     }
 
     #[test]

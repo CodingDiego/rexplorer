@@ -8,6 +8,8 @@
 //! URLs such as `ms-settings:`, `shell:AppsFolder\<app>`) sets `forward`: the caller hands the command line to
 //! the real Explorer.
 
+use crate::i18n::trf;
+
 #[derive(Debug, Default, PartialEq, Clone)]
 pub struct Args {
     pub paths: Vec<String>,
@@ -28,8 +30,12 @@ pub struct Args {
     pub elevated: bool,
     /// Run the desktop context-menu helper (install starts it at sign-in).
     pub desktop: bool,
+    /// Show the desktop's icons in a rexplorer window (opt-in).
+    pub desktop_icons: bool,
     /// Not ours to handle: pass the whole command line to Windows Explorer and exit.
     pub forward: bool,
+    /// A separate window that leaves the running one, and its session, alone.
+    pub new_window: bool,
 }
 
 /// Explorer's comma-chained switches in one argument (`/n,/e,/select,C:\x`). False when something in it is not
@@ -120,7 +126,7 @@ fn long_value(
     it: &mut impl Iterator<Item = String>,
 ) -> Option<std::result::Result<String, String>> {
     if a == name {
-        return Some(it.next().ok_or_else(|| format!("{name} needs a value")));
+        return Some(it.next().ok_or_else(|| trf("cli.err.needs_value", &[("option", &name)])));
     }
     a.strip_prefix(name)?.strip_prefix('=').map(|v| Ok(v.to_string()))
 }
@@ -159,8 +165,10 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> std::result::Result<Arg
             "--overwrite" => out.overwrite = true,
             "--elevated" => out.elevated = true,
             "--desktop" => out.desktop = true,
+            "--desktop-icons" => out.desktop_icons = true,
+            "--new-window" => out.new_window = true,
             "-h" | "--help" => out.help = true,
-            _ if a.starts_with('-') => return Err(format!("unknown option: {a}")),
+            _ if a.starts_with('-') => return Err(trf("cli.err.unknown_option", &[("option", &a)])),
             _ if a.starts_with('/') && !explorer_switches(&a, &mut it, &mut out) => {
                 return Ok(Args { forward: true, ..Default::default() });
             }
@@ -177,23 +185,53 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> std::result::Result<Arg
     Ok(out)
 }
 
+/// Option column and the key of its description, in usage order. Only the description is translated.
+const OPTS: [(&str, &str); 16] = [
+    ("--select <path>", "cli.opt.select"),
+    ("--profile <name>", "cli.opt.profile"),
+    ("--new-tab, -t", "cli.opt.new_tab"),
+    ("--search <text>", "cli.opt.search"),
+    ("--register", "cli.opt.register"),
+    ("--unregister", "cli.opt.unregister"),
+    ("--install", "cli.opt.install"),
+    ("--uninstall", "cli.opt.uninstall"),
+    ("--import-explorer", "cli.opt.import_explorer"),
+    ("--overwrite", "cli.opt.overwrite"),
+    ("--recover", "cli.opt.recover"),
+    ("--desktop", "cli.opt.desktop"),
+    ("--desktop-icons", "cli.opt.desktop_icons"),
+    ("--new-window", "cli.opt.new_window"),
+    ("--elevated", "cli.opt.elevated"),
+    ("-h, --help", "cli.opt.help"),
+];
+
+/// Names a description may mention; they are never translated.
+const NAMES: [(&str, &dyn std::fmt::Display); 7] = [
+    ("path", &"<path>"),
+    ("select", &"/select,<path>"),
+    ("text", &"<text>"),
+    ("programs", &r"%LOCALAPPDATA%\Programs"),
+    ("install", &"--install"),
+    ("import", &"--import-explorer"),
+    ("ini", &"settings.ini"),
+];
+
+fn usage_with(describe: impl Fn(&'static str) -> String) -> String {
+    let mut s = "rexplorer [options] [folder...]\n".to_string();
+    for (opt, key) in OPTS {
+        // Padded by the option column, so the descriptions line up whatever their length.
+        s.push_str(&format!("  {opt:<20}{}\n", describe(key)));
+    }
+    s
+}
+
 pub fn usage() -> String {
-    "rexplorer [options] [folder...]\n\
-     \x20 --select <path>     open the parent folder with <path> selected (also /select,<path>)\n\
-     \x20 --profile <name>    use the named settings profile\n\
-     \x20 --new-tab, -t       open in a new tab of the running window\n\
-     \x20 --search <text>     start with a search for <text>\n\
-     \x20 --register          register as a shell handler\n\
-     \x20 --unregister        remove the shell handler registration\n\
-     \x20 --install           copy rexplorer to %LOCALAPPDATA%\\Programs and make it the default file manager\n\
-     \x20 --uninstall         undo --install\n\
-     \x20 --import-explorer   copy Windows Explorer's settings into the active profile (backs up settings.ini)\n\
-     \x20 --overwrite         with --import-explorer: also replace values you changed in rexplorer\n\
-     \x20 --recover           restore the previous session after a crash\n\
-     \x20 --desktop           run the helper that shows rexplorer's context menu on the desktop\n\
-     \x20 --elevated          when started elevated, stay so (drive-wide indexed search) instead of restarting unelevated\n\
-     \x20 -h, --help          show this help\n"
-        .to_string()
+    usage_with(|k| trf(k, &NAMES))
+}
+
+#[cfg(test)]
+fn usage_in(t: &crate::i18n::Table) -> String {
+    usage_with(|k| t.fmt(k, &NAMES))
 }
 
 /// Serialise for WM_COPYDATA: one `key=value` per line.
@@ -358,11 +396,75 @@ mod tests {
     }
 
     #[test]
+    fn desktop_icons_flag() {
+        let a = p(&["--desktop-icons"]).unwrap();
+        assert!(a.desktop_icons && !a.desktop);
+        let a = p(&["--desktop"]).unwrap();
+        assert!(a.desktop && !a.desktop_icons);
+        let a = p(&[]).unwrap();
+        assert!(!a.desktop && !a.desktop_icons);
+    }
+
+    #[test]
+    fn new_window_flag() {
+        let a = p(&["--new-window", "C:\\x"]).unwrap();
+        assert!(a.new_window && a.paths == ["C:\\x"]);
+        assert!(!parse_payload(&payload(&Args { new_window: true, ..Default::default() })).new_window);
+    }
+
+    #[test]
     fn usage_mentions_every_option() {
         let u = usage();
         assert!(u.starts_with("rexplorer [options] [folder...]\n"));
-        for o in ["--select", "/select,", "--profile", "--new-tab", "-t", "--register", "--unregister", "--install", "--uninstall", "--import-explorer", "--overwrite", "--recover", "--elevated", "--desktop", "--search", "-h", "--help"] {
+        for o in ["--select", "/select,", "--profile", "--new-tab", "-t", "--register", "--unregister", "--install", "--uninstall", "--import-explorer", "--overwrite", "--recover", "--elevated", "--desktop", "--desktop-icons", "--new-window", "--search", "-h", "--help"] {
             assert!(u.contains(o), "{o}");
         }
+    }
+
+    fn flags(u: &str) -> std::collections::BTreeSet<String> {
+        u.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '/' || c == ',')).filter(|w| w.starts_with("--") || w.starts_with('/')).map(str::to_string).collect()
+    }
+
+    #[test]
+    fn spanish_usage_keeps_every_option() {
+        let es = crate::i18n::Table::new(Some(crate::i18n::ES));
+        let (en, sp) = (usage(), usage_in(&es));
+        assert_ne!(en, sp, "the Spanish table is used");
+        assert_eq!(flags(&en), flags(&sp));
+        assert!(flags(&sp).len() >= 15);
+        assert!(sp.starts_with("rexplorer [options] [folder...]
+"));
+        for o in ["-t", "-h", "<path>", "<text>", "/select,<path>", r"%LOCALAPPDATA%\Programs", "settings.ini"] {
+            assert!(sp.contains(o), "{o}");
+        }
+    }
+
+    #[test]
+    fn every_opt_key_has_a_usage_line_and_back() {
+        let keys: Vec<String> = crate::i18n::Table::parse(crate::i18n::EN).into_keys().filter(|k| k.starts_with("cli.opt.")).collect();
+        assert_eq!(keys.len(), OPTS.len());
+        assert!(OPTS.iter().all(|(_, k)| keys.iter().any(|x| x == k)), "{keys:?}");
+        let u = usage();
+        for (name, _) in OPTS {
+            assert!(u.lines().any(|l| l.trim_start().starts_with(name)), "{name}");
+        }
+        assert_eq!(u.lines().count(), OPTS.len() + 1);
+    }
+
+    #[test]
+    fn usage_columns_align_in_every_language() {
+        for table in [crate::i18n::Table::new(None), crate::i18n::Table::new(Some(crate::i18n::ES))] {
+            for l in usage_in(&table).lines().skip(1) {
+                assert!(l.starts_with("  -"), "{l}");
+                assert_eq!(l.chars().nth(21), Some(' '), "{l}");
+                assert_ne!(l.chars().nth(22), Some(' '), "{l}");
+            }
+        }
+    }
+
+    #[test]
+    fn argument_errors_carry_the_option() {
+        assert_eq!(p(&["--select"]).unwrap_err(), "--select needs a value");
+        assert_eq!(p(&["--nope=1"]).unwrap_err(), "unknown option: --nope=1");
     }
 }

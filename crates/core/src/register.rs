@@ -16,6 +16,8 @@ use windows::Win32::System::Registry::{
 use windows::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify, SHDeleteEmptyKeyW};
 use windows::core::{Error, HSTRING, PCWSTR, Result, w};
 
+use crate::i18n::trf;
+
 /// Shell classes whose `open` verb is overridden.
 pub const CLASSES: [&str; 3] = ["Folder", "Directory", "Drive"];
 /// The real per-user classes key, relative to HKCU.
@@ -147,7 +149,7 @@ pub fn foreign_override(base: &str) -> Option<HSTRING> {
 /// program's override already exists.
 pub fn register(base: &str, exe: &Path) -> Result<()> {
     if let Some(key) = foreign_override(base) {
-        return Err(Error::new(E_FAIL, format!("another override exists: {key}")));
+        return Err(Error::new(E_FAIL, trf("reg.override_exists", &[("key", &key)])));
     }
     for (key, name, value) in writes(base, exe) {
         set_sz(&key, PCWSTR(HSTRING::from(name).as_ptr()), &value)?;

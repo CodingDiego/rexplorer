@@ -9,6 +9,12 @@ pub(crate) unsafe fn attach(edit: HWND) {
     let _ = SetWindowSubclass(edit, Some(subclass), SUBCLASS_ID, 0);
 }
 
+/// Explorer's address bar suggestions: paths and typed URLs as you type; forced on/off so the per-user AutoSuggest/Append keys do not decide.
+pub(crate) unsafe fn autocomplete(edit: HWND) -> Result<()> {
+    use windows::Win32::UI::Shell::{SHACF_AUTOAPPEND_FORCE_OFF, SHACF_AUTOSUGGEST_FORCE_ON, SHACF_FILESYSTEM, SHACF_URLALL, SHAutoComplete};
+    SHAutoComplete(edit, SHACF_FILESYSTEM | SHACF_URLALL | SHACF_AUTOSUGGEST_FORCE_ON | SHACF_AUTOAPPEND_FORCE_OFF)
+}
+
 /// 0 blank, 1 word character, 2 punctuation.
 fn class(c: u16) -> u8 {
     match char::from_u32(c as u32) {
@@ -84,6 +90,25 @@ mod tests {
 
     fn u(s: &str) -> Vec<u16> {
         s.encode_utf16().collect()
+    }
+
+    #[test]
+    fn address_autocomplete_attaches_and_keeps_typing() {
+        unsafe {
+            let _com = rexplorer_core::com::ComInit::sta();
+            let parent = CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR::null(), WS_OVERLAPPEDWINDOW, 0, 0, 200, 100, None, None, None, None).unwrap();
+            let edit = CreateWindowExW(WINDOW_EX_STYLE(0), WC_EDITW, PCWSTR::null(), WS_CHILD, 0, 0, 100, 20, Some(parent), None, None, None).unwrap();
+            assert!(autocomplete(edit).is_ok());
+            attach(edit); // after the autocomplete's own subclass, so it sees the key first
+            let text = HSTRING::from(r"C:\x y");
+            SendMessageW(edit, WM_SETTEXT, None, Some(LPARAM(text.as_ptr() as isize)));
+            SendMessageW(edit, EM_SETSEL, Some(WPARAM(6)), Some(LPARAM(6)));
+            SendMessageW(edit, WM_CHAR, Some(WPARAM(0x7F)), None);
+            let mut buf = [0u16; 32];
+            let n = SendMessageW(edit, WM_GETTEXT, Some(WPARAM(buf.len())), Some(LPARAM(buf.as_mut_ptr() as isize))).0 as usize;
+            assert_eq!(String::from_utf16_lossy(&buf[..n]), r"C:\x ");
+            let _ = DestroyWindow(parent);
+        }
     }
 
     #[test]

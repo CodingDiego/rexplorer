@@ -21,7 +21,7 @@ use windows::Win32::UI::Controls::{
     HIMAGELIST, IImageList, ILD_PRESERVEALPHA, ILD_TRANSPARENT, ImageList_Draw, ImageList_GetIconSize,
 };
 use windows::Win32::UI::Shell::{
-    ASSOCF_INIT_IGNOREUNKNOWN, ASSOCSTR_COMMAND, AssocQueryStringW, SHFILEINFOW, SHGFI_FLAGS, SHGFI_PIDL, SHGFI_SMALLICON, SHGFI_SYSICONINDEX,
+    ASSOCF_INIT_IGNOREUNKNOWN, ASSOCSTR_COMMAND, AssocQueryStringW, IShellFolder, SHBindToParent, SHFILEINFOW, SHGFI_FLAGS, SHGFI_PIDL, SHGFI_SMALLICON, SHGFI_SYSICONINDEX,
     SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW, SHGetImageList, SHGetNameFromIDList, SHIL_EXTRALARGE, SHIL_JUMBO,
     SIGDN_PARENTRELATIVEPARSING,
 };
@@ -152,7 +152,12 @@ fn sys_index(path: &str, extra: SHGFI_FLAGS) -> Option<i32> {
     let name = HSTRING::from(path);
     let mut fi = SHFILEINFOW::default();
     let flags = SHGFI_SYSICONINDEX | SHGFI_SMALLICON | extra;
-    let himl = unsafe { SHGetFileInfoW(PCWSTR(name.as_ptr()), FILE_ATTRIBUTE_NORMAL, Some(&mut fi), size_of::<SHFILEINFOW>() as u32, flags) };
+    let get = |fi: &mut SHFILEINFOW| unsafe { SHGetFileInfoW(PCWSTR(name.as_ptr()), FILE_ATTRIBUTE_NORMAL, Some(fi), size_of::<SHFILEINFOW>() as u32, flags) };
+    // The image list's first use racing another thread's comes back empty once.
+    let himl = match get(&mut fi) {
+        0 => get(&mut fi),
+        h => h,
+    };
     (himl != 0).then_some(fi.iIcon)
 }
 
@@ -277,6 +282,19 @@ fn straighten(bmp: HBITMAP) {
 fn confined_to_corner(bmp: HBITMAP, edge: u32) -> bool {
     let Some((px, w, _)) = dib_pixels(bmp) else { return false };
     px.chunks_exact(4).enumerate().all(|(i, p)| p[3] == 0 || (i as u32 % w < edge && i as u32 / w < edge))
+}
+
+/// The shell's overlay for `abs` (shortcut arrow, sync state) as its own 48 px premultiplied image; None without one.
+pub fn overlay_bitmap(abs: &Pidl) -> Option<HBITMAP> {
+    let mut last = std::ptr::null_mut();
+    let parent: IShellFolder = unsafe { SHBindToParent(abs.as_ptr(), Some(&mut last)) }.ok()?;
+    let slot = crate::item::overlay_slot(&parent, last);
+    if slot == 0 {
+        return None;
+    }
+    let list: IImageList = unsafe { SHGetImageList(SHIL_EXTRALARGE as i32) }.ok()?;
+    let index = unsafe { list.GetOverlayImage(slot as i32) }.ok()?;
+    draw_system_icon(SHIL_EXTRALARGE, index)
 }
 
 /// For an item the shell gives the blank page: the opening app's icon as a straight-alpha DIB at least
@@ -405,6 +423,33 @@ mod tests {
 
     fn blue(w: u32, h: u32) -> Vec<u8> {
         [255u8, 0, 0, 255].repeat((w * h) as usize)
+    }
+
+    #[test]
+    fn overlay_bitmap_draws_in_the_lower_left() {
+        use windows::Win32::UI::Shell::{SHParseDisplayName, Common::ITEMIDLIST};
+        let _com = ComInit::sta();
+        let dir = tmp("overlay");
+        std::fs::write(dir.join("t.txt"), b"x").unwrap();
+        crate::item::make_shortcut(&dir.join("t.txt"), &dir.join("t.lnk"));
+        let abs = |n: &str| unsafe {
+            let wide = windows::core::HSTRING::from(dir.join(n).as_os_str());
+            let mut p: *mut ITEMIDLIST = std::ptr::null_mut();
+            SHParseDisplayName(windows::core::PCWSTR(wide.as_ptr()), None, &mut p, 0, None).unwrap();
+            Pidl::from_raw(p)
+        };
+        let (lnk, txt) = (overlay_bitmap(&abs("t.lnk")), overlay_bitmap(&abs("t.txt")));
+        let found = lnk.and_then(|b| {
+            let (px, w, h) = dib_pixels(b)?;
+            let hit = (h / 2..h).any(|y| (0..w / 2).any(|x| px[((y * w + x) * 4 + 3) as usize] > 0));
+            unsafe {
+                let _ = DeleteObject(b.into());
+            }
+            Some(hit)
+        });
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(found, Some(true), "the shortcut arrow overlay (absent if the Shell Icons 29 override removed it)");
+        assert!(txt.is_none());
     }
 
     #[test]

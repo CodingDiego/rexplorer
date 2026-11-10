@@ -14,6 +14,21 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{Error, HSTRING, PCWSTR, Result, w};
 
+/// Arguments for a separate window on `folder`. A command line is readable by the user's other processes, so a
+/// name that carries a password (an FTP URL) opens the start place instead.
+pub fn new_window_args(folder: &str) -> Vec<String> {
+    let mut a = vec!["--new-window".to_string()];
+    if !folder.is_empty() && !folder.starts_with(['-', '/']) && crate::connect::redact(folder) == folder {
+        a.push(folder.to_string());
+    }
+    a
+}
+
+/// Ctrl+N: starts another process that owns its own window.
+pub fn open_new_window(folder: &str) -> bool {
+    std::env::current_exe().and_then(|exe| std::process::Command::new(exe).args(new_window_args(folder)).spawn()).is_ok()
+}
+
 pub const COPYDATA_MAGIC: usize = 0x5245584;
 
 pub struct Guard(HANDLE);
@@ -218,6 +233,17 @@ mod tests {
         assert!(send(h, "x"));
         unsafe { PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0)).unwrap() };
         thread.join().unwrap();
+    }
+
+    #[test]
+    fn new_window_args_keep_secrets_off_the_command_line() {
+        assert_eq!(new_window_args("C:\\a b"), ["--new-window", "C:\\a b"]);
+        for none in ["", "ftp://bob:pw@h/x", "-x"] {
+            assert_eq!(new_window_args(none), ["--new-window"], "{none:?}");
+        }
+        assert_eq!(new_window_args("ftp://bob@h/x").len(), 2);
+        let a = rexplorer_core::cli::parse(new_window_args("C:\\a b")).unwrap();
+        assert!(a.new_window && a.paths == ["C:\\a b"]);
     }
 
     #[test]

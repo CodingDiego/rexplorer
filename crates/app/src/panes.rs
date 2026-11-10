@@ -3,15 +3,16 @@
 //! Pane visibility and widths live in the session (widths in 96-DPI pixels; the sidebar uses the tree's width).
 
 use super::*;
-use crate::nav::{Target, go, listing};
+use crate::nav::{Listing, Target, go, listing, source};
 use crate::sidebar::{self, Row};
+use rexplorer_core::i18n::{tr, trf, trn};
 use rexplorer_core::tree::{self, TreePane};
 use std::sync::atomic::{AtomicBool, Ordering};
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::{
-    FOLDERID_Desktop, FOLDERID_Profile, FOLDERID_PublicDesktop, ILIsEqual, IShellFolder, IShellFolder2, KF_FLAG_DEFAULT,
-    SHGFI_ICON, SHGetKnownFolderPath,
+    FDTF_SHORTDATE, FDTF_SHORTTIME, FOLDERID_Desktop, FOLDERID_Profile, FOLDERID_PublicDesktop, ILIsEqual, IShellFolder,
+    IShellFolder2, KF_FLAG_DEFAULT, SHFormatDateTimeW, SHGFI_ICON, SHGetKnownFolderPath,
 };
 use windows::core::{GUID, Interface};
 
@@ -177,17 +178,31 @@ pub(crate) unsafe fn show_left(app: *mut App) {
     nav::session_changed(app);
 }
 
-pub(crate) unsafe fn toggle_preview(app: *mut App) {
+/// The two modes of the one right-hand slot.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum RightPane {
+    Preview,
+    Details,
+}
+
+/// The new (show_preview, show_details): toggling the one that is on turns it off, turning one on turns the other off.
+pub(crate) fn right_panes(preview: bool, details: bool, which: RightPane) -> (bool, bool) {
+    match which {
+        RightPane::Preview => (!preview, false),
+        RightPane::Details => (false, !details),
+    }
+}
+
+pub(crate) unsafe fn toggle_right(app: *mut App, which: RightPane) {
     let a = &mut *app;
-    a.session.show_preview = !a.session.show_preview;
-    let show = a.session.show_preview;
-    let _ = ShowWindow(a.panes.preview, if show { SW_SHOW } else { SW_HIDE });
+    (a.session.show_preview, a.session.show_details) = right_panes(a.session.show_preview, a.session.show_details, which);
+    let any = a.session.show_preview || a.session.show_details;
+    // Releases a hosted preview handler and leaves details mode.
+    preview_pane::show(a.panes.preview, None);
+    let _ = ShowWindow(a.panes.preview, if any { SW_SHOW } else { SW_HIDE });
     ui::layout(app);
-    if show {
+    if any {
         update_preview(app);
-    } else {
-        // Releases a hosted preview handler.
-        preview_pane::show((*app).panes.preview, None);
     }
     commands::update(app);
     nav::session_changed(app);
@@ -203,7 +218,7 @@ pub(crate) unsafe fn layout(app: *mut App, top: i32, bottom: i32, w: i32) {
     a.panes.split_tree = RECT::default();
     a.panes.split_preview = RECT::default();
     let mut right = w - gap;
-    if s.show_preview {
+    if s.show_preview || s.show_details {
         let pw = scale(s.preview_width, dpi).min((right - min_list - gap).max(0));
         right -= pw;
         let _ = MoveWindow(a.panes.preview, right, top, pw, h, true);
@@ -322,17 +337,20 @@ pub(crate) unsafe fn on_sidebar_rows(app: *mut App, rows: Box<SidebarRows>) {
 
 /// Right-click on a sidebar row: "Unpin from Home" on a pinned Quick Access folder, "Pin to Home" on a frequent one,
 /// "Remove bookmark" on a bookmark.
-pub(crate) unsafe fn sidebar_menu(app: *mut App, index: usize) {
+pub(crate) unsafe fn sidebar_menu(app: *mut App, index: usize, at: Option<POINT>) {
     let kind = (&(*app).panes.sidebar_kinds).get(index).cloned();
     let text = match &kind {
-        Some(Kind::Pinned) => "Unpin from Home",
-        Some(Kind::Frequent) => "Pin to Home",
-        Some(Kind::Bookmark(_)) => "Remove bookmark",
+        Some(Kind::Pinned) => tr("menu.list.unpin_home"),
+        Some(Kind::Frequent) => tr("menu.more.pin_home"),
+        Some(Kind::Bookmark(_)) => tr("side.remove_bookmark"),
         _ => return,
     };
     let target = sidebar::target((*app).sidebar, index);
-    let mut pt = POINT::default();
-    let _ = GetCursorPos(&mut pt);
+    let pt = at.unwrap_or_else(|| {
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        pt
+    });
     if ui::popup(app, &[(1, text.to_string())], &[], pt.x, pt.y) != 1 {
         return;
     }
@@ -376,7 +394,7 @@ fn small_icon(pidl: &Pidl) -> Option<HICON> {
     (!fi.hIcon.is_invalid()).then_some(fi.hIcon)
 }
 
-fn known_folder(id: &GUID) -> Option<String> {
+pub(crate) fn known_folder(id: &GUID) -> Option<String> {
     unsafe {
         let p = SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None).ok()?;
         let s = p.to_string().ok();
@@ -411,15 +429,19 @@ fn sidebar_rows(bookmarks: &[(String, String)]) -> SidebarRows {
     }
     for (label, target) in bookmarks {
         if let Ok(f) = ShellFolder::parse(target) {
-            b.add("Favorites", label.clone(), f.parsing_name.clone(), &f.pidl, Kind::Bookmark(label.clone()), true);
+            b.add(tr("side.favorites"), label.clone(), f.parsing_name.clone(), &f.pidl, Kind::Bookmark(label.clone()), true);
         }
     }
     // Quick Access in the shell's order and names: the pinned known folders, the Recycle Bin, the user's pins.
     if let Ok(qa) = ShellFolder::parse(&format!("shell:{}", nav::QUICK_ACCESS)) {
         for item in qa.enumerate().unwrap_or_default().iter().filter(|i| i.is_folder()) {
             let kind = if item.property_bool(&home::IS_PINNED) == Some(false) { Kind::Frequent } else { Kind::Pinned };
-            b.add("Favorites", item.display_name(), item.parsing_name(), &qa.child_pidl(item), kind, true);
+            b.add(tr("side.favorites"), item.display_name(), item.parsing_name(), &qa.child_pidl(item), kind, true);
         }
+    }
+    // The Recycle Bin is always a Favorites row; the dedupe skips it when Quick Access pinned it.
+    if let Ok(f) = ShellFolder::parse("shell:RecycleBinFolder") {
+        b.add(tr("side.favorites"), f.name.clone(), f.parsing_name.clone(), &f.pidl, Kind::Place, true);
     }
     let cloud = ui::cloud_roots();
     if let Ok(pc) = ShellFolder::parse("shell:MyComputerFolder") {
@@ -431,7 +453,7 @@ fn sidebar_rows(bookmarks: &[(String, String)]) -> SidebarRows {
         });
         items.sort_by_key(|i| i.parsing_name());
         for d in &items {
-            b.add("This PC", d.display_name(), d.parsing_name(), &pc.child_pidl(d), Kind::Place, false);
+            b.add(tr("side.this_pc"), d.display_name(), d.parsing_name(), &pc.child_pidl(d), Kind::Place, false);
         }
         // Devices: what the desktop root adds besides files and the shell's own places (Phone Link phones, Linux).
         if let Some(root) = pc.parent() {
@@ -444,18 +466,24 @@ fn sidebar_rows(bookmarks: &[(String, String)]) -> SidebarRows {
                     || p.eq_ignore_ascii_case(&profile)
                     || cloud.iter().any(|(l, _)| l.eq_ignore_ascii_case(&label));
                 if !skip {
-                    b.add("Devices", label, p, &root.child_pidl(item), Kind::Place, true);
+                    b.add(tr("side.devices"), label, p, &root.child_pidl(item), Kind::Place, true);
                 }
             }
         }
     }
     for (label, path) in cloud {
         if let Ok(f) = ShellFolder::parse(path) {
-            b.add("Cloud", label.clone(), f.parsing_name.clone(), &f.pidl, Kind::Place, false);
+            b.add(tr("side.cloud"), label.clone(), f.parsing_name.clone(), &f.pidl, Kind::Place, false);
+        }
+    }
+    // Libraries, as one row, when the shell has any (Explorer's nav pane option is not read).
+    if let Ok(f) = ShellFolder::parse("shell:Libraries") {
+        if f.enumerate().is_ok_and(|v| !v.is_empty()) {
+            b.add("", f.name.clone(), f.parsing_name.clone(), &f.pidl, Kind::Place, false);
         }
     }
     if let Ok(f) = ShellFolder::parse("shell:NetworkPlacesFolder") {
-        b.add("Network", f.name.clone(), f.parsing_name.clone(), &f.pidl, Kind::Place, false);
+        b.add(tr("side.network"), f.name.clone(), f.parsing_name.clone(), &f.pidl, Kind::Place, false);
     }
     b
 }
@@ -529,7 +557,7 @@ pub(crate) unsafe fn end_drag(app: *mut App) {
 
 /// Selection changed: refresh the preview once the selection settles.
 pub(crate) unsafe fn schedule_preview(app: *mut App) {
-    if (*app).session.show_preview {
+    if (*app).session.show_preview || (*app).session.show_details {
         SetTimer(Some((*app).hwnd), TIMER_PREVIEW, 150, None);
         stop_hover(app);
     }
@@ -567,35 +595,135 @@ pub(crate) unsafe fn prefetch_hovered(app: *mut App) {
     preview_pane::prefetch(path, l.folder.child_pidl(item), preview_pane::request_size((*app).panes.preview));
 }
 
+/// The focused item if it is selected, else the first selected one; None without a selection.
+unsafe fn focused_selected(app: *mut App) -> Option<usize> {
+    let list = (*app).list;
+    if SendMessageW(list, LVM_GETSELECTEDCOUNT, None, None).0 == 0 {
+        return None;
+    }
+    let mut i = SendMessageW(list, LVM_GETNEXTITEM, Some(WPARAM(usize::MAX)), Some(LPARAM(LVNI_FOCUSED as isize))).0;
+    let selected = |i: isize| SendMessageW(list, LVM_GETITEMSTATE, Some(WPARAM(i as usize)), Some(LPARAM(LVIS_SELECTED.0 as isize))).0 != 0;
+    if i < 0 || !selected(i) {
+        i = SendMessageW(list, LVM_GETNEXTITEM, Some(WPARAM(usize::MAX)), Some(LPARAM(LVNI_SELECTED as isize))).0;
+    }
+    usize::try_from(i).ok()
+}
+
+fn subject_of(l: &Listing, item: &ShellItem) -> preview_pane::Subject {
+    let parsing = item.parsing_name();
+    let (_, type_col) = size_and_type_columns(&l.folder.folder);
+    preview_pane::Subject {
+        path: ui::is_fs_path(&parsing).then(|| PathBuf::from(&parsing)),
+        abs_pidl: l.folder.child_pidl(item),
+        name: item.display_name(),
+        is_folder: item.is_folder(),
+        size: if item.is_folder() { None } else { item.size() },
+        type_text: type_col.map(|c| item.detail(c)).unwrap_or_default(),
+    }
+}
+
 /// Shows the focused (else first) selected item, or nothing without a selection.
 pub(crate) unsafe fn update_preview(app: *mut App) {
+    if (*app).session.show_details {
+        return update_details(app);
+    }
     if !(*app).session.show_preview {
         return;
     }
-    let list = (*app).list;
     let subject = (|| {
         let l = listing(app)?;
-        if SendMessageW(list, LVM_GETSELECTEDCOUNT, None, None).0 == 0 {
-            return None;
-        }
-        let mut i = SendMessageW(list, LVM_GETNEXTITEM, Some(WPARAM(usize::MAX)), Some(LPARAM(LVNI_FOCUSED as isize))).0;
-        let selected = |i: isize| SendMessageW(list, LVM_GETITEMSTATE, Some(WPARAM(i as usize)), Some(LPARAM(LVIS_SELECTED.0 as isize))).0 != 0;
-        if i < 0 || !selected(i) {
-            i = SendMessageW(list, LVM_GETNEXTITEM, Some(WPARAM(usize::MAX)), Some(LPARAM(LVNI_SELECTED as isize))).0;
-        }
-        let item = l.items.get(usize::try_from(i).ok()?)?;
-        let parsing = item.parsing_name();
-        let (_, type_col) = size_and_type_columns(&l.folder.folder);
-        Some(preview_pane::Subject {
-            path: ui::is_fs_path(&parsing).then(|| PathBuf::from(&parsing)),
-            abs_pidl: l.folder.child_pidl(item),
-            name: item.display_name(),
-            is_folder: item.is_folder(),
-            size: if item.is_folder() { None } else { item.size() },
-            type_text: type_col.map(|c| item.detail(c)).unwrap_or_default(),
-        })
+        let item = l.items.get(focused_selected(app)?)?;
+        Some(subject_of(l, item))
     })();
     preview_pane::show((*app).panes.preview, subject);
+}
+
+// ---- details -------------------------------------------------------------------------------------
+
+/// What the details pane is about: the folder, one item or several.
+pub(crate) enum Info {
+    Folder { name: String, count: usize },
+    One { name: String, type_text: String, size: Option<u64>, modified: Option<String>, created: Option<String> },
+    Many { count: usize, bytes: Option<u64> },
+}
+
+pub(crate) fn details_text(info: &Info) -> preview_pane::DetailsText {
+    let size = |b: u64| statusbar::format_size(b);
+    match info {
+        Info::Folder { name, count } => preview_pane::DetailsText {
+            heading: name.clone(),
+            sub: trn("status.items", *count as u64),
+            rows: Vec::new(),
+        },
+        Info::One { name, type_text, size: bytes, modified, created } => {
+            let mut rows = Vec::new();
+            rows.extend(bytes.map(|b| (tr("preview.size"), size(b))));
+            rows.extend(modified.clone().map(|m| (tr("preview.date_modified"), m)));
+            rows.extend(created.clone().map(|c| (tr("preview.date_created"), c)));
+            preview_pane::DetailsText { heading: name.clone(), sub: type_text.clone(), rows }
+        }
+        Info::Many { count, bytes } => preview_pane::DetailsText {
+            heading: trf("preview.items_selected", &[("n", count)]),
+            sub: String::new(),
+            rows: bytes.map(|b| (tr("preview.total_size"), size(b))).into_iter().collect(),
+        },
+    }
+}
+
+const PKEY_DATE_MODIFIED: windows::Win32::Foundation::PROPERTYKEY =
+    windows::Win32::Foundation::PROPERTYKEY { fmtid: GUID::from_u128(0xB725F130_47EF_101A_A5F1_02608C9EEBAC), pid: 14 };
+const PKEY_DATE_CREATED: windows::Win32::Foundation::PROPERTYKEY =
+    windows::Win32::Foundation::PROPERTYKEY { fmtid: GUID::from_u128(0xB725F130_47EF_101A_A5F1_02608C9EEBAC), pid: 15 };
+
+/// A UTC FILETIME as the local short date and time.
+fn format_time(ft: &windows::Win32::Foundation::FILETIME) -> Option<String> {
+    let mut flags = FDTF_SHORTDATE | FDTF_SHORTTIME;
+    let mut buf = [0u16; 128];
+    let n = unsafe { SHFormatDateTimeW(ft, Some(&mut flags as *mut u32), &mut buf) };
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    (n > 0).then(|| preview_pane::strip_marks(&String::from_utf16_lossy(&buf[..end])))
+}
+
+/// The details pane for the selection: text from the listing's items, the picture and the dimensions from workers.
+pub(crate) unsafe fn update_details(app: *mut App) {
+    // The load's completion schedules the refresh.
+    if cur(app).loading.is_some() {
+        return;
+    }
+    let selected = SendMessageW((*app).list, LVM_GETSELECTEDCOUNT, None, None).0 as usize;
+    let l = listing(app);
+    let one = if selected == 1 { l.and_then(|l| Some((l, l.items.get(focused_selected(app)?)?))) } else { None };
+    let (info, subject, dims) = if selected >= 2 {
+        (Info::Many { count: selected, bytes: ui::selected_bytes(app, selected) }, None, false)
+    } else if let Some((l, item)) = one {
+        let sub = subject_of(l, item);
+        let remote = ui::is_remote(&l.folder.parsing_name) || ui::is_remote(&item.parsing_name());
+        let dims = !sub.is_folder && !remote && sub.path.as_ref().is_some_and(|p| rexplorer_core::preview::is_image(p.extension().and_then(|e| e.to_str()).unwrap_or("")));
+        let time = |key| item.property_time(key).and_then(|t| format_time(&t));
+        let info = Info::One {
+            name: sub.name.clone(),
+            type_text: sub.type_text.clone(),
+            size: sub.size,
+            modified: time(&PKEY_DATE_MODIFIED),
+            created: time(&PKEY_DATE_CREATED),
+        };
+        (info, (!remote).then_some(sub), dims)
+    } else {
+        let info = Info::Folder {
+            name: l.map_or_else(|| cur(app).name.clone(), |l| l.folder.name.clone()),
+            count: source(app).map_or(0, |s| s.len()),
+        };
+        let subject = l.filter(|l| !ui::is_remote(&l.folder.parsing_name)).map(|l| preview_pane::Subject {
+            path: ui::is_fs_path(&l.folder.parsing_name).then(|| PathBuf::from(&l.folder.parsing_name)),
+            abs_pidl: l.folder.pidl.clone(),
+            name: l.folder.name.clone(),
+            is_folder: true,
+            size: None,
+            type_text: String::new(),
+        });
+        (info, subject, false)
+    };
+    preview_pane::show_details((*app).panes.preview, subject, details_text(&info), dims);
 }
 
 /// Shell column indices of System.Size and System.ItemTypeText (column titles are localized, keys are not).
@@ -639,12 +767,13 @@ mod tests {
         let downloads = rows[1].target.to_lowercase();
         assert_eq!(rows.iter().filter(|r| r.target.to_lowercase() == downloads).count(), 1, "Quick Access does not repeat it");
         let recycle = "::{645FF040-5081-101B-9F08-00AA002F954E}";
-        // The Recycle Bin is listed once: under Favorites when Quick Access pins it (a per-user choice), else elsewhere.
+        // The Recycle Bin is listed once, under Favorites: pinned by Quick Access (a per-user choice) or added after it.
         let bins: Vec<usize> = rows.iter().enumerate().filter(|(_, r)| r.target.eq_ignore_ascii_case(recycle)).map(|(i, _)| i).collect();
         assert_eq!(bins.len(), 1, "Recycle Bin once: {names:?}");
-        if rows[bins[0]].section == "Favorites" {
-            assert_eq!(kinds[bins[0]], Kind::Pinned);
-        }
+        assert_eq!(rows[bins[0]].section, "Favorites");
+        assert!(matches!(kinds[bins[0]], Kind::Pinned | Kind::Place));
+        let libs = ShellFolder::parse("shell:Libraries").and_then(|f| f.enumerate()).is_ok_and(|v| !v.is_empty());
+        assert_eq!(rows.iter().any(|r| r.target.eq_ignore_ascii_case("::{031E4825-7B94-4DC3-B131-E946B44C8DD5}")), libs, "Libraries row iff the shell has libraries");
         assert!(rows.iter().any(|r| r.section == "This PC" && r.target == "C:\\"), "drives: {names:?}");
         assert!(!rows.iter().any(|r| r.section == "This PC" && r.target.len() > 3 && ui::is_fs_path(&r.target)), "no user folders under This PC");
         assert!(rows.iter().filter(|r| r.section == "Devices").all(|r| !NOT_DEVICES.contains(&r.target.as_str())));
@@ -661,6 +790,50 @@ mod tests {
         assert!(is_under(r"C:\Users\v\Desktop", r"C:\Users\v\Desktop\"));
         assert!(!is_under(r"C:\Users\v\Desktop2", r"C:\Users\v\Desktop"));
         assert!(!is_under("::{B2B4A4D1-2754-4140-A2EB-9A76D9D7CDC6}", r"C:\Users\v\Desktop"));
+    }
+
+    #[test]
+    fn right_panes_exclude_each_other() {
+        use RightPane::*;
+        assert_eq!(right_panes(false, false, Preview), (true, false));
+        assert_eq!(right_panes(false, false, Details), (false, true));
+        assert_eq!(right_panes(true, false, Details), (false, true));
+        assert_eq!(right_panes(false, true, Preview), (true, false));
+        assert_eq!(right_panes(true, false, Preview), (false, false));
+        assert_eq!(right_panes(false, true, Details), (false, false));
+    }
+
+    #[test]
+    fn details_text_rows() {
+        let one = |size, modified: Option<&str>, created: Option<&str>| {
+            details_text(&Info::One { name: "a.png".into(), type_text: "PNG File".into(), size, modified: modified.map(Into::into), created: created.map(Into::into) })
+        };
+        let t = one(Some(1536), Some("m"), None);
+        assert_eq!((t.heading.as_str(), t.sub.as_str()), ("a.png", "PNG File"));
+        assert_eq!(t.rows, vec![("Size", "1.5 KB".to_string()), ("Date modified", "m".to_string())]);
+        let t = one(None, Some("m"), Some("c"));
+        assert_eq!(t.rows, vec![("Date modified", "m".to_string()), ("Date created", "c".to_string())]);
+        let t = details_text(&Info::Many { count: 3, bytes: Some(2048) });
+        assert_eq!((t.heading.as_str(), t.sub.as_str()), ("3 items selected", ""));
+        assert_eq!(t.rows, vec![("Total size", "2.0 KB".to_string())]);
+        assert!(details_text(&Info::Many { count: 3, bytes: None }).rows.is_empty());
+        for (n, sub) in [(0, "0 items"), (1, "1 item"), (12, "12 items")] {
+            let t = details_text(&Info::Folder { name: "Docs".into(), count: n });
+            assert_eq!((t.heading.as_str(), t.sub.as_str()), ("Docs", sub));
+            assert!(t.rows.is_empty());
+        }
+    }
+
+    #[test]
+    fn format_time_is_local_text() {
+        use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+        use windows::Win32::System::Time::SystemTimeToFileTime;
+        let st = SYSTEMTIME { wYear: 2024, wMonth: 6, wDay: 15, wHour: 12, ..Default::default() };
+        let mut ft = FILETIME::default();
+        unsafe { SystemTimeToFileTime(&st, &mut ft).unwrap() };
+        let text = format_time(&ft).expect("a date");
+        assert!(text.contains("2024"), "{text}");
+        assert!(!text.chars().any(|c| matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}')), "{text:?}");
     }
 
     #[test]

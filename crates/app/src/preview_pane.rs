@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 use std::ffi::c_void;
 use std::io::Read;
+use rexplorer_core::i18n::tr;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,13 +18,18 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{HSTRING, PCWSTR, Result, w};
+use windows::Win32::Foundation::PROPERTYKEY;
+use windows::Win32::UI::Shell::{IShellItem2, SHCreateItemFromParsingName};
+use windows::core::{GUID, HSTRING, PCWSTR, Result, w};
 
 /// Reserved for the parent's notifications; the pane currently sends none.
 pub const PVN_FIRST: u32 = 0x9000;
 /// Posted to the pane by a worker that filled the cache for a file (lparam = Box<PathBuf> of it); the pane shows the
 /// subject again from the cache if it is still that file.
 const PV_READY: u32 = WM_APP + 0x51;
+
+/// Posted to the pane by the Dimensions worker (lparam = Box<(PathBuf, String)>: the file and its "2 x 3" text).
+const PV_DIMS: u32 = WM_APP + 0x52;
 
 // The Edit word-wraps all of its text on every set and resize, so keep what goes in small.
 const MAX_TEXT: u64 = 64 * 1024;
@@ -172,6 +178,13 @@ pub struct Subject {
     pub type_text: String,
 }
 
+/// What the pane shows in details mode besides the picture: a heading, a line under it and label/value rows.
+pub struct DetailsText {
+    pub heading: String,
+    pub sub: String,
+    pub rows: Vec<(&'static str, String)>,
+}
+
 struct State {
     bg: u32,
     /// The frame color around the card, for its painted corners.
@@ -189,6 +202,8 @@ struct State {
     subject: Option<Subject>,
     /// The shown file's mtime and size when its handler opened or its text was set: both are kept while they still match.
     stamp: Option<Stamp>,
+    /// Details mode (Alt+Shift+P): drawn instead of the caption, never with the Edit or a handler.
+    details: Option<DetailsText>,
 }
 
 /// Formats a byte count like "1.5 MB" (binary units, one decimal above 1 KB).
@@ -203,7 +218,7 @@ fn format_size(n: u64) -> String {
         v /= 1024.0;
         i += 1;
     }
-    format!("{v:.1} {}", U[i])
+    format!("{} {}", format!("{v:.1}").replace('.', rexplorer_core::i18n::tr("num.decimal")), U[i])
 }
 
 /// UTF-8 lossy, BOM stripped, every line break normalised to CRLF for the Edit control.
@@ -273,6 +288,7 @@ pub fn create(parent: HWND, id: usize) -> Result<HWND> {
             preview: None,
             subject: None,
             stamp: None,
+            details: None,
         }));
         let r = CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -352,6 +368,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        PV_DIMS => {
+            let (path, text) = *Box::from_raw(lparam.0 as *mut (PathBuf, String));
+            let shown = (*s).subject.as_ref().and_then(|sub| sub.path.as_ref()) == Some(&path);
+            if let (Some(d), true) = (&mut (*s).details, shown) {
+                if !d.rows.iter().any(|r| r.0 == tr("preview.dimensions")) {
+                    d.rows.push((tr("preview.dimensions"), text));
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+            }
+            LRESULT(0)
+        }
         WM_DESTROY => {
             (*s).preview = None;
             (*s).subject = None;
@@ -405,7 +432,9 @@ unsafe fn paint(hwnd: HWND, s: *mut State) {
         let old = SelectObject(mem, bmp.into());
         FillRect(mem, &rc, (*s).brush);
 
-        if let Some((hb, bw, bh)) = (*s).bitmap.clone() {
+        if (*s).details.is_some() {
+            paint_details(hwnd, s, hdc, mem);
+        } else if let Some((hb, bw, bh)) = (*s).bitmap.clone() {
             let c = content_rect(hwnd);
             let cap = caption_height(hwnd);
             let area_h = (c.bottom - c.top - cap).max(1);
@@ -414,17 +443,7 @@ unsafe fn paint(hwnd: HWND, s: *mut State) {
             let (dw, dh) = (((bw as f64 * fit) as i32).max(1), ((bh as f64 * fit) as i32).max(1));
             let x = c.left + ((c.right - c.left - dw) / 2).max(0);
             let y = c.top + ((area_h - dh) / 2).max(0);
-            let src = CreateCompatibleDC(Some(hdc));
-            let prev = SelectObject(src, hb.0.into());
-            let bf = BLENDFUNCTION {
-                BlendOp: AC_SRC_OVER as u8,
-                BlendFlags: 0,
-                SourceConstantAlpha: 255,
-                AlphaFormat: AC_SRC_ALPHA as u8,
-            };
-            let _ = AlphaBlend(mem, x, y, dw, dh, src, 0, 0, bw, bh, bf);
-            SelectObject(src, prev);
-            let _ = DeleteDC(src);
+            blend(hdc, mem, &hb, (x, y, dw, dh), (bw, bh));
 
             let font = if (*s).ui_font.is_invalid() {
                 GetStockObject(DEFAULT_GUI_FONT)
@@ -454,6 +473,57 @@ unsafe fn paint(hwnd: HWND, s: *mut State) {
         let _ = DeleteDC(mem);
     }
     let _ = EndPaint(hwnd, &ps);
+}
+
+unsafe fn blend(hdc: HDC, mem: HDC, hb: &Bmp, (x, y, dw, dh): (i32, i32, i32, i32), (bw, bh): (i32, i32)) {
+    let src = CreateCompatibleDC(Some(hdc));
+    let prev = SelectObject(src, hb.0.into());
+    let bf = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
+    let _ = AlphaBlend(mem, x, y, dw, dh, src, 0, 0, bw, bh, bf);
+    SelectObject(src, prev);
+    let _ = DeleteDC(src);
+}
+
+/// Details mode: the picture in a square at the top, then the heading, the line under it and the label/value rows.
+/// Colors come from the theme (text, secondary), so a contrast theme needs nothing here.
+unsafe fn paint_details(hwnd: HWND, s: *mut State, hdc: HDC, mem: HDC) {
+    let Some(d) = &(*s).details else { return };
+    let c = content_rect(hwnd);
+    let edge = details_edge(c.right - c.left, c.bottom - c.top, scale(hwnd, 256));
+    let mut y = c.top;
+    if let Some((hb, bw, bh)) = (*s).bitmap.clone() {
+        let fit = (edge as f64 / bw.max(1) as f64).min(edge as f64 / bh.max(1) as f64).min(1.0);
+        let (dw, dh) = (((bw as f64 * fit) as i32).max(1), ((bh as f64 * fit) as i32).max(1));
+        let x = c.left + ((c.right - c.left - dw) / 2).max(0);
+        blend(hdc, mem, &hb, (x, y + ((edge - dh) / 2).max(0), dw, dh), (bw, bh));
+        y += edge + scale(hwnd, 8);
+    }
+    let font = if (*s).ui_font.is_invalid() { GetStockObject(DEFAULT_GUI_FONT) } else { (*s).ui_font.into() };
+    let of = SelectObject(mem, font);
+    SetBkMode(mem, TRANSPARENT);
+    let fmt = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX;
+    let line = |y: i32, left: i32, right: i32, h: i32, color: u32, text: &str| {
+        // An empty line (no type text, several items) has nothing to draw, and DrawTextW is not called with no characters.
+        if text.is_empty() {
+            return;
+        }
+        let mut r = RECT { left, top: y, right, bottom: y + h };
+        SetTextColor(mem, COLORREF(color));
+        let mut t: Vec<u16> = text.encode_utf16().collect();
+        DrawTextW(mem, &mut t, &mut r, fmt);
+    };
+    let (h_head, h_row, gap) = (scale(hwnd, 24), scale(hwnd, 20), scale(hwnd, 8));
+    line(y, c.left, c.right, h_head, (*s).text, &d.heading);
+    y += h_head;
+    line(y, c.left, c.right, h_row, (*s).secondary, &d.sub);
+    y += h_row + gap;
+    let split = c.left + (c.right - c.left) * 2 / 5;
+    for (label, value) in &d.rows {
+        line(y, c.left, split, h_row, (*s).secondary, label);
+        line(y, split, c.right, h_row, (*s).text, value);
+        y += h_row;
+    }
+    SelectObject(mem, of);
 }
 
 pub fn set_theme(hwnd: HWND, t: &Theme) {
@@ -498,6 +568,7 @@ pub fn show(hwnd: HWND, subject: Option<Subject>) {
         let same = match (&subject, &(*s).subject) {
             (Some(new), Some(old)) => {
                 (if (*s).preview.is_some() { HANDLERS.load(Ordering::Relaxed) } else { (*s).stamp.is_some() })
+                    && (*s).details.is_none()
                     && new.path.is_some()
                     && new.path == old.path
                     && new.path.as_deref().and_then(stamp) == (*s).stamp
@@ -508,14 +579,7 @@ pub fn show(hwnd: HWND, subject: Option<Subject>) {
             (*s).subject = subject;
             return;
         }
-        (*s).preview = None;
-        (*s).subject = None;
-        (*s).stamp = None;
-        clear_bitmap(s);
-        (*s).name.clear();
-        (*s).detail.clear();
-        let _ = ShowWindow((*s).edit, SW_HIDE);
-        let _ = SetWindowTextW((*s).edit, w!(""));
+        reset(s);
         if let Some(sub) = subject {
             present(hwnd, s, &sub, true);
             (*s).subject = Some(sub);
@@ -524,16 +588,93 @@ pub fn show(hwnd: HWND, subject: Option<Subject>) {
     }
 }
 
+/// Back to an empty pane: no handler, subject, picture, details or text.
+unsafe fn reset(s: *mut State) {
+    (*s).preview = None;
+    (*s).subject = None;
+    (*s).stamp = None;
+    (*s).details = None;
+    clear_bitmap(s);
+    (*s).name.clear();
+    (*s).detail.clear();
+    let _ = ShowWindow((*s).edit, SW_HIDE);
+    let _ = SetWindowTextW((*s).edit, w!(""));
+}
+
+/// Details mode: `text` and, for a subject, its picture (from the cache, fetched by a worker); `dims` also reads an
+/// image's dimensions on a worker. The Edit and handlers are never used.
+pub fn show_details(hwnd: HWND, subject: Option<Subject>, text: DetailsText, dims: bool) {
+    unsafe {
+        let s = state(hwnd);
+        if s.is_null() {
+            return;
+        }
+        reset(s);
+        (*s).details = Some(text);
+        if let Some(sub) = subject {
+            present(hwnd, s, &sub, true);
+            if let (true, Some(path)) = (dims, sub.path.clone()) {
+                let notify = hwnd.0 as isize;
+                std::thread::spawn(move || {
+                    crate::ui::background_priority();
+                    let _com = ComInit::mta();
+                    let Some(text) = image_dimensions(&path) else { return };
+                    let b = Box::into_raw(Box::new((path, text)));
+                    if PostMessageW(Some(HWND(notify as *mut c_void)), PV_DIMS, WPARAM(0), LPARAM(b as isize)).is_err() {
+                        drop(Box::from_raw(b));
+                    }
+                });
+            }
+            (*s).subject = Some(sub);
+        }
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+}
+
+/// The shell wraps dates and "2 x 3" in direction marks; they show as boxes in some fonts and break comparisons.
+pub fn strip_marks(s: &str) -> String {
+    s.chars().filter(|c| !matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}')).collect()
+}
+
+/// Reading a cloud placeholder's properties would download it (RECALL_ON_DATA_ACCESS or OFFLINE).
+fn dims_allowed(attrs: u32) -> bool {
+    attrs & (0x0040_0000 | 0x1000) == 0
+}
+
+/// "2 x 3" for a local image, from the shell's property system; call it off the UI thread.
+fn image_dimensions(path: &Path) -> Option<String> {
+    use std::os::windows::fs::MetadataExt;
+    const PKEY_IMAGE_DIMENSIONS: PROPERTYKEY = PROPERTYKEY { fmtid: GUID::from_u128(0x6444048F_4C8B_11D1_8B70_080036B11A03), pid: 13 };
+    if !dims_allowed(std::fs::metadata(path).ok()?.file_attributes()) {
+        return None;
+    }
+    unsafe {
+        let item: IShellItem2 = SHCreateItemFromParsingName(&HSTRING::from(path.as_os_str()), None).ok()?;
+        let text = strip_marks(&rexplorer_core::com::take_cotaskmem_string(item.GetString(&PKEY_IMAGE_DIMENSIONS).ok()?));
+        (!text.is_empty()).then_some(text)
+    }
+}
+
+/// The picture edge in details mode: at most half the height, so the rows keep their room.
+fn details_edge(w: i32, h: i32, max: i32) -> i32 {
+    w.min(h / 2).min(max).max(1)
+}
+
 /// Shows `sub` from the cache; a file not cached yet gets the caption now and, when `spawn`, a worker that posts
 /// PV_READY. Folders and virtual items (no cache key) are asked for synchronously.
 unsafe fn present(hwnd: HWND, s: *mut State, sub: &Subject, spawn: bool) {
     let kind = match (&sub.path, sub.is_folder) {
-        (Some(p), false) => kind_of(p),
+        (Some(p), false) if (*s).details.is_none() => kind_of(p),
         _ => Kind::None,
     };
     let path = sub.path.as_deref().unwrap_or(Path::new(""));
     let key = sub.path.as_deref().filter(|_| !sub.is_folder);
-    let size = request_size(hwnd);
+    let size = if (*s).details.is_some() {
+        let c = content_rect(hwnd);
+        details_edge(c.right - c.left, c.bottom - c.top, scale(hwnd, 256))
+    } else {
+        request_size(hwnd)
+    };
     let start = |kind: Kind| {
         if spawn {
             fetch(path.to_path_buf(), sub.abs_pidl.clone(), size, kind, hwnd.0 as isize);
@@ -585,6 +726,11 @@ pub fn set_rect(hwnd: HWND, rect: RECT) {
 }
 
 #[cfg(test)]
+pub fn details_of(hwnd: HWND) -> Option<(String, Vec<(&'static str, String)>)> {
+    unsafe { (*state(hwnd)).details.as_ref().map(|d| (d.heading.clone(), d.rows.clone())) }
+}
+
+#[cfg(test)]
 pub fn has_bitmap(hwnd: HWND) -> bool {
     unsafe { (*state(hwnd)).bitmap.is_some() }
 }
@@ -623,6 +769,78 @@ mod tests {
         assert_eq!(thumb_size(300, 200, 44), 156);
         assert_eq!(thumb_size(100, 10, 44), 1);
         assert_eq!(detail_text(None, "Folder"), "Folder");
+    }
+
+    #[test]
+    fn details_pure_helpers() {
+        assert_eq!(strip_marks("\u{200e}1/2/2026\u{200f} \u{202a}3:04\u{202c}"), "1/2/2026 3:04");
+        assert!(dims_allowed(0x20));
+        assert!(!dims_allowed(0x0040_0000));
+        assert!(!dims_allowed(0x1000));
+        assert!(!dims_allowed(0x0040_0020));
+        assert_eq!(details_edge(300, 800, 256), 256);
+        assert_eq!(details_edge(200, 800, 256), 200);
+        assert_eq!(details_edge(300, 300, 256), 150);
+        assert_eq!(details_edge(0, 0, 256), 1);
+    }
+
+    #[test]
+    fn details_mode_rows_picture_and_dimensions() {
+        let _com = ComInit::sta();
+        let dir = std::env::temp_dir().join(format!("rexplorer-details-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bmp = dir.join("p.bmp");
+        let mut b = b"BM".to_vec();
+        for v in [54u32 + 24, 0, 54, 40, 2, 3] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&24u16.to_le_bytes());
+        b.extend_from_slice(&[0u8; 24]);
+        b.extend_from_slice(&[0x80u8; 24]);
+        std::fs::write(&bmp, &b).unwrap();
+        let digits = |s: &str| s.chars().filter(char::is_ascii_digit).collect::<String>();
+        assert_eq!(digits(&image_dimensions(&bmp).expect("dimensions")), "23");
+        let mut pi = std::ptr::null_mut();
+        let abs = unsafe {
+            SHParseDisplayName(&HSTRING::from(bmp.as_os_str()), None, &mut pi, 0, None).unwrap();
+            Pidl::from_raw(pi)
+        };
+        let text = |h: &str| DetailsText { heading: h.into(), sub: String::new(), rows: vec![] };
+        unsafe {
+            let parent = CreateWindowExW(
+                WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR::null(), WS_OVERLAPPEDWINDOW,
+                0, 0, 800, 600, None, None, None, None,
+            )
+            .unwrap();
+            let pane = create(parent, 7).unwrap();
+            set_rect(pane, RECT { left: 0, top: 0, right: 400, bottom: 500 });
+            pump();
+
+            show_details(pane, None, text("3 items selected"), false);
+            assert_eq!(details_of(pane).map(|d| d.0).as_deref(), Some("3 items selected"));
+            assert!(!has_bitmap(pane));
+
+            let subject = Subject { path: Some(bmp.clone()), abs_pidl: abs, name: "p.bmp".into(), is_folder: false, size: Some(78), type_text: "BMP".into() };
+            show_details(pane, Some(subject), text("p.bmp"), true);
+            let mut dims = None;
+            for _ in 0..300 {
+                pump();
+                dims = details_of(pane).and_then(|d| d.1.into_iter().find(|r| r.0 == "Dimensions"));
+                if dims.is_some() && has_bitmap(pane) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(has_bitmap(pane), "the picture comes through the cache");
+            assert_eq!(digits(&dims.expect("a Dimensions row").1), "23");
+
+            show(pane, None);
+            assert!(details_of(pane).is_none());
+            assert!(!has_bitmap(pane));
+            let _ = DestroyWindow(parent);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

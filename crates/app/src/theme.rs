@@ -1,11 +1,12 @@
 //! Applies a `rexplorer_core::settings::Theme` to the main window and the common controls.
 #![allow(dead_code)]
 
-use rexplorer_core::settings::Theme;
+use rexplorer_core::settings::{Contrast, Theme};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::Controls::*;
+use windows::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, HSTRING, PCSTR, PCWSTR, w};
@@ -69,6 +70,15 @@ fn dwm_set<T>(hwnd: HWND, attr: DWMWINDOWATTRIBUTE, v: &T) {
 }
 
 pub fn apply_window(hwnd: HWND, t: &Theme) {
+    if t.contrast.is_some() {
+        // Plain system frame; also resets what a normal theme set before a live switch.
+        dwm_set(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &BOOL::from(false));
+        dwm_set(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &DWMSBT_AUTO);
+        dwm_set(hwnd, DWMWA_CAPTION_COLOR, &COLORREF(DWMWA_COLOR_DEFAULT));
+        dwm_set(hwnd, DWMWA_BORDER_COLOR, &COLORREF(DWMWA_COLOR_DEFAULT));
+        let _ = unsafe { SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED) };
+        return;
+    }
     dwm_set(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &BOOL::from(t.dark));
     let backdrop = if t.mica { DWMSBT_MAINWINDOW } else { DWMSBT_AUTO };
     dwm_set(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop);
@@ -327,11 +337,94 @@ pub fn blend(a: u32, b: u32, t: f32) -> u32 {
 }
 
 pub fn hover(t: &Theme) -> u32 {
-    blend(t.background, t.text, 0.08)
+    if t.contrast.is_some() { t.background } else { blend(t.background, t.text, 0.08) }
 }
 
 pub fn pressed(t: &Theme) -> u32 {
-    blend(t.background, t.text, 0.14)
+    if t.contrast.is_some() { t.selection } else { blend(t.background, t.text, 0.14) }
+}
+
+/// `base` as the user sees it: while a Windows contrast theme is on, the system colors replace the palette.
+/// `sys` is the color lookup (`sys_color`, or a fake in tests); it is never called when `high_contrast` is false.
+pub fn effective_theme(base: &Theme, high_contrast: bool, sys: impl Fn(SYS_COLOR_INDEX) -> u32) -> Theme {
+    let mut t = base.clone();
+    if !high_contrast {
+        return t;
+    }
+    // secondary_text is WINDOWTEXT on purpose: GRAYTEXT is for disabled text only.
+    (t.background, t.surface) = (sys(COLOR_WINDOW), sys(COLOR_WINDOW));
+    (t.text, t.secondary_text, t.border) = (sys(COLOR_WINDOWTEXT), sys(COLOR_WINDOWTEXT), sys(COLOR_WINDOWTEXT));
+    (t.accent, t.selection) = (sys(COLOR_HIGHLIGHT), sys(COLOR_HIGHLIGHT));
+    (t.dark, t.mica) = (false, false);
+    t.contrast = Some(Contrast {
+        highlight_text: sys(COLOR_HIGHLIGHTTEXT),
+        hot: sys(COLOR_HOTLIGHT),
+        gray: sys(COLOR_GRAYTEXT),
+        button_face: sys(COLOR_BTNFACE),
+        button_text: sys(COLOR_BTNTEXT),
+    });
+    t
+}
+
+/// True while Windows has a contrast theme on.
+pub fn high_contrast_on() -> bool {
+    let mut hc = HIGHCONTRASTW { cbSize: size_of::<HIGHCONTRASTW>() as u32, ..Default::default() };
+    unsafe { SystemParametersInfoW(SPI_GETHIGHCONTRAST, hc.cbSize, Some(&mut hc as *mut _ as *mut _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0)) }
+        .is_ok()
+        && hc.dwFlags.0 & HCF_HIGHCONTRASTON.0 != 0
+}
+
+/// The real system color lookup.
+pub fn sys_color(i: SYS_COLOR_INDEX) -> u32 {
+    unsafe { GetSysColor(i) }
+}
+
+/// Messages that mean the system colors or the contrast theme may have changed.
+pub fn is_color_change(msg: u32, wparam: usize, setting: Option<&str>) -> bool {
+    match msg {
+        WM_SYSCOLORCHANGE | WM_THEMECHANGED => true,
+        WM_SETTINGCHANGE => wparam == SPI_SETHIGHCONTRAST.0 as usize || setting == Some("ImmersiveColorSet"),
+        _ => false,
+    }
+}
+
+/// Text or glyph color on a `t.selection` / `t.accent` fill: HIGHLIGHTTEXT in a contrast theme, else `color`.
+pub fn on_selection(t: &Theme, color: u32) -> u32 {
+    t.contrast.map_or(color, |c| c.highlight_text)
+}
+
+/// Outlines `r` (same right/bottom +1 convention as `fill_round`) with a `width`-px pen drawn inside `r`, corners rounded by `radius`.
+pub unsafe fn outline_round(dc: HDC, r: &RECT, color: u32, radius: i32, width: i32) {
+    unsafe {
+        let pen = CreatePen(PS_INSIDEFRAME, width, COLORREF(color));
+        let (ob, op) = (SelectObject(dc, GetStockObject(NULL_BRUSH)), SelectObject(dc, pen.into()));
+        let _ = RoundRect(dc, r.left, r.top, r.right + 1, r.bottom + 1, 2 * radius, 2 * radius);
+        SelectObject(dc, ob);
+        SelectObject(dc, op);
+        let _ = DeleteObject(pen.into());
+    }
+}
+
+/// Hover by shape in a contrast theme: call right after a hover `fill_round`. Nothing in normal themes.
+pub unsafe fn hot_outline(dc: HDC, r: &RECT, t: &Theme, radius: i32, dpi: u32) {
+    if let Some(c) = t.contrast {
+        unsafe { outline_round(dc, r, c.hot, radius, (dpi as i32 / 96).max(1)) };
+    }
+}
+
+/// A push button in system colors: face (selection when pressed), 1 px outline, focus rectangle. Returns the label
+/// color, or None (nothing drawn) outside a contrast theme.
+pub unsafe fn contrast_button(dc: HDC, r: &RECT, t: &Theme, pressed: bool, focused: bool, disabled: bool, radius: i32) -> Option<u32> {
+    let c = t.contrast?;
+    let edge = if disabled { c.gray } else { c.button_text };
+    unsafe {
+        fill_round(dc, r, if pressed { t.selection } else { c.button_face }, radius);
+        outline_round(dc, r, edge, radius, 1);
+        if focused {
+            let _ = DrawFocusRect(dc, &RECT { left: r.left + 3, top: r.top + 3, right: r.right - 3, bottom: r.bottom - 3 });
+        }
+    }
+    Some(if disabled { c.gray } else if pressed { c.highlight_text } else { c.button_text })
 }
 
 #[cfg(test)]
@@ -356,6 +449,145 @@ mod tests {
             let len = lf.lfFaceName.iter().position(|&c| c == 0).unwrap_or(32);
             String::from_utf16_lossy(&lf.lfFaceName[..len])
         }
+    }
+
+    /// 0x0010_0000 + index: every system color distinct and recognizable.
+    fn fake(i: SYS_COLOR_INDEX) -> u32 {
+        0x0010_0000 + i.0 as u32
+    }
+
+    /// A contrast theme from a white-on-black style lookup; BTNFACE, BTNTEXT and GRAYTEXT distinct. Colors are
+    /// R == B so the DIB (0x00RRGGBB) and COLORREF (0x00BBGGRR) orders agree.
+    pub(crate) fn contrast_theme(base: Theme) -> Theme {
+        effective_theme(&base, true, |i| match i {
+            COLOR_WINDOW | COLOR_HIGHLIGHTTEXT => 0xFFFFFF,
+            COLOR_WINDOWTEXT => 0x000000,
+            COLOR_HIGHLIGHT => 0xA000A0,
+            COLOR_BTNFACE => 0xC0C0C0,
+            COLOR_BTNTEXT => 0x101010,
+            COLOR_GRAYTEXT => 0x808080,
+            _ => 0x0000FF,
+        })
+    }
+
+    /// Runs `f` on a 40x40 32-bit DIB filled 0x2060A0, then hands it the pixel reader.
+    fn on_dib(f: impl FnOnce(HDC, &dyn Fn(usize, usize) -> u32)) {
+        unsafe {
+            let dc = CreateCompatibleDC(None);
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER { biSize: size_of::<BITMAPINFOHEADER>() as u32, biWidth: 40, biHeight: -40, biPlanes: 1, biBitCount: 32, biCompression: BI_RGB.0, ..Default::default() },
+                ..Default::default()
+            };
+            let mut bits = std::ptr::null_mut();
+            let bmp = CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
+            let old = SelectObject(dc, bmp.into());
+            let brush = CreateSolidBrush(COLORREF(0x2060A0));
+            FillRect(dc, &RECT { left: 0, top: 0, right: 40, bottom: 40 }, brush);
+            let px = std::slice::from_raw_parts(bits as *const u32, 1600);
+            f(dc, &|x, y| { let _ = GdiFlush(); px[y * 40 + x] & 0xFF_FFFF });
+            SelectObject(dc, old);
+            let _ = DeleteObject(brush.into());
+            let _ = DeleteObject(bmp.into());
+            let _ = DeleteDC(dc);
+        }
+    }
+
+    #[test]
+    fn effective_theme_off_returns_base() {
+        assert_eq!(effective_theme(&Theme::dark(), false, |_| panic!("read")), Theme::dark());
+    }
+
+    #[test]
+    fn effective_theme_maps_system_colors() {
+        let base = Theme { icon_theme: Some("x".into()), font: "F".into(), font_size: 13, ..Theme::dark() };
+        let t = effective_theme(&base, true, fake);
+        assert_eq!((t.background, t.surface), (fake(COLOR_WINDOW), fake(COLOR_WINDOW)));
+        assert_eq!((t.text, t.secondary_text, t.border), (fake(COLOR_WINDOWTEXT), fake(COLOR_WINDOWTEXT), fake(COLOR_WINDOWTEXT)));
+        assert_eq!((t.accent, t.selection), (fake(COLOR_HIGHLIGHT), fake(COLOR_HIGHLIGHT)));
+        assert_eq!(
+            t.contrast,
+            Some(Contrast { highlight_text: fake(COLOR_HIGHLIGHTTEXT), hot: fake(COLOR_HOTLIGHT), gray: fake(COLOR_GRAYTEXT), button_face: fake(COLOR_BTNFACE), button_text: fake(COLOR_BTNTEXT) })
+        );
+        assert!(!t.dark && !t.mica);
+        assert_eq!((&t.name, &t.icon_theme, &t.font, t.font_size), (&base.name, &base.icon_theme, &base.font, base.font_size));
+    }
+
+    #[test]
+    fn effective_theme_ignores_base_palette() {
+        let lookups: [fn(SYS_COLOR_INDEX) -> u32; 2] = [
+            |i| if i == COLOR_WINDOW { 0xFFFFFF } else if i == COLOR_WINDOWTEXT { 0 } else { 0x0000FF },
+            |i| if i == COLOR_WINDOW { 0 } else if i == COLOR_WINDOWTEXT { 0xFFFFFF } else { 0x0000FF },
+        ];
+        for sys in lookups {
+            let (a, b) = (effective_theme(&Theme::light(), true, sys), effective_theme(&Theme::dark(), true, sys));
+            assert_eq!(
+                [a.background, a.surface, a.text, a.secondary_text, a.accent, a.selection, a.border],
+                [b.background, b.surface, b.text, b.secondary_text, b.accent, b.selection, b.border]
+            );
+            assert_eq!(a.contrast, b.contrast);
+            assert!(!a.dark && !b.dark);
+        }
+    }
+
+    #[test]
+    fn hover_pressed_in_contrast() {
+        let c = contrast_theme(Theme::dark());
+        assert_eq!((hover(&c), pressed(&c)), (c.background, c.selection));
+        let l = Theme::light();
+        assert_eq!((hover(&l), pressed(&l)), (blend(l.background, l.text, 0.08), blend(l.background, l.text, 0.14)));
+    }
+
+    #[test]
+    fn on_selection_only_in_contrast() {
+        assert_eq!(on_selection(&Theme::light(), 0x123456), 0x123456);
+        let c = contrast_theme(Theme::light());
+        assert_eq!(on_selection(&c, 0x123456), c.contrast.unwrap().highlight_text);
+    }
+
+    #[test]
+    fn color_change_messages() {
+        let hc = SPI_SETHIGHCONTRAST.0 as usize;
+        assert!(is_color_change(WM_SYSCOLORCHANGE, 0, None));
+        assert!(is_color_change(WM_THEMECHANGED, 0, None));
+        assert!(is_color_change(WM_SETTINGCHANGE, hc, None));
+        assert!(is_color_change(WM_SETTINGCHANGE, 0, Some("ImmersiveColorSet")));
+        assert!(!is_color_change(WM_SETTINGCHANGE, 0, Some("intl")));
+        assert!(!is_color_change(WM_SETTINGCHANGE, SPI_SETWORKAREA.0 as usize, None));
+        assert!(!is_color_change(WM_SIZE, 0, None));
+    }
+
+    #[test]
+    fn outline_round_draws_the_edge_only() {
+        on_dib(|dc, at| unsafe {
+            outline_round(dc, &RECT { left: 4, top: 4, right: 36, bottom: 36 }, 0, 6, 1);
+            assert_eq!(at(20, 4), 0, "the edge");
+            assert_eq!((at(20, 20), at(1, 1)), (0xA06020, 0xA06020), "inside and outside untouched");
+            hot_outline(dc, &RECT { left: 8, top: 8, right: 32, bottom: 32 }, &Theme::light(), 4, 96);
+            assert_eq!(at(20, 8), 0xA06020, "no hot outline in a normal theme");
+        });
+    }
+
+    #[test]
+    fn contrast_button_draws_system_colors() {
+        let t = contrast_theme(Theme::light());
+        let c = t.contrast.unwrap();
+        let rc = RECT { left: 4, top: 4, right: 36, bottom: 36 };
+        on_dib(|dc, at| unsafe {
+            assert_eq!(contrast_button(dc, &rc, &t, false, false, false, 4), Some(c.button_text));
+            assert_eq!((at(20, 20), at(20, 4)), (c.button_face, c.button_text));
+        });
+        on_dib(|dc, at| unsafe {
+            assert_eq!(contrast_button(dc, &rc, &t, true, false, false, 4), Some(c.highlight_text));
+            assert_eq!(at(20, 20), t.selection);
+        });
+        on_dib(|dc, at| unsafe {
+            assert_eq!(contrast_button(dc, &rc, &t, false, false, true, 4), Some(c.gray));
+            assert_eq!(at(20, 4), c.gray);
+        });
+        on_dib(|dc, at| unsafe {
+            assert_eq!(contrast_button(dc, &rc, &Theme::light(), false, true, false, 4), None);
+            assert_eq!((at(20, 20), at(20, 4)), (0xA06020, 0xA06020));
+        });
     }
 
     #[test]
@@ -446,7 +678,7 @@ mod tests {
                 0, 0, 300, 200, Some(parent), None, None, None,
             )
             .unwrap();
-            for t in [Theme::light(), Theme::dark()] {
+            for t in [contrast_theme(Theme::light()), Theme::light(), Theme::dark()] {
                 apply_window(parent, &t);
                 apply_list(list, &t);
                 apply_control(list, &t);

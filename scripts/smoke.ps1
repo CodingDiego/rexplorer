@@ -536,9 +536,9 @@ Run-Check 'views' {
     $icon = Wait-Until { (& $view) -eq 0 } 2000
     $ini = Get-Content (Join-Path $script:fake 'rexplorer\settings.ini') -Raw
     $saved = $ini -match '(?m)^view=icons\s*$'
-    $null = Send-KeysOrCommand '^+1' 25
+    $null = Send-KeysOrCommand '^+6' 25
     $details = Wait-Until { (& $view) -eq 1 } 2000
-    $d = "LVM_GETVIEW $v0 -> Ctrl+Shift+2 ($how) icon=$icon (profile view=icons saved=$saved) -> Ctrl+Shift+1 details=$details"
+    $d = "LVM_GETVIEW $v0 -> Ctrl+Shift+2 ($how) icon=$icon (profile view=icons saved=$saved) -> Ctrl+Shift+6 details=$details"
     if ($v0 -eq 1 -and $icon -and $saved -and $details) { @('PASS', $d) } else { @('FAIL', $d) }
   } finally { Remove-Fresh }
 }

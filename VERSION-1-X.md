@@ -31,10 +31,15 @@ The README also lists the sidebar as mouse-only.
 - [ ] **[blocker] UI Automation for every custom control.** ([#21](https://github.com/CodingDiego/rexplorer/issues/21)) *Done when:* each one exposes name, role, state and
   invoke/selection patterns, and Narrator can read and operate tabs, crumbs, every toolbar button, every sidebar row,
   Home tiles and rows, and the preview caption.
+  *Status 2026-11-10:* built with MSAA (`crates/core/src/access.rs`), which Narrator reads through its bridge;
+  tested in-process only, not yet with Narrator or NVDA. The preview caption is not exposed.
 - [ ] **[blocker] Full keyboard reach.** ([#22](https://github.com/CodingDiego/rexplorer/issues/22)) *Done when:* every control is reachable with Tab/F6 and operable without a
   mouse, the sidebar included. The focus is always visible, and the README's keyboard section covers each control.
+  *Status 2026-11-10:* Tab and F6 reach the view, breadcrumb, address, search, sidebar and tab strip, and each
+  has keys. Crumbs hidden behind the breadcrumb's "..." are mouse-only. Not yet pressed on a real keyboard.
 - [ ] **[blocker] High contrast.** ([#23](https://github.com/CodingDiego/rexplorer/issues/23)) *Done when:* with a Windows contrast theme on, rexplorer uses system colors
   instead of its themes, and nothing is invisible.
+  *Status 2026-11-10:* built (`theme.rs` `effective_theme`); never seen under a real contrast theme.
 - [ ] **[should] Text scaling.** ([#24](https://github.com/CodingDiego/rexplorer/issues/24)) *Done when:* Windows "Text size" (Accessibility > Text size) up to 225% gives no clipped or
   overlapping text.
 - [ ] **[should] An accessibility check in the smoke test.** ([#25](https://github.com/CodingDiego/rexplorer/issues/25)) *Done when:* an automated pass walks the UIA tree and fails on unnamed
@@ -77,8 +82,9 @@ The README also lists the sidebar as mouse-only.
 
 ## 5. Localization
 
-rexplorer's own strings are English-only and in the code. Sizes, dates and item names already come from the shell
-in the user's language, so a Spanish Windows shows "Nueva carpeta" next to English menus.
+Since 2026-11-10 rexplorer's own strings come from a table (`crates/core/src/i18n.rs`, 220 keys): English built
+in, Spanish shipped, `lang\<code>.ini` to add a language. Command line, install and register messages are
+translated too. Spanish dialogs have not been checked for clipped text. The two items below stay open until that check.
 
 - [ ] **[blocker] Externalized strings.** ([#37](https://github.com/CodingDiego/rexplorer/issues/37)) *Done when:* every user-visible string comes from a resource table, and a
   missing translation falls back to English.
@@ -89,6 +95,14 @@ in the user's language, so a Spanish Windows shows "Nueva carpeta" next to Engli
 ## 6. Explorer parity for daily use
 
 Each gap below is either closed, or explicitly accepted for 1.0 and listed under "Known gaps" in the release notes.
+The row-by-row status of every Explorer behaviour is in [docs/EXPLORER-PARITY.md](docs/EXPLORER-PARITY.md).
+
+- [ ] **[blocker] No BROKEN or REPORTED BROKEN rows in the parity checklist.** As of 2026-11-09: dragging files
+  to other programs ([#75](https://github.com/CodingDiego/rexplorer/issues/75)) is broken; F2 rename and click-again
+  rename were reported broken and pass when driven with window messages. *Done when:* each is proven with a real
+  keyboard and mouse on the built exe, and the checklist row reads WORKS.
+- [ ] **[blocker] Daily-use rows of the parity checklist.** *Done when:* every MISSING or PARTIAL row in its
+  sections 1 to 7 and 10 is WORKS, or accepted for 1.0 with a reason in the release notes.
 
 - [ ] **[blocker] Desktop menu completeness** ([#40](https://github.com/CodingDiego/rexplorer/issues/40)). The desktop menu shipped in 0.1.3
   (`rexplorer --desktop`). *Done when:* right-dragging desktop icons works as in Explorer, and Shift+F10 and the Menu

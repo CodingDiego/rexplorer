@@ -6,6 +6,7 @@ use std::ffi::c_void;
 use std::sync::Once;
 use std::sync::atomic::Ordering;
 
+use rexplorer_core::i18n::tr as loc;
 use rexplorer_core::settings::{HOME_START, Theme};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
@@ -32,6 +33,7 @@ const ID_UL_HOVER: i32 = 105;
 const ID_RECENT: i32 = 106;
 const ID_FREQ: i32 = 107;
 const ID_CLEAR: i32 = 108;
+const ID_RESTORE_TABS: i32 = 109;
 const ID_RESTORE: i32 = 110; // + page
 const ID_LIST: i32 = 120;
 const ID_HIDDEN_SHOW: i32 = 121;
@@ -45,7 +47,7 @@ const ID_HOVER_DELAY: i32 = 128;
 const ID_SYSTEM: i32 = 130;
 const ID_ARCHIVES: i32 = 131;
 
-const PAGES: [&str; 3] = ["General", "View", "Search"];
+const PAGES: [&str; 3] = ["fo.page_general", "fo.page_view", "fo.page_search"];
 const TAB: (i32, i32, i32, i32) = (12, 12, 72, 28);
 /// Client size and page rectangle (x, y, w, h) in 96-DPI pixels; the controls are placed relative to the page.
 const CLIENT: (i32, i32) = (480, 480);
@@ -82,35 +84,37 @@ const fn c(page: usize, kind: Kind, id: i32, text: &'static str, x: i32, y: i32,
 
 const RESTORE: (i32, i32, i32, i32) = (324, 352, 120, 26);
 
-const CTLS: [Ctl; 28] = [
-    c(0, Kind::Label, -1, "Open rexplorer to:", 12, 12, 180, 26),
+const CTLS: [Ctl; 30] = [
+    c(0, Kind::Label, -1, "fo.open_to", 12, 12, 180, 26),
     c(0, Kind::Combo, ID_START, "", 200, 12, 232, 26),
-    c(0, Kind::Header, -1, "Click items as follows", 12, 52, 432, 20),
-    c(0, Kind::Radio(1), ID_SINGLE, "Single-click to open an item (point to select)", 24, 76, 408, ROW),
-    c(0, Kind::Radio(2), ID_UL_ALWAYS, "Always underline item names", 48, 100, 384, ROW),
-    c(0, Kind::Radio(2), ID_UL_HOVER, "Underline item names only when I point at them", 48, 124, 384, ROW),
-    c(0, Kind::Radio(1), ID_DOUBLE, "Double-click to open an item (single-click to select)", 24, 148, 408, ROW),
-    c(0, Kind::Header, -1, "Privacy", 12, 188, 432, 20),
-    c(0, Kind::Check, ID_RECENT, "Show recently used files on Home", 24, 212, 408, ROW),
-    c(0, Kind::Check, ID_FREQ, "Show frequently used folders on Home", 24, 236, 408, ROW),
-    c(0, Kind::Label, -1, "Clear the recent folders list (Ctrl+P)", 24, 268, 300, 26),
-    c(0, Kind::Push, ID_CLEAR, "Clear", 344, 268, 88, 26),
-    c(0, Kind::Push, ID_RESTORE, "Restore defaults", RESTORE.0, RESTORE.1, RESTORE.2, RESTORE.3),
-    c(1, Kind::Header, -1, "Advanced settings", 12, 12, 432, 20),
+    c(0, Kind::Header, -1, "fo.click_items", 12, 52, 432, 20),
+    c(0, Kind::Radio(1), ID_SINGLE, "fo.single_click", 24, 76, 408, ROW),
+    c(0, Kind::Radio(2), ID_UL_ALWAYS, "fo.underline_always", 48, 100, 384, ROW),
+    c(0, Kind::Radio(2), ID_UL_HOVER, "fo.underline_hover", 48, 124, 384, ROW),
+    c(0, Kind::Radio(1), ID_DOUBLE, "fo.double_click", 24, 148, 408, ROW),
+    c(0, Kind::Header, -1, "fo.privacy", 12, 188, 432, 20),
+    c(0, Kind::Check, ID_RECENT, "fo.show_recent", 24, 212, 408, ROW),
+    c(0, Kind::Check, ID_FREQ, "fo.show_frequent", 24, 236, 408, ROW),
+    c(0, Kind::Label, -1, "fo.clear_recent", 24, 268, 300, 26),
+    c(0, Kind::Push, ID_CLEAR, "fo.clear", 344, 268, 88, 26),
+    c(0, Kind::Header, -1, "fo.startup", 12, 304, 432, 20),
+    c(0, Kind::Check, ID_RESTORE_TABS, "fo.restore_tabs", 24, 328, 296, ROW),
+    c(0, Kind::Push, ID_RESTORE, "fo.restore_defaults", RESTORE.0, RESTORE.1, RESTORE.2, RESTORE.3),
+    c(1, Kind::Header, -1, "fo.advanced", 12, 12, 432, 20),
     c(1, Kind::List, ID_LIST, "", 12, 36, 432, 200),
-    c(1, Kind::Header, -1, "Timing", 12, 252, 432, 20),
-    c(1, Kind::Label, -1, "Search delay (ms)", 24, 280, 200, 26),
+    c(1, Kind::Header, -1, "fo.timing", 12, 252, 432, 20),
+    c(1, Kind::Label, -1, "fo.search_delay", 24, 280, 200, 26),
     c(1, Kind::Edit, ID_SEARCH_DELAY, "", 240, 280, 72, 26),
-    c(1, Kind::Hint, -1, "50 to 5000", 324, 280, 120, 26),
-    c(1, Kind::Label, -1, "Hover preview delay (ms)", 24, 314, 200, 26),
+    c(1, Kind::Hint, -1, "fo.range_search", 324, 280, 120, 26),
+    c(1, Kind::Label, -1, "fo.hover_delay", 24, 314, 200, 26),
     c(1, Kind::Edit, ID_HOVER_DELAY, "", 240, 314, 72, 26),
-    c(1, Kind::Hint, -1, "200 to 10000", 324, 314, 120, 26),
-    c(1, Kind::Push, ID_RESTORE + 1, "Restore defaults", RESTORE.0, RESTORE.1, RESTORE.2, RESTORE.3),
-    c(2, Kind::Header, -1, "When searching non-indexed locations", 12, 12, 432, 20),
-    c(2, Kind::Check, ID_SYSTEM, "Include system folders", 24, 36, 408, ROW),
-    c(2, Kind::Check, ID_ARCHIVES, "Include compressed files (ZIP, CAB...)", 24, 60, 408, ROW),
-    c(2, Kind::Push, ID_RESTORE + 2, "Restore defaults", RESTORE.0, RESTORE.1, RESTORE.2, RESTORE.3),
-    c(2, Kind::Hint, -1, "Searches of a whole drive from rexplorer --elevated use the drive's index instead.", 24, 96, 408, 40),
+    c(1, Kind::Hint, -1, "fo.range_hover", 324, 314, 120, 26),
+    c(1, Kind::Push, ID_RESTORE + 1, "fo.restore_defaults", RESTORE.0, RESTORE.1, RESTORE.2, RESTORE.3),
+    c(2, Kind::Header, -1, "fo.when_searching", 12, 12, 432, 20),
+    c(2, Kind::Check, ID_SYSTEM, "fo.include_system", 24, 36, 408, ROW),
+    c(2, Kind::Check, ID_ARCHIVES, "fo.include_archives", 24, 60, 408, ROW),
+    c(2, Kind::Push, ID_RESTORE + 2, "fo.restore_defaults", RESTORE.0, RESTORE.1, RESTORE.2, RESTORE.3),
+    c(2, Kind::Hint, -1, "fo.elevated_hint", 24, 96, 408, 40),
 ];
 
 fn at(id: i32) -> usize {
@@ -157,11 +161,11 @@ unsafe fn text_width(dc: HDC, font: HFONT, s: &str) -> i32 {
 
 /// Colors of a field and its frame on the page.
 fn field_colors(t: &Theme) -> (u32, u32) {
-    (theme::blend(t.surface, t.text, 0.3), t.background)
+    (if t.contrast.is_some() { t.text } else { theme::blend(t.surface, t.text, 0.3) }, t.background)
 }
 
 fn line_color(t: &Theme) -> u32 {
-    theme::blend(t.surface, t.text, 0.14)
+    if t.contrast.is_some() { t.text } else { theme::blend(t.surface, t.text, 0.14) }
 }
 
 struct Fonts {
@@ -173,7 +177,11 @@ struct Fonts {
 unsafe fn draw_option(dc: HDC, r: &RECT, kind: Kind, on: bool, enabled: bool, focus: bool, label: &str, t: &Theme, f: &Fonts, dpi: i32, bg: u32) {
     let g = 16 * dpi / 96;
     let gy = r.top + (r.bottom - r.top - g) / 2;
-    let fade = |c: u32| if enabled { c } else { theme::blend(c, bg, 0.55) };
+    let fade = |c: u32| match t.contrast {
+        _ if enabled => c,
+        Some(k) => k.gray,
+        None => theme::blend(c, bg, 0.55),
+    };
     let b = RECT { left: r.left, top: gy, right: r.left + g, bottom: gy + g };
     if let Kind::Radio(_) = kind {
         let glyph = if on { "\u{ECCB}" } else { "\u{ECCA}" };
@@ -182,7 +190,7 @@ unsafe fn draw_option(dc: HDC, r: &RECT, kind: Kind, on: bool, enabled: bool, fo
     } else if on {
         theme::fill_round(dc, &b, fade(t.accent), 4 * dpi / 96);
         let mut gr = b;
-        text(dc, f.glyphs, 0x00FF_FFFF, "\u{E73E}", &mut gr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        text(dc, f.glyphs, theme::on_selection(t, 0x00FF_FFFF), "\u{E73E}", &mut gr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     } else {
         field(dc, &b, fade(t.secondary_text), bg, 4 * dpi / 96);
     }
@@ -227,14 +235,14 @@ struct ListState {
 
 fn list_rows() -> Vec<Row> {
     vec![
-        row(Kind::Header, 0, -1, "Files and folders"),
-        row(Kind::Header, 1, -1, "Hidden files and folders"),
-        row(Kind::Radio(1), 2, ID_HIDDEN_SHOW, "Show hidden files, folders and drives"),
-        row(Kind::Radio(1), 2, ID_HIDDEN_HIDE, "Don't show hidden files, folders or drives"),
-        row(Kind::Check, 1, ID_EXT, "Hide extensions for known file types"),
-        row(Kind::Check, 1, ID_STATUS, "Show status bar"),
-        row(Kind::Check, 1, ID_PREVIEW, "Show preview handlers in preview pane"),
-        row(Kind::Check, 1, ID_CHECKS, "Use check boxes to select items"),
+        row(Kind::Header, 0, -1, "fo.files_folders"),
+        row(Kind::Header, 1, -1, "fo.hidden"),
+        row(Kind::Radio(1), 2, ID_HIDDEN_SHOW, "fo.hidden_show"),
+        row(Kind::Radio(1), 2, ID_HIDDEN_HIDE, "fo.hidden_hide"),
+        row(Kind::Check, 1, ID_EXT, "fo.hide_ext"),
+        row(Kind::Check, 1, ID_STATUS, "fo.show_status"),
+        row(Kind::Check, 1, ID_PREVIEW, "fo.preview_handlers"),
+        row(Kind::Check, 1, ID_CHECKS, "fo.check_boxes"),
     ]
 }
 
@@ -288,13 +296,17 @@ unsafe fn list_paint(h: HWND, ls: &ListState) {
         let rr = RECT { left: x, top, right, bottom: top + rh };
         if focused && i == ls.focus && !matches!(r.kind, Kind::Header) {
             let pill = RECT { left: 4 * dpi / 96, top: top + 1, right: rc.right - 4 * dpi / 96, bottom: top + rh - 1 };
-            theme::fill_round(dc, &pill, t.selection, 4 * dpi / 96);
+            if t.contrast.is_some() {
+                let _ = DrawFocusRect(dc, &pill);
+            } else {
+                theme::fill_round(dc, &pill, t.selection, 4 * dpi / 96);
+            }
         }
         if r.kind == Kind::Header {
             let mut tr = rr;
-            text(dc, ls.fonts.ui, if r.level == 0 { t.text } else { t.secondary_text }, r.text, &mut tr, DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            text(dc, ls.fonts.ui, if r.level == 0 { t.text } else { t.secondary_text }, loc(r.text), &mut tr, DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         } else {
-            draw_option(dc, &rr, r.kind, r.on, true, false, r.text, t, &ls.fonts, dpi, fill);
+            draw_option(dc, &rr, r.kind, r.on, true, false, loc(r.text), t, &ls.fonts, dpi, fill);
         }
     }
     let _ = BitBlt(wdc, 0, 0, rc.right, rc.bottom, Some(dc), 0, 0, SRCCOPY);
@@ -503,7 +515,7 @@ unsafe fn create_children(hwnd: HWND, st: &mut State) {
     let tab = WS_TABSTOP.0;
     for (i, ctl) in CTLS.iter().enumerate() {
         st.hw[i] = match ctl.kind {
-            Kind::Check | Kind::Radio(_) | Kind::Push => mk(w!("BUTTON"), ctl.text, tab | BS_OWNERDRAW as u32, ctl.id, std::ptr::null()),
+            Kind::Check | Kind::Radio(_) | Kind::Push => mk(w!("BUTTON"), loc(ctl.text), tab | BS_OWNERDRAW as u32, ctl.id, std::ptr::null()),
             Kind::Edit => {
                 let h = mk(w!("EDIT"), "", tab | ES_AUTOHSCROLL as u32 | ES_NUMBER as u32, ctl.id, std::ptr::null());
                 crate::edit::attach(h);
@@ -537,9 +549,9 @@ unsafe fn create_children(hwnd: HWND, st: &mut State) {
             _ => HWND::default(),
         };
     }
-    st.ok = mk(w!("BUTTON"), "OK", tab | BS_OWNERDRAW as u32, IDOK.0, std::ptr::null());
-    st.cancel = mk(w!("BUTTON"), "Cancel", tab | BS_OWNERDRAW as u32, IDCANCEL.0, std::ptr::null());
-    st.apply = mk(w!("BUTTON"), "Apply", tab | BS_OWNERDRAW as u32 | WS_DISABLED.0, ID_APPLY, std::ptr::null());
+    st.ok = mk(w!("BUTTON"), loc("fo.ok"), tab | BS_OWNERDRAW as u32, IDOK.0, std::ptr::null());
+    st.cancel = mk(w!("BUTTON"), loc("fo.cancel"), tab | BS_OWNERDRAW as u32, IDCANCEL.0, std::ptr::null());
+    st.apply = mk(w!("BUTTON"), loc("fo.apply"), tab | BS_OWNERDRAW as u32 | WS_DISABLED.0, ID_APPLY, std::ptr::null());
     for h in [st.ok, st.cancel, st.apply] {
         let _ = ShowWindow(h, SW_SHOW);
     }
@@ -586,7 +598,7 @@ unsafe fn load(st: &mut State, p: &Profile, page: Option<usize>) {
     if want(0) {
         let combo = st.hw[at(ID_START)];
         SendMessageW(combo, CB_RESETCONTENT, None, None);
-        let mut entries = vec!["Home".to_string(), "This PC".to_string()];
+        let mut entries = vec![loc("fo.start_home").to_string(), loc("side.this_pc").to_string()];
         if let Some(o) = &st.start_other {
             entries.push(o.clone());
         }
@@ -612,6 +624,7 @@ unsafe fn load(st: &mut State, p: &Profile, page: Option<usize>) {
             (ID_UL_HOVER, !always),
             (ID_RECENT, p.show_recent),
             (ID_FREQ, p.show_frequent),
+            (ID_RESTORE_TABS, p.restore_tabs),
         ] {
             set_on(st, id, on);
         }
@@ -660,6 +673,7 @@ unsafe fn profile_of(st: &State, base: &Profile) -> Profile {
         underline_titles: if get_on(st, ID_UL_ALWAYS) { "always" } else { "hover" }.into(),
         show_recent: get_on(st, ID_RECENT),
         show_frequent: get_on(st, ID_FREQ),
+        restore_tabs: get_on(st, ID_RESTORE_TABS),
         show_hidden: get_on(st, ID_HIDDEN_SHOW),
         show_extensions: !get_on(st, ID_EXT),
         show_status: get_on(st, ID_STATUS),
@@ -717,12 +731,18 @@ unsafe fn draw_push(st: &State, di: &DRAWITEMSTRUCT) {
     };
     let dc = di.hDC;
     solid(dc, &di.rcItem, outside);
-    field(dc, &di.rcItem, if disabled { line_color(t) } else { border }, fill, 4 * dpi / 96);
     let mut buf = [0u16; 64];
     let n = GetWindowTextW(di.hwndItem, &mut buf) as usize;
     let label = String::from_utf16_lossy(&buf[..n]);
-    let color = if primary && !disabled { 0x00FF_FFFF } else if disabled { theme::blend(t.surface, t.text, 0.4) } else { t.text };
     let mut r = di.rcItem;
+    // One pixel in: the outline includes its right and bottom edge.
+    let inner = RECT { right: r.right - 1, bottom: r.bottom - 1, ..r };
+    if let Some(c) = theme::contrast_button(dc, &inner, t, pressed, di.itemState.0 & ODS_FOCUS.0 != 0, disabled, 4 * dpi / 96) {
+        text(dc, st.fonts.ui, c, &label, &mut r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        return;
+    }
+    field(dc, &di.rcItem, if disabled { line_color(t) } else { border }, fill, 4 * dpi / 96);
+    let color = if primary && !disabled { 0x00FF_FFFF } else if disabled { theme::blend(t.surface, t.text, 0.4) } else { t.text };
     text(dc, st.fonts.ui, color, &label, &mut r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
 
@@ -743,7 +763,8 @@ unsafe fn draw_combo(st: &State, di: &DRAWITEMSTRUCT) {
     let label = String::from_utf16_lossy(&buf[..n]);
     let pad = if row { 10 } else { 4 } * dpi / 96;
     let mut r = RECT { left: di.rcItem.left + pad, right: di.rcItem.right - 4 * dpi / 96, ..di.rcItem };
-    text(di.hDC, st.fonts.ui, t.text, &label, &mut r, DT_VCENTER | DT_SINGLELINE | DT_PATH_ELLIPSIS);
+    let ink = if hot || focused { theme::on_selection(t, t.text) } else { t.text };
+    text(di.hDC, st.fonts.ui, ink, &label, &mut r, DT_VCENTER | DT_SINGLELINE | DT_PATH_ELLIPSIS);
 }
 
 unsafe fn draw_item(st: &State, di: &DRAWITEMSTRUCT) {
@@ -788,9 +809,9 @@ unsafe fn paint_background(hwnd: HWND, dc: HDC, st: &State) {
             solid(dc, &body, line);
             solid(dc, &RECT { left: r.left + 1, top: r.top + 1, right: r.right - 1, bottom: r.bottom + 1 }, t.surface);
             solid(dc, &RECT { left: r.left, top: r.top, right: r.right, bottom: r.top + 2 * dpi / 96 }, t.accent);
-            text(dc, st.fonts.ui, t.text, name, &mut tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            text(dc, st.fonts.ui, t.text, loc(name), &mut tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         } else {
-            text(dc, st.fonts.ui, t.secondary_text, name, &mut tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            text(dc, st.fonts.ui, t.secondary_text, loc(name), &mut tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
     }
     let (ox, oy) = page_origin(dpi);
@@ -800,18 +821,18 @@ unsafe fn paint_background(hwnd: HWND, dc: HDC, st: &State) {
         match ctl.kind {
             Kind::Header => {
                 let mut tr = r;
-                text(dc, st.fonts.ui, t.text, ctl.text, &mut tr, DT_VCENTER | DT_SINGLELINE);
-                let x = r.left + text_width(dc, st.fonts.ui, ctl.text) + 8 * dpi / 96;
+                text(dc, st.fonts.ui, t.text, loc(ctl.text), &mut tr, DT_VCENTER | DT_SINGLELINE);
+                let x = r.left + text_width(dc, st.fonts.ui, loc(ctl.text)) + 8 * dpi / 96;
                 solid(dc, &RECT { left: x, top: (r.top + r.bottom) / 2, right: r.right, bottom: (r.top + r.bottom) / 2 + 1 }, line);
             }
             Kind::Label => {
                 let mut tr = r;
-                text(dc, st.fonts.ui, t.text, ctl.text, &mut tr, DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                text(dc, st.fonts.ui, t.text, loc(ctl.text), &mut tr, DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             }
             Kind::Hint => {
                 let mut tr = r;
                 let flags = if r.bottom - r.top > 30 * dpi / 96 { DT_WORDBREAK } else { DT_VCENTER | DT_SINGLELINE };
-                text(dc, st.fonts.ui, t.secondary_text, ctl.text, &mut tr, flags);
+                text(dc, st.fonts.ui, t.secondary_text, loc(ctl.text), &mut tr, flags);
             }
             Kind::Edit => {
                 let (border, fill) = field_colors(t);
@@ -1038,7 +1059,7 @@ unsafe fn dialog(app: *mut App) {
     let created = CreateWindowExW(
         WINDOW_EX_STYLE(0),
         w!("RexFolderOptions"),
-        w!("Folder options"),
+        &HSTRING::from(loc("fo.title")),
         style,
         pr.left + (pr.right - pr.left - w) / 2,
         pr.top + (pr.bottom - pr.top - h) / 2,
@@ -1050,10 +1071,13 @@ unsafe fn dialog(app: *mut App) {
         Some(&mut *st as *mut State as *const c_void),
     );
     if let Ok(hwnd) = created {
-        let dark = t.dark as i32;
-        let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const i32 as *const c_void, 4);
-        for attr in [DWMWA_CAPTION_COLOR, DWMWA_BORDER_COLOR] {
-            let _ = DwmSetWindowAttribute(hwnd, attr, &t.background as *const u32 as *const c_void, 4);
+        // A contrast theme keeps the system's caption and frame.
+        if t.contrast.is_none() {
+            let dark = t.dark as i32;
+            let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const i32 as *const c_void, 4);
+            for attr in [DWMWA_CAPTION_COLOR, DWMWA_BORDER_COLOR] {
+                let _ = DwmSetWindowAttribute(hwnd, attr, &t.background as *const u32 as *const c_void, 4);
+            }
         }
         create_children(hwnd, &mut st);
         load(&mut st, &p, None);
@@ -1102,6 +1126,7 @@ unsafe fn apply_profile(app: *mut App, new: Profile) {
         ("underline_titles", old.underline_titles.clone(), new.underline_titles.clone()),
         ("show_recent", b(old.show_recent), b(new.show_recent)),
         ("show_frequent", b(old.show_frequent), b(new.show_frequent)),
+        ("restore_tabs", b(old.restore_tabs), b(new.restore_tabs)),
         ("show_status", b(old.show_status), b(new.show_status)),
         ("preview_handlers", b(old.preview_handlers), b(new.preview_handlers)),
         ("item_checkboxes", b(old.item_checkboxes), b(new.item_checkboxes)),

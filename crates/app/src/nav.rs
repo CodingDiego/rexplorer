@@ -3,11 +3,17 @@
 
 use super::*;
 use crate::source::Source;
+use crate::ui::{Entry, hinted};
+use rexplorer_core::i18n::{tr, trf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
-use windows::Win32::Foundation::E_ABORT;
-use windows::Win32::UI::Shell::{SHGetNameFromIDList, SHParseDisplayName, SIGDN, SIGDN_DESKTOPABSOLUTEPARSING, SIGDN_NORMALDISPLAY};
+use windows::Win32::Foundation::{E_ABORT, FILETIME, SYSTEMTIME};
+use windows::Win32::Globalization::{GetLocaleInfoEx, LOCALE_IFIRSTDAYOFWEEK, LOCALE_RETURN_NUMBER};
+use windows::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
+use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToFileTime, SystemTimeToTzSpecificLocalTime};
+use windows::Win32::UI::Shell::Common::SHCOLSTATE_TYPE_DATE;
+use windows::Win32::UI::Shell::{FOLDERID_Downloads, SHGetNameFromIDList, SHParseDisplayName, SIGDN, SIGDN_DESKTOPABSOLUTEPARSING, SIGDN_NORMALDISPLAY};
 
 /// The shell's Home ("Inicio") and Quick Access, as parsing names.
 pub(crate) const HOME: &str = "::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}";
@@ -68,6 +74,14 @@ pub(crate) struct Listing {
     /// Shell column index, not header position.
     pub sort_col: u32,
     pub sort_desc: bool,
+    /// The shell column the rows are grouped by (None: no groups); `groups` holds (header, first row), in row order.
+    pub group: Option<u32>,
+    pub groups: Vec<(String, usize)>,
+    /// The shown columns in display order as (shell index, width in 96-DPI pixels, 0 = the shell's default); empty
+    /// until the user changes them.
+    pub layout: Vec<(u32, i32)>,
+    /// The view this folder was last left in (None: the last one chosen anywhere).
+    pub view: Option<views::View>,
     /// Home and Quick Access: what the Home page shows, built with the listing.
     pub home: Option<home::Content>,
     /// A filesystem folder the file system refuses to read (listed empty): why (the status bar says it).
@@ -83,8 +97,11 @@ pub(crate) struct Tab {
     /// Parsing name of the place shown (or requested, before the first load finishes); goes to the session.
     pub name: String,
     pub source: Option<Source>,
-    pub back: Vec<Target>,
-    pub forward: Vec<Target>,
+    /// Places left, with the label the history menu shows.
+    pub back: Vec<(Target, String)>,
+    pub forward: Vec<(Target, String)>,
+    /// Entries a multi-step jump went past; the next landing puts them on the other stack in order.
+    pub skipped: Vec<(Target, String)>,
     /// Watches the folder from the tab's first show until it closes, so a tab switch need not reload.
     pub watch: Option<ChangeWatch>,
     /// A change was notified in the folder since its load started: showing the tab reloads it.
@@ -166,16 +183,18 @@ pub(crate) unsafe fn navigate(app: *mut App, t: usize, target: Target, history: 
     if let Some(Source::Search(s)) = &mut tab.source {
         s.stop();
     }
-    // The worker sorts, as on_enum_done would: a refresh keeps the tab's sort, anything else starts by name.
+    // The worker sorts, as on_enum_done would: a refresh keeps the tab's sort, anything else the folder's remembered
+    // one, else load() picks the default.
     let sort = match &tab.source {
-        Some(Source::Shell(l)) if history == History::Refresh => (l.sort_col, l.sort_desc),
-        _ => (0, false),
+        Some(Source::Shell(l)) if history == History::Refresh => Some((l.sort_col, l.sort_desc, l.group)),
+        _ => None,
     };
+    let saved = (*app).session.folders.clone();
     let latest = tab.latest.clone();
     let hwnd = (*app).hwnd.0 as isize;
     let show_hidden = (*app).profile.show_hidden;
     // Details' first screen from the top; a refresh keeps its scroll position, so it (and theme icons) load as painted.
-    let prefill = if history == History::Refresh || views::icon_theme_active(app) || (*app).views.view != views::View::Details {
+    let prefill = if history == History::Refresh || views::icon_theme_active(app) || (*app).views.view.px() > 0 {
         0
     } else {
         SendMessageW((*app).list, LVM_GETCOUNTPERPAGE, None, None).0.max(0) as usize + 1
@@ -183,7 +202,7 @@ pub(crate) unsafe fn navigate(app: *mut App, t: usize, target: Target, history: 
     std::thread::spawn(move || {
         let _com = ComInit::mta();
         let superseded = || latest.load(Ordering::Relaxed) != generation;
-        let result = load(target, show_hidden, sort, prefill, &superseded);
+        let result = load(target, show_hidden, sort, &saved, prefill, &superseded);
         // A newer load of this tab would make on_enum_done drop this one anyway.
         if superseded() {
             return;
@@ -198,9 +217,10 @@ pub(crate) unsafe fn go(app: *mut App, target: Target, history: History) {
     navigate(app, (*app).active, target, history);
 }
 
-/// Worker side: the listing sorted by `sort` (shell column, descending), the first `prefill` icons looked up.
+/// Worker side: the listing sorted by `sort` (shell column, descending, grouped by date; else `saved` for the
+/// folder, else `default_sort`), the first `prefill` icons looked up.
 /// Once `superseded` says a newer load of the tab started, gives up after enumerating (an error nobody reads).
-fn load(target: Target, show_hidden: bool, sort: (u32, bool), prefill: usize, superseded: &dyn Fn() -> bool) -> std::result::Result<Loaded, LoadError> {
+fn load(target: Target, show_hidden: bool, sort: Option<(u32, bool, Option<u32>)>, saved: &[(String, session::FolderView)], prefill: usize, superseded: &dyn Fn() -> bool) -> std::result::Result<Loaded, LoadError> {
     if let Target::Name(n) = &target {
         if let Some((archive, dir)) = archive_view::split_archive_path(n).filter(|(a, _)| a.is_file()) {
             return source::load_archive(&archive, &dir).map_err(|err| LoadError { name: n.clone(), err });
@@ -235,10 +255,19 @@ fn load(target: Target, show_hidden: bool, sort: (u32, bool), prefill: usize, su
     if items.is_empty() && denied.is_none() {
         denied = why();
     }
-    let columns = folder.columns();
+    let fv = saved.iter().find(|(k, _)| k.eq_ignore_ascii_case(&folder.parsing_name)).map(|(_, f)| f);
+    let columns = match fv.filter(|f| !f.cols.is_empty()) {
+        Some(f) => {
+            let menu = folder.menu_columns();
+            let offered: Vec<u32> = menu.iter().map(|c| c.index).collect();
+            chosen_columns(&offered, &f.cols).into_iter().filter_map(|i| menu.iter().find(|c| c.index == i).cloned()).collect()
+        }
+        None => folder.columns(),
+    };
+    let sort = sort.or_else(|| fv.map(|f| (f.sort.0, f.sort.1, f.group))).unwrap_or_else(|| default_sort(&folder.parsing_name, &columns));
     let icons = vec![ICON_UNKNOWN; items.len()];
     let cells = vec![std::cell::OnceCell::new(); items.len()];
-    let mut l = Listing { folder, items, columns, icons, cells, sort_col: sort.0, sort_desc: sort.1, home: None, denied };
+    let mut l = Listing { folder, items, columns, icons, cells, sort_col: sort.0, sort_desc: sort.1, group: sort.2, groups: Vec::new(), layout: fv.map_or(Vec::new(), |f| f.cols.clone()), view: fv.map(|f| views::View::parse(&f.view)), home: None, denied };
     if is_home(&l) {
         l.home = Some(home::build(&l.folder, &l.items));
     }
@@ -251,6 +280,16 @@ fn load(target: Target, show_hidden: bool, sort: (u32, bool), prefill: usize, su
         }
     }
     Ok(Loaded { source: Source::Shell(l), crumbs, icon })
+}
+
+/// Downloads opens newest first (its first date column, descending) grouped by date; every other folder by name.
+fn default_sort(parsing_name: &str, columns: &[Column]) -> (u32, bool, Option<u32>) {
+    let trim = |s: &str| s.trim_end_matches('\\').to_lowercase();
+    let downloads = panes::known_folder(&FOLDERID_Downloads).is_some_and(|d| trim(&d) == trim(parsing_name));
+    match columns.iter().find(|c| c.kind == SHCOLSTATE_TYPE_DATE) {
+        Some(c) if downloads => (c.index, true, Some(c.index)),
+        _ => (0, false, None),
+    }
 }
 
 fn folder_icon(pidl: &Pidl) -> (usize, i32) {
@@ -304,33 +343,37 @@ pub(crate) unsafe fn on_enum_done(app: *mut App, done: Box<EnumDone>) {
             } else if let Some(s) = source(app) {
                 set_text((*app).addr, &s.editing_name());
             }
-            message(hwnd, &format!("Cannot open {}\n\n{err}", crate::connect::redact(&name)));
+            message(hwnd, &trf("err.open", &[("name", &crate::connect::redact(&name)), ("error", &err)]));
             return;
         }
         Ok(loaded) => loaded,
     };
 
     let refresh = done.history == History::Refresh;
+    // Read before the listing goes: in group view the list asks it (the groups callback) where each row is.
+    let (shown, shown_top) = if refresh && active { (list::selected_indices(list), SendMessageW(list, LVM_GETTOPINDEX, None, None).0 as i32) } else { (Vec::new(), 0) };
     let tab = &mut (&mut (*app).tabs)[t];
     let old = tab.source.take();
-    let (mut sort_col, mut sort_desc) = (0, false);
+    let mut sort = None;
+    let mut carry = None;
     let mut keep: Vec<String> = Vec::new();
     let mut top = 0;
     if let Some(old) = &old {
         match done.history {
             History::Push => {
-                tab.back.push(old.location());
+                tab.back.push((old.location(), history_label(old)));
                 tab.forward.clear();
+                tab.skipped.clear();
             }
-            History::Back => tab.forward.push(old.location()),
-            History::Forward => tab.back.push(old.location()),
+            History::Back => land(&mut tab.forward, (old.location(), history_label(old)), std::mem::take(&mut tab.skipped)),
+            History::Forward => land(&mut tab.back, (old.location(), history_label(old)), std::mem::take(&mut tab.skipped)),
             History::Refresh => {
                 if let Source::Shell(old) = old {
-                    sort_col = old.sort_col;
-                    sort_desc = old.sort_desc;
+                    sort = Some((old.sort_col, old.sort_desc, old.group));
+                    carry = Some((old.columns.clone(), old.layout.clone(), old.view));
                     if active {
-                        keep = list::selected_indices(list).iter().filter_map(|&i| old.items.get(i)).map(|i| i.parsing_name()).collect();
-                        top = SendMessageW(list, LVM_GETTOPINDEX, None, None).0 as i32;
+                        keep = shown.iter().filter_map(|&i| old.items.get(i)).map(|i| i.parsing_name()).collect();
+                        top = shown_top;
                     } else {
                         keep = std::mem::take(&mut tab.selected);
                         top = tab.top;
@@ -346,10 +389,18 @@ pub(crate) unsafe fn on_enum_done(app: *mut App, done: Box<EnumDone>) {
 
     let mut src = loaded.source;
     if let Source::Shell(l) = &mut src {
+        // A reload keeps the header, so the listing keeps the columns it shows (a column toggled while it ran), their
+        // layout and the view.
+        let mut regroup = false;
+        if let Some((columns, layout, view)) = carry {
+            regroup = columns.iter().map(|c| c.index).ne(l.columns.iter().map(|c| c.index));
+            (l.columns, l.layout, l.view) = (columns, layout, view);
+        }
         // load() sorted by the sort the tab had then; only a sort changed meanwhile (a header click) sorts again.
-        if (l.sort_col, l.sort_desc) != (sort_col, sort_desc) {
-            l.sort_col = sort_col;
-            l.sort_desc = sort_desc;
+        if let Some((c, d, g)) = sort.filter(|&s| regroup || s != (l.sort_col, l.sort_desc, l.group)) {
+            l.sort_col = c;
+            l.sort_desc = d;
+            l.group = g;
             sort_listing(l);
         }
     }
@@ -360,7 +411,9 @@ pub(crate) unsafe fn on_enum_done(app: *mut App, done: Box<EnumDone>) {
     tabs::set_title((*app).strip, t, &crate::connect::redact(&src.title()));
     if !refresh {
         (*app).recent.push(&crate::connect::redact(&tab.name)); // recents are saved to disk
-        (*app).recent.save();
+        if !(*app).secondary {
+            (*app).recent.save();
+        }
     }
     tab.source = Some(src);
     if active {
@@ -391,6 +444,7 @@ pub(crate) unsafe fn show(app: *mut App, mode: Show) {
 }
 
 unsafe fn show_source(app: *mut App, mode: Show) {
+    list::set_groups(app, false);
     let hwnd = (*app).hwnd;
     let list = (*app).list;
     let tab = cur(app);
@@ -413,6 +467,10 @@ unsafe fn show_source(app: *mut App, mode: Show) {
         _ => source::leave_browser(app),
     }
     if let Source::Shell(l) = src {
+        // A folder opens in the view it was left in; one with no memory in the last view chosen anywhere.
+        if !is_home(l) {
+            views::show_view(app, l.view.unwrap_or_else(|| views::View::parse(&(*app).session.view)));
+        }
         if !(*app).image_list_set {
             if let Some(first) = l.items.first() {
                 let (himl, _) = first.icon_index(&l.folder.pidl);
@@ -424,6 +482,7 @@ unsafe fn show_source(app: *mut App, mode: Show) {
     }
     if !matches!(mode, Show::Restore { columns: false, .. }) {
         set_columns(app, &src.columns());
+        apply_layout(app);
     }
     // The shell's FTP folder keeps user:password in its names; nothing on screen shows the password.
     set_text((*app).addr, &crate::connect::redact(&src.editing_name()));
@@ -448,6 +507,7 @@ unsafe fn show_source(app: *mut App, mode: Show) {
     views::reset(app, count);
     // The list asks for item text synchronously from here on, so the source must be in place first.
     SendMessageW(list, LVM_SETITEMCOUNT, Some(WPARAM(count)), Some(LPARAM(LVSICF_NOSCROLL as isize)));
+    list::set_groups(app, true);
     list::set_item_state(list, usize::MAX, LIST_VIEW_ITEM_STATE_FLAGS(0), LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0));
     if !matches!(mode, Show::Restore { columns: false, .. }) {
         panes::sync_tree(app);
@@ -474,7 +534,10 @@ unsafe fn show_source(app: *mut App, mode: Show) {
             }
             let per_page = SendMessageW(list, LVM_GETCOUNTPERPAGE, None, None).0 as i32;
             let last = (top + per_page - 1).min(count as i32 - 1);
-            if last >= 0 {
+            if top <= 0 {
+                // In group view ENSUREVISIBLE(0) leaves the first group's header above the view.
+                SendMessageW(list, WM_VSCROLL, Some(WPARAM(SB_TOP.0 as usize)), None);
+            } else if last >= 0 {
                 SendMessageW(list, LVM_ENSUREVISIBLE, Some(WPARAM(last as usize)), Some(LPARAM(0)));
                 SendMessageW(list, LVM_ENSUREVISIBLE, Some(WPARAM(top.max(0) as usize)), Some(LPARAM(0)));
             }
@@ -577,11 +640,12 @@ pub(crate) unsafe fn on_home_notify(app: *mut App, nm: &home::NmHome) {
                 list::set_item_state(list, f, LVIS_FOCUSED, LVIS_FOCUSED);
             }
         }
-        home::HN_ACTIVATE => source::activate(app, nm.index),
+        home::HN_ACTIVATE => activate_or_tab(app, nm.index, GetKeyState(VK_CONTROL.0 as i32) < 0),
         home::HN_CONTEXT => list::show_menu(app, nm.index != usize::MAX, None),
         home::HN_CONTEXT_KEY => list::show_menu(app, nm.index != usize::MAX, Some(home::menu_point((*app).home))),
         home::HN_KEYDOWN => list::on_key(app, VIRTUAL_KEY(nm.index as u16)),
         home::HN_RENAME => list::rename_item(app, nm.index, &home::rename_text((*app).home), false),
+        home::HN_DRAG => list::begin_drag(app),
         home::HN_FILTER => cur(app).home_filter = home::filter((*app).home),
         _ => {}
     }
@@ -597,6 +661,151 @@ pub(crate) unsafe fn update_chrome(app: *mut App) {
     ui::update_status(app);
 }
 
+/// Keys; the draw sites translate.
+pub(crate) const DATE_GROUPS: [&str; 9] = [
+    "group.date.future",
+    "group.date.today",
+    "group.date.yesterday",
+    "group.date.earlier_week",
+    "group.date.last_week",
+    "group.date.earlier_month",
+    "group.date.last_month",
+    "group.date.earlier_year",
+    "group.date.long_ago",
+];
+
+/// Days since 1601-01-01 to (year, month, day): Howard Hinnant's civil_from_days, moved to that epoch.
+fn civil(day: i64) -> (i64, i64, i64) {
+    let z = day - 134_774 + 719_468;
+    let (era, doe) = (z.div_euclid(146_097), z.rem_euclid(146_097));
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + (m <= 2) as i64, m, doy - (153 * mp + 2) / 5 + 1)
+}
+
+/// The DATE_GROUPS index Explorer puts `day` in, seen from `today` (both days since 1601-01-01, which was a Monday);
+/// the first rule that matches wins. `week_start` is the first day of the week, 0 = Monday.
+fn date_group(day: i64, today: i64, week_start: i64) -> usize {
+    let week = today - (today - week_start).rem_euclid(7);
+    let ((y, m, _), (ty, tm, _)) = (civil(day), civil(today));
+    let months = y * 12 + m - (ty * 12 + tm);
+    match day {
+        d if d > today => 0,
+        d if d == today => 1,
+        d if d == today - 1 => 2,
+        d if d >= week => 3,
+        d if d >= week - 7 => 4,
+        _ if months == 0 => 5,
+        _ if months == -1 => 6,
+        _ if y == ty => 7,
+        _ => 8,
+    }
+}
+
+/// The local day of a UTC time, by the time zone's rules at that date (as Explorer shows it).
+fn local_day(ft: FILETIME) -> Option<i64> {
+    let (mut utc, mut local, mut out) = (SYSTEMTIME::default(), SYSTEMTIME::default(), FILETIME::default());
+    unsafe {
+        FileTimeToSystemTime(&ft, &mut utc).ok()?;
+        SystemTimeToTzSpecificLocalTime(None, &utc, &mut local).ok()?;
+        SystemTimeToFileTime(&local, &mut out).ok()?;
+    }
+    Some(((out.dwHighDateTime as i64) << 32 | out.dwLowDateTime as i64) / 864_000_000_000)
+}
+
+/// The user's first day of the week, 0 = Monday.
+fn week_start() -> i64 {
+    let mut n = [0u16; 2];
+    unsafe { GetLocaleInfoEx(PCWSTR::null(), LOCALE_IFIRSTDAYOFWEEK | LOCALE_RETURN_NUMBER, Some(&mut n)) };
+    n[0] as i64 % 7
+}
+
+pub(crate) const SIZE_GROUPS: [&str; 8] = [
+    "group.size.gigantic",
+    "group.size.huge",
+    "group.size.large",
+    "group.size.medium",
+    "group.size.small",
+    "group.size.tiny",
+    "group.size.empty",
+    "group.unspecified",
+];
+
+/// The SIZE_GROUPS index Explorer puts an item in (0 is the largest, as 0 is the newest date).
+fn size_group(folder: bool, bytes: Option<u64>) -> usize {
+    match bytes {
+        _ if folder => 7,
+        None => 7,
+        Some(0) => 6,
+        Some(b) if b < 16 << 10 => 5,
+        Some(b) if b < 1 << 20 => 4,
+        Some(b) if b < 128 << 20 => 3,
+        Some(b) if b < 1 << 30 => 2,
+        Some(b) if b <= 4 << 30 => 1,
+        Some(_) => 0,
+    }
+}
+
+/// A name's group: its first letter, "0 - 9" for a digit, else "Other".
+fn name_group(name: &str) -> String {
+    match name.chars().next() {
+        Some(c) if c.is_ascii_digit() => "0 - 9".to_string(),
+        Some(c) if c.is_alphabetic() => c.to_uppercase().collect(),
+        _ => tr("group.other").to_string(),
+    }
+}
+
+/// Ranks for text group labels: (rank per label, the distinct labels in rank order). An empty label is "Unspecified";
+/// that and "Other" go last.
+fn text_ranks(labels: Vec<String>) -> (Vec<usize>, Vec<String>) {
+    let (unspecified, other) = (tr("group.unspecified"), tr("group.other"));
+    let labels: Vec<String> = labels.into_iter().map(|l| if l.is_empty() { unspecified.to_string() } else { l }).collect();
+    let mut table = labels.clone();
+    table.sort_by_cached_key(|l| (l == unspecified || l == other, l.to_lowercase()));
+    table.dedup();
+    (labels.iter().map(|l| table.iter().position(|t| t == l).unwrap_or(0)).collect(), table)
+}
+
+/// Whether the lowest group rank comes first: always, unless the rows are sorted by the group column in the order that
+/// is not its natural one.
+fn groups_lowest_first(same_col: bool, sort_desc: bool, desc_first: bool) -> bool {
+    !same_col || sort_desc == desc_first
+}
+
+/// (rank per item, labels by rank) for grouping `items` by column `c`; None when the column has no usable key.
+unsafe fn group_ranks(folder: &ShellFolder, c: &Column, items: &[ShellItem]) -> Option<(Vec<usize>, Vec<String>)> {
+    if c.kind == SHCOLSTATE_TYPE_DATE {
+        let key = folder.column_key(c.index)?;
+        let (today, week) = (local_day(GetSystemTimeAsFileTime()).unwrap_or_default(), week_start());
+        // An item without that date goes with the oldest.
+        let ranks = items.iter().map(|it| it.property_time(&key).and_then(local_day).map_or(8, |d| date_group(d, today, week))).collect();
+        return Some((ranks, DATE_GROUPS.iter().map(|s| tr(s).to_string()).collect()));
+    }
+    if panes::size_and_type_columns(&folder.folder).0 == Some(c.index) {
+        let ranks = items.iter().map(|it| size_group(it.is_folder(), it.size())).collect();
+        return Some((ranks, SIZE_GROUPS.iter().map(|s| tr(s).to_string()).collect()));
+    }
+    // shortcut: text groups read every row's cell on the UI thread; move to the worker if a big folder stalls
+    Some(text_ranks(items.iter().map(|it| if c.index == 0 { name_group(&it.display_name()) } else { it.detail(c.index) }).collect()))
+}
+
+/// Stable-sorts the sorted `items` by group `rank`, the lowest rank first when `desc` (newest first), so a
+/// folders-first order cannot split a group. Returns the groups as (rank, first row).
+fn group_rows<T>(items: &mut Vec<T>, rank: impl Fn(&T) -> usize, desc: bool) -> Vec<(usize, usize)> {
+    let mut ranked: Vec<(usize, T)> = items.drain(..).map(|t| (rank(&t), t)).collect();
+    ranked.sort_by_key(|&(r, _)| if desc { r } else { usize::MAX - r });
+    let mut groups: Vec<(usize, usize)> = Vec::new();
+    for (i, (r, t)) in ranked.into_iter().enumerate() {
+        if groups.last().is_none_or(|g| g.0 != r) {
+            groups.push((r, i));
+        }
+        items.push(t);
+    }
+    groups
+}
+
 pub(crate) unsafe fn sort_listing(l: &mut Listing) {
     let folder = &l.folder;
     let col = l.sort_col;
@@ -604,8 +813,116 @@ pub(crate) unsafe fn sort_listing(l: &mut Listing) {
     if l.sort_desc {
         l.items.reverse();
     }
+    let gc = l.group.and_then(|g| l.columns.iter().find(|c| c.index == g));
+    l.groups = match gc.and_then(|c| group_ranks(folder, c, &l.items).map(|r| (c, r))) {
+        Some((c, (ranks, table))) => {
+            let first = groups_lowest_first(c.index == col, l.sort_desc, c.descending_first());
+            let mut paired: Vec<(usize, ShellItem)> = ranks.into_iter().zip(l.items.drain(..)).collect();
+            let groups = group_rows(&mut paired, |p| p.0, first);
+            l.items.extend(paired.into_iter().map(|p| p.1));
+            groups.into_iter().map(|(r, f)| (table[r].clone(), f)).collect()
+        }
+        None => Vec::new(),
+    };
     l.icons.fill(ICON_UNKNOWN);
     l.cells.fill(Default::default());
+}
+
+/// Remembers the active folder's view, sort, grouping and columns (on disk, a moment later).
+pub(crate) unsafe fn remember_folder(app: *mut App) {
+    let Some(l) = listing(app) else { return };
+    if is_home(l) || cur(app).loading.is_some() {
+        return;
+    }
+    let fv = session::FolderView { view: (*app).views.view.name().to_string(), sort: (l.sort_col, l.sort_desc), group: l.group, cols: l.layout.clone() };
+    (*app).session.remember(&l.folder.parsing_name, fv);
+    session_changed(app);
+}
+
+/// After the user resized or dragged a header: takes the header's widths and order into the listing and remembers them.
+pub(crate) unsafe fn remember_layout(app: *mut App) {
+    let layout = header_layout(app);
+    if layout.is_empty() {
+        return;
+    }
+    if let Some(Source::Shell(l)) = &mut cur(app).source {
+        l.layout = layout;
+    }
+    remember_folder(app);
+}
+
+/// `layout` with column `index` shown or hidden: removed when there, else appended at its default width. Name stays.
+pub(crate) fn toggled(layout: &[(u32, i32)], index: u32) -> Vec<(u32, i32)> {
+    let mut out: Vec<(u32, i32)> = layout.iter().copied().filter(|c| index == 0 || c.0 != index).collect();
+    if index != 0 && out.len() == layout.len() {
+        out.push((index, 0));
+    }
+    out
+}
+
+/// The shell columns to show: Name first (the list reads it as header position 0), then each layout column the
+/// folder offers, once, in layout order.
+pub(crate) fn chosen_columns(available: &[u32], layout: &[(u32, i32)]) -> Vec<u32> {
+    let mut out = vec![0];
+    for &(i, _) in layout {
+        if available.contains(&i) && !out.contains(&i) {
+            out.push(i);
+        }
+    }
+    out
+}
+
+/// Header positions in display order: the layout's columns that are shown, then any others as they are.
+fn display_order(layout: &[(u32, i32)], shown: &[u32]) -> Vec<i32> {
+    let mut out: Vec<i32> = Vec::new();
+    for (i, _) in layout {
+        if let Some(p) = shown.iter().position(|s| s == i).map(|p| p as i32).filter(|p| !out.contains(p)) {
+            out.push(p);
+        }
+    }
+    let rest: Vec<i32> = (0..shown.len() as i32).filter(|p| !out.contains(p)).collect();
+    out.extend(rest);
+    out
+}
+
+/// The layout the header shows: its positions in display order and each position's width.
+fn layout_of(order: &[i32], shown: &[u32], widths96: &[i32]) -> Vec<(u32, i32)> {
+    order
+        .iter()
+        .filter_map(|&o| Some((*shown.get(usize::try_from(o).ok()?)?, *widths96.get(o as usize)?)))
+        .collect()
+}
+
+/// The active listing's layout as the header has it now; the listing's own outside Details (an icon view's header
+/// is not there to ask).
+pub(crate) unsafe fn header_layout(app: *mut App) -> Vec<(u32, i32)> {
+    let Some(l) = listing(app) else { return Vec::new() };
+    let list = (*app).list;
+    let header = HWND(SendMessageW(list, LVM_GETHEADER, None, None).0 as *mut c_void);
+    let n = l.columns.len();
+    if (*app).views.view != views::View::Details || header.is_invalid() || SendMessageW(header, HDM_GETITEMCOUNT, None, None).0 as usize != n {
+        return l.layout.clone();
+    }
+    let mut order = vec![0i32; n];
+    SendMessageW(list, LVM_GETCOLUMNORDERARRAY, Some(WPARAM(n)), Some(LPARAM(order.as_mut_ptr() as isize)));
+    let dpi = GetDpiForWindow((*app).hwnd).max(96) as i32;
+    let widths: Vec<i32> = (0..n).map(|i| SendMessageW(list, LVM_GETCOLUMNWIDTH, Some(WPARAM(i)), None).0 as i32 * 96 / dpi).collect();
+    let shown: Vec<u32> = l.columns.iter().map(|c| c.index).collect();
+    layout_of(&order, &shown, &widths)
+}
+
+/// Puts the listing's remembered widths and order on the header (after set_columns).
+pub(crate) unsafe fn apply_layout(app: *mut App) {
+    let Some(l) = listing(app).filter(|l| !l.layout.is_empty()) else { return };
+    let (list, dpi) = ((*app).list, GetDpiForWindow((*app).hwnd).max(96) as i32);
+    let shown: Vec<u32> = l.columns.iter().map(|c| c.index).collect();
+    for &(index, w) in &l.layout {
+        if let (true, Some(pos)) = (w > 0, shown.iter().position(|&s| s == index)) {
+            SendMessageW(list, LVM_SETCOLUMNWIDTH, Some(WPARAM(pos)), Some(LPARAM((w.max(20) * dpi / 96) as isize)));
+        }
+    }
+    let order = display_order(&l.layout, &shown);
+    SendMessageW(list, LVM_SETCOLUMNORDERARRAY, Some(WPARAM(order.len())), Some(LPARAM(order.as_ptr() as isize)));
 }
 
 pub(crate) unsafe fn set_columns(app: *mut App, columns: &[Column]) {
@@ -629,6 +946,7 @@ pub(crate) unsafe fn set_columns(app: *mut App, columns: &[Column]) {
         };
         SendMessageW(list, LVM_INSERTCOLUMNW, Some(WPARAM(i)), Some(LPARAM(&col as *const _ as isize)));
     }
+    list::set_sort_arrow(app);
 }
 
 /// Reloads the active tab; a search runs again. Nothing while a navigation is in flight: reloading the place being
@@ -671,14 +989,74 @@ pub(crate) unsafe fn mark_changed(app: *mut App, items: &[Pidl]) -> bool {
 }
 
 pub(crate) unsafe fn go_back(app: *mut App) {
-    if let Some(p) = cur(app).back.pop() {
-        go(app, p, History::Back);
-    }
+    jump(app, true, 1);
 }
 
 pub(crate) unsafe fn go_forward(app: *mut App) {
-    if let Some(p) = cur(app).forward.pop() {
-        go(app, p, History::Forward);
+    jump(app, false, 1);
+}
+
+/// Goes `steps` entries back or forward. A load that fails loses the popped entries, as a single step always did.
+pub(crate) unsafe fn jump(app: *mut App, back: bool, steps: usize) {
+    let tab = cur(app);
+    let Some(((target, _), skipped)) = take_steps(if back { &mut tab.back } else { &mut tab.forward }, steps) else { return };
+    tab.skipped = skipped;
+    go(app, target, if back { History::Back } else { History::Forward });
+}
+
+/// Pops `steps` entries: the last popped is the destination, the rest (pop order) are skipped. None, stack untouched, for 0 or too many.
+pub(crate) fn take_steps<T>(stack: &mut Vec<T>, steps: usize) -> Option<(T, Vec<T>)> {
+    if steps == 0 || steps > stack.len() {
+        return None;
+    }
+    let mut s = stack.split_off(stack.len() - steps);
+    s.reverse();
+    let t = s.pop()?;
+    Some((t, s))
+}
+
+/// The place left goes on the other stack, then the skipped ones, so they come back in order.
+fn land<T>(other: &mut Vec<T>, left: T, skipped: Vec<T>) {
+    other.push(left);
+    other.extend(skipped);
+}
+
+/// Menu rows for a history stack: next destination first, `&` doubled (menus eat it), passwords redacted, at most 16.
+fn history_entries(labels: &[&str]) -> Vec<(usize, String)> {
+    labels.iter().rev().take(16).enumerate().map(|(k, l)| (k + 1, crate::connect::redact(l).replace('&', "&&"))).collect()
+}
+
+/// The label a history entry shows: a search goes back to its folder, so its folder's name.
+pub(crate) fn history_label(s: &Source) -> String {
+    match s {
+        Source::Search(s) => s.root_crumbs.last().map(|c| c.name.clone()).unwrap_or_default(),
+        _ => s.title(),
+    }
+}
+
+/// Right click on Back or Forward: the places that button would go through, newest first.
+pub(crate) unsafe fn on_nav_context(app: *mut App, lparam: LPARAM) {
+    let (x, y) = (lparam.0 as i16 as i32, (lparam.0 >> 16) as i16 as i32);
+    if x == -1 && y == -1 {
+        return;
+    }
+    let at = POINT { x, y };
+    let hit = |cmd| toolbar::button_rect((*app).nav, cmd).filter(|r| windows::Win32::Graphics::Gdi::PtInRect(r, at).as_bool());
+    let (back, r) = match (hit(CMD_BACK), hit(CMD_FORWARD)) {
+        (Some(r), _) => (true, r),
+        (_, Some(r)) => (false, r),
+        _ => return,
+    };
+    let tab = cur(app);
+    let stack = if back { &tab.back } else { &tab.forward };
+    let labels: Vec<&str> = stack.iter().map(|(_, l)| l.as_str()).collect();
+    let entries = history_entries(&labels);
+    if entries.is_empty() {
+        return;
+    }
+    let picked = ui::popup(app, &entries, &[], r.left, r.bottom);
+    if picked != 0 {
+        jump(app, back, picked);
     }
 }
 
@@ -702,6 +1080,7 @@ pub(crate) unsafe fn new_tab(app: *mut App, target: Target, activate: bool, sele
         source: None,
         back: Vec::new(),
         forward: Vec::new(),
+        skipped: Vec::new(),
         watch: None,
         dirty: false,
         pending: 0,
@@ -823,6 +1202,7 @@ unsafe fn begin_skeleton(app: *mut App) {
     (*app).skeleton = true;
     show_home(app, false);
     let list = (*app).list;
+    list::set_groups(app, false);
     views::reset(app, 0);
     SendMessageW(list, LVM_SETITEMCOUNT, Some(WPARAM(0)), Some(LPARAM(0)));
     panes::schedule_preview(app);
@@ -885,6 +1265,66 @@ pub(crate) unsafe fn close_tab(app: *mut App, t: usize) {
     session_changed(app);
 }
 
+/// TN_MOVE: the strip already moved its title; the tab, the active index and the session follow.
+pub(crate) unsafe fn tab_moved(app: *mut App, from: usize, to: usize) {
+    let n = (*app).tabs.len();
+    if from >= n || to >= n || from == to {
+        return;
+    }
+    let t = (*app).tabs.remove(from);
+    (*app).tabs.insert(to, t);
+    (*app).active = tabs::moved((*app).active, from, to);
+    session_changed(app);
+}
+
+const TAB_DUPLICATE: usize = 1;
+const TAB_CLOSE: usize = 2;
+const TAB_CLOSE_OTHERS: usize = 3;
+const TAB_CLOSE_RIGHT: usize = 4;
+
+/// Tabs that "Close other tabs" (others) or "Close tabs to the right" close around tab `i`, highest first so the indexes stay valid.
+fn to_close(n: usize, i: usize, others: bool) -> Vec<usize> {
+    (0..n).rev().filter(|&j| if others { j != i } else { j > i }).collect()
+}
+
+/// TN_CONTEXT: the tab's right-click menu.
+pub(crate) unsafe fn tab_menu(app: *mut App, i: usize, at: Option<POINT>) {
+    let n = (*app).tabs.len();
+    let Some(name) = (&(*app).tabs).get(i).map(|t| t.name.clone()) else { return };
+    let entries = [
+        Entry::new(TAB_DUPLICATE, tr("tabs.duplicate"), 0).enabled(!name.is_empty()),
+        Entry::sep(),
+        Entry::new(TAB_CLOSE, &hinted("tabs.close", "Ctrl+W"), 0),
+        Entry::new(TAB_CLOSE_OTHERS, tr("tabs.close_others"), 0).enabled(n > 1),
+        Entry::new(TAB_CLOSE_RIGHT, tr("tabs.close_right"), 0).enabled(i + 1 < n),
+    ];
+    let pt = at.unwrap_or_else(|| {
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        pt
+    });
+    match ui::pick_entries(app, &entries, pt.x, pt.y) {
+        // Same place, without the history: the copy sits next to its source.
+        Some(TAB_DUPLICATE) => {
+            new_tab(app, Target::Name(name), true, None);
+            let last = (*app).tabs.len() - 1;
+            tabs::move_tab((*app).strip, last, i + 1);
+            tab_moved(app, last, i + 1);
+        }
+        Some(TAB_CLOSE) => close_tab(app, i),
+        Some(c @ (TAB_CLOSE_OTHERS | TAB_CLOSE_RIGHT)) => {
+            // The kept tab is shown first, so closing the active one does not load a neighbour on the way.
+            if c == TAB_CLOSE_OTHERS || (*app).active > i {
+                switch_tab(app, i);
+            }
+            for j in to_close(n, i, c == TAB_CLOSE_OTHERS) {
+                close_tab(app, j);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub(crate) unsafe fn cycle_tab(app: *mut App, delta: isize) {
     let n = (*app).tabs.len() as isize;
     if n > 1 {
@@ -898,6 +1338,21 @@ pub(crate) unsafe fn open_in_background(app: *mut App, index: usize) {
     let Some(item) = l.items.get(index) else { return };
     if item.is_folder() {
         new_tab(app, Target::Pidl(l.folder.child_pidl(item)), false, None);
+    }
+}
+
+/// Ctrl+double-click opens a folder in a background tab. In single-click mode comctl32 may report a Ctrl+click as an
+/// activation, which would steal multi-select, so that mode keeps its plain activation.
+pub(crate) fn opens_tab(ctrl: bool, folder: bool, single_click: bool) -> bool {
+    ctrl && folder && !single_click
+}
+
+pub(crate) unsafe fn activate_or_tab(app: *mut App, index: usize, ctrl: bool) {
+    let folder = listing(app).and_then(|l| l.items.get(index)).is_some_and(|i| i.is_folder());
+    if opens_tab(ctrl, folder, (*app).profile.single_click) {
+        open_in_background(app, index);
+    } else {
+        source::activate(app, index);
     }
 }
 
@@ -940,6 +1395,9 @@ pub(crate) unsafe fn session_changed(app: *mut App) {
 }
 
 pub(crate) unsafe fn save_session(app: *mut App) {
+    if (*app).secondary {
+        return;
+    }
     let a = &mut *app;
     let named: Vec<(usize, &Tab)> = a.tabs.iter().enumerate().filter(|(_, t)| !t.name.is_empty()).collect();
     a.session.active = named.iter().position(|(i, _)| *i == a.active).unwrap_or(0);
@@ -950,6 +1408,33 @@ pub(crate) unsafe fn save_session(app: *mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_jump_keeps_order() {
+        let mut b = vec!["A", "B", "D", "E"];
+        assert_eq!(take_steps(&mut b, 3), Some(("B", vec!["E", "D"])));
+        assert_eq!(b, ["A"]);
+        let mut f = vec![];
+        land(&mut f, "C", vec!["E", "D"]);
+        assert_eq!((f.pop(), f.pop(), f.pop()), (Some("D"), Some("E"), Some("C")));
+        assert_eq!(take_steps(&mut b, 0), None);
+        assert_eq!(take_steps(&mut b, 9), None);
+        assert_eq!(b, ["A"]);
+    }
+
+    #[test]
+    fn history_menu_rows() {
+        assert_eq!(history_entries(&["A", "R&D"]), [(1, "R&&D".to_string()), (2, "A".to_string())]);
+        assert_eq!(history_entries(&["x"; 20]).len(), 16);
+    }
+
+    #[test]
+    fn to_close_rules() {
+        assert_eq!(to_close(4, 1, true), [3, 2, 0]);
+        assert_eq!(to_close(4, 1, false), [3, 2]);
+        assert!(to_close(4, 3, false).is_empty());
+        assert!(to_close(1, 0, true).is_empty());
+    }
 
     #[test]
     fn destinations_resolve_namespace_names_and_keep_typed_paths() {
@@ -965,8 +1450,16 @@ mod tests {
         assert_eq!(destination(&Target::Name(bad.clone())), (bad.clone(), bad));
     }
 
+    #[test]
+    fn ctrl_double_click_opens_folders_in_a_tab() {
+        assert!(opens_tab(true, true, false));
+        assert!(!opens_tab(true, false, false));
+        assert!(!opens_tab(false, true, false));
+        assert!(!opens_tab(true, true, true));
+    }
+
     fn shell_listing(dir: &std::path::Path, sort: (u32, bool), prefill: usize) -> Listing {
-        match load(Target::Name(dir.display().to_string()), true, sort, prefill, &|| false) {
+        match load(Target::Name(dir.display().to_string()), true, Some((sort.0, sort.1, None)), &[], prefill, &|| false) {
             Ok(Loaded { source: Source::Shell(l), .. }) => l,
             _ => panic!("a shell listing"),
         }
@@ -1001,8 +1494,187 @@ mod tests {
         let Source::Shell(l) = &mut src else { unreachable!() };
         unsafe { sort_listing(l) };
         assert!(l.cells[1].get().is_none(), "sorting moves the rows");
-        assert!(load(Target::Name(dir.display().to_string()), true, (0, false), 0, &|| true).is_err(), "superseded");
+        assert!(load(Target::Name(dir.display().to_string()), true, Some((0, false, None)), &[], 0, &|| true).is_err(), "superseded");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_sort_is_name_except_downloads_newest_first() {
+        let _com = ComInit::mta();
+        let l = shell_listing(&std::env::temp_dir(), (0, false), 0);
+        let date = l.columns.iter().find(|c| c.kind == SHCOLSTATE_TYPE_DATE).expect("a date column").index;
+        assert_eq!(default_sort(&std::env::temp_dir().display().to_string(), &l.columns), (0, false, None));
+        let dl = panes::known_folder(&FOLDERID_Downloads).unwrap();
+        assert_eq!(default_sort(&dl, &l.columns), (date, true, Some(date)));
+        assert_eq!(default_sort(&format!("{}\\", dl.to_uppercase()), &l.columns), (date, true, Some(date)), "case and trailing backslash");
+    }
+
+    /// Days since 1601-01-01 of a date, as Windows counts them (independent of `civil`).
+    fn day(y: u16, m: u16, d: u16) -> i64 {
+        let mut ft = FILETIME::default();
+        unsafe { SystemTimeToFileTime(&SYSTEMTIME { wYear: y, wMonth: m, wDay: d, ..Default::default() }, &mut ft) }.unwrap();
+        ((ft.dwHighDateTime as i64) << 32 | ft.dwLowDateTime as i64) / 864_000_000_000
+    }
+
+    #[test]
+    fn civil_epoch_is_monday_1601() {
+        assert_eq!((day(1601, 1, 1), civil(0)), (0, (1601, 1, 1)));
+        assert_eq!(day(2026, 10, 12) % 7, 0, "a Monday");
+        for (y, m, d) in [(1601, 12, 31), (1700, 3, 1), (1900, 2, 28), (2000, 2, 29), (2024, 12, 31), (2026, 10, 13), (2028, 2, 29), (2100, 3, 1)] {
+            assert_eq!(civil(day(y, m, d)), (y as i64, m as i64, d as i64));
+        }
+    }
+
+    #[test]
+    fn date_groups_like_explorer() {
+        let today = day(2026, 10, 13); // a Tuesday
+        let g = |y, m, d, week_start| tr(DATE_GROUPS[date_group(day(y, m, d), today, week_start)]);
+        let monday = [
+            ((2026, 10, 14), "In the future"),
+            ((2026, 10, 13), "Today"),
+            ((2026, 10, 12), "Yesterday"),
+            ((2026, 10, 11), "Last week"),
+            ((2026, 10, 5), "Last week"),
+            ((2026, 10, 4), "Earlier this month"),
+            ((2026, 10, 1), "Earlier this month"),
+            ((2026, 9, 30), "Last month"),
+            ((2026, 9, 1), "Last month"),
+            ((2026, 8, 31), "Earlier this year"),
+            ((2026, 1, 1), "Earlier this year"),
+            ((2025, 12, 31), "A long time ago"),
+        ];
+        for ((y, m, d), want) in monday {
+            assert_eq!(g(y, m, d, 0), want, "{y}-{m}-{d}");
+        }
+        // Weeks that start on Sunday: the 11th is this week's.
+        assert_eq!(g(2026, 10, 11, 6), "Earlier this week");
+        assert_eq!(g(2026, 10, 4, 6), "Last week");
+        assert_eq!(g(2026, 10, 3, 6), "Earlier this month");
+    }
+
+    #[test]
+    fn date_group_edges() {
+        let g = |d, today| tr(DATE_GROUPS[date_group(d, today, 0)]);
+        // Today starts the week: the day before is Yesterday, the one before that last week.
+        assert_eq!(g(day(2026, 10, 11), day(2026, 10, 12)), "Yesterday");
+        assert_eq!(g(day(2026, 10, 10), day(2026, 10, 12)), "Last week");
+        let today = day(2026, 1, 2);
+        assert_eq!(g(day(2025, 12, 31), today), "Earlier this week");
+        assert_eq!(g(day(2025, 12, 22), today), "Last week");
+        assert_eq!(g(day(2025, 12, 15), today), "Last month");
+        assert_eq!(g(day(2025, 11, 30), today), "A long time ago");
+        assert_eq!(g(day(2028, 2, 29), day(2028, 3, 1)), "Yesterday");
+        assert_eq!(g(day(2028, 2, 1), day(2028, 3, 1)), "Last month");
+    }
+
+    #[test]
+    fn group_rows_contiguous_stable() {
+        let names = |rows: &[(&'static str, usize)]| rows.iter().map(|r| r.0).collect::<Vec<_>>();
+        // The shell's order (folders F first) with each row's group rank; newest first is the lowest rank first.
+        let mut rows = vec![("F1", 2), ("F2", 1), ("a", 1), ("b", 2), ("c", 8), ("d", 2)];
+        assert_eq!(group_rows(&mut rows, |r| r.1, true), [(1, 0), (2, 2), (8, 5)]);
+        assert_eq!(names(&rows), ["F2", "a", "F1", "b", "d", "c"]);
+        let mut rows = vec![("F1", 2), ("F2", 1), ("c", 8), ("b", 2), ("a", 1)];
+        assert_eq!(group_rows(&mut rows, |r| r.1, false), [(8, 0), (2, 1), (1, 3)]);
+        assert_eq!(names(&rows), ["c", "F1", "b", "F2", "a"]);
+        assert!(group_rows(&mut Vec::<u8>::new(), |_| 0, true).is_empty());
+    }
+
+    #[test]
+    fn toggled_columns() {
+        let base = [(0, 300), (3, 100)];
+        assert_eq!(toggled(&base, 2), [(0, 300), (3, 100), (2, 0)]);
+        assert_eq!(toggled(&base, 3), [(0, 300)]);
+        assert_eq!(toggled(&base, 0), base);
+    }
+
+    #[test]
+    fn chosen_columns_keep_name_first() {
+        assert_eq!(chosen_columns(&[0, 1, 2, 3, 4, 10], &[(3, 0), (0, 0), (2, 0), (99, 0), (3, 0)]), [0, 3, 2]);
+        assert_eq!(chosen_columns(&[0, 1], &[]), [0]);
+    }
+
+    #[test]
+    fn layout_round_trip() {
+        let layout = [(3, 100), (0, 300), (2, 90)];
+        assert_eq!(display_order(&layout, &[0, 3, 2]), [1, 0, 2]);
+        assert_eq!(layout_of(&[1, 0, 2], &[0, 3, 2], &[300, 100, 90]), layout);
+        assert_eq!(display_order(&[(9, 1)], &[0, 3]), [0, 1]);
+        assert_eq!(display_order(&[(3, 1), (3, 2)], &[0, 3]), [1, 0]);
+    }
+
+    #[test]
+    fn size_groups_like_explorer() {
+        let g = |folder, b| tr(SIZE_GROUPS[size_group(folder, b)]);
+        assert_eq!(g(false, Some(0)), "Empty (0 KB)");
+        for b in [1, 16 * 1024 - 1] {
+            assert_eq!(g(false, Some(b)), "Tiny (0 - 16 KB)");
+        }
+        assert_eq!(g(false, Some(16 * 1024)), "Small (16 KB - 1 MB)");
+        assert_eq!(g(false, Some(1 << 20)), "Medium (1 - 128 MB)");
+        assert_eq!(g(false, Some(128 << 20)), "Large (128 MB - 1 GB)");
+        assert_eq!(g(false, Some(1 << 30)), "Huge (1 - 4 GB)");
+        assert_eq!(g(false, Some(4 << 30)), "Huge (1 - 4 GB)");
+        assert_eq!(g(false, Some((4 << 30) + 1)), "Gigantic (> 4 GB)");
+        assert_eq!(g(true, Some(0)), "Unspecified");
+        assert_eq!(g(false, None), "Unspecified");
+    }
+
+    #[test]
+    fn name_groups() {
+        for (n, g) in [("alpha", "A"), ("Ébène", "É"), ("42.txt", "0 - 9"), ("_x", "Other"), ("", "Other")] {
+            assert_eq!(name_group(n), g, "{n}");
+        }
+    }
+
+    #[test]
+    fn text_ranks_put_unspecified_last() {
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(text_ranks(s(&["Text Document", "", "JPEG image", "Text Document"])), (vec![1, 2, 0, 1], s(&["JPEG image", "Text Document", "Unspecified"])));
+    }
+
+    #[test]
+    fn group_order_follows_the_group_column() {
+        assert!(groups_lowest_first(false, false, false) && groups_lowest_first(false, true, true));
+        assert!(groups_lowest_first(true, true, true));
+        assert!(!groups_lowest_first(true, false, true));
+        assert!(groups_lowest_first(true, false, false));
+        assert!(!groups_lowest_first(true, true, false));
+    }
+
+    #[test]
+    fn load_groups_by_date_size_and_name() {
+        let _com = ComInit::mta();
+        let dir = std::env::temp_dir().join(format!("rexplorer-nav-groups-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        for n in ["new.txt", "old.txt"] {
+            std::fs::write(dir.join(n), b"x").unwrap();
+        }
+        let old = std::time::SystemTime::now() - Duration::from_secs(800 * 86_400);
+        std::fs::File::options().write(true).open(dir.join("old.txt")).unwrap().set_modified(old).unwrap();
+        let probe = shell_listing(&dir, (0, false), 0);
+        let date = probe.columns.iter().find(|c| c.kind == SHCOLSTATE_TYPE_DATE).expect("a date column").index;
+        let size = panes::size_and_type_columns(&probe.folder.folder).0.unwrap();
+        let get = |sort| match load(Target::Name(dir.display().to_string()), true, Some(sort), &[], 0, &|| false) {
+            Ok(Loaded { source: Source::Shell(l), .. }) => (
+                l.items.iter().map(|i| i.display_name().trim_end_matches(".txt").to_string()).collect::<Vec<_>>(),
+                l.groups.into_iter().map(|(g, f)| (g, f)).collect::<Vec<_>>(),
+            ),
+            _ => panic!("a shell listing"),
+        };
+        let by_date = get((date, true, Some(date)));
+        let none = get((date, true, None)).1;
+        let by_name = get((0, false, Some(0)));
+        let by_size = get((size, true, Some(size)));
+        let _ = std::fs::remove_dir_all(&dir);
+        let at = |g: &[(String, usize)]| g.iter().map(|(l, f)| (l.clone(), *f)).collect::<Vec<_>>();
+        let want = |v: &[(&str, usize)]| v.iter().map(|(l, f)| (l.to_string(), *f)).collect::<Vec<_>>();
+        assert_eq!(by_date.0, ["new", "sub", "old"], "the folder stays in its group");
+        assert_eq!(at(&by_date.1), want(&[("Today", 0), ("A long time ago", 2)]));
+        assert!(none.is_empty(), "off");
+        assert_eq!(by_name.0, ["new", "old", "sub"]);
+        assert_eq!(at(&by_name.1), want(&[("N", 0), ("O", 1), ("S", 2)]));
+        assert_eq!(at(&by_size.1), want(&[("Tiny (0 - 16 KB)", 0), ("Unspecified", 2)]));
     }
 
     #[test]

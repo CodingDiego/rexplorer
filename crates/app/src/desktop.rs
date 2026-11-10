@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, Ordering}
 use rexplorer_core::com::ComInit;
 use rexplorer_core::desktop::{self, ARRANGE, DesktopView, ICON_SIZES, SORT_KEYS};
 use rexplorer_core::folder::ShellFolder;
+use rexplorer_core::i18n::tr;
 use rexplorer_core::item::ShellItem;
 use rexplorer_core::menu::{ContextMenu, Picked};
 use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM};
@@ -92,6 +93,7 @@ pub(crate) fn run() -> Result<()> {
         let hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, CLASS, w!("rexplorer desktop menu"), WS_POPUP, 0, 0, 0, 0, None, None, Some(hinst), None)?;
         TARGET.store(hwnd.0 as isize, Ordering::SeqCst);
         std::thread::spawn(hook_thread);
+        rexplorer_core::packaged::warm();
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
@@ -291,16 +293,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 /// The background menu's own part, ahead of the shell's: View, Sort by | Refresh, Paste.
 unsafe fn background_entries(view: &DesktopView) -> Vec<Entry> {
     let size = view.icon_size().unwrap_or(0);
-    let mut look: Vec<Entry> = ICON_SIZES.iter().enumerate().map(|(i, (t, s))| Entry { checked: *s == size, ..Entry::new(ICON + i, t, 0) }).collect();
+    let mut look: Vec<Entry> = ICON_SIZES.iter().enumerate().map(|(i, (t, s))| Entry { checked: *s == size, ..Entry::new(ICON + i, tr(t), 0) }).collect();
     look.push(Entry::sep());
-    look.extend(ARRANGE.iter().enumerate().map(|(i, (t, f))| Entry { checked: view.has_flag(*f).unwrap_or(false), ..Entry::new(ARRANGE_ID + i, t, 0) }));
-    let sort = SORT_KEYS.iter().enumerate().map(|(i, (t, _))| Entry::new(SORT + i, t, 0)).collect();
+    look.extend(ARRANGE.iter().enumerate().map(|(i, (t, f))| Entry { checked: view.has_flag(*f).unwrap_or(false), ..Entry::new(ARRANGE_ID + i, tr(t), 0) }));
+    let sort = SORT_KEYS.iter().enumerate().map(|(i, (t, _))| Entry::new(SORT + i, tr(t), 0)).collect();
     vec![
-        Entry { sub: look, ..Entry::new(0, "View", 0xE8A9) },
-        Entry { sub: sort, ..Entry::new(0, "Sort by", 0xE8CB) },
+        Entry { sub: look, ..Entry::new(0, tr("menu.list.view"), 0xE8A9) },
+        Entry { sub: sort, ..Entry::new(0, tr("menu.list.sort_by"), 0xE8CB) },
         Entry::sep(),
-        Entry::new(REFRESH, "Refresh", 0xE72C),
-        Entry::new(PASTE, "Paste", 0xE77F).enabled(commands::clipboard_has_files()),
+        Entry::new(REFRESH, tr("menu.list.refresh"), 0xE72C),
+        Entry::new(PASTE, tr("menu.list.paste"), 0xE77F).enabled(commands::clipboard_has_files()),
         Entry::sep(),
     ]
 }
@@ -394,6 +396,7 @@ unsafe fn menu_for(hwnd: HWND, list: HWND, at: At) {
         Some(Ok(Picked::Rename)) => index.map_or(Ok(()), |i| view.rename(i)),
         Some(Ok(Picked::Own(REFRESH))) => view.refresh(),
         Some(Ok(Picked::Own(PASTE))) => menu.map_or(Ok(()), |m| m.invoke_verb(hwnd, "paste", false)),
+        Some(Ok(Picked::Delete)) => menu.map_or(Ok(()), |m| m.invoke_verb(hwnd, "delete", false)),
         Some(Ok(Picked::Own(id))) if id >= SORT => SORT_KEYS.get(id - SORT).map_or(Ok(()), |(_, k)| view.sort_by(*k)),
         Some(Ok(Picked::Own(id))) if id >= ARRANGE_ID => ARRANGE.get(id - ARRANGE_ID).map_or(Ok(()), |(_, f)| view.toggle_flag(*f)),
         Some(Ok(Picked::Own(id))) if id >= ICON => ICON_SIZES.get(id - ICON).map_or(Ok(()), |(_, s)| view.set_icon_size(*s)),

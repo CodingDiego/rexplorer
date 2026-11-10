@@ -5,11 +5,14 @@ use std::ffi::c_void;
 use std::mem::size_of;
 use std::sync::Once;
 
+use rexplorer_core::access;
+use rexplorer_core::i18n::tr;
 use rexplorer_core::fuzzy::{Candidate, rank};
 use rexplorer_core::settings::Theme;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Accessibility::{ROLE_SYSTEM_LIST, ROLE_SYSTEM_LISTITEM};
 use windows::Win32::UI::Controls::{NMHDR, WM_MOUSELEAVE};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
@@ -113,13 +116,15 @@ struct State {
     model: Model,
     edit: HWND,
     font: HFONT,
-    colors: [u32; 4], // surface, text, secondary, selection
+    colors: [u32; 5], // surface, text, secondary, selection, text on the selection
+    contrast: bool,
     brush: HBRUSH,
     id: usize,
     dpi: u32,
     picked: Option<String>,
     tracking: bool,
     closing: bool,
+    acc: Option<access::Server>,
 }
 
 static REGISTER: Once = Once::new();
@@ -153,13 +158,15 @@ pub fn open(parent: HWND, id: usize, candidates: Vec<Candidate>, t: &Theme, font
             model,
             edit: HWND::default(),
             font,
-            colors: [t.surface, t.text, t.secondary_text, t.selection],
+            colors: [t.surface, t.text, t.secondary_text, t.selection, theme::on_selection(t, t.text)],
+            contrast: t.contrast.is_some(),
             brush: CreateSolidBrush(COLORREF(t.surface)),
             id,
             dpi,
             picked: None,
             tracking: false,
             closing: false,
+            acc: None,
         }));
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW,
@@ -276,6 +283,49 @@ unsafe fn on_change(hwnd: HWND, st: *mut State) {
     let got = GetWindowTextW((*st).edit, &mut buf).max(0) as usize;
     (*st).model.set_query(&String::from_utf16_lossy(&buf[..got]));
     refresh(hwnd, st);
+    access::event(EVENT_OBJECT_REORDER, hwnd, None);
+    selection_changed(hwnd, st);
+}
+
+/// Tells screen readers which result row is current. Call after the model changed, with no borrow alive.
+unsafe fn selection_changed(hwnd: HWND, st: *mut State) {
+    if !(*st).model.results().is_empty() {
+        access::event(EVENT_OBJECT_SELECTION, hwnd, Some((*st).model.selected()));
+    }
+}
+
+/// A row as painted, in client coordinates.
+fn row_rect(i: usize, cw: i32, dpi: u32) -> RECT {
+    let (row_h, m) = (sc(ROW_H, dpi), sc(PAD - 4, dpi));
+    let top = sc(EDIT_AREA, dpi) + i as i32 * row_h;
+    RECT { left: m, top, right: cw - m, bottom: top + row_h }
+}
+
+/// Moves to result row `i` and confirms it (a click on the row, or its accessible default action).
+unsafe fn pick_row(hwnd: HWND, st: *mut State, i: usize) {
+    let delta = i as i32 - (*st).model.selected() as i32;
+    (*st).model.move_sel(delta);
+    confirm(hwnd, st);
+}
+
+unsafe fn acc_tree(hwnd: HWND, st: *mut State, t: &mut access::Tree) {
+    let s = &*st;
+    let mut rc = RECT::default();
+    let _ = GetClientRect(hwnd, &mut rc);
+    t.name = tr("pal.name").into();
+    t.role = ROLE_SYSTEM_LIST;
+    for (i, &ci) in s.model.results().iter().enumerate() {
+        let c = &s.model.cands[ci];
+        t.items.push(access::Item {
+            name: c.text.clone(),
+            description: if c.target != c.text { c.target.clone() } else { String::new() },
+            role: ROLE_SYSTEM_LISTITEM,
+            state: STATE_SYSTEM_SELECTABLE | if i == s.model.selected() { STATE_SYSTEM_SELECTED } else { 0 },
+            rect: row_rect(i, rc.right, s.dpi),
+            action: tr("tb.action_open"),
+            ..Default::default()
+        });
+    }
 }
 
 /// Result row under the mouse position packed in `lparam`.
@@ -303,6 +353,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_ERASEBKGND => return LRESULT(1),
         WM_PAINT => paint(hwnd, st),
+        WM_GETOBJECT if access::is_client(lparam) => return (*st).acc.get_or_insert_with(|| access::Server::new(hwnd)).answer(wparam),
+        access::WM_ACC_ITEMS => {
+            acc_tree(hwnd, st, &mut *(lparam.0 as *mut access::Tree));
+            return LRESULT(1);
+        }
+        access::WM_ACC_INVOKE => {
+            if wparam.0 < (*st).model.results().len() {
+                pick_row(hwnd, st, wparam.0);
+            }
+            return LRESULT(0);
+        }
         WM_CTLCOLOREDIT => {
             let hdc = HDC(wparam.0 as *mut c_void);
             SetTextColor(hdc, COLORREF((*st).colors[1]));
@@ -315,6 +376,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 VK_UP | VK_DOWN => {
                     (*st).model.move_sel(if wparam.0 as u16 == VK_UP.0 { -1 } else { 1 });
                     let _ = InvalidateRect(Some(hwnd), None, false);
+                    selection_changed(hwnd, st);
                 }
                 VK_RETURN => confirm(hwnd, st),
                 _ => finish(hwnd, st, PN_CLOSE),
@@ -339,15 +401,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if delta != 0 {
                     (*st).model.move_sel(delta);
                     let _ = InvalidateRect(Some(hwnd), None, false);
+                    selection_changed(hwnd, st);
                 }
             }
         }
         WM_MOUSELEAVE => (*st).tracking = false,
         WM_LBUTTONDOWN => {
             if let Some(row) = row_under(st, lparam) {
-                let delta = row as i32 - (*st).model.selected() as i32;
-                (*st).model.move_sel(delta);
-                confirm(hwnd, st);
+                pick_row(hwnd, st, row);
             }
         }
         _ => {}
@@ -394,33 +455,37 @@ unsafe fn paint(hwnd: HWND, st: *mut State) {
     let bmp = CreateCompatibleBitmap(hdc, cw, ch);
     let old_bmp = SelectObject(mem, bmp.into());
     let s = &*st;
-    let [bg, text, secondary, sel] = s.colors;
+    let [bg, text, secondary, sel, on_sel] = s.colors;
     let font = if s.font.is_invalid() { GetStockObject(DEFAULT_GUI_FONT) } else { s.font.into() };
     let old_font = SelectObject(mem, font);
     SetBkMode(mem, TRANSPARENT);
 
     fill(mem, &rc, bg);
     // Rows are pills inset like the Edit's text, so names line up with what is typed.
-    let (pad, row_h, m) = (sc(TEXT_X, s.dpi), sc(ROW_H, s.dpi), sc(PAD - 4, s.dpi));
+    let pad = sc(TEXT_X, s.dpi);
     for (i, &ci) in s.model.results().iter().enumerate() {
-        let top = sc(EDIT_AREA, s.dpi) + i as i32 * row_h;
-        let row = RECT { left: m, top, right: cw - m, bottom: top + row_h };
+        let row = row_rect(i, cw, s.dpi);
         if i == s.model.selected() {
             theme::fill_round(mem, &row, sel, sc(6, s.dpi));
         }
         let c = &s.model.cands[ci];
         let flags = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
         let mut name = RECT { left: pad, right: cw - pad, ..row };
-        SetTextColor(mem, COLORREF(text));
+        let selected = i == s.model.selected();
+        SetTextColor(mem, COLORREF(if selected { on_sel } else { text }));
         let mut measure = name;
         draw_text(mem, &c.text, &mut measure, flags | DT_CALCRECT);
         draw_text(mem, &c.text, &mut name, flags | DT_END_ELLIPSIS);
         let left = pad + (measure.right - measure.left) + pad;
         if c.target != c.text && left < cw - pad {
             let mut tr = RECT { left, right: cw - pad, ..row };
-            SetTextColor(mem, COLORREF(secondary));
+            SetTextColor(mem, COLORREF(if selected && s.contrast { on_sel } else { secondary }));
             draw_text(mem, &c.target, &mut tr, flags | DT_RIGHT | DT_PATH_ELLIPSIS);
         }
+    }
+    if s.contrast {
+        // Popup and parent share a color: the popup needs an edge (one pixel in keeps right and bottom visible).
+        theme::outline_round(mem, &RECT { right: cw - 1, bottom: ch - 1, ..rc }, text, sc(RADIUS, s.dpi), 1);
     }
     let _ = BitBlt(hdc, 0, 0, cw, ch, Some(mem), 0, 0, SRCCOPY);
     SelectObject(mem, old_font);
@@ -466,8 +531,12 @@ mod tests {
         assert_eq!(row_at(88 + 128, 3, 192), Some(2));
     }
 
+    /// Opening a palette takes the foreground, which deactivates (and so closes) another open palette: one at a time.
+    static ONE_PALETTE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn open_under_hidden_parent() {
+        let _one = ONE_PALETTE.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let parent = CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR::null(), WS_OVERLAPPEDWINDOW, 0, 0, 800, 600, None, None, None, None).unwrap();
             let hwnd = open(parent, 7, vec![c("Documents"), c("Downloads")], &Theme::light(), HFONT::default()).unwrap();
@@ -479,6 +548,68 @@ mod tests {
             assert_eq!(picked(hwnd), None);
             close(hwnd);
             assert!(!IsWindow(Some(hwnd)).as_bool());
+            let _ = DestroyWindow(parent);
+        }
+    }
+
+    thread_local! {
+        static NOTES: std::cell::RefCell<Vec<(u32, Option<String>)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    unsafe extern "system" fn rec_parent(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        if msg == WM_NOTIFY {
+            let hdr = &*(lparam.0 as *const NMHDR);
+            NOTES.with(|n| n.borrow_mut().push((hdr.code, picked(hdr.hwndFrom))));
+            return LRESULT(0);
+        }
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+
+    #[test]
+    fn accessible_results_and_pick() {
+        use crate::acc_test::*;
+        use rexplorer_core::com::ComInit;
+        use windows::Win32::Foundation::CO_E_OBJNOTCONNECTED;
+        let _one = ONE_PALETTE.lock().unwrap_or_else(|e| e.into_inner());
+        let _com = ComInit::sta();
+        unsafe {
+            let hinst = GetModuleHandleW(None).unwrap().into();
+            let wc = WNDCLASSW { lpfnWndProc: Some(rec_parent), hInstance: hinst, lpszClassName: w!("RexPaletteAccParent"), ..Default::default() };
+            RegisterClassW(&wc);
+            let parent = CreateWindowExW(WINDOW_EX_STYLE(0), w!("RexPaletteAccParent"), PCWSTR::null(), WS_OVERLAPPEDWINDOW, 0, 0, 800, 600, None, None, Some(hinst), None).unwrap();
+            // The palette closes when it loses activation (the user clicked another window): that says nothing
+            // about its accessible tree, so open it again.
+            let mut p = HWND::default();
+            for _ in 0..5 {
+                p = open(parent, 7, vec![c("Documents"), c("Downloads")], &Theme::light(), HFONT::default()).unwrap();
+                pump();
+                if IsWindow(Some(p)).as_bool() {
+                    break;
+                }
+            }
+            NOTES.with(|n| n.borrow_mut().clear());
+            let acc = object(p);
+            let k = kids(&acc);
+            assert_eq!([k[0].name.as_str(), k[1].name.as_str()], ["Documents", "Downloads"]);
+            assert_eq!(k[0].description, "C:\\Documents");
+            assert!(k.iter().all(|k| k.role == ROLE_SYSTEM_LISTITEM));
+            assert_ne!(k[0].state & STATE_SYSTEM_SELECTED, 0);
+            assert_eq!(k[1].state & STATE_SYSTEM_SELECTED, 0);
+            let mut rc = RECT::default();
+            let _ = GetClientRect(p, &mut rc);
+            let r = screen(p, row_rect(1, rc.right, GetDpiForWindow(parent).max(96)));
+            assert_eq!((k[1].rect.left, k[1].rect.top, k[1].rect.right, k[1].rect.bottom), (r.left, r.top, r.right, r.bottom));
+            let r0 = root(&acc);
+            assert_eq!((r0.name.as_str(), r0.role), ("Command palette", ROLE_SYSTEM_LIST));
+            let hk = hook();
+            SendMessageW(p, WM_APP_KEY, Some(WPARAM(VK_DOWN.0 as usize)), None);
+            assert!(hk.take().contains(&(EVENT_OBJECT_SELECTION, p, 2)));
+            drop(hk);
+            assert!(IsWindow(Some(p)).as_bool());
+            invoke(&acc, 2).unwrap();
+            assert_eq!(NOTES.with(|n| n.borrow().clone()), [(PN_PICK, Some("C:\\Downloads".to_string()))]);
+            assert!(!IsWindow(Some(p)).as_bool());
+            assert_eq!(acc.accChildCount().unwrap_err().code(), CO_E_OBJNOTCONNECTED);
             let _ = DestroyWindow(parent);
         }
     }

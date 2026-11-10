@@ -21,10 +21,10 @@ use windows::core::{GUID, Interface, Result};
 
 use crate::com::Pidl;
 
-/// The View menu's icon sizes, as Explorer offers them on the desktop.
-pub const ICON_SIZES: [(&str, i32); 3] = [("Large icons", 96), ("Medium icons", 48), ("Small icons", 32)];
+/// The View menu's icon sizes, as Explorer offers them on the desktop (label keys; the app translates).
+pub const ICON_SIZES: [(&str, i32); 3] = [("desk.large_icons", 96), ("desk.medium_icons", 48), ("desk.small_icons", 32)];
 /// The View menu's arrangement switches.
-pub const ARRANGE: [(&str, FOLDERFLAGS); 2] = [("Auto arrange icons", FWF_AUTOARRANGE), ("Align icons to grid", FWF_SNAPTOGRID)];
+pub const ARRANGE: [(&str, FOLDERFLAGS); 2] = [("desk.auto_arrange", FWF_AUTOARRANGE), ("desk.align_grid", FWF_SNAPTOGRID)];
 
 const fn pkey(g: u128, pid: u32) -> PROPERTYKEY {
     PROPERTYKEY { fmtid: GUID::from_u128(g), pid }
@@ -32,10 +32,10 @@ const fn pkey(g: u128, pid: u32) -> PROPERTYKEY {
 const STORAGE: u128 = 0xB725F130_47EF_101A_A5F1_02608C9EEBAC;
 /// The Sort by menu: System.ItemNameDisplay, System.Size, System.ItemTypeText, System.DateModified.
 pub const SORT_KEYS: [(&str, PROPERTYKEY); 4] = [
-    ("Name", pkey(STORAGE, 10)),
-    ("Size", pkey(STORAGE, 12)),
-    ("Item type", pkey(0x28636AA6_953D_11D2_B5D6_00C04FD918D0, 11)),
-    ("Date modified", pkey(STORAGE, 14)),
+    ("col.name", pkey(STORAGE, 10)),
+    ("col.size", pkey(STORAGE, 12)),
+    ("desk.item_type", pkey(0x28636AA6_953D_11D2_B5D6_00C04FD918D0, 11)),
+    ("col.date_modified", pkey(STORAGE, 14)),
 ];
 
 pub struct DesktopView {

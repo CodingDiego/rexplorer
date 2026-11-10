@@ -6,7 +6,7 @@ use windows::Win32::UI::WindowsAndMessaging::{ACCEL, ACCEL_VIRT_FLAGS, FALT, FCO
 use crate::*;
 
 /// The commands a `[keys]` line can name.
-const NAMES: [(&str, u16); 22] = [
+const NAMES: [(&str, u16); 40] = [
     ("cmd.back", CMD_BACK),
     ("cmd.forward", CMD_FORWARD),
     ("cmd.up", CMD_UP),
@@ -24,11 +24,29 @@ const NAMES: [(&str, u16); 22] = [
     ("cmd.terminal", CMD_TERMINAL),
     ("cmd.toggle_sidebar", CMD_TOGGLE_SIDEBAR),
     ("cmd.toggle_preview", CMD_TOGGLE_PREVIEW),
+    ("cmd.toggle_details", CMD_TOGGLE_DETAILS),
     ("cmd.search", CMD_SEARCH),
     ("cmd.pin", CMD_PIN),
     ("cmd.view_details", CMD_VIEW1),
     ("cmd.view_icons", CMD_VIEW1 + 1),
     ("cmd.view_thumbnails", CMD_VIEW1 + 2),
+    ("cmd.view_extra_large", CMD_VIEW_XL),
+    ("cmd.view_medium", CMD_VIEW_MEDIUM),
+    ("cmd.view_small", CMD_VIEW_SMALL),
+    ("cmd.view_list", CMD_VIEW_LIST),
+    ("cmd.view_tiles", CMD_VIEW_TILES),
+    ("cmd.view_content", CMD_VIEW_CONTENT),
+    ("cmd.new_folder", CMD_NEW_FOLDER),
+    ("cmd.open_tab", CMD_OPEN_TAB),
+    ("cmd.fullscreen", CMD_FULLSCREEN),
+    ("cmd.invert_selection", CMD_INVERT),
+    ("cmd.next_pane", CMD_FOCUS_NEXT),
+    ("cmd.prev_pane", CMD_FOCUS_PREV),
+    ("cmd.new_window", CMD_NEW_WINDOW),
+    ("cmd.undo", CMD_UNDO),
+    ("cmd.redo", CMD_REDO),
+    ("cmd.copy_path", CMD_COPY_PATH),
+    ("cmd.fit_columns", CMD_FIT_COLUMNS),
 ];
 
 /// `Ctrl+Shift+X`, `F5`, `Alt+Left`: (modifier flags, virtual key); None when it is not one of those.
@@ -88,7 +106,8 @@ pub fn apply(defaults: &[ACCEL], overrides: &[(String, String)]) -> Vec<ACCEL> {
             .map(|(flags, key)| ACCEL { fVirt: ACCEL_VIRT_FLAGS(FVIRTKEY.0 | flags), key: key.0, cmd })
             .collect();
         if !chords.is_empty() {
-            table.retain(|a| a.cmd != cmd);
+            // A user's chord wins over another command's default.
+            table.retain(|a| a.cmd != cmd && !chords.iter().any(|c| c.fVirt == a.fVirt && c.key == a.key));
             table.extend(chords);
         }
     }
@@ -123,5 +142,101 @@ mod tests {
         assert_eq!(of(CMD_CLOSE_TAB).len(), 1);
         let t = apply(&defaults, &[("cmd.address".into(), "Ctrl+L, Alt+D, nope".into())]);
         assert_eq!(t.iter().filter(|a| a.cmd == CMD_ADDRESS).count(), 2);
+    }
+
+    #[test]
+    fn explorer_view_chords() {
+        let t = apply(&ACCELS, &[]);
+        let want = [CMD_VIEW_XL, CMD_VIEW1 + 1, CMD_VIEW_MEDIUM, CMD_VIEW_SMALL, CMD_VIEW_LIST, CMD_VIEW1, CMD_VIEW_TILES, CMD_VIEW_CONTENT];
+        for (i, cmd) in want.into_iter().enumerate() {
+            let key = VK_1.0 + i as u16;
+            let on: Vec<u16> = t.iter().filter(|a| a.fVirt.0 == FVIRTKEY.0 | FCONTROL.0 | FSHIFT.0 && a.key == key).map(|a| a.cmd).collect();
+            assert_eq!(on, [cmd], "Ctrl+Shift+{}", i + 1);
+        }
+        assert!(!t.iter().any(|a| a.cmd == CMD_VIEW1 + 2), "Thumbnails has no default chord");
+        let t = apply(&ACCELS, &[("cmd.view_small".into(), "Ctrl+Alt+S".into())]);
+        assert_eq!(t.iter().filter(|a| a.cmd == CMD_VIEW_SMALL).count(), 1);
+    }
+
+    #[test]
+    fn new_view_commands_are_rebindable() {
+        let of = |t: &[ACCEL], cmd: u16| t.iter().filter(|a| a.cmd == cmd).map(|a| (a.fVirt.0, a.key)).collect::<Vec<_>>();
+        let t = apply(&ACCELS, &[("cmd.view_tiles".into(), "Ctrl+Alt+T".into())]);
+        assert_eq!(of(&t, CMD_VIEW_TILES), [(FVIRTKEY.0 | FCONTROL.0 | FALT.0, VK_T.0)]);
+        assert!(!t.iter().any(|a| a.fVirt.0 == FVIRTKEY.0 | FCONTROL.0 | FSHIFT.0 && a.key == VK_7.0));
+        let t = apply(&ACCELS, &[("cmd.view_thumbnails".into(), "Ctrl+Shift+3".into())]);
+        assert_eq!(of(&t, CMD_VIEW1 + 2), [(FVIRTKEY.0 | FCONTROL.0 | FSHIFT.0, VK_3.0)]);
+        assert!(of(&t, CMD_VIEW_MEDIUM).is_empty());
+        for (name, cmd) in [("cmd.view_list", CMD_VIEW_LIST), ("cmd.view_content", CMD_VIEW_CONTENT)] {
+            let t = apply(&ACCELS, &[(name.into(), "Ctrl+Alt+K".into())]);
+            assert_eq!(of(&t, cmd), [(FVIRTKEY.0 | FCONTROL.0 | FALT.0, VK_K.0)], "{name}");
+        }
+    }
+
+    #[test]
+    fn details_pane_chord() {
+        let t = apply(&ACCELS, &[]);
+        let has = |flags: u8, key: VIRTUAL_KEY, cmd: u16| t.iter().any(|a| a.fVirt.0 == FVIRTKEY.0 | flags && a.key == key.0 && a.cmd == cmd);
+        assert!(has(FALT.0 | FSHIFT.0, VK_P, CMD_TOGGLE_DETAILS));
+        assert!(has(FALT.0, VK_P, CMD_TOGGLE_PREVIEW));
+        let t = apply(&ACCELS, &[("cmd.toggle_details".into(), "Ctrl+Alt+D".into())]);
+        let d: Vec<_> = t.iter().filter(|a| a.cmd == CMD_TOGGLE_DETAILS).map(|a| (a.fVirt.0, a.key)).collect();
+        assert_eq!(d, vec![(FVIRTKEY.0 | FCONTROL.0 | FALT.0, VK_D.0)]);
+    }
+
+    #[test]
+    fn batch_c_chords() {
+        let t = apply(&ACCELS, &[]);
+        let has = |flags: u8, key: VIRTUAL_KEY, cmd: u16| t.iter().any(|a| a.fVirt.0 == FVIRTKEY.0 | flags && a.key == key.0 && a.cmd == cmd);
+        assert!(has(FCONTROL.0 | FSHIFT.0, VK_C, CMD_COPY_PATH));
+        assert!(has(FCONTROL.0, VK_ADD, CMD_FIT_COLUMNS));
+        assert!(has(0, VK_TAB, CMD_FOCUS_NEXT) && has(FSHIFT.0, VK_TAB, CMD_FOCUS_PREV));
+        assert!(has(0, VK_F6, CMD_FOCUS_NEXT) && has(FSHIFT.0, VK_F6, CMD_FOCUS_PREV), "F6 stays");
+        assert!(!t.iter().any(|a| a.fVirt.0 == FVIRTKEY.0 | FCONTROL.0 && a.key == VK_C.0), "plain Ctrl+C is the list's own key");
+        let t = apply(&ACCELS, &[("cmd.copy_path".into(), "Alt+C".into())]);
+        let c: Vec<_> = t.iter().filter(|a| a.cmd == CMD_COPY_PATH).map(|a| (a.fVirt.0, a.key)).collect();
+        assert_eq!(c, vec![(FVIRTKEY.0 | FALT.0, VK_C.0)]);
+        let t = apply(&ACCELS, &[("cmd.fit_columns".into(), "Alt+F".into())]);
+        assert_eq!(t.iter().filter(|a| a.cmd == CMD_FIT_COLUMNS).count(), 1);
+    }
+
+    #[test]
+    fn rename_edits_keep_tab() {
+        use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, MSG, WINDOW_EX_STYLE, WM_KEYDOWN, WS_CHILD, WS_OVERLAPPEDWINDOW};
+        unsafe {
+            let parent = CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR::null(), WS_OVERLAPPEDWINDOW, 0, 0, 200, 100, None, None, None, None).unwrap();
+            let edit = CreateWindowExW(WINDOW_EX_STYLE(0), w!("EDIT"), PCWSTR::null(), WS_CHILD, 0, 0, 100, 20, Some(parent), None, None, None).unwrap();
+            let msg = |hwnd, vk: VIRTUAL_KEY| MSG { hwnd, message: WM_KEYDOWN, wParam: WPARAM(vk.0 as usize), ..Default::default() };
+            assert!(crate::edit_keeps_tab(&msg(edit, VK_TAB)), "a rename edit in the tree or the embedded view commits on Tab");
+            assert!(!crate::edit_keeps_tab(&msg(edit, VK_F5)));
+            assert!(!crate::edit_keeps_tab(&msg(parent, VK_TAB)), "Tab moves on from the panes themselves");
+            let _ = DestroyWindow(parent);
+        }
+    }
+
+    #[test]
+    fn no_duplicate_default_chords() {
+        for (i, a) in ACCELS.iter().enumerate() {
+            assert!(!ACCELS[..i].iter().any(|b| b.fVirt == a.fVirt && b.key == a.key), "chord of command {} repeats", a.cmd);
+        }
+    }
+
+    #[test]
+    fn undo_redo_chords() {
+        let t = apply(&ACCELS, &[]);
+        let has = |key: VIRTUAL_KEY, cmd: u16| t.iter().any(|a| a.fVirt.0 == FVIRTKEY.0 | FCONTROL.0 && a.key == key.0 && a.cmd == cmd);
+        assert!(has(VK_Z, CMD_UNDO) && has(VK_Y, CMD_REDO));
+        let t = apply(&ACCELS, &[("cmd.undo".into(), "Alt+Z".into())]);
+        let u: Vec<_> = t.iter().filter(|a| a.cmd == CMD_UNDO).map(|a| (a.fVirt.0, a.key)).collect();
+        assert_eq!(u, vec![(FVIRTKEY.0 | FALT.0, VK_Z.0)]);
+    }
+
+    #[test]
+    fn user_chord_wins_over_a_default() {
+        let t = apply(&ACCELS, &[("cmd.new_tab".into(), "Ctrl+Y".into())]);
+        assert!(!t.iter().any(|a| a.cmd == CMD_REDO && a.key == VK_Y.0 && a.fVirt.0 == FVIRTKEY.0 | FCONTROL.0));
+        let y: Vec<_> = t.iter().filter(|a| a.key == VK_Y.0 && a.fVirt.0 == FVIRTKEY.0 | FCONTROL.0).collect();
+        assert_eq!(y.len(), 1);
+        assert_eq!(y[0].cmd, CMD_NEW_TAB);
     }
 }
