@@ -90,7 +90,7 @@ dialogs and results are the shell's own.
 | Back / forward history dropdown | UNVERIFIED | `nav.rs` | Built 2026-11-09: right-click Back or Forward. Press-and-hold: no. |
 | F5 | UNVERIFIED | `main.rs:163` | |
 | F4 focuses the address | WORKS | `main.rs` ACCELS | 2026-11-09: an F4 key message moves the focus to the address edit. No dropdown list as in Explorer. |
-| F6 / Tab between panes | WORKS | `ui.rs` | 2026-11-09: F6 key messages go list, address, search, list. Shift+F6, the tree and Home not checked. Sidebar still has no keyboard focus ([#22](https://github.com/CodingDiego/rexplorer/issues/22)). |
+| F6 / Tab between panes | WORKS | `ui.rs` `cycle_focus` | 2026-11-10: F6 and Tab key messages go list, address, search, sidebar, tab strip, list. Shift+F6 and Shift+Tab not pressed. Tab in a rename box still renames the next item. |
 | Ctrl+N new window | WORKS | `instance.rs` `open_new_window`, `--new-window` | 2026-11-09: the command opened a second process on the same folder; closing it changed no settings file. That window saves no tabs, placement or recents. The chord itself was not pressed. |
 | Ctrl+Enter opens in a new tab | UNVERIFIED | `main.rs` `CMD_OPEN_TAB`, `nav.rs` `activate_or_tab` | The command runs without error, the new tab was not confirmed. Ctrl+double-click built 2026-11-09: opens a background tab (Explorer opens a window). |
 
@@ -100,14 +100,14 @@ dialogs and results are the shell's own.
 |---|---|---|---|
 | Details | UNVERIFIED | `views.rs:268` | |
 | Icons in four sizes | UNVERIFIED | `views.rs` | Extra large, Large, Medium and Small built 2026-11-09. |
-| List, Tiles, Content | MISSING | | |
-| Ctrl+wheel changes icon size | UNVERIFIED | `views.rs` | Built 2026-11-09: one view per notch. |
+| List, Tiles, Content | WORKS | `views.rs` | 2026-11-10: all nine views switch on the exe by command, items intact, F2 selects the name only. Content is a wide tile with three lines, not Explorer's layout. List shows no groups (the control cannot). |
+| Ctrl+wheel changes icon size | UNVERIFIED | `views.rs` | All nine views in Explorer's order since 2026-11-10; a real wheel was not turned. |
 | Click a column to sort | UNVERIFIED | `list.rs:132` | |
 | Choose columns | UNVERIFIED | `folder.rs`, `commands.rs` `column_menu` | Built 2026-11-09: right-click the header. No "More..." and no "Size column to fit". |
 | Column widths and order remembered | UNVERIFIED | `session.rs` `folders.txt` | Built 2026-11-09: kept per folder on disk. |
 | Group by | UNVERIFIED | `nav.rs`, `commands.rs` | Built 2026-11-09: any shown column. A text column on a very large folder can pause the window. |
 | Each folder remembers its view | UNVERIFIED | `session.rs` `folders.txt` | Built 2026-11-09: view, sort, group and columns, kept across restarts. |
-| Ctrl+Shift+1..8 | PARTIAL | `main.rs` | 1 to 3 keep rexplorer's meaning (Details, Large icons, Thumbnails); 4 is Small and 6 is Details since 2026-11-09. |
+| Ctrl+Shift+1..8 | UNVERIFIED | `main.rs` `ACCELS` | Explorer's meaning since 2026-11-10: extra large, large, medium, small, list, details, tiles, content. Thumbnails has no default chord. The chords were not pressed. |
 
 ## 8. Search
 
@@ -126,7 +126,7 @@ dialogs and results are the shell's own.
 | Item menu, background menu, Shift for extended verbs | UNVERIFIED | `list.rs:402`, `menu.rs:59-86` | |
 | Open with, Send to | UNVERIFIED | `menu.rs:293` | [#46](https://github.com/CodingDiego/rexplorer/issues/46) |
 | Windows 11 app entries (Open in Terminal, Open with Code) | UNVERIFIED | `packaged.rs:295` | Uncommitted; skipped over 16 items. |
-| Shift+F10, Menu key | UNVERIFIED | `list.rs:816` | |
+| Shift+F10, Menu key | UNVERIFIED | `list.rs`, `sidebar.rs`, `tabs.rs` | Also in the sidebar and the tab strip since 2026-11-10. |
 | Properties, Alt+Enter | UNVERIFIED | `main.rs:169` | |
 | Enter / double-click opens | UNVERIFIED | `source.rs:397` | |
 | Run as administrator | PARTIAL | | Only through the shell menu. |
@@ -136,7 +136,7 @@ dialogs and results are the shell's own.
 
 | Explorer behaviour | Status | Evidence | Note |
 |---|---|---|---|
-| Quick access, This PC, drives, Network | UNVERIFIED | `panes.rs:418-457` | Mouse only. |
+| Quick access, This PC, drives, Network | UNVERIFIED | `panes.rs`, `sidebar.rs` | Keyboard since 2026-11-10: arrows, Home, End, PgUp, PgDn, Enter, Esc, type-ahead, Shift+F10 ([#22](https://github.com/CodingDiego/rexplorer/issues/22)). |
 | Folder tree that follows the current folder | PARTIAL | `tree.rs:60`, `panes.rs:98` | Off by default; replaces the sidebar. |
 | Libraries | UNVERIFIED | `panes.rs` | Built 2026-11-09: a Libraries row, and Recycle Bin under Favorites. |
 | Ctrl+T, Ctrl+W, Ctrl+Tab, Ctrl+1..9 | UNVERIFIED | `main.rs:171-174` | |
@@ -148,7 +148,7 @@ dialogs and results are the shell's own.
 | Explorer behaviour | Status | Evidence | Note |
 |---|---|---|---|
 | Preview pane, Alt+P | UNVERIFIED | `panes.rs:180` | |
-| Details pane, Alt+Shift+P | MISSING | | |
+| Details pane, Alt+Shift+P | WORKS | `panes.rs` `toggle_right`, `preview_pane.rs` | 2026-11-10: on the exe by command, right text for none, one and several items; swaps with the preview pane. The chord was not pressed; network and cloud items untested. |
 | Item count in the status bar | UNVERIFIED | `ui.rs:837` | |
 | Thumbnails and file-type icons | UNVERIFIED | `images.rs:33`, `source.rs:319` | |
 | Icon overlays (shortcut arrow, OneDrive state) | UNVERIFIED | `item.rs` `overlay_slot` | Built 2026-11-09. Asked on the window thread for rows scrolled into view. |
@@ -172,22 +172,27 @@ dialogs and results are the shell's own.
 | Explorer behaviour | Status | Evidence | Note |
 |---|---|---|---|
 | Default folder handler, Win+E, `/select`, `/e` | UNVERIFIED | `register.rs:148`, `cli.rs` | Not installed since 2026-10-18. |
-| Desktop icons view | MISSING | `desktop.rs:1` | `--desktop` only replaces the desktop's menu. |
+| Desktop icons view | UNVERIFIED | `desktop_icons.rs` | Built 2026-11-10, never run: opt-in `--desktop-icons`, a bottom window on the primary monitor's work area, positions in `desktop-icons.txt`. `--desktop` still only replaces the desktop's menu. |
 | Jump list, AppUserModelID | MISSING | | |
 | F11 full screen | WORKS | `ui.rs` `toggle_fullscreen` | 2026-11-09: the command makes the window cover the monitor and a second one restores the exact placement. |
 | Follow the system light / dark setting | UNVERIFIED | `settings.rs` | Built 2026-11-09: `theme=system`. |
 | Per-monitor DPI | UNVERIFIED | `main.rs:310`, `:653` | [#33](https://github.com/CodingDiego/rexplorer/issues/33) |
-| High contrast | MISSING | | [#23](https://github.com/CodingDiego/rexplorer/issues/23) |
-| Screen reader support for the custom controls | MISSING | | [#21](https://github.com/CodingDiego/rexplorer/issues/21) |
+| High contrast | UNVERIFIED | `theme.rs` `effective_theme` | Built 2026-11-10: system colors, outlines for hover and selection, live switch. Never seen under a real contrast theme. [#23](https://github.com/CodingDiego/rexplorer/issues/23) |
+| Screen reader support for the custom controls | UNVERIFIED | `core/access.rs` | Built 2026-11-10: MSAA for Home, tabs, breadcrumb, sidebar, toolbars, palette and status bar, tested in-process. Not tried with Narrator or NVDA. [#21](https://github.com/CodingDiego/rexplorer/issues/21) |
 | Show hidden files, show extensions | UNVERIFIED | `folder_options.rs:663`, `:1087` | |
+| Copy as path, Ctrl+Shift+C | UNVERIFIED | `list.rs` `copy_as_path` | Built 2026-11-10. Not run: it writes the real clipboard. Refuses names with quotes or line breaks (archive folders). |
+| Size all columns to fit, Ctrl+numpad Plus | UNVERIFIED | `list.rs` `fit_columns` | Built 2026-11-10; widths grew on the exe by command. |
+| Esc cancels a cut | UNVERIFIED | `list.rs` `cancel_cut` | Built 2026-11-10. Not run: real clipboard. |
+| Keyboard in the tab strip and on Home | UNVERIFIED | `tabs.rs`, `home.rs` | Built 2026-11-10: Left, Right, Home, End on tabs; Shift and Ctrl with arrows, Space and type-ahead on Home. |
+| Language | UNVERIFIED | `core/i18n.rs`, `lang/es.ini` | Built 2026-11-10: English built in, Spanish shipped, `language=` in `[general]` (default: Windows' language), `lang\<code>.ini` overrides, restart to apply. Status bar seen in Spanish on the exe; dialogs not checked for clipping. |
 
 ## Order of work
 
 1. Check with a real keyboard and mouse: F2, click-again rename and dragging to other programs, in a folder and
-   on Home. Then every UNVERIFIED row built on 2026-11-09.
-2. Undo for the cases not recorded yet.
-3. Search filters, indexed search without elevation, rename and drag for archive members.
+   on Home. Then every UNVERIFIED row built on 2026-11-09 and 2026-11-10.
+2. Try `--desktop-icons`, a Windows contrast theme, and Narrator.
+3. Undo for the cases not recorded yet.
+4. Search filters, indexed search without elevation, rename and drag for archive members.
 
-Not planned for this round: screen reader support, high contrast, localization, the desktop icons view, the
-details pane, and the List / Tiles / Content views. They stay MISSING and are tracked in
-[VERSION-1-X.md](../VERSION-1-X.md).
+Deliberate differences from Explorer: Backspace goes up, Ctrl+D pins, Ctrl+Shift+E opens Explorer, F4 has no
+dropdown, F10 opens no menu bar, the breadcrumb takes no keyboard focus.

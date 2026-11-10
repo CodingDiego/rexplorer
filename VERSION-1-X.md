@@ -31,10 +31,15 @@ The README also lists the sidebar as mouse-only.
 - [ ] **[blocker] UI Automation for every custom control.** ([#21](https://github.com/CodingDiego/rexplorer/issues/21)) *Done when:* each one exposes name, role, state and
   invoke/selection patterns, and Narrator can read and operate tabs, crumbs, every toolbar button, every sidebar row,
   Home tiles and rows, and the preview caption.
+  *Status 2026-11-10:* built with MSAA (`crates/core/src/access.rs`), which Narrator reads through its bridge;
+  tested in-process only, not yet with Narrator or NVDA. The preview caption is not exposed.
 - [ ] **[blocker] Full keyboard reach.** ([#22](https://github.com/CodingDiego/rexplorer/issues/22)) *Done when:* every control is reachable with Tab/F6 and operable without a
   mouse, the sidebar included. The focus is always visible, and the README's keyboard section covers each control.
+  *Status 2026-11-10:* Tab and F6 reach the view, address, search, sidebar and tab strip, and each has keys; the
+  breadcrumb still takes no focus. Not yet pressed on a real keyboard.
 - [ ] **[blocker] High contrast.** ([#23](https://github.com/CodingDiego/rexplorer/issues/23)) *Done when:* with a Windows contrast theme on, rexplorer uses system colors
   instead of its themes, and nothing is invisible.
+  *Status 2026-11-10:* built (`theme.rs` `effective_theme`); never seen under a real contrast theme.
 - [ ] **[should] Text scaling.** ([#24](https://github.com/CodingDiego/rexplorer/issues/24)) *Done when:* Windows "Text size" (Accessibility > Text size) up to 225% gives no clipped or
   overlapping text.
 - [ ] **[should] An accessibility check in the smoke test.** ([#25](https://github.com/CodingDiego/rexplorer/issues/25)) *Done when:* an automated pass walks the UIA tree and fails on unnamed
@@ -77,8 +82,9 @@ The README also lists the sidebar as mouse-only.
 
 ## 5. Localization
 
-rexplorer's own strings are English-only and in the code. Sizes, dates and item names already come from the shell
-in the user's language, so a Spanish Windows shows "Nueva carpeta" next to English menus.
+Since 2026-11-10 rexplorer's own strings come from a table (`crates/core/src/i18n.rs`, 220 keys): English built
+in, Spanish shipped, `lang\<code>.ini` to add a language. Command line, install and register messages are still
+English. Spanish dialogs have not been checked for clipped text. The two items below stay open until that check.
 
 - [ ] **[blocker] Externalized strings.** ([#37](https://github.com/CodingDiego/rexplorer/issues/37)) *Done when:* every user-visible string comes from a resource table, and a
   missing translation falls back to English.
