@@ -333,7 +333,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rexplorer-dragdrop-{}-{tag}", std::process::id()));
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("a.txt"), b"x").unwrap();
-        Fixture(dir)
+        // The shell answers with long names; %TEMP% can be a short one (RUNNER~1 on CI).
+        let long = std::fs::canonicalize(&dir).unwrap();
+        Fixture(std::path::PathBuf::from(long.to_string_lossy().trim_start_matches(r"\\?\")))
     }
 
     /// A shell target whose Drop pumps messages (the right-drag menu, a copy's progress) while another drag
