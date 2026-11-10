@@ -210,7 +210,8 @@ Every change is written to the active profile in settings.ini and applies at onc
 | Ctrl+Z, Ctrl+Y | Undo, redo: rename, new items, delete to the Recycle Bin, paste, drops on the list |
 | Ctrl+I | Invert the selection |
 | F4, F3 / Ctrl+E | Address, search box |
-| F6, Shift+F6 | Next, previous pane (view, address, search, sidebar or tree, tab strip) |
+| F6, Shift+F6 | Next, previous pane (view, breadcrumb, address, search, sidebar or tree, tab strip) |
+| Breadcrumb focused | Left, Right, Home, End move along the path; Enter goes there; Down, Alt+Down or Space opens that folder's list; Esc returns to the view |
 | F11 | Full screen |
 | Right-click a column header | Choose columns |
 | Right-click Back / Forward | History menu |
@@ -508,7 +509,8 @@ for the custom controls, not tried with Narrator). The list below holds the gaps
 
 Language: rexplorer's own text is English or Spanish, following Windows; `language=es` (or `en`, `system`) under
 `[general]` in `settings.ini` chooses, and a `lang\<code>.ini` file of `key=text` lines in the settings folder
-overrides or adds a language. A restart applies it. Command line, install and register messages stay English.
+overrides or adds a language. A restart applies it. `--help`, argument errors and the install, uninstall and
+register messages follow it too (the `cli.*`, `inst.*` and `reg.*` keys).
 
 Known and not fixed: a few internal window messages carry a pointer (the accessibility tree request
 `WM_APP+0x3F00`, the pane's worker results), so another program running as the same user at the same integrity
@@ -516,7 +518,7 @@ level can crash rexplorer by sending one with a bad value. Windows blocks lower-
 at the same level could already inject code, so this is a robustness gap, not a privilege boundary.
 
 Where rexplorer differs from Explorer on purpose: Backspace goes up, Ctrl+D pins, Ctrl+Shift+E opens Explorer,
-F4 has no dropdown, F10 opens no menu bar, the breadcrumb takes no keyboard focus.
+F4 has no dropdown and F10 opens no menu bar. Crumbs hidden behind the breadcrumb's "..." are reachable by mouse only.
 
 - Archive members show placeholders in the icons and thumbnails views, have no preview, and cannot be dragged,
   sorted by column or renamed. Search results have no thumbnails or preview.

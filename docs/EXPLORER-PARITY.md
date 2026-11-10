@@ -90,7 +90,7 @@ dialogs and results are the shell's own.
 | Back / forward history dropdown | UNVERIFIED | `nav.rs` | Built 2026-11-09: right-click Back or Forward. Press-and-hold: no. |
 | F5 | UNVERIFIED | `main.rs:163` | |
 | F4 focuses the address | WORKS | `main.rs` ACCELS | 2026-11-09: an F4 key message moves the focus to the address edit. No dropdown list as in Explorer. |
-| F6 / Tab between panes | WORKS | `ui.rs` `cycle_focus` | 2026-11-10: F6 and Tab key messages go list, address, search, sidebar, tab strip, list. Shift+F6 and Shift+Tab not pressed. Tab in a rename box still renames the next item. |
+| F6 / Tab between panes | WORKS | `ui.rs` `cycle_focus` | 2026-11-10: F6 and Tab key messages go list, breadcrumb, address, search, sidebar, tab strip, list. On the breadcrumb Left then Enter went to the parent folder; its dropdown on Down was not opened. Shift+F6 and Shift+Tab not pressed. Tab in a rename box still renames the next item. |
 | Ctrl+N new window | WORKS | `instance.rs` `open_new_window`, `--new-window` | 2026-11-09: the command opened a second process on the same folder; closing it changed no settings file. That window saves no tabs, placement or recents. The chord itself was not pressed. |
 | Ctrl+Enter opens in a new tab | UNVERIFIED | `main.rs` `CMD_OPEN_TAB`, `nav.rs` `activate_or_tab` | The command runs without error, the new tab was not confirmed. Ctrl+double-click built 2026-11-09: opens a background tab (Explorer opens a window). |
 
@@ -184,7 +184,7 @@ dialogs and results are the shell's own.
 | Size all columns to fit, Ctrl+numpad Plus | UNVERIFIED | `list.rs` `fit_columns` | Built 2026-11-10; widths grew on the exe by command. |
 | Esc cancels a cut | UNVERIFIED | `list.rs` `cancel_cut` | Built 2026-11-10. Not run: real clipboard. |
 | Keyboard in the tab strip and on Home | UNVERIFIED | `tabs.rs`, `home.rs` | Built 2026-11-10: Left, Right, Home, End on tabs; Shift and Ctrl with arrows, Space and type-ahead on Home. |
-| Language | UNVERIFIED | `core/i18n.rs`, `lang/es.ini` | Built 2026-11-10: English built in, Spanish shipped, `language=` in `[general]` (default: Windows' language), `lang\<code>.ini` overrides, restart to apply. Status bar seen in Spanish on the exe; dialogs not checked for clipping. |
+| Language | UNVERIFIED | `core/i18n.rs`, `lang/es.ini` | Built 2026-11-10: English built in, Spanish shipped, `language=` in `[general]` (default: Windows' language), `lang\<code>.ini` overrides, restart to apply. `--help`, argument errors and the install, uninstall and register messages follow it too. Status bar seen in Spanish on the exe; dialogs not checked for clipping. |
 
 ## Order of work
 
@@ -195,4 +195,4 @@ dialogs and results are the shell's own.
 4. Search filters, indexed search without elevation, rename and drag for archive members.
 
 Deliberate differences from Explorer: Backspace goes up, Ctrl+D pins, Ctrl+Shift+E opens Explorer, F4 has no
-dropdown, F10 opens no menu bar, the breadcrumb takes no keyboard focus.
+dropdown, and F10 opens no menu bar.
