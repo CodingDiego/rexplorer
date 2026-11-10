@@ -10,8 +10,8 @@ pub const EN: &str = include_str!("lang/en.ini");
 pub const ES: &str = include_str!("lang/es.ini");
 pub const BUILTIN: [(&str, &str); 2] = [("en", EN), ("es", ES)];
 /// First segment of every key.
-pub const AREAS: [&str; 16] =
-    ["menu", "tb", "status", "group", "col", "home", "side", "fo", "conn", "pal", "preview", "tabs", "desk", "dlg", "err", "num"];
+pub const AREAS: [&str; 19] =
+    ["menu", "tb", "status", "group", "col", "home", "side", "fo", "conn", "pal", "preview", "tabs", "desk", "dlg", "err", "num", "cli", "inst", "reg"];
 
 pub struct Table {
     map: HashMap<String, String>,

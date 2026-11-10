@@ -22,6 +22,7 @@ use windows::Win32::UI::Shell::{
 use windows::core::{Error, HSTRING, Interface, PCWSTR, Result, w};
 
 use crate::com::{ComInit, take_cotaskmem_string};
+use crate::i18n::{tr, trf};
 use crate::register::{self, delete_empty, is_foreign, key_exists, read_sz, remove_if_ours, set_sz};
 
 /// The real registry base, relative to HKCU.
@@ -57,24 +58,22 @@ pub fn is_installed(dir: &Path) -> bool {
 /// What `install` changes, for the confirmation dialog.
 pub fn plan(dir: &Path, reg_base: &str) -> String {
     let c = classes(reg_base);
+    let ex = "explorer.exe";
     let mut s = format!(
-        "Copy rexplorer to {}\n\n\
-         Open folders, drives, Win+E, the taskbar's and Start's File Explorer with it:\n\
+        "{}\n\n{}\n\
          HKCU\\{c}\\{{Folder, Directory, Drive}}\\shell\\open\\command\n\
          HKCU\\{c}\\CLSID\\{}\\shell\\{{open, opennewwindow}}\\command\n\n\
-         Answer programs that start explorer.exe by name:\nHKCU\\{}\n",
-        dir.join(EXE).display(),
+         {}\nHKCU\\{}\n",
+        trf("inst.plan.copy", &[("path", &dir.join(EXE).display())]),
+        tr("inst.plan.open"),
         register::EXPLORER_CLSID,
+        trf("inst.plan.app_paths", &[("explorer", &ex)]),
         app_paths(reg_base)
     );
     if reg_base == REAL_REG_BASE {
-        s.push_str("\nAdd rexplorer to the Start menu, and show its context menu on the desktop from now on (a small helper \
-                    that starts at sign-in).\n");
+        s.push_str(&format!("\n{}\n", tr("inst.plan.start")));
     }
-    s.push_str(
-        "\nPer-user only: nothing under HKLM changes and no elevation is needed. The desktop itself, the taskbar and \
-         other programs' Open / Save dialogs stay Explorer's. Undo with rexplorer --uninstall or More > Uninstall.",
-    );
+    s.push_str(&format!("\n{}", trf("inst.plan.footer", &[("explorer", &ex), ("undo", &"rexplorer --uninstall")])));
     s
 }
 
@@ -162,7 +161,7 @@ impl Rollback {
         let created: Vec<&Path> = dir.ancestors().take_while(|d| !d.as_os_str().is_empty() && !d.exists()).collect();
         self.0.extend(created.into_iter().rev().map(|d| Undo::Dir(d.to_path_buf())));
         step("dir")?;
-        std::fs::create_dir_all(dir).map_err(|e| fail(format!("Cannot create {}: {e}", dir.display())))
+        std::fs::create_dir_all(dir).map_err(|e| fail(trf("inst.err.create_dir", &[("path", &dir.display()), ("error", &e)])))
     }
 
     /// Writes `path` with `write`, first moving an existing file aside to `<path>.bak` (renaming works even for a
@@ -172,7 +171,7 @@ impl Rollback {
             let bak = backup_of(path);
             let _ = std::fs::remove_file(&bak);
             // The rename is atomic, so it is journaled once done: an undo for a failed rename would delete `path`.
-            std::fs::rename(path, &bak).map_err(|e| fail(format!("Cannot move {} aside: {e}", path.display())))?;
+            std::fs::rename(path, &bak).map_err(|e| fail(trf("inst.err.move_aside", &[("path", &path.display()), ("error", &e)])))?;
             Some(bak)
         } else {
             None
@@ -204,31 +203,31 @@ impl Rollback {
             let (ok, what) = match u {
                 Undo::Value { key, name, prior } => {
                     let (k, n) = (HSTRING::from(&key), HSTRING::from(name));
-                    let name = if name.is_empty() { "(default)" } else { name };
+                    let name = if name.is_empty() { tr("inst.undo.default_value") } else { name };
                     match prior {
                         Some(v) => (
                             set_sz(&k, PCWSTR(n.as_ptr()), &v).is_ok(),
-                            format!("HKCU\\{key} {name}: set it back to \"{v}\""),
+                            trf("inst.undo.set_back", &[("key", &format!("HKCU\\{key}")), ("name", &name), ("value", &v)]),
                         ),
                         None => {
                             let err = unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, &k, PCWSTR(n.as_ptr())) };
                             let ok = err.is_ok() || err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND;
-                            (ok, format!("HKCU\\{key} {name}: delete it"))
+                            (ok, trf("inst.undo.delete", &[("key", &format!("HKCU\\{key}")), ("name", &name)]))
                         }
                     }
                 }
-                Undo::Key(k) => (!key_exists(&k) || delete_empty(&k), format!("HKCU\\{k}: delete it once empty")),
+                Undo::Key(k) => (!key_exists(&k) || delete_empty(&k), trf("inst.undo.delete_key", &[("key", &format!("HKCU\\{k}"))])),
                 Undo::Dir(d) => {
-                    (!d.exists() || std::fs::remove_dir(&d).is_ok(), format!("{}: delete it once empty", d.display()))
+                    (!d.exists() || std::fs::remove_dir(&d).is_ok(), trf("inst.undo.delete_dir", &[("path", &d.display())]))
                 }
                 Undo::File { path, backup } => {
                     let gone = !path.exists() || std::fs::remove_file(&path).is_ok();
                     match backup {
                         Some(b) => (
                             gone && std::fs::rename(&b, &path).is_ok(),
-                            format!("{}: replace it with {}", path.display(), b.display()),
+                            trf("inst.undo.restore_file", &[("path", &path.display()), ("backup", &b.display())]),
                         ),
-                        None => (gone, format!("{}: delete it", path.display())),
+                        None => (gone, trf("inst.undo.delete_file", &[("path", &path.display())])),
                     }
                 }
             };
@@ -238,9 +237,9 @@ impl Rollback {
         }
         register::notify();
         if failed.is_empty() {
-            Ok("Rolled back: everything is as it was before the install.".to_string())
+            Ok(tr("inst.rolled_back").to_string())
         } else {
-            Err(fail(format!("Roll back could not restore these; fix them by hand:\n\n{}", failed.join("\n"))))
+            Err(fail(trf("inst.rollback_failed", &[("list", &failed.join("\n"))])))
         }
     }
 }
@@ -283,10 +282,10 @@ fn apply(dir: &Path, reg_base: &str, journal: &mut Rollback) -> Result<String> {
     let classes = classes(reg_base);
     let ap = app_paths(reg_base);
     if let Some(k) = register::foreign_override(&classes) {
-        return Err(fail(format!("Another program already overrides HKCU\\{k}; nothing was changed.")));
+        return Err(fail(trf("inst.err.overrides", &[("key", &format!("HKCU\\{k}"))])));
     }
     if is_foreign(&HSTRING::from(&ap)) {
-        return Err(fail(format!("Another program already answers HKCU\\{ap}; nothing was changed.")));
+        return Err(fail(trf("inst.err.answers", &[("key", &format!("HKCU\\{ap}"))])));
     }
     let target = dir.join(EXE);
     let commands: Vec<String> = register::command_keys(&classes).into_iter().map(|(k, _)| k.to_string()).collect();
@@ -305,13 +304,13 @@ fn apply(dir: &Path, reg_base: &str, journal: &mut Rollback) -> Result<String> {
             push(&mut rec, format!("dir {}", dir.display()));
             journal.create_dir(dir)?;
         }
-        let src = std::env::current_exe().map_err(|e| fail(format!("Cannot find the running exe: {e}")))?;
+        let src = std::env::current_exe().map_err(|e| fail(trf("inst.err.no_exe", &[("error", &e)])))?;
         push(&mut rec, format!("file {}", target.display()));
         if !same_file(&src, &target) {
             let copy = || std::fs::copy(&src, &target).map(|_| ());
-            journal.file(&target, || copy().map_err(|e| fail(format!("Cannot copy to {}: {e}", target.display()))))?;
+            journal.file(&target, || copy().map_err(|e| fail(trf("inst.err.copy", &[("path", &target.display()), ("error", &e)]))))?;
         }
-        summary.push(format!("Copied to {}", target.display()));
+        summary.push(trf("inst.sum.copied", &[("path", &target.display())]));
         for k in &commands {
             push(&mut rec, format!("value {k}"));
         }
@@ -319,21 +318,21 @@ fn apply(dir: &Path, reg_base: &str, journal: &mut Rollback) -> Result<String> {
             journal.set(&k.to_string(), name, &value)?;
         }
         register::notify();
-        summary.push("Folders, drives and Win+E open rexplorer".to_string());
+        summary.push(tr("inst.sum.open").to_string());
         push(&mut rec, format!("value {ap}"));
         journal.set(&ap, "", &target.display().to_string())?;
         journal.set(&ap, "Path", &dir.display().to_string())?;
-        summary.push("Programs that start explorer.exe by name get rexplorer".to_string());
+        summary.push(trf("inst.sum.app_paths", &[("explorer", &"explorer.exe")]));
         // Under a test base the real Start menu is left alone.
         if reg_base == REAL_REG_BASE {
             let lnk = known_folder(&FOLDERID_Programs)?.join("rexplorer.lnk");
             push(&mut rec, format!("file {}", lnk.display()));
             journal.file(&lnk, || shortcut(&target, "", &lnk))?;
-            summary.push("Start menu shortcut added".to_string());
+            summary.push(tr("inst.sum.start_menu").to_string());
             let lnk = known_folder(&FOLDERID_Startup)?.join("rexplorer desktop menu.lnk");
             push(&mut rec, format!("file {}", lnk.display()));
             journal.file(&lnk, || shortcut(&target, "--desktop", &lnk))?;
-            summary.push("The desktop shows rexplorer's context menu (started now and at every sign-in)".to_string());
+            summary.push(tr("inst.sum.desktop").to_string());
         }
         Ok(())
     })();
@@ -341,7 +340,7 @@ fn apply(dir: &Path, reg_base: &str, journal: &mut Rollback) -> Result<String> {
     let record = dir.join(RECORD);
     let wrote = journal.file(&record, || {
         std::fs::write(&record, rec.join("\n") + "\n")
-            .map_err(|e| fail(format!("Cannot write {}: {e}", record.display())))
+            .map_err(|e| fail(trf("inst.err.write", &[("path", &record.display()), ("error", &e)])))
     });
     result?;
     wrote?;
@@ -354,7 +353,7 @@ fn apply(dir: &Path, reg_base: &str, journal: &mut Rollback) -> Result<String> {
 pub fn uninstall(dir: &Path) -> Result<String> {
     let rec = read_record(dir);
     if rec.is_empty() {
-        return Err(fail(format!("rexplorer is not installed in {} (no {RECORD}).", dir.display())));
+        return Err(fail(trf("inst.err.not_installed", &[("dir", &dir.display()), ("record", &RECORD)])));
     }
     let lines = |kind: &str| -> Vec<String> {
         rec.iter().filter_map(|l| l.strip_prefix(kind).and_then(|r| r.strip_prefix(' ')).map(str::to_string)).collect()
@@ -362,7 +361,7 @@ pub fn uninstall(dir: &Path) -> Result<String> {
     let mut summary = vec![];
     for k in lines("value") {
         if !remove_if_ours(&HSTRING::from(&k))? {
-            summary.push(format!("Left HKCU\\{k}: another program changed it"));
+            summary.push(trf("inst.un.left", &[("key", &format!("HKCU\\{k}"))]));
         }
     }
     let mut keys = lines("key");
@@ -371,7 +370,7 @@ pub fn uninstall(dir: &Path) -> Result<String> {
         delete_empty(k);
     }
     register::notify();
-    summary.insert(0, "Folders, drives, Win+E and explorer.exe open Windows Explorer again".to_string());
+    summary.insert(0, trf("inst.un.restored", &[("explorer", &"explorer.exe")]));
     let exe = dir.join(EXE);
     for f in lines("file").iter().map(PathBuf::from).filter(|f| *f != exe) {
         let _ = std::fs::remove_file(f);
@@ -381,13 +380,13 @@ pub fn uninstall(dir: &Path) -> Result<String> {
         // Running: it can still be moved out of the way; the next rexplorer start deletes it.
         let aside = std::env::temp_dir().join(format!("rexplorer-{}.old", std::process::id()));
         if std::fs::rename(&exe, &aside).is_err() {
-            summary.push(format!("Close rexplorer, then delete {}", exe.display()));
+            summary.push(trf("inst.un.close", &[("path", &exe.display())]));
         }
     }
     for d in lines("dir") {
         let _ = std::fs::remove_dir(d);
     }
-    summary.push(format!("Removed {}", exe.display()));
+    summary.push(trf("inst.un.removed", &[("path", &exe.display())]));
     Ok(summary.join("\n"))
 }
 
@@ -515,6 +514,36 @@ mod tests {
         failed.rollback.run().unwrap();
         assert_eq!(s.registry(), before);
         assert!(!key_exists(&app_paths(&s.base)) && !s.dir.exists());
+    }
+
+    #[test]
+    fn plan_and_summaries_keep_paths_and_commands_verbatim() {
+        let dir = Path::new(r"C:\x\app");
+        let real = plan(dir, REAL_REG_BASE);
+        for want in [r"Copy rexplorer to C:\x\app\rexplorer.exe", r"HKCU\Software\Classes\{Folder, Directory, Drive}\shell\open\command", register::EXPLORER_CLSID, r"HKCU\Software\Microsoft\Windows\CurrentVersion\App Paths\explorer.exe", "Start menu", "rexplorer --uninstall", "HKLM"] {
+            assert!(real.contains(want), "{want}\n{real}");
+        }
+        assert!(!plan(dir, r"Software\rexplorer-test").contains("Start menu"), "a test base leaves the Start menu alone");
+        let s = Scratch::new("summary");
+        let sum = install(&s.dir, &s.base).unwrap();
+        assert!(sum.starts_with("Copied to ") && sum.contains("Programs that start explorer.exe by name get rexplorer"), "{sum}");
+        let un = uninstall(&s.dir).unwrap();
+        assert!(un.contains("open Windows Explorer again") && un.contains("Removed "), "{un}");
+        let err = uninstall(&s.dir).unwrap_err().message();
+        assert!(err.contains("is not installed in") && err.contains("install.txt"), "{err}");
+    }
+
+    #[test]
+    fn rollback_summary_lists_what_it_could_not_restore() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let s = Scratch::new("summary-fail");
+        let failed = s.failing_install("end");
+        // Held open without sharing, so deleting it fails and the rollback lists it.
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(s.dir.join(EXE)).unwrap();
+        let err = failed.rollback.run().unwrap_err().message();
+        drop(held);
+        assert!(err.starts_with("Roll back could not restore these; fix them by hand:"), "{err}");
+        assert!(err.contains("rexplorer.exe: delete it"), "{err}");
     }
 
     fn files(dir: &Path) -> Vec<String> {
