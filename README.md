@@ -510,6 +510,11 @@ Language: rexplorer's own text is English or Spanish, following Windows; `langua
 `[general]` in `settings.ini` chooses, and a `lang\<code>.ini` file of `key=text` lines in the settings folder
 overrides or adds a language. A restart applies it. Command line, install and register messages stay English.
 
+Known and not fixed: a few internal window messages carry a pointer (the accessibility tree request
+`WM_APP+0x3F00`, the pane's worker results), so another program running as the same user at the same integrity
+level can crash rexplorer by sending one with a bad value. Windows blocks lower-integrity senders, and a program
+at the same level could already inject code, so this is a robustness gap, not a privilege boundary.
+
 Where rexplorer differs from Explorer on purpose: Backspace goes up, Ctrl+D pins, Ctrl+Shift+E opens Explorer,
 F4 has no dropdown, F10 opens no menu bar, the breadcrumb takes no keyboard focus.
 
