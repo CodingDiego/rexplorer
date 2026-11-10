@@ -302,6 +302,9 @@ pub(crate) struct App {
 }
 
 fn main() -> Result<()> {
+    // Before the usage and argument-error boxes, so they speak the user's language too. Reads settings.ini only (a
+    // missing or unreadable file means `system`); nothing may call `tr` before this line: the first call freezes English.
+    rexplorer_core::i18n::init(&settings::dir(), &Settings::load().language, &system_language());
     let args = match cli::parse(std::env::args().skip(1)) {
         Ok(a) if a.help => return Ok(info_box(&cli::usage(), MB_ICONINFORMATION)),
         Ok(a) => a,
@@ -311,9 +314,6 @@ fn main() -> Result<()> {
         // Explorer arguments we do not handle (/idlist, URLs, apps): the real Explorer gets them verbatim.
         std::process::exit(if rexplorer_core::fallback::forward_command_line().is_ok() { 0 } else { 1 });
     }
-    // The register, install and import dialogs speak the user's language too; the usage and argument errors above stay English.
-    // Nothing before this line may call `tr` (the first call freezes English for the process).
-    rexplorer_core::i18n::init(&settings::dir(), &Settings::load().language, &system_language());
     if args.register || args.unregister {
         unsafe { ui::register_flow(None, args.unregister) };
         return Ok(());
@@ -538,7 +538,7 @@ unsafe fn pane_accel(app: *mut App, msg: &MSG, focus: HWND) -> bool {
     // The embedded Explorer view keeps Ctrl+Z / Ctrl+Y for its own undo.
     let undo_key = GetKeyState(VK_CONTROL.0 as i32) < 0 && matches!(VIRTUAL_KEY(msg.wParam.0 as u16), VK_Z | VK_Y);
     let panes = (*app).panes.tree.as_ref().is_some_and(|t| inside(t.hwnd())) || (!undo_key && source::browser_hwnd(app).is_some_and(inside));
-    focus == (*app).search || focus == (*app).sidebar || focus == (*app).strip || (panes && !edit_keeps_tab(msg))
+    focus == (*app).search || focus == (*app).sidebar || focus == (*app).strip || focus == (*app).crumbs || (panes && !edit_keeps_tab(msg))
 }
 
 /// Tab in an Edit (a rename in the tree or the embedded view) is the Edit's: it commits and edits the next item.
@@ -860,7 +860,8 @@ unsafe fn on_notify(app: *mut App, lparam: LPARAM) -> LRESULT {
                 }
             }
             breadcrumb::CN_EDIT => ui::show_edit(app),
-            breadcrumb::CN_DROPDOWN => ui::crumb_dropdown(app, nm.index),
+            breadcrumb::CN_DROPDOWN => ui::crumb_dropdown(app, nm.index, None),
+            breadcrumb::CN_DROPDOWN_KEY => ui::crumb_dropdown(app, nm.index, Some(breadcrumb::menu_point(from, nm.index))),
             _ => {}
         }
     } else if from == (*app).sidebar && hdr.code == sidebar::SN_PICK {

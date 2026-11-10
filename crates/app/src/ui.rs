@@ -350,14 +350,21 @@ fn next_pane(at: Option<usize>, n: usize, back: bool) -> usize {
     }
 }
 
-/// Moves the keyboard focus (F6, Tab) around the view, the address bar, the search box, the left pane (the folder
-/// tree, else the sidebar, when shown) and the tab strip.
+/// The panes in F6 order; the crumbs, the left pane and the strip are left out when hidden.
+fn panes_in_order<T>(view: T, crumbs: Option<T>, addr: T, search: T, left: Option<T>, strip: Option<T>) -> Vec<T> {
+    [Some(view), crumbs, Some(addr), Some(search), left, strip].into_iter().flatten().collect()
+}
+
+/// Moves the keyboard focus (F6, Tab) around the view, the breadcrumb, the address bar, the search box, the left
+/// pane (the folder tree, else the sidebar, when shown) and the tab strip.
 pub(crate) unsafe fn cycle_focus(app: *mut App, back: bool) {
     let view = source::browser_hwnd(app).unwrap_or_else(|| view_hwnd(app));
     let tree = (*app).panes.tree.as_ref().filter(|_| (*app).session.show_tree).map(|t| t.hwnd());
     let shown = |h: HWND| IsWindowVisible(h).as_bool().then_some(h);
     let left = tree.or_else(|| shown((*app).sidebar));
-    let panes: Vec<HWND> = [Some(view), Some((*app).addr), Some((*app).search), left, shown((*app).strip)].into_iter().flatten().collect();
+    // The address Edit covers the breadcrumb while it is shown.
+    let crumbs = shown((*app).crumbs).filter(|_| !IsWindowVisible((*app).addr).as_bool());
+    let panes = panes_in_order(view, crumbs, (*app).addr, (*app).search, left, shown((*app).strip));
     let focus = GetFocus();
     let at = panes.iter().position(|&h| h == focus || IsChild(h, focus).as_bool());
     let h = panes[next_pane(at, panes.len(), back)];
@@ -585,17 +592,23 @@ unsafe fn glyph_bitmap(owner: HWND, glyph: u16) -> Option<HBITMAP> {
 }
 
 /// Breadcrumb chevron: the subfolders of crumb `index`, listed on the UI thread only where that is cheap.
-pub(crate) unsafe fn crumb_dropdown(app: *mut App, index: usize) {
-    let Some(c) = cur(app).crumbs.get(index) else { return };
-    let Some(pidl) = &c.pidl else { return };
+/// `at`: the screen point of a keyboard-opened menu (which beeps when the crumb has no dropdown); else the cursor.
+pub(crate) unsafe fn crumb_dropdown(app: *mut App, index: usize, at: Option<POINT>) {
+    let beep = || {
+        if at.is_some() {
+            let _ = MessageBeep(MB_OK);
+        }
+    };
+    let Some(c) = cur(app).crumbs.get(index) else { return beep() };
+    let Some(pidl) = &c.pidl else { return beep() };
     if !(is_fs_path(&c.parsing) || c.parsing.eq_ignore_ascii_case(THIS_PC)) {
-        return;
+        return beep();
     }
     // A dead share would block here until the SMB timeout; the crumb itself still navigates.
     if is_remote(&c.parsing) {
-        return;
+        return beep();
     }
-    let Ok(folder) = ShellFolder::from_pidl(pidl) else { return };
+    let Ok(folder) = ShellFolder::from_pidl(pidl) else { return beep() };
     // Bounded: this runs on the UI thread, and the menu shows 500 at most anyway.
     let Ok(mut items) = folder.subfolders_up_to(2000) else { return };
     items.retain(|i| i.is_folder() && !i.is_hidden());
@@ -605,6 +618,7 @@ pub(crate) unsafe fn crumb_dropdown(app: *mut App, index: usize) {
     let entries: Vec<(usize, String)> = items.iter().enumerate().map(|(i, it)| (i + 1, it.display_name())).collect();
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
+    let pt = at.unwrap_or(pt);
     let picked = popup(app, &entries, &[], pt.x, pt.y);
     if let Some(item) = picked.checked_sub(1).and_then(|i| items.get(i)) {
         go(app, Target::Pidl(folder.child_pidl(item)), nav::History::Push);
@@ -932,7 +946,7 @@ pub(crate) unsafe fn update_status(app: *mut App) {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_fs_path, next_pane};
+    use super::{is_fs_path, next_pane, panes_in_order};
 
     #[test]
     fn fs_paths() {
@@ -951,5 +965,10 @@ mod tests {
         assert_eq!(next_pane(Some(0), 4, true), 3);
         assert_eq!(next_pane(Some(2), 3, true), 1);
         assert_eq!((next_pane(None, 3, false), next_pane(None, 3, true)), (0, 0));
+        let order = panes_in_order("view", Some("crumbs"), "addr", "search", Some("left"), Some("strip"));
+        assert_eq!(order, ["view", "crumbs", "addr", "search", "left", "strip"]);
+        let walked: Vec<_> = std::iter::successors(Some(0), |&i| Some(next_pane(Some(i), order.len(), false))).take(7).map(|i| order[i]).collect();
+        assert_eq!(walked, ["view", "crumbs", "addr", "search", "left", "strip", "view"]);
+        assert_eq!(panes_in_order("view", None, "addr", "search", None, None), ["view", "addr", "search"], "hidden panes are skipped");
     }
 }
