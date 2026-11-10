@@ -4,6 +4,19 @@ A Windows file manager in Rust that hosts the Windows shell namespace and render
 controls. Fast on the common path, delegates everything else to the shell, and falls back to Windows
 Explorer (embedded in the window) for folders it cannot list.
 
+rexplorer is not affiliated with or endorsed by Microsoft. Windows and File Explorer are trademarks of Microsoft
+Corporation; they are named here only to say what rexplorer replaces.
+
+Supported Windows: Windows 10 22H2 and Windows 11. Older versions are not supported. Each release is meant to be
+smoke-tested on both (see CONTRIBUTING.md); the numbers below come from Windows 11 only.
+
+Every release is listed in [CHANGELOG.md](CHANGELOG.md). Dependency upkeep and translations are described in
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
+Using rexplorer day to day (install, revert, keys, settings, troubleshooting): [docs/USER-GUIDE.md](docs/USER-GUIDE.md).
+How it is built (crates, threads, messages, timers): [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Building needs
+Rust 1.88 or newer (`rust-version` in `Cargo.toml`).
+
 Layout:
 
 - `crates/core`: headless shell layer (folders, items, menus, notifications). Tested against the real shell.
@@ -56,7 +69,11 @@ path bar, a 220 px search field, Terminal, Connect); a 44 px command bar (below)
 list card (or the Home page) and the preview card; a status bar (centered item and selection counts, search progress; the profile on the
 right). The 8 px gaps between the left pane and the cards are splitters (drag to resize, 120 to 600 px). The window
 follows the theme (title bar color, Mica when the theme asks for it, themed list, header, Edits and fonts that follow
-the monitor DPI). Minimum size 640x400.
+the monitor DPI). Minimum size 640x400. Windows' Text size (Settings > Accessibility > Text size, 100-225%) grows
+the fonts and every bar, row and tile that holds text, live; icons and glyphs follow the display scale only, and
+fixed or user-set widths (the sidebar, the panes, the search field, a tab's maximum) do not grow, so long text gets
+an ellipsis. Folder options and Connect pick up a Text size change when reopened, and rebuild their fonts when
+dragged to a monitor with another scale.
 
 Sidebar, every row read from the shell with its localized name and icon:
 
@@ -102,7 +119,7 @@ shell's own New submenu: shortcut, text document and so on) | **Cut**, **Copy**,
 Icons, Thumbnails, then Sidebar, Folder tree and Preview pane, all with checks) | **More** (...), and on the right
 a **Preview** toggle. The buttons are enabled from the current state and update on a selection change, a tab
 switch, the end of a load and a clipboard change: Cut and Rename need a shell folder (Rename exactly one item),
-Copy and Delete also work on search results, Paste needs files on the clipboard, New and Sort are off on Home,
+Copy and Delete also work on search results, Paste needs files on the clipboard, New is off on Home,
 Share needs a selection in a shell folder or on Home. Share opens the Windows share sheet over the window for the
 selected files (through `IDataTransferManagerInterop`; the shell's own "Windows.ModernShare" verb refuses a
 desktop window); folders cannot be shared, as in Explorer, and a selection without files beeps.
@@ -112,8 +129,10 @@ verbs. The old list / grid view segment is gone: the views are in View v and on 
 Home page: Home and Quick Access open a page of their own in the list's place, drawn like Explorer's: a "Quick
 access" title, a responsive grid of 280x72 folder tiles (as many columns as fit, re-flowed on resize and DPI change) (40 px icon, name, the parent folder relative to the
 profile, a pin glyph on pinned folders only), three pills and a table of files (icon, name with its folder
-below, Date modified, Type, Size, and Activity when the shell has any, e.g. "X edited this" on cloud files; column
-titles from the shell, so localized), newest access first. The pills filter the table: **Recent** (the recent
+below, Date modified, Type, Size, Status (the cloud state from `System.StorageProviderUIStatus`, empty for local
+files), and Activity when the shell has any, e.g. "X edited this" on cloud files; column titles from the shell, so
+localized), newest access first. A click on a column title sorts by it (again: the other way), as does the Sort
+menu (a column, then Ascending / Descending); the sort lasts for the session and keeps the selection. The pills filter the table: **Recent** (the recent
 files), **Favorites** (files added to Favorites) and **Shared** (files shared with you, the shell's "shared"
 group); each tab keeps its own pill (not saved). Empty tables read "No recent files", "No favorites yet" or
 "Nothing shared with you". A file the shell lists in two groups (recent and a favorite) is one row with both. It scrolls (wheel and
@@ -134,7 +153,8 @@ folder, About, and **Quick access**: the profile's bookmarks and the cloud-sync 
 **Folder options...** (More menu) is a themed tabbed dialog with OK, Cancel and Apply. General: the start folder (Home,
 This PC or the profile's own), single or double click to open with the underline choice (`underline_titles`), Home's
 Privacy switches (`show_recent`, `show_frequent`) and a Clear button for the Ctrl+P recent folders list (rexplorer's own
-`recent.txt`; Windows' Recent folder is never touched). View: hidden files, hide extensions (folder lists and search results alike; ZIP and CAB files count as files, and a
+`recent.txt`; Windows' Recent folder is never touched), and **Check GitHub daily for a new version**
+(`check_updates`, off by default; see "Update check" below). View: hidden files, hide extensions (folder lists and search results alike; ZIP and CAB files count as files, and a
 rename keeps the hidden extension), status bar
 (`show_status`), shell preview handlers in the preview pane (`preview_handlers`), check boxes to select items
 (`item_checkboxes`), and the search and hover-preview delays (clamped to 50..5000 and 200..10000 ms). Search: whether a
@@ -154,7 +174,12 @@ Every change is written to the active profile in settings.ini and applies at onc
   Name, Date modified, Type, Size; directories first. Enter on a directory enters it, Backspace / Alt+Up goes up
   (at the archive's root: back to its folder), Enter on a file extracts it to
   `%TEMP%\rexplorer-archive\<hash>\` (cached per archive and modification time) and opens it with its default
-  app. Right-click: **Extract all to...** (folder picker) or **Extract here** (the archive's folder). Archives
+  app. Right-click: **Extract all to...** (folder picker) or **Extract here** (the archive's folder). Extraction
+  never replaces a file already in the target, and never writes a member whose name would land outside it (a `..`
+  step, a drive letter, or a `:` that would make a hidden stream); both kinds are skipped and counted in one
+  message. Members with a `:` in their name (made on Linux or macOS) are not listed. Members show their type's
+  icon in every view; pictures get thumbnails, and pictures and text up to 32 MB a preview. To show them, members
+  are extracted to `%TEMP%\rexplorer-show-<pid>`, removed when the tab closes and when rexplorer exits. Archives
   are read-only: no rename, delete or drop. The archive is listed on a worker thread.
 - **Search results**: type in the search box and press Enter (Ctrl+F focuses it). The search walks the current
   folder and every subfolder on a worker thread (archives, links and hidden `C:\$...` folders are skipped);
@@ -163,9 +188,13 @@ Every change is written to the active profile in settings.ini and applies at onc
   navigating anywhere stops it. When rexplorer runs elevated (`rexplorer --elevated` from an admin console; an
   elevated start without the flag restarts itself unelevated, as Explorer never shows an elevated folder window)
   and the folder is a drive root, the drive's NTFS index (read once per drive from the MFT, then kept for the
-  session) answers instead, up to 5000 results.
-  Enter on a result opens it (folders and .rar files in place); the context menu, Delete and Ctrl+C / Ctrl+X
-  work on results that share one folder.
+  session) answers instead, up to 5000 results. Unelevated, a folder the Windows Search index covers is searched
+  through the index, and the folders its rules leave out below it (AppData in a profile) are walked; a folder the
+  index does not cover, a stopped Windows Search service, or Search inside archives uses the walk alone. Index
+  results match the real file name (extension included) and are as current as the index.
+  Enter on a result opens it (folders and .rar files in place); the context menu, Delete and Ctrl+C / Ctrl+X work
+  on results from any number of folders. Back from a folder opened out of the results returns to them with their
+  selection, scroll and sort; a tab keeps its last 4 result lists, and Back to an older one opens its folder.
 - **The embedded Explorer view**: a folder that exists but cannot be listed (a phone, an odd namespace
   extension) opens in an Explorer view hosted in place of the list. The breadcrumb, title and address follow
   it; navigating inside it to a folder the list can show brings the list back, as does going anywhere else.
@@ -207,11 +236,12 @@ Every change is written to the active profile in settings.ini and applies at onc
 | Ctrl+Shift+N | New folder, then rename it |
 | Ctrl+N | New window on the current folder (it saves no tabs, placement or recents) |
 | Ctrl+Enter, Ctrl+double-click | Open the folder in a background tab |
-| Ctrl+Z, Ctrl+Y | Undo, redo: rename, new items, delete to the Recycle Bin, paste, drops on the list |
+| Ctrl+Z, Ctrl+Y | Undo, redo: rename, new items (the toolbar's New and the context menu's New submenu), delete to the Recycle Bin, paste, drops on the list, the sidebar, crumbs, tabs and Home. `--desktop-icons` has its own for its Delete and rename |
 | Ctrl+I | Invert the selection |
 | F4, F3 / Ctrl+E | Address, search box |
-| F6, Shift+F6 | Next, previous pane (view, breadcrumb, address, search, sidebar or tree, tab strip) |
-| Breadcrumb focused | Left, Right, Home, End move along the path; Enter goes there; Down, Alt+Down or Space opens that folder's list; Esc returns to the view |
+| F6, Shift+F6 | Next, previous pane (view, breadcrumb, address, search, sidebar or tree, tab strip, navigation toolbar, tools bar, command bar). The preview and details pane is not a stop: it holds nothing to operate |
+| Breadcrumb focused | Left, Right, Home, End move along the path; Enter goes there; Down, Alt+Down or Space opens that folder's list; Left on the first shown crumb, when some are hidden behind "...", opens the same menu a click on "..." does; Esc returns to the view |
+| A toolbar focused | Left, Right, Home, End move between buttons (no wrap; disabled buttons are skipped); Enter or Space presses; Down or Alt+Down opens the menu of New, Sort, View or More; Esc returns to the view |
 | F11 | Full screen |
 | Right-click a column header | Choose columns |
 | Right-click Back / Forward | History menu |
@@ -239,7 +269,9 @@ icon views and in the preview pane a folder shows the shell's composed thumbnail
 peek at a file inside (a picture strip, a document sheet; the shell picks the file). Drag items
 out of the list to anywhere that accepts files (**currently unreliable**: other programs often never see the
 drag, [#75](https://github.com/CodingDiego/rexplorer/issues/75)), or drop files onto a folder item or the list
-background.
+background. A drag the target refused or you cancelled shows no message, as in Explorer; only a failure of the drag
+itself does. Each drag that applied nothing adds one line to `rexplorer.log` (see the files below) with its outcome,
+the error code, whether a mouse button was down and how long it lasted, without file names.
 
 ### Command line
 
@@ -255,6 +287,7 @@ rexplorer [options] [folder...]
   --unregister        undo --register
   --install           copy rexplorer to %LOCALAPPDATA%\Programs and make it the default file manager
   --uninstall         undo --install
+  --quiet             with --install or --uninstall: no dialog (exit code 0 done, 1 failed)
   --import-explorer   copy Windows Explorer's settings into the active profile (backs up settings.ini)
   --overwrite         with --import-explorer: also replace values you changed in rexplorer
   --recover           restore the previous session after a crash
@@ -281,7 +314,45 @@ Explorer instead of running (so a crash loop stops at Explorer). A start without
 Ctrl+Shift+E and the fallbacks start `%SystemRoot%\explorer.exe` by full path, so they reach Explorer even when
 rexplorer answers for `explorer.exe`.
 
+From 1.0 these options keep their meaning until 2.0: `--select` and `/select,`, `--profile`, `--new-tab` and `-t`,
+`--search`, `--register`, `--unregister`, `--install`, `--uninstall`, `--import-explorer`, `--overwrite`,
+`--recover`, `--elevated`, `-h` and `--help`, and the Explorer argument forms above. `--new-window`,
+`--desktop-icons`, `--desktop` and `--quiet` are not frozen: they may change in any release.
+
+`--quiet` is for scripted installs (the winget package): with `--install` it skips the warning, rolls back a
+failed install without asking and shows no summary; with `--uninstall` it shows no summary. Exit codes: 0 done,
+1 failed, and 2 when you answer No to the interactive warning.
+
+Hand-off to a running window: the second launch sends its arguments as `key=value` lines whose first line is
+`v=1` (`cli::PROTOCOL`). A running window answers 1 when it takes them and 0 when the version differs; the new
+launch then opens its own window, so a folder is never dropped between two versions. A payload without a `v=`
+line (rexplorer up to 0.1.4) is accepted. The version goes up only when a line changes meaning.
+
+### Stability and deprecation
+
+From 1.0 rexplorer follows semantic versioning: a patch release only fixes bugs, a minor release adds features
+without breaking the frozen command line, the `settings.ini` keys or the hand-off to a running window, and
+only a major release may break them.
+
+A deprecated flag, settings key or hand-off field keeps working for two minor releases or six months after the
+release that deprecates it, whichever is longer. The release notes announce the deprecation and the earliest release
+that removes it. Removal also waits for the next major release for anything frozen above.
+
+Settings files carry a format version, now 1: `format=1` under `[general]` in `settings.ini` (it covers `[keys]`),
+under `[theme]` in each `themes\*.ini`, and as the first line of `session.txt` and `folders.txt`. A file without one
+is format 0 (0.1.x) and is read as is; the first start of a format-1 build adds the one `format=1` line to
+`settings.ini` and each theme and changes nothing else. Keys and sections rexplorer does not know are kept when it
+writes these files. A file from a newer format is read for the keys this build knows: `settings.ini` and themes
+from a newer format are never rewritten whole, and `session.txt` and `folders.txt` keep the newer number and the
+lines this build cannot read. The contract: a new format only adds keys and never changes what an existing key
+means. `icons\<name>\` has no version: its PNG file layout is the format.
+
 ### Install
+
+Releases ship two zips, `rexplorer-<version>-x64.zip` and `rexplorer-<version>-arm64.zip` (arm64 is cross-compiled
+and not yet tested on ARM hardware). `SHA256SUMS.txt` lists both zips and both exes, the exes with their folder
+(`rexplorer-<version>-x64/rexplorer.exe`); check a download with `Get-FileHash <file>` against it. A winget package
+(`CodingDiego.rexplorer`) is drafted under `manifests\` but not published yet.
 
 Option A, the script (no administrator prompt: rexplorer installs per user, under `HKCU` and `%LOCALAPPDATA%`, and
 running it elevated would only hand user-writable files rights they should not have):
@@ -361,7 +432,8 @@ had changed to what was there before, or **Keep changes**, which you can still u
 Escape hatch: `rexplorer --uninstall` (or More > **Uninstall...**, or `%LOCALAPPDATA%\Programs\rexplorer\rexplorer.exe
 --uninstall` from Win+R) reverts what install.txt lists: the values that still name rexplorer (a value another
 program has written since is left alone), the keys install created once they are empty, the shortcut, then the
-copy (if it is running it moves to `%TEMP%`, deleted at the next start). Both print a summary in a message box
+copy (if it is running it moves to `%TEMP%`, deleted at the next start), a leftover `rexplorer.old`, and the
+folders install created, if they are empty. Both print a summary in a message box
 and exit 0, or non-zero on an error. If rexplorer keeps crashing, the crash guard above opens Explorer.
 
 Nothing touches HKLM and nothing needs elevation: all of it is per-user under HKCU and `%LOCALAPPDATA%`.
@@ -399,7 +471,7 @@ profile=default                  ; the active profile
 [profile default]
 start=shell:::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}   ; where a launch without folders, and a new tab, start: Home
 theme=dark                       ; a file name in themes\ without .ini, or system to follow Windows
-view=details                     ; details | icons | thumbnails (the view segment writes it back here)
+view=details                     ; details | small | medium | icons | thumbnails | extra-large | list | tiles | content (the view segment writes it back here)
 show_tree=false                  ; the folder tree instead of the sidebar
 show_preview=false
 tree_width=220                   ; sidebar (or tree) width, 96-DPI pixels
@@ -453,11 +525,30 @@ the pane widths; saved within 2 s of each change and on exit; a search tab is sa
 (palette history), `window.txt` (placement), `folders.txt` (each folder's view, sort, group, columns and widths;
 at most 500 folders). A first run, or `--profile`, takes view and panes from the profile;
 later runs from the session. A session written before the sidebar existed (no `sidebar=`) opens with the sidebar.
+`rexplorer.log`: one timestamped line per drag that applied nothing, per UI-thread hang (`hang: UI thread blocked
+N s in <operation> (<message>)` after 5 s, then `answered again after N s`; nothing is killed) and per panic; debug
+builds also log `slow: <message> to <class> took N ms` for any message over 50 ms. It holds no file paths and starts
+again past 64 KB. `update-check.txt`: the update check's cache (below).
 
-The exe carries a Common Controls 6 manifest (`crates/app/build.rs`): icon views and the themed controls need it.
-It also carries Windows Explorer's own icon, so the taskbar and the title bar look like Explorer's: `scripts/extract-icon.py` copies the
-first icon group of `C:\Windows\explorer.exe` into `crates/app/app.ico` (Microsoft's artwork, for personal use), and `build.rs` compiles
-`app.rc` with the newest Windows SDK `rc.exe` it finds and links the result. Without the SDK the build warns and skips the icon.
+Crash reports stay on this PC, in `%LOCALAPPDATA%\rexplorer\crashes`: a minidump `rexplorer-<unix time>-<pid>.dmp`
+per crash, and for a panic a `.txt` beside it with the version, the message and a backtrace. The newest 10 are kept;
+older ones go at startup. Nothing is ever sent. After a crash the recovered window offers to open that folder; to
+report a crash, attach the files to a private security advisory or an issue on GitHub (see `SECURITY.md`).
+
+Update check (`check_updates=true` in the profile, or Folder options > General): at most one HTTPS GET a day, at
+start or when the box is turned on, to `api.github.com/repos/CodingDiego/rexplorer/releases/latest`. It sends only
+`User-Agent: rexplorer/<version>` (no cookies, credentials or ids), follows no redirect and reads at most 1 MiB.
+WinHTTP uses the system's automatic proxy settings, so on a network with proxy auto-discovery Windows may look one
+up. The answer is cached in `update-check.txt` (its time is the last check, its text the version found; delete it to
+check at the next start). A newer version shows "rexplorer X is out" on the right of the status bar and an entry in
+More; both open the release page in the browser. Nothing is downloaded or run, every failure is silent and waits a
+day too, and a window left open for days checks again only at its next start.
+
+The exe carries a manifest (`crates/app/app.manifest` and the Common Controls 6 dependency, `crates/app/build.rs`):
+icon views and the themed controls need Common Controls 6, it declares Windows 10 and 11, and it is `longPathAware`,
+so paths over 260 characters work where Windows' LongPathsEnabled policy is on. The icon is rexplorer's own:
+`python -I scripts/make-icon.py` regenerates `crates/app/app.ico`, and `build.rs` compiles `app.rc` (the icon and
+the version resource) with the newest Windows SDK `rc.exe` it finds. Without the SDK the build warns and skips both.
 
 ### Smoke test
 
@@ -489,8 +580,25 @@ scratch folder and `HKCU\Software\rexplorer-test\<pid>`: the install warning is 
 install.txt, the five command keys and App Paths appear, then all of it is gone, the scratch key included; the real keys, App Paths and Start menu are never
 written) and explorer-args (`/select,<file>` selects it, `/e,<dir>` and `<dir>\` open it; `/idlist,x` and `/zzz`
 exit within 2 s, handed to Explorer, which opens a window for `/zzz`). `-Only <regex>` runs the matching checks. The whole run uses a scratch `APPDATA`,
-so the user's settings, window placement and open rexplorer window are never touched. The keyboard, share and dnd
-checks need an interactive desktop that lets the window come to the foreground; they report SKIP otherwise.
+so the user's settings, window placement and open rexplorer window are never touched; `REXPLORER_INSTALL_DIR` and
+`REXPLORER_REG_BASE` point at scratch places for the whole run. The checks drive the app with `WM_COMMAND` posted to
+its own window instead of keystrokes; the dnd drag is the only real input, and it is let go at its start point if
+the foreground leaves rexplorer. The clipboard is saved and restored around the command bar check. Share and dnd
+need an interactive desktop and SKIP without one. `pin` and `home-open` change this user's Quick Access, Recent
+list and file classes, so they SKIP unless `-UserState` is given. The `accessibility` check walks the UI Automation
+tree on Home and in a folder with the preview pane on, and fails on any unnamed focusable or interactive element
+(scroll bars, the title bar and the embedded Explorer view are excluded, each with its reason). The script exits 1
+on any FAIL, and with `-NoSkip` also on any SKIP (the release run: `-NoSkip -UserState` on an interactive desktop).
+
+`scripts\soak.ps1 [-Minutes 480]` drives one rexplorer for that long (default 10, a harness check) through
+navigation, preview, thumbnails, tabs, search, copy and paste while it churns files itself, and samples GDI and USER
+objects, handles, threads and private bytes every 30 s to a CSV in `%TEMP%`. After a warm-up it fails when the
+median of the last fifth exceeds the median of the first fifth × 1.05 plus a slack (GDI 50, USER 50, handles 200,
+threads 10, private 50 MB). Do not use the clipboard during a run.
+
+`scripts\budgets.ps1` fails when a median is over budget: start to the first visible window ≤ 600 ms, the 100k-file
+folder listed ≤ 600 ms, idle ≤ 1% of a core (`-Focus` for the focused idle budget). It shares
+`%TEMP%\rexplorer-bench` with the smoke test and creates it when missing.
 `smoke.ps1 -Screenshots` also writes `docs\screenshots\dark.png`, `light.png` and `home.png` (rendered with
 `PrintWindow`, so nothing else on the screen is captured). home.png shows the machine's own Quick Access; the file
 rows and the tile subtitles that are paths are pixelated (1/12 and back, nearest neighbor), at rects Home reports
@@ -503,9 +611,10 @@ behaviour marked WORKS, BROKEN, UNVERIFIED, PARTIAL or MISSING. As of 2026-11-09
 programs is unreliable and F2 and click-again rename were reported broken (not reproduced). Most of the features
 added that day (drag images, right-button drag, drops on the sidebar, crumbs and tabs, tab reordering, the column
 chooser, icon overlays, cut fading) are marked UNVERIFIED: built and unit-tested, not yet tried with a real mouse.
-Undo does not cover drops outside the file list. Added on 2026-11-10 and also UNVERIFIED: the desktop icons view
-(`--desktop-icons`, never run), high contrast (never seen under a contrast theme) and screen reader support (MSAA
-for the custom controls, not tried with Narrator). The list below holds the gaps of rexplorer's own features.
+Added on 2026-11-10 and also UNVERIFIED: the desktop icons view (`--desktop-icons`, never run), high contrast (never
+seen under a contrast theme), screen reader support (MSAA for the custom controls, not tried with Narrator or NVDA),
+toolbar keyboard reach, Text size, indexed search, Back to search results, Home sorting, archive thumbnails and
+preview, and the update check. The list below holds the gaps of rexplorer's own features.
 
 Language: rexplorer's own text is English or Spanish, following Windows; `language=es` (or `en`, `system`) under
 `[general]` in `settings.ini` chooses, and a `lang\<code>.ini` file of `key=text` lines in the settings folder
@@ -515,25 +624,37 @@ register messages follow it too (the `cli.*`, `inst.*` and `reg.*` keys).
 Known and not fixed: a few internal window messages carry a pointer (the accessibility tree request
 `WM_APP+0x3F00`, the pane's worker results), so another program running as the same user at the same integrity
 level can crash rexplorer by sending one with a bad value. Windows blocks lower-integrity senders, and a program
-at the same level could already inject code, so this is a robustness gap, not a privilege boundary.
+at the same level could already inject code, so this is a robustness gap, not a privilege boundary. A worker result
+posted to a window that has already closed leaks its memory.
 
 Where rexplorer differs from Explorer on purpose: Backspace goes up, Ctrl+D pins, Ctrl+Shift+E opens Explorer,
-F4 has no dropdown and F10 opens no menu bar. Crumbs hidden behind the breadcrumb's "..." are reachable by mouse only.
+F4 has no dropdown and F10 opens no menu bar. Left on the first shown crumb opens the "..." menu, the root's
+subfolders, as a click does; the hidden crumbs themselves are not keyboard stops.
 
-- Archive members show placeholders in the icons and thumbnails views, have no preview, and cannot be dragged,
-  sorted by column or renamed. Search results have no thumbnails or preview.
-- The context menu on search results needs every selected result in one folder.
-- Back from a folder opened out of search results returns to the searched folder, not to the results.
-- Search result icons come from the extension (no per-file icons such as an exe's own).
-- Only .rar archives get the archive view (zip is the shell's); multi-volume and encrypted .rar are untested.
+- Accessibility: the address and search boxes have no accessible name. While a text or shell-handler preview
+  shows, the preview pane's accessible object lists no child windows, so a pure-MSAA screen reader may not reach
+  the text or the handler. A focused toolbar starts again at its first button.
+- Archive members cannot be dragged, sorted by column or renamed. Encrypted .rar gets unrar's error, with no
+  password prompt; multi-volume .rar is untested, and opening a `.partN.rar` other than the first is not redirected.
+  An archive rewritten during the session with a same-size member can show the old member until the tab closes.
+- Search results have no thumbnails or preview. Index results depend on the index being current and may leave out
+  hidden or system files it does not hold.
+- Only .rar archives get the archive view (zip is the shell's).
 - The embedded Explorer view keeps Windows' own colors, not the theme.
-- Home page: no location-status column; Sort is disabled on Home (tiles keep the shell's order, files are
-  newest-accessed first); tile subtitles are computed from the path, not read from the shell. The Shared pill
-  relies on the shell's undocumented `System.Home.Grouping` value 5. Home keeps listing a recent file for a while
-  after the file and its Recent shortcut are deleted (the shell caches it).
+- Home page: its sort is not saved across restarts, and its right-click menu has no Sort submenu; tile subtitles
+  are computed from the path, not read from the shell. The Shared pill relies on the shell's undocumented
+  `System.Home.Grouping` value 5 (when it is missing, nothing is shared rather than an error). Home keeps listing a
+  recent file for a while after the file and its Recent shortcut are deleted (the shell caches it).
+- Undo does not cover pastes the shell staged in %TEMP% (zip contents), Keep-both copies (`x (2)`), or paste and
+  drop on `--desktop-icons`. A paste or drop is recorded before it runs.
+- Text size: fixed or user-set widths do not grow with it.
+- Paths over 260 characters need Windows' LongPathsEnabled policy.
+- A settings file from a newer rexplorer format loads without a warning.
+- Turning the update check off does not hide a notice already shown until the next start.
+- `--quiet` still shows the usage box when the command line itself is wrong.
 - Pin to Home on a frequent folder and the pinned / frequent split were tried on one machine only; a folder that
   is both frequent and pinned through another tool shows as pinned.
-- The sidebar is mouse-only (no keyboard focus). The embedded Explorer view and the command palette keep GDI
+- The embedded Explorer view and the command palette keep GDI
   window regions, so their corners are not antialiased. A scroll bar redrawn by the system on hover can show a
   square corner until the next paint.
 - Share skips selected rows without a local file (on Home, files shared with you live only in the cloud); with
@@ -541,6 +662,16 @@ F4 has no dropdown and F10 opens no menu bar. Crumbs hidden behind the breadcrum
 - `ftp://` browsing goes through the shell's FTP folder (present on Windows 11 25H2, untested against a live
   server); where it is missing the URL shows the not-found error.
 - Small icons of shell folders resolve on the UI thread.
+
+Not part of 1.0 (decided, not built):
+
+- Merging a tab into another rexplorer window by dragging it. Dragging a tab out makes a new window. Reason: it needs
+  a cross-window hand-off of the tab's state, and the Explorer-style tear-out covers the common case.
+- FTP. The Connect dialog and `ftp://` browsing are present but have never been tested against a live server, so
+  1.0 makes no promise that they work. Reason: no test server or hosted runner to verify it; it may be
+  removed in a later release.
+- Right-to-left layout (Arabic, Hebrew). The window does not mirror. Reason: it touches every custom-drawn control and
+  hit test, and no right-to-left translation exists yet.
 
 ## Benchmark
 

@@ -6,6 +6,9 @@ changes status only when the behaviour was proven on the built exe.
 Last full review: 2026-11-09, working tree on top of `9781cc2`. The review read the code. Only the rows whose
 note gives a date were run on the exe.
 
+2026-11-10, v1 release-candidate round (`ADD/v1-release-candidate`, uncommitted): rows it touched say "v1 round".
+Nothing from that round was run on the exe or with a real keyboard or mouse, so no row moved to WORKS.
+
 | Status | Meaning |
 |---|---|
 | **WORKS** | Proven on the exe (the note says how). |
@@ -35,13 +38,13 @@ dialogs and results are the shell's own.
 
 | Explorer behaviour | Status | Evidence | Note |
 |---|---|---|---|
-| Drag files out to another program | **BROKEN** | `list.rs:334` `begin_drag`, `dragdrop.rs:54` | [#75](https://github.com/CodingDiego/rexplorer/issues/75): intermittent, target often never gets DragEnter. |
+| Drag files out to another program | **BROKEN** | `list.rs:334` `begin_drag`, `dragdrop.rs:54` | [#75](https://github.com/CodingDiego/rexplorer/issues/75): intermittent, target often never gets DragEnter. v1 round: cause still unknown; each drag that applied nothing is logged to `%APPDATA%\rexplorer\rexplorer.log` (outcome, HRESULT, button state, duration; `dragdrop.rs` `drag_note`) for the next real-mouse run. |
 | Drag onto a folder row of the same list | UNVERIFIED | `list.rs:350` `register_drop` | Shell drop target. |
 | Drop files from another program into the list | UNVERIFIED | `dragdrop.rs:81` `DropForwarder` | List only. |
-| Drop onto the Home page, sidebar rows, breadcrumb crumbs, tabs | UNVERIFIED | `list.rs` `register_folder_drops` | Built 2026-11-09; hit tests are unit-tested. Hovering 0.7 s on a tab switches to it. Needs a real drag. |
+| Drop onto the Home page, sidebar rows, breadcrumb crumbs, tabs | UNVERIFIED | `list.rs` `register_folder_drops` | Built 2026-11-09; hit tests are unit-tested. Hovering 0.7 s on a tab switches to it. Needs a real drag. v1 round: these drops are recorded for Ctrl+Z (`list.rs` `register_folder_drop`). |
 | Drop onto the folder tree | UNVERIFIED | `tree.rs:60` | Whatever the shell tree control does by itself. |
 | Drag from Home tiles and rows | UNVERIFIED | `home.rs` `HN_DRAG` | Built 2026-11-09; the notification is unit-tested. Needs a real mouse. |
-| No error box after a drop the target refused or the user cancelled | UNVERIFIED | `list.rs` `begin_drag` | 2026-11-09: the box now shows only when the drag data cannot be built. |
+| No error box after a drop the target refused or the user cancelled | UNVERIFIED | `list.rs` `begin_drag` | 2026-11-09: the box now shows only when the drag data cannot be built. v1 round: also when the drag loop itself fails; a refused or cancelled drag shows none. |
 | Drag from search results and archive members | PARTIAL | `dragdrop.rs` `data_object_of_paths` | Search results: built 2026-11-09, data object tested headless, drag unverified. Archive members: no. |
 | Right-button drag with the Copy / Move / Shortcut menu | UNVERIFIED | `LVN_BEGINRDRAG`, `SHDoDragDrop` | Built 2026-11-09. Needs a real mouse. |
 | Drag image (the translucent icons and count) | UNVERIFIED | `SHDoDragDrop`, `IDropTargetHelper` | Built 2026-11-09. No image for drags from Home. |
@@ -55,7 +58,7 @@ dialogs and results are the shell's own.
 | Ctrl+V | UNVERIFIED | `list.rs:599` | Shell verb on the folder. |
 | Cut items look faded | UNVERIFIED | `dragdrop.rs` `cut_paths`, `LVIS_CUT` | Built 2026-11-09. Not run: it needs the real clipboard. Not on Home. |
 | Paste shortcut | PARTIAL | `menu.rs:90` | Only as the shell's own menu entry. |
-| Ctrl+Z undo, Ctrl+Y redo | PARTIAL | `core/undo.rs` | 2026-11-09: rename, undo, redo, undo proven on the exe by command. Recorded: rename, New folder and New items, Delete to the Recycle Bin (key, command bar, right-click), Ctrl+V, drops on the list. Not recorded: drops on the sidebar, crumbs, tabs and Home, pastes from %TEMP%, the desktop helper, the shell's New submenu. [#27](https://github.com/CodingDiego/rexplorer/issues/27) |
+| Ctrl+Z undo, Ctrl+Y redo | PARTIAL | `core/undo.rs` | 2026-11-09: rename, undo, redo, undo proven on the exe by command. Recorded: rename, New folder and New items, Delete to the Recycle Bin (key, command bar, right-click), Ctrl+V, drops on the list. v1 round, unverified: also drops on the sidebar, crumbs, tabs and Home, the shell's New submenu, and Delete and rename in `--desktop-icons` (its own Ctrl+Z / Ctrl+Y). Not recorded: pastes from %TEMP%, Keep-both copies, paste or drop on `--desktop-icons`. [#27](https://github.com/CodingDiego/rexplorer/issues/27) |
 
 ## 4. Delete and new
 
@@ -65,7 +68,7 @@ dialogs and results are the shell's own.
 | Shift+Delete deletes permanently | UNVERIFIED | `menu.rs:274` | Relies on `CMIC_MASK_SHIFT_DOWN`. |
 | New folder from the command bar, then rename | UNVERIFIED | `commands.rs:141`, `:177` | The rename step uses the broken path above. |
 | Ctrl+Shift+N | WORKS | `commands.rs` `new_folder` | 2026-11-09: the command creates "Nueva carpeta" on disk and opens its rename. The key chord itself was not pressed. |
-| New > text document, shortcut and so on | UNVERIFIED | `commands.rs:145` | Shell's New submenu. |
+| New > text document, shortcut and so on | UNVERIFIED | `commands.rs:145`, `menu.rs` `Picked::New` | Shell's New submenu. v1 round: the background menu's New starts an in-place rename of the new item and Ctrl+Z removes it. New > Shortcut also starts the rename while its wizard is open. |
 
 ## 5. Selection
 
@@ -86,11 +89,12 @@ dialogs and results are the shell's own.
 | Ctrl+L / Alt+D, typed paths, `shell:` names | UNVERIFIED | `main.rs:164`, `nav.rs:221` | |
 | `%ENV%` names in the address | UNVERIFIED | | Depends on the shell's parser. |
 | Address autocomplete | UNVERIFIED | `edit.rs`, `SHAutoComplete` | Built 2026-11-09. Escape leaves the bar at once instead of closing the dropdown first. |
-| Breadcrumb dropdowns | PARTIAL | `ui.rs:524` | Not for remote or virtual crumbs. |
+| Breadcrumb dropdowns | PARTIAL | `ui.rs:524` | Not for remote or virtual crumbs. v1 round, unverified: Left on the first shown crumb opens the "..." overflow menu, the same one a click opens. |
 | Back / forward history dropdown | UNVERIFIED | `nav.rs` | Built 2026-11-09: right-click Back or Forward. Press-and-hold: no. |
 | F5 | UNVERIFIED | `main.rs:163` | |
 | F4 focuses the address | WORKS | `main.rs` ACCELS | 2026-11-09: an F4 key message moves the focus to the address edit. No dropdown list as in Explorer. |
 | F6 / Tab between panes | WORKS | `ui.rs` `cycle_focus` | 2026-11-10: F6 and Tab key messages go list, breadcrumb, address, search, sidebar, tab strip, list. On the breadcrumb Left then Enter went to the parent folder; its dropdown on Down was not opened. Shift+F6 and Shift+Tab not pressed. Tab in a rename box still renames the next item. |
+| F6 / Tab reach the toolbars; keys inside a toolbar | UNVERIFIED | `toolbar.rs`, `ui.rs` `panes_in_order`, `main.rs` `pane_accel` | v1 round: navigation toolbar, tools bar and command bar join the cycle after the tab strip. Left / Right / Home / End move, Enter or Space press, Down or Alt+Down opens New / Sort / View / More, Esc returns to the view. Focus rectangle drawn. [#22](https://github.com/CodingDiego/rexplorer/issues/22) |
 | Ctrl+N new window | WORKS | `instance.rs` `open_new_window`, `--new-window` | 2026-11-09: the command opened a second process on the same folder; closing it changed no settings file. That window saves no tabs, placement or recents. The chord itself was not pressed. |
 | Ctrl+Enter opens in a new tab | UNVERIFIED | `main.rs` `CMD_OPEN_TAB`, `nav.rs` `activate_or_tab` | The command runs without error, the new tab was not confirmed. Ctrl+double-click built 2026-11-09: opens a background tab (Explorer opens a window). |
 
@@ -116,15 +120,16 @@ dialogs and results are the shell's own.
 | Ctrl+F search box, results view | UNVERIFIED | `source.rs:459` | |
 | Ctrl+E, F3 | WORKS | `main.rs` ACCELS | 2026-11-09: an F3 key message moves the focus to the search box. Ctrl+E shares the command; chord not pressed. |
 | Filters (`kind:`, `date:`, size) | MISSING | | |
-| Indexed search without elevation | MISSING | | [#41](https://github.com/CodingDiego/rexplorer/issues/41) |
-| Results: icons, thumbnails, preview, drag, sort, rename, refresh | PARTIAL | `source.rs`, `search.rs` | Icons, sort, delete, rename and drag built 2026-11-09, unverified. Thumbnails, preview and refresh: no. [#41](https://github.com/CodingDiego/rexplorer/issues/41), [#42](https://github.com/CodingDiego/rexplorer/issues/42) |
+| Indexed search without elevation | UNVERIFIED | `core/wsearch.rs`, `source.rs` `start_search` | v1 round: a root the Windows Search index covers is queried through it, and the folders its rules leave out (AppData in a profile) are walked; otherwise the walk as before. Index rows match the real file name (extension included). Never run with WSearch on. [#41](https://github.com/CodingDiego/rexplorer/issues/41) |
+| Results: icons, thumbnails, preview, drag, sort, rename, refresh | PARTIAL | `source.rs`, `search.rs` | Icons, sort, delete, rename and drag built 2026-11-09, unverified. Thumbnails, preview and refresh: no. [#41](https://github.com/CodingDiego/rexplorer/issues/41) |
+| Results: context menu across folders, Back returns to them | UNVERIFIED | `menu.rs` `for_scattered`, `nav.rs` `Kept` | v1 round: one menu for results from several folders; Back restores the results with selection, scroll and sort. The last 4 per tab are kept. [#42](https://github.com/CodingDiego/rexplorer/issues/42) |
 
 ## 9. Context menus and opening
 
 | Explorer behaviour | Status | Evidence | Note |
 |---|---|---|---|
 | Item menu, background menu, Shift for extended verbs | UNVERIFIED | `list.rs:402`, `menu.rs:59-86` | |
-| Open with, Send to | UNVERIFIED | `menu.rs:293` | [#46](https://github.com/CodingDiego/rexplorer/issues/46) |
+| Open with, Send to | UNVERIFIED | `menu.rs:293` | v1 round: a test gets one menu with Properties for three files and opens the sheet. Send to not tested. [#46](https://github.com/CodingDiego/rexplorer/issues/46) |
 | Windows 11 app entries (Open in Terminal, Open with Code) | UNVERIFIED | `packaged.rs:295` | Uncommitted; skipped over 16 items. |
 | Shift+F10, Menu key | UNVERIFIED | `list.rs`, `sidebar.rs`, `tabs.rs` | Also in the sidebar and the tab strip since 2026-11-10. |
 | Properties, Alt+Enter | UNVERIFIED | `main.rs:169` | |
@@ -148,6 +153,7 @@ dialogs and results are the shell's own.
 | Explorer behaviour | Status | Evidence | Note |
 |---|---|---|---|
 | Preview pane, Alt+P | UNVERIFIED | `panes.rs:180` | |
+| Home: location status column, sort | UNVERIFIED | `home.rs` `STATUS`, `next_sort` | v1 round: a Status column (cloud state, empty for local files), sort by header click or the Sort menu, for the session only. [#45](https://github.com/CodingDiego/rexplorer/issues/45) |
 | Details pane, Alt+Shift+P | WORKS | `panes.rs` `toggle_right`, `preview_pane.rs` | 2026-11-10: on the exe by command, right text for none, one and several items; swaps with the preview pane. The chord was not pressed; network and cloud items untested. |
 | Item count in the status bar | UNVERIFIED | `ui.rs:837` | |
 | Thumbnails and file-type icons | UNVERIFIED | `images.rs:33`, `source.rs:319` | |
@@ -158,11 +164,13 @@ dialogs and results are the shell's own.
 
 | Explorer behaviour | Status | Evidence | Note |
 |---|---|---|---|
-| Progress, conflict and elevation dialogs | UNVERIFIED | `menu.rs:263` | The shell's; no `IFileOperation` of our own. [#26](https://github.com/CodingDiego/rexplorer/issues/26) |
+| Progress, conflict and elevation dialogs | UNVERIFIED | `menu.rs:263` | The shell's; no `IFileOperation` of our own. v1 round: `core/tests/data_ops.rs` checks copy and move conflicts (Replace, Keep both), cancel and recycle against the shell's engine, compiled only; no app path silences the shell's UI. [#26](https://github.com/CodingDiego/rexplorer/issues/26) |
 | Recycle Bin restore and empty | UNVERIFIED | | Shell verbs. |
-| Network and UNC | UNVERIFIED | `ui.rs:51` | [#34](https://github.com/CodingDiego/rexplorer/issues/34) |
+| Network and UNC | UNVERIFIED | `ui.rs:51` | v1 round: resolving an unreachable share's address touches no network on the window thread (test compiled only). [#34](https://github.com/CodingDiego/rexplorer/issues/34) |
+| Paths over 260 characters | UNVERIFIED | `app.manifest` `longPathAware` | v1 round: declared; needs the LongPathsEnabled policy on. A core test of a long folder may fail, since the test exe has no such manifest. [#34](https://github.com/CodingDiego/rexplorer/issues/34) |
 | MTP phones | PARTIAL | `nav.rs:236` | Falls back to an embedded Explorer view. |
 | Zip as a folder | UNVERIFIED | `source.rs:405` | |
+| .rar members: icons, thumbnails, preview | UNVERIFIED | `archive_view.rs`, `thumbs.rs`, `panes.rs` | v1 round: type icons for every member, picture thumbnails and a preview up to 32 MB, extracted to `%TEMP%\rexplorer-show-<pid>`. Extract here / Extract all never replace a file already there. Encrypted .rar: no password prompt. [#43](https://github.com/CodingDiego/rexplorer/issues/43) |
 | FTP | UNVERIFIED | `connect.rs` | [#36](https://github.com/CodingDiego/rexplorer/issues/36) |
 | Control Panel, Libraries | PARTIAL | | Typed `shell:` names only. |
 | OneDrive placeholders | PARTIAL | `connect.rs:87` | No state icons. |
@@ -172,13 +180,14 @@ dialogs and results are the shell's own.
 | Explorer behaviour | Status | Evidence | Note |
 |---|---|---|---|
 | Default folder handler, Win+E, `/select`, `/e` | UNVERIFIED | `register.rs:148`, `cli.rs` | Not installed since 2026-10-18. |
-| Desktop icons view | UNVERIFIED | `desktop_icons.rs` | Built 2026-11-10, never run: opt-in `--desktop-icons`, a bottom window on the primary monitor's work area, positions in `desktop-icons.txt`. `--desktop` still only replaces the desktop's menu. |
+| Desktop icons view | UNVERIFIED | `desktop_icons.rs` | Built 2026-11-10, never run: opt-in `--desktop-icons`, a bottom window on the primary monitor's work area, positions in `desktop-icons.txt`. `--desktop` still only replaces the desktop's menu. v1 round: its own Ctrl+Z / Ctrl+Y for Delete and rename; its window is named "Desktop" for screen readers. |
 | Jump list, AppUserModelID | MISSING | | |
 | F11 full screen | WORKS | `ui.rs` `toggle_fullscreen` | 2026-11-09: the command makes the window cover the monitor and a second one restores the exact placement. |
 | Follow the system light / dark setting | UNVERIFIED | `settings.rs` | Built 2026-11-09: `theme=system`. |
-| Per-monitor DPI | UNVERIFIED | `main.rs:310`, `:653` | [#33](https://github.com/CodingDiego/rexplorer/issues/33) |
+| Per-monitor DPI | UNVERIFIED | `main.rs:310`, `:653` | v1 round: Folder options and Connect also rebuild their fonts when moved to another monitor. [#33](https://github.com/CodingDiego/rexplorer/issues/33) |
+| Windows Text size | UNVERIFIED | `theme.rs` `text_scale` | v1 round: fonts and text-holding metrics follow Accessibility > Text size (100-225%), live. Fixed widths do not grow. [#24](https://github.com/CodingDiego/rexplorer/issues/24) |
 | High contrast | UNVERIFIED | `theme.rs` `effective_theme` | Built 2026-11-10: system colors, outlines for hover and selection, live switch. Never seen under a real contrast theme. [#23](https://github.com/CodingDiego/rexplorer/issues/23) |
-| Screen reader support for the custom controls | UNVERIFIED | `core/access.rs` | Built 2026-11-10: MSAA for Home, tabs, breadcrumb, sidebar, toolbars, palette and status bar, tested in-process. Not tried with Narrator or NVDA. [#21](https://github.com/CodingDiego/rexplorer/issues/21) |
+| Screen reader support for the custom controls | UNVERIFIED | `core/access.rs` | Built 2026-11-10: MSAA for Home, tabs, breadcrumb, sidebar, toolbars, palette and status bar, tested in-process; the preview and details pane since the v1 round. The address and search boxes have no accessible name. Not tried with Narrator or NVDA. [#21](https://github.com/CodingDiego/rexplorer/issues/21) |
 | Show hidden files, show extensions | UNVERIFIED | `folder_options.rs:663`, `:1087` | |
 | Copy as path, Ctrl+Shift+C | UNVERIFIED | `list.rs` `copy_as_path` | Built 2026-11-10. Not run: it writes the real clipboard. Refuses names with quotes or line breaks (archive folders). |
 | Size all columns to fit, Ctrl+numpad Plus | UNVERIFIED | `list.rs` `fit_columns` | Built 2026-11-10; widths grew on the exe by command. |
@@ -191,8 +200,10 @@ dialogs and results are the shell's own.
 1. Check with a real keyboard and mouse: F2, click-again rename and dragging to other programs, in a folder and
    on Home. Then every UNVERIFIED row built on 2026-11-09 and 2026-11-10.
 2. Try `--desktop-icons`, a Windows contrast theme, and Narrator.
-3. Undo for the cases not recorded yet.
-4. Search filters, indexed search without elevation, rename and drag for archive members.
+3. The v1 round's rows: toolbar keys, indexed search, results Back, Home sort, archive thumbnails, Text size,
+   then read `rexplorer.log` after each failed drag to another program.
+4. Undo for the cases not recorded yet.
+5. Search filters, thumbnails and preview for search results, rename and drag for archive members.
 
 Deliberate differences from Explorer: Backspace goes up, Ctrl+D pins, Ctrl+Shift+E opens Explorer, F4 has no
 dropdown, and F10 opens no menu bar.

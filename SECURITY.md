@@ -46,4 +46,5 @@ Out of scope:
 - Preview handlers run out of process (`prevhost.exe`) and are not used for files from the Internet zone.
 - An elevated start restarts unelevated unless `--elevated` is passed.
 - Everything rexplorer installs is per-user (HKCU, `%LOCALAPPDATA%`); nothing needs administrator rights.
-- Dependencies are checked with `cargo audit` in CI.
+- Dependencies are checked with `cargo audit` in CI every week; failures are triaged within 7 days (see
+  CONTRIBUTING.md, Dependencies).
