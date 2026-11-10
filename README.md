@@ -182,7 +182,7 @@ Every change is written to the active profile in settings.ini and applies at onc
 | Ctrl+L, Alt+D | Edit the address over the breadcrumb |
 | Ctrl+F | Search box (Enter searches, Escape stops and returns to the list) |
 | Escape (list) | Stop a running search |
-| F2, Delete, Shift+Delete, Ctrl+C/X/V, Ctrl+A, Alt+Enter | Shell verbs on the selection (F2 on shell items only) |
+| F2, Delete, Shift+Delete, Ctrl+C/X/V, Ctrl+A, Alt+Enter | Shell verbs on the selection (F2 on shell items only). F2 and click-again rename were reported broken and could not be reproduced, see [the parity checklist](docs/EXPLORER-PARITY.md) |
 | Right-click | Full shell context menu (Shift adds the extended verbs); the background adds View, Sort by, Refresh, Paste, Pin on top; archives get the extract menu |
 | Ctrl+Shift+E | Open the current folder in Windows Explorer (an archive: its folder) |
 | Ctrl+T, Ctrl+W | New tab at the start place, close tab (closing the last tab closes the window) |
@@ -194,7 +194,19 @@ Every change is written to the active profile in settings.ini and applies at onc
 | Ctrl+` | Terminal (Windows Terminal, else cmd) in the current filesystem folder |
 | Ctrl+B | Show / hide the sidebar (hides the folder tree when that is showing instead) |
 | Alt+P | Show / hide the preview pane (text in a monospace Edit, preview handlers in place, else a thumbnail) |
-| Ctrl+Shift+1 / 2 / 3, View menu | Details / icons (96 px) / thumbnails (128 px) |
+| Ctrl+Shift+1 / 2 / 3, View menu | Details / large icons / thumbnails. Ctrl+Shift+4 is small icons, Ctrl+Shift+6 details; the View menu also has extra large and medium |
+| Ctrl+wheel | Step through the views, one per notch |
+| Ctrl+Shift+N | New folder, then rename it |
+| Ctrl+N | New window on the current folder (it saves no tabs, placement or recents) |
+| Ctrl+Enter, Ctrl+double-click | Open the folder in a background tab |
+| Ctrl+Z, Ctrl+Y | Undo, redo: rename, new items, delete to the Recycle Bin, paste, drops on the list |
+| Ctrl+I | Invert the selection |
+| F4, F3 / Ctrl+E | Address, search box |
+| F6, Shift+F6 | Next, previous pane (view, address, search, tree) |
+| F11 | Full screen |
+| Right-click a column header | Choose columns |
+| Right-click Back / Forward | History menu |
+| Drag a tab, right-click a tab | Reorder, or tear out to a new window; Duplicate, Close others, Close to the right |
 | Connect button | FTP dialog (host, port, user, password, path); the `ftp://` URL opens in a new tab |
 
 Shortcuts work while the tree, the search box or the embedded Explorer view has the focus, except Enter and
@@ -204,7 +216,9 @@ They can be rebound in a `[keys]` section of `settings.ini`: one line per comman
 several chords `cmd.back=Alt+Left, Backspace`. Commands: `cmd.back`, `cmd.forward`, `cmd.up`, `cmd.refresh`,
 `cmd.address`, `cmd.explorer`, `cmd.enter`, `cmd.escape`, `cmd.properties`, `cmd.new_tab`, `cmd.close_tab`,
 `cmd.next_tab`, `cmd.prev_tab`, `cmd.palette`, `cmd.terminal`, `cmd.toggle_sidebar`, `cmd.toggle_preview`,
-`cmd.search`, `cmd.pin`, `cmd.view_details`, `cmd.view_icons`, `cmd.view_thumbnails`. A chord is `Ctrl`, `Alt`,
+`cmd.search`, `cmd.pin`, `cmd.view_details`, `cmd.view_icons`, `cmd.view_thumbnails`, `cmd.view_extra_large`,
+`cmd.view_medium`, `cmd.view_small`, `cmd.new_folder`, `cmd.open_tab`, `cmd.fullscreen`, `cmd.invert_selection`,
+`cmd.next_pane`, `cmd.prev_pane`, `cmd.new_window`, `cmd.undo`, `cmd.redo`. A chord is `Ctrl`, `Alt`,
 `Shift` in any combination plus a key: a letter, digit or backquote (these need Ctrl or Alt, so typing keeps
 working), `F1`..`F24`, `Left`, `Right`, `Up`, `Down`, `Enter`, `Esc`, `Tab`, `Space`, `Backspace`, `Delete`,
 `Insert`, `Home`, `End`, `PageUp`, `PageDown`. A command whose line has no valid chord keeps its defaults.
@@ -212,7 +226,9 @@ working), `F1`..`F24`, `Left`, `Right`, `Up`, `Down`, `Enter`, `Esc`, `Tab`, `Sp
 Icon and thumbnail images render on a worker thread and land as they finish; the last 512 are cached. In both
 icon views and in the preview pane a folder shows the shell's composed thumbnail, as Explorer's: the folder with a
 peek at a file inside (a picture strip, a document sheet; the shell picks the file). Drag items
-out of the list to anywhere that accepts files, or drop files onto a folder item or the list background.
+out of the list to anywhere that accepts files (**currently unreliable**: other programs often never see the
+drag, [#75](https://github.com/CodingDiego/rexplorer/issues/75)), or drop files onto a folder item or the list
+background.
 
 ### Command line
 
@@ -221,6 +237,7 @@ rexplorer [options] [folder...]
   --select <path>     open the parent folder with <path> selected (also /select,<path>)
   --profile <name>    use the named settings profile
   --new-tab, -t       open in a new tab of the running window
+  --new-window        open a second window (it saves no tabs, placement or recents)
   --search <text>     search the (first) folder opened for <text>
   --register          open folders and Win+E with this exe (per-user HKCU\Software\Classes keys; asks first)
   --unregister        undo --register
@@ -369,7 +386,7 @@ profile=default                  ; the active profile
 
 [profile default]
 start=shell:::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}   ; where a launch without folders, and a new tab, start: Home
-theme=dark                       ; a file name in themes\ without .ini
+theme=dark                       ; a file name in themes\ without .ini, or system to follow Windows
 view=details                     ; details | icons | thumbnails (the view segment writes it back here)
 show_tree=false                  ; the folder tree instead of the sidebar
 show_preview=false
@@ -421,7 +438,8 @@ an icon nor an opener keeps the blank page.
 
 Written by the app: `session.txt` (`tab=` lines, `active=`, `view=`, `tree=` / `sidebar=` / `preview=` as 0 or 1,
 the pane widths; saved within 2 s of each change and on exit; a search tab is saved as its folder), `recent.txt`
-(palette history), `window.txt` (placement). A first run, or `--profile`, takes view and panes from the profile;
+(palette history), `window.txt` (placement), `folders.txt` (each folder's view, sort, group, columns and widths;
+at most 500 folders). A first run, or `--profile`, takes view and panes from the profile;
 later runs from the session. A session written before the sidebar existed (no `sidebar=`) opens with the sidebar.
 
 The exe carries a Common Controls 6 manifest (`crates/app/build.rs`): icon views and the themed controls need it.
@@ -468,8 +486,15 @@ through WM_APP+0x54.
 
 ### Known gaps
 
-- Search results and archive members show placeholders in the icons and thumbnails views, have no preview,
-  cannot be dragged, sorted by column or renamed; search results are not refreshed after a delete.
+**[docs/EXPLORER-PARITY.md](docs/EXPLORER-PARITY.md) is the full checklist against Windows Explorer**: every
+behaviour marked WORKS, BROKEN, UNVERIFIED, PARTIAL or MISSING. As of 2026-11-09 dragging files to other
+programs is unreliable and F2 and click-again rename were reported broken (not reproduced). Most of the features
+added that day (drag images, right-button drag, drops on the sidebar, crumbs and tabs, tab reordering, the column
+chooser, icon overlays, cut fading) are marked UNVERIFIED: built and unit-tested, not yet tried with a real mouse.
+Undo does not cover drops outside the file list. The list below holds the gaps of rexplorer's own features.
+
+- Archive members show placeholders in the icons and thumbnails views, have no preview, and cannot be dragged,
+  sorted by column or renamed. Search results have no thumbnails or preview.
 - The context menu on search results needs every selected result in one folder.
 - Back from a folder opened out of search results returns to the searched folder, not to the results.
 - Search result icons come from the extension (no per-file icons such as an exe's own).

@@ -89,6 +89,14 @@ in the user's language, so a Spanish Windows shows "Nueva carpeta" next to Engli
 ## 6. Explorer parity for daily use
 
 Each gap below is either closed, or explicitly accepted for 1.0 and listed under "Known gaps" in the release notes.
+The row-by-row status of every Explorer behaviour is in [docs/EXPLORER-PARITY.md](docs/EXPLORER-PARITY.md).
+
+- [ ] **[blocker] No BROKEN or REPORTED BROKEN rows in the parity checklist.** As of 2026-11-09: dragging files
+  to other programs ([#75](https://github.com/CodingDiego/rexplorer/issues/75)) is broken; F2 rename and click-again
+  rename were reported broken and pass when driven with window messages. *Done when:* each is proven with a real
+  keyboard and mouse on the built exe, and the checklist row reads WORKS.
+- [ ] **[blocker] Daily-use rows of the parity checklist.** *Done when:* every MISSING or PARTIAL row in its
+  sections 1 to 7 and 10 is WORKS, or accepted for 1.0 with a reason in the release notes.
 
 - [ ] **[blocker] Desktop menu completeness** ([#40](https://github.com/CodingDiego/rexplorer/issues/40)). The desktop menu shipped in 0.1.3
   (`rexplorer --desktop`). *Done when:* right-dragging desktop icons works as in Explorer, and Shift+F10 and the Menu
