@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 use rexplorer_core::icons::{self, IconTheme};
 use rexplorer_core::images::ImageCache;
+use windows::Win32::UI::HiDpi::GetSystemMetricsForDpi;
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, AlphaBlend, BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CreateCompatibleDC,
     CreateDIBSection, DIB_RGB_COLORS, DeleteDC, GdiFlush, GetObjectW, HALFTONE, HBITMAP, SRCCOPY, SelectObject,
@@ -24,10 +25,15 @@ pub(crate) enum View {
     Icons,
     Thumbnails,
     ExtraLarge,
+    List,
+    Tiles,
+    /// A tile variant (one tile per row, three lines), not Explorer's own Content view.
+    Content,
 }
 
-/// The Ctrl+wheel order, smallest first.
-const STEPS: [View; 6] = [View::Details, View::Small, View::Medium, View::Icons, View::Thumbnails, View::ExtraLarge];
+/// The Ctrl+wheel order, smallest first; Thumbnails sits between Large and Extra large by size.
+const STEPS: [View; 9] =
+    [View::Content, View::Tiles, View::Details, View::List, View::Small, View::Medium, View::Icons, View::Thumbnails, View::ExtraLarge];
 
 impl View {
     pub fn parse(s: &str) -> View {
@@ -37,6 +43,9 @@ impl View {
             "icons" => View::Icons,
             "thumbnails" => View::Thumbnails,
             "extra-large" => View::ExtraLarge,
+            "list" => View::List,
+            "tiles" => View::Tiles,
+            "content" => View::Content,
             _ => View::Details,
         }
     }
@@ -49,6 +58,9 @@ impl View {
             View::Icons => "icons",
             View::Thumbnails => "thumbnails",
             View::ExtraLarge => "extra-large",
+            View::List => "list",
+            View::Tiles => "tiles",
+            View::Content => "content",
         }
     }
 
@@ -68,21 +80,24 @@ impl View {
     /// Image edge in 96-DPI pixels for the icon views; 0 for the views that use the small icons.
     pub fn px(self) -> i32 {
         match self {
-            View::Details | View::Small => 0,
-            View::Medium => 48,
+            View::Details | View::Small | View::List => 0,
+            View::Medium | View::Tiles | View::Content => 48,
             View::Icons => 96,
             View::Thumbnails => 128,
             View::ExtraLarge => 256,
         }
     }
 
-    const COMMANDS: [(View, u16); 6] = [
+    const COMMANDS: [(View, u16); 9] = [
         (View::Details, CMD_VIEW1),
         (View::Icons, CMD_VIEW1 + 1),
         (View::Thumbnails, CMD_VIEW1 + 2),
         (View::ExtraLarge, CMD_VIEW_XL),
         (View::Medium, CMD_VIEW_MEDIUM),
         (View::Small, CMD_VIEW_SMALL),
+        (View::List, CMD_VIEW_LIST),
+        (View::Tiles, CMD_VIEW_TILES),
+        (View::Content, CMD_VIEW_CONTENT),
     ];
 
     pub fn command(self) -> u16 {
@@ -92,6 +107,53 @@ impl View {
     pub fn of_command(cmd: u16) -> Option<View> {
         Self::COMMANDS.iter().find(|c| c.1 == cmd).map(|c| c.0)
     }
+}
+
+/// The header positions a tile shows under its name (Tiles: two, Content: three), from `ncols` header columns.
+/// Positions, not titles: the titles are localized.
+pub(crate) fn tile_columns(view: View, ncols: usize) -> Vec<u32> {
+    let (candidates, most): (&[u32], usize) = match view {
+        View::Tiles => (&[2, 3, 1], 2),
+        View::Content => (&[1, 2, 3], 3),
+        _ => return Vec::new(),
+    };
+    let mut cols: Vec<u32> = candidates.iter().copied().filter(|&c| (c as usize) < ncols).take(most).collect();
+    cols.sort();
+    cols
+}
+
+/// Tiles in one row, from the positions of items 0 and 1: 1 when the second is on another row or has no pitch.
+fn per_row(x0: i32, x1: i32, y0: i32, y1: i32, width: i32) -> i32 {
+    if y1 != y0 || x1 <= x0 { 1 } else { ((width - x0) / (x1 - x0)).max(1) }
+}
+
+/// Content tile width: the client area minus the scrollbar and a margin.
+fn content_width(client: i32, scrollbar: i32, dpi: i32) -> i32 {
+    (client - scrollbar - 8 * dpi / 96).max(100 * dpi / 96)
+}
+
+/// Tells the tile view how many lines a tile has and, for Content, how wide it is. No-op in the other views.
+pub(crate) unsafe fn set_tile_info(app: *mut App) {
+    let a = &*app;
+    let view = a.views.view;
+    if !matches!(view, View::Tiles | View::Content) {
+        return;
+    }
+    let mut info = LVTILEVIEWINFO {
+        cbSize: size_of::<LVTILEVIEWINFO>() as u32,
+        dwMask: LVTVIM_COLUMNS | LVTVIM_TILESIZE,
+        dwFlags: LVTVIF_AUTOSIZE,
+        cLines: tile_columns(view, usize::MAX).len() as i32,
+        ..Default::default()
+    };
+    if view == View::Content {
+        let dpi = GetDpiForWindow(a.hwnd);
+        let mut rc = RECT::default();
+        let _ = GetClientRect(a.list, &mut rc);
+        info.dwFlags = LVTVIF_FIXEDWIDTH;
+        info.sizeTile.cx = content_width(rc.right, GetSystemMetricsForDpi(SM_CXVSCROLL, dpi), dpi as i32);
+    }
+    SendMessageW(a.list, LVM_SETTILEVIEWINFO, None, Some(LPARAM(&info as *const _ as isize)));
 }
 
 /// (whole notches, remainder) after adding a wheel delta; 120 is one notch, high-resolution wheels send less.
@@ -338,6 +400,11 @@ pub(crate) unsafe fn set_view(app: *mut App, view: View) {
         a.profile.view = view.name().to_string();
         save_profile_key(&a.profile.name, "view", view.name());
         apply(app);
+        // The list view has no groups: they go off there and come back in the other views. Not from apply: a
+        // navigation's show_view runs before the new item count, and groups go on only after it (show_source).
+        if !(*app).skeleton {
+            list::set_groups(app, true);
+        }
         nav::session_changed(app);
     }
     nav::remember_folder(app);
@@ -350,7 +417,11 @@ pub(crate) unsafe fn apply(app: *mut App) {
     let view = a.views.view;
     if view.px() == 0 {
         // shortcut: small icons use the 28 px row-high images; give Small its own 16 px list if rows look loose
-        let lv = if view == View::Small { LV_VIEW_SMALLICON } else { LV_VIEW_DETAILS };
+        let lv = match view {
+            View::Small => LV_VIEW_SMALLICON,
+            View::List => LV_VIEW_LIST,
+            _ => LV_VIEW_DETAILS,
+        };
         SendMessageW(list, LVM_SETVIEW, Some(WPARAM(lv as usize)), None);
     } else {
         let dpi = GetDpiForWindow(a.hwnd) as i32;
@@ -365,10 +436,15 @@ pub(crate) unsafe fn apply(app: *mut App) {
                 let _ = ImageList_Destroy(Some(old));
             }
         }
-        // Distance between tile origins: image plus room for two lines of label.
-        let (cx, cy) = (size + 40 * dpi / 96, size + 44 * dpi / 96);
-        SendMessageW(list, LVM_SETICONSPACING, Some(WPARAM(0)), Some(LPARAM(((cy as isize) << 16) | cx as isize)));
-        SendMessageW(list, LVM_SETVIEW, Some(WPARAM(LV_VIEW_ICON as usize)), None);
+        if matches!(view, View::Tiles | View::Content) {
+            set_tile_info(app);
+            SendMessageW(list, LVM_SETVIEW, Some(WPARAM(LV_VIEW_TILE as usize)), None);
+        } else {
+            // Distance between tile origins: image plus room for two lines of label.
+            let (cx, cy) = (size + 40 * dpi / 96, size + 44 * dpi / 96);
+            SendMessageW(list, LVM_SETICONSPACING, Some(WPARAM(0)), Some(LPARAM(((cy as isize) << 16) | cx as isize)));
+            SendMessageW(list, LVM_SETVIEW, Some(WPARAM(LV_VIEW_ICON as usize)), None);
+        }
     }
     let count = nav::source(app).map_or(0, |s| s.len());
     reset(app, count);
@@ -417,7 +493,7 @@ pub(crate) unsafe fn on_cache_hint(app: *mut App, from: i32, to: i32) {
     let count = (*app).views.slots.len();
     // What the worker may still render: the screen (and the hint, should the two disagree) plus a lookahead. Slots
     // requested outside it are dropped there, so they ask again if scrolled back to.
-    let screen = on_screen((*app).list);
+    let screen = on_screen(app);
     let first = screen.start.min(from);
     let win = thumbs::visible_range(first, screen.end.max(to + 1) - first, count, LOOKAHEAD);
     let v = &mut (*app).views;
@@ -446,14 +522,32 @@ pub(crate) unsafe fn on_cache_hint(app: *mut App, from: i32, to: i32) {
 
 /// The items an icon view has on screen, from its scroll position: after a thumbnail lands, its redraw can make
 /// LVN_ODCACHEHINT shrink to that one item.
-unsafe fn on_screen(list: HWND) -> std::ops::Range<i32> {
+unsafe fn on_screen(app: *mut App) -> std::ops::Range<i32> {
+    let list = (*app).list;
     let mut origin = POINT::default();
     SendMessageW(list, LVM_GETORIGIN, None, Some(LPARAM(&mut origin as *mut POINT as isize)));
-    let space = SendMessageW(list, LVM_GETITEMSPACING, Some(WPARAM(0)), None).0 as u32;
-    let (cx, cy) = ((space & 0xFFFF).max(1) as i32, (space >> 16).max(1) as i32);
     let mut rc = RECT::default();
     let _ = GetClientRect(list, &mut rc);
-    let per_row = (rc.right / cx).max(1);
+    let (per_row, cy) = if matches!((*app).views.view, View::Tiles | View::Content) {
+        // Tile sizes follow their text: the grid is read from where items 0, 1 and the first of the next row sit.
+        let count = (*app).views.slots.len() as i32;
+        if count < 2 {
+            return 0..count;
+        }
+        let pos = |i: i32| {
+            let mut p = POINT::default();
+            SendMessageW(list, LVM_GETITEMPOSITION, Some(WPARAM(i as usize)), Some(LPARAM(&mut p as *mut POINT as isize)));
+            p
+        };
+        let (p0, p1) = (pos(0), pos(1));
+        let per = per_row(p0.x, p1.x, p0.y, p1.y, rc.right);
+        (per, if per < count { pos(per).y - p0.y } else { rc.bottom })
+    } else {
+        let space = SendMessageW(list, LVM_GETITEMSPACING, Some(WPARAM(0)), None).0 as u32;
+        let cx = (space & 0xFFFF).max(1) as i32;
+        ((rc.right / cx).max(1), (space >> 16).max(1) as i32)
+    };
+    let cy = cy.max(1);
     let top = origin.y.max(0);
     top / cy * per_row..(top + rc.bottom) / cy * per_row + per_row
 }
@@ -484,8 +578,8 @@ unsafe fn request(app: *mut App, i: usize) -> i32 {
     if !t.in_window(i) {
         return 0;
     }
-    // The Icons view shows pictures as thumbnails and everything else as its icon.
-    let icon_only = matches!(v.view, View::Icons | View::Medium) && !is_picture(&parsing);
+    // These views show pictures as thumbnails and everything else as its icon.
+    let icon_only = matches!(v.view, View::Icons | View::Medium | View::Tiles | View::Content) && !is_picture(&parsing);
     t.request((v.token << 32) | i, l.folder.child_pidl(item), v.size, icon_only);
     v.slots[i] = REQUESTED;
     0
@@ -767,21 +861,25 @@ mod tests {
         }
         assert_eq!(View::parse("icons"), View::Icons);
         assert_eq!(View::parse("thumbnails"), View::Thumbnails);
+        assert_eq!(View::parse("list"), View::List);
+        assert_eq!(View::parse("tiles"), View::Tiles);
+        assert_eq!(View::parse("content"), View::Content);
         assert_eq!(View::parse("bogus"), View::Details);
         assert_eq!(View::Thumbnails.next(), View::ExtraLarge);
-        assert_eq!(View::ExtraLarge.next(), View::Details);
+        assert_eq!(View::ExtraLarge.next(), View::Content);
     }
 
     #[test]
-    fn wheel_steps_clamp_at_the_ends() {
-        assert_eq!(View::Details.step(true), View::Small);
-        assert_eq!(View::Small.step(true), View::Medium);
-        assert_eq!(View::Medium.step(true), View::Icons);
-        assert_eq!(View::Icons.step(true), View::Thumbnails);
-        assert_eq!(View::Thumbnails.step(true), View::ExtraLarge);
-        assert_eq!(View::ExtraLarge.step(true), View::ExtraLarge);
-        assert_eq!(View::Details.step(false), View::Details);
-        assert_eq!(View::ExtraLarge.step(false), View::Thumbnails);
+    fn wheel_steps_follow_explorer_order() {
+        use View::*;
+        assert_eq!(STEPS, [Content, Tiles, Details, List, Small, Medium, Icons, Thumbnails, ExtraLarge]);
+        assert_eq!(Details.step(true), List);
+        assert_eq!(List.step(true), Small);
+        assert_eq!(Icons.step(true), Thumbnails);
+        assert_eq!(ExtraLarge.step(true), ExtraLarge);
+        assert_eq!(Details.step(false), Tiles);
+        assert_eq!(Tiles.step(false), Content);
+        assert_eq!(Content.step(false), Content);
     }
 
     #[test]
@@ -801,6 +899,13 @@ mod tests {
             assert_eq!(View::of_command(v.command()), Some(v));
         }
         assert_eq!(View::of_command(CMD_SEARCH), None);
+        let mut ids: Vec<u16> = STEPS.iter().map(|v| v.command()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 9);
+        assert_eq!(View::of_command(CMD_VIEW_LIST), Some(View::List));
+        assert_eq!(View::of_command(CMD_VIEW_TILES), Some(View::Tiles));
+        assert_eq!(View::of_command(CMD_VIEW_CONTENT), Some(View::Content));
     }
 
     #[test]
@@ -809,6 +914,35 @@ mod tests {
         assert_eq!(max_images(256), 384);
         assert_eq!(max_images(4096), 64);
         assert_eq!((View::Small.px(), View::Medium.px(), View::ExtraLarge.px()), (0, 48, 256));
+        assert_eq!((View::List.px(), View::Tiles.px(), View::Content.px()), (0, 48, 48));
+    }
+
+    #[test]
+    fn tile_columns_pick_header_positions() {
+        assert_eq!(tile_columns(View::Tiles, 4), [2, 3]);
+        assert_eq!(tile_columns(View::Tiles, 3), [1, 2]);
+        assert_eq!(tile_columns(View::Tiles, 2), [1]);
+        assert!(tile_columns(View::Tiles, 1).is_empty());
+        assert_eq!(tile_columns(View::Content, 4), [1, 2, 3]);
+        assert_eq!(tile_columns(View::Content, 12), [1, 2, 3]);
+        assert_eq!(tile_columns(View::Content, 2), [1]);
+        assert!(tile_columns(View::Details, 4).is_empty());
+        assert!(tile_columns(View::List, 4).is_empty());
+    }
+
+    #[test]
+    fn tile_grid_per_row() {
+        assert_eq!(per_row(8, 300, 0, 0, 1000), 3);
+        assert_eq!(per_row(8, 8, 0, 70, 1000), 1, "Content: the next item is below");
+        assert_eq!(per_row(8, 300, 0, 0, 200), 1);
+        assert_eq!(per_row(8, 8, 0, 0, 1000), 1, "no pitch");
+    }
+
+    #[test]
+    fn content_width_fills_the_row() {
+        assert_eq!(content_width(1000, 17, 96), 975);
+        assert_eq!(content_width(2000, 34, 192), 1950);
+        assert_eq!(content_width(50, 17, 96), 100);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 //! Headless shell-namespace layer. No window code lives here.
+pub mod access;
 pub mod archive;
 pub mod browser;
 pub mod cli;
@@ -10,6 +11,7 @@ pub mod elevation;
 pub mod fallback;
 pub mod folder;
 pub mod fuzzy;
+pub mod i18n;
 pub mod icons;
 pub mod import_explorer;
 pub mod install;

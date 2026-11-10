@@ -6,10 +6,13 @@ use std::ffi::c_void;
 use std::mem::size_of;
 use std::sync::Once;
 
-use rexplorer_core::settings::Theme;
+use rexplorer_core::access;
+use rexplorer_core::i18n::tr;
+use rexplorer_core::settings::{Contrast, Theme};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Accessibility::{ROLE_SYSTEM_PUSHBUTTON, ROLE_SYSTEM_TOOLBAR};
 use windows::Win32::UI::Controls::*;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
@@ -108,6 +111,8 @@ struct State {
     selection: u32,
     hover_fill: u32,
     accent: u32,
+    /// Some while a Windows contrast theme is on.
+    contrast: Option<Contrast>,
     font: HFONT,
     icon: Option<HICON>,
     crumbs: Vec<String>,
@@ -115,6 +120,7 @@ struct State {
     origin: i32,
     hover: Hit,
     tracking: bool,
+    acc: Option<access::Server>,
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -149,6 +155,7 @@ pub fn create(parent: HWND, id: usize) -> Result<HWND> {
             selection: t.selection,
             hover_fill: crate::theme::hover(&t),
             accent: t.accent,
+            contrast: t.contrast,
             font: HFONT::default(),
             icon: None,
             crumbs: Vec::new(),
@@ -156,6 +163,7 @@ pub fn create(parent: HWND, id: usize) -> Result<HWND> {
             origin: 0,
             hover: Hit::Empty,
             tracking: false,
+            acc: None,
         }));
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -184,6 +192,7 @@ pub fn set_theme(hwnd: HWND, t: &Theme) {
             s.selection = t.selection;
             s.hover_fill = crate::theme::hover(t);
             s.accent = t.accent;
+            s.contrast = t.contrast;
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
     }
@@ -195,6 +204,7 @@ pub fn set_crumbs(hwnd: HWND, crumbs: &[String]) {
             s.crumbs = crumbs.to_vec();
             s.hover = Hit::Empty;
             let _ = InvalidateRect(Some(hwnd), None, false);
+            access::event(EVENT_OBJECT_REORDER, hwnd, None);
         }
     }
 }
@@ -232,6 +242,24 @@ unsafe fn notify(hwnd: HWND, code: u32, index: usize) {
     }
 }
 
+unsafe fn acc_tree(hwnd: HWND, st: &State, t: &mut access::Tree) {
+    unsafe {
+        let mut rc = RECT::default();
+        let _ = GetClientRect(hwnd, &mut rc);
+        t.name = tr("tb.address_name").into();
+        t.role = ROLE_SYSTEM_TOOLBAR;
+        for (i, text) in st.crumbs.iter().enumerate() {
+            // The layout is only computed in paint and can be stale: a crumb it does not cover is reported hidden.
+            let shown = i.checked_sub(st.layout.first_visible).and_then(|k| st.layout.items.get(k));
+            let (state, rect) = match shown {
+                Some((c, _)) => (0, RECT { left: st.origin + c.left, top: 0, right: st.origin + c.right, bottom: rc.bottom }),
+                None => (STATE_SYSTEM_INVISIBLE.0, RECT::default()),
+            };
+            t.items.push(access::Item { name: text.clone(), role: ROLE_SYSTEM_PUSHBUTTON, state, rect, action: tr("tb.action_open"), ..Default::default() });
+        }
+    }
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         if msg == WM_NCCREATE {
@@ -251,6 +279,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         };
         match msg {
             WM_ERASEBKGND => return LRESULT(1),
+            WM_GETOBJECT if access::is_client(lparam) => return st.acc.get_or_insert_with(|| access::Server::new(hwnd)).answer(wparam),
+            access::WM_ACC_ITEMS => {
+                acc_tree(hwnd, st, &mut *(lparam.0 as *mut access::Tree));
+                return LRESULT(1);
+            }
+            access::WM_ACC_INVOKE => {
+                if wparam.0 < st.crumbs.len() {
+                    notify(hwnd, CN_CRUMB, wparam.0);
+                }
+            }
             WM_SETFONT => {
                 st.font = HFONT(wparam.0 as *mut c_void);
                 let _ = InvalidateRect(Some(hwnd), None, false);
@@ -337,6 +375,11 @@ unsafe fn paint(hwnd: HWND, st: &mut State) {
         let bg = CreateSolidBrush(COLORREF(st.background));
         FillRect(mem, &rc, bg);
         fill_round(mem, &rc, st.surface, s(8));
+        if st.contrast.is_some() {
+            // Surface and header share a color: the field needs an edge.
+            // outline_round includes right and bottom: one pixel in keeps them inside the client area.
+            crate::theme::outline_round(mem, &RECT { right: cw - 1, bottom: ch - 1, ..rc }, st.text, s(8), 1);
+        }
 
         let text_font = if st.font.is_invalid() { HFONT(GetStockObject(DEFAULT_GUI_FONT).0) } else { st.font };
         let glyph = glyph_font(mem, s(12));
@@ -378,10 +421,13 @@ unsafe fn paint(hwnd: HWND, st: &mut State) {
         };
         if let Some(r) = hover_rect {
             fill_round(mem, &r, st.hover_fill, s(6));
+            if let Some(c) = st.contrast {
+                crate::theme::outline_round(mem, &r, c.hot, s(6), (dpi / 96).max(1));
+            }
         }
 
         let flags = DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX;
-        let chevron_color = blend(st.secondary, st.background, 0.6);
+        let chevron_color = if st.contrast.is_some() { st.text } else { blend(st.secondary, st.background, 0.6) };
         if first > 0 {
             if let Some((c, _)) = st.layout.items.first() {
                 let mut r = at(&RECT { left: 0, top: 0, right: c.left, bottom: 0 });
@@ -393,7 +439,8 @@ unsafe fn paint(hwnd: HWND, st: &mut State) {
         for (k, (c, chev)) in st.layout.items.iter().enumerate() {
             let (mut cr, mut kr) = (at(c), at(chev));
             SelectObject(mem, text_font.into());
-            SetTextColor(mem, COLORREF(st.text));
+            let current = st.contrast.filter(|_| k + 1 == st.layout.items.len());
+            SetTextColor(mem, COLORREF(current.map_or(st.text, |c| c.highlight_text)));
             DrawTextW(mem, &mut wide(&st.crumbs[first + k]), &mut cr, flags);
             SelectObject(mem, glyph.into());
             SetTextColor(mem, COLORREF(chevron_color));
@@ -499,6 +546,62 @@ mod tests {
             assert_eq!(state(bc).unwrap().crumbs.len(), 3);
             let _ = DestroyWindow(parent);
             pump();
+        }
+    }
+
+    thread_local! {
+        static NOTES: std::cell::RefCell<Vec<(u32, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    unsafe extern "system" fn rec_parent(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        if msg == WM_NOTIFY {
+            let nm = &*(lparam.0 as *const NmCrumb);
+            NOTES.with(|n| n.borrow_mut().push((nm.hdr.code, nm.index)));
+            return LRESULT(0);
+        }
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+
+    #[test]
+    fn accessible_crumbs() {
+        use crate::acc_test::*;
+        use rexplorer_core::com::ComInit;
+        let _com = ComInit::sta();
+        unsafe {
+            let hinst = GetModuleHandleW(None).unwrap().into();
+            let wc = WNDCLASSW { lpfnWndProc: Some(rec_parent), hInstance: hinst, lpszClassName: w!("RexCrumbsAccParent"), ..Default::default() };
+            RegisterClassW(&wc);
+            let parent = CreateWindowExW(WINDOW_EX_STYLE(0), w!("RexCrumbsAccParent"), windows::core::PCWSTR::null(), WS_OVERLAPPEDWINDOW, 0, 0, 800, 600, None, None, Some(hinst), None).unwrap();
+            let bc = create(parent, 7).unwrap();
+            let _ = MoveWindow(bc, 0, 0, 600, 32, false);
+            let names = ["This PC".to_string(), "C:".to_string(), "Users".to_string()];
+            set_crumbs(bc, &names);
+            // Set before any pump: a paint would recompute the layout.
+            state(bc).unwrap().layout = layout(&[40, 50, 60], 10, 8, 210);
+            state(bc).unwrap().origin = 30;
+            let acc = object(bc);
+            let k = kids(&acc);
+            assert_eq!(k.iter().map(|k| k.name.as_str()).collect::<Vec<_>>(), ["This PC", "C:", "Users"]);
+            assert!(k.iter().all(|k| k.role == ROLE_SYSTEM_PUSHBUTTON));
+            assert_ne!(k[0].state & STATE_SYSTEM_INVISIBLE.0, 0);
+            let c = state(bc).unwrap().layout.items[0].0;
+            let r = screen(bc, RECT { left: 30 + c.left, top: 0, right: 30 + c.right, bottom: 32 });
+            assert_eq!((k[1].rect.left, k[1].rect.top, k[1].rect.right, k[1].rect.bottom), (r.left, r.top, r.right, r.bottom));
+            let r0 = root(&acc);
+            assert_eq!((r0.name.as_str(), r0.role), ("Address", ROLE_SYSTEM_TOOLBAR));
+            NOTES.with(|n| n.borrow_mut().clear());
+            invoke(&acc, 3).unwrap();
+            assert_eq!(NOTES.with(|n| n.borrow().clone()), [(CN_CRUMB, 2)]);
+            let click_x = 30 + state(bc).unwrap().layout.items[1].0.left + 1;
+            NOTES.with(|n| n.borrow_mut().clear());
+            SendMessageW(bc, WM_LBUTTONDOWN, Some(WPARAM(1)), Some(LPARAM(click_x as isize | (5 << 16))));
+            assert_eq!(NOTES.with(|n| n.borrow().clone()), [(CN_CRUMB, 2)], "the same record as a click");
+            let hk = hook();
+            set_crumbs(bc, &names);
+            assert!(hk.take().contains(&(EVENT_OBJECT_REORDER, bc, 0)));
+            drop(hk);
+            let _ = DestroyWindow(parent);
+            assert_eq!(acc.accChildCount().unwrap_err().code(), windows::Win32::Foundation::CO_E_OBJNOTCONNECTED);
         }
     }
 }

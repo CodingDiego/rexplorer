@@ -28,6 +28,8 @@ pub struct Args {
     pub elevated: bool,
     /// Run the desktop context-menu helper (install starts it at sign-in).
     pub desktop: bool,
+    /// Show the desktop's icons in a rexplorer window (opt-in).
+    pub desktop_icons: bool,
     /// Not ours to handle: pass the whole command line to Windows Explorer and exit.
     pub forward: bool,
     /// A separate window that leaves the running one, and its session, alone.
@@ -161,6 +163,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> std::result::Result<Arg
             "--overwrite" => out.overwrite = true,
             "--elevated" => out.elevated = true,
             "--desktop" => out.desktop = true,
+            "--desktop-icons" => out.desktop_icons = true,
             "--new-window" => out.new_window = true,
             "-h" | "--help" => out.help = true,
             _ if a.starts_with('-') => return Err(format!("unknown option: {a}")),
@@ -194,6 +197,7 @@ pub fn usage() -> String {
      \x20 --overwrite         with --import-explorer: also replace values you changed in rexplorer\n\
      \x20 --recover           restore the previous session after a crash\n\
      \x20 --desktop           run the helper that shows rexplorer's context menu on the desktop\n\
+     \x20 --desktop-icons     show the desktop's icons in a rexplorer window (opt-in, primary monitor)\n\
      \x20 --new-window        open a separate window (does not hand off; saves no session)\n\
      \x20 --elevated          when started elevated, stay so (drive-wide indexed search) instead of restarting unelevated\n\
      \x20 -h, --help          show this help\n"
@@ -362,6 +366,16 @@ mod tests {
     }
 
     #[test]
+    fn desktop_icons_flag() {
+        let a = p(&["--desktop-icons"]).unwrap();
+        assert!(a.desktop_icons && !a.desktop);
+        let a = p(&["--desktop"]).unwrap();
+        assert!(a.desktop && !a.desktop_icons);
+        let a = p(&[]).unwrap();
+        assert!(!a.desktop && !a.desktop_icons);
+    }
+
+    #[test]
     fn new_window_flag() {
         let a = p(&["--new-window", "C:\\x"]).unwrap();
         assert!(a.new_window && a.paths == ["C:\\x"]);
@@ -372,7 +386,7 @@ mod tests {
     fn usage_mentions_every_option() {
         let u = usage();
         assert!(u.starts_with("rexplorer [options] [folder...]\n"));
-        for o in ["--select", "/select,", "--profile", "--new-tab", "-t", "--register", "--unregister", "--install", "--uninstall", "--import-explorer", "--overwrite", "--recover", "--elevated", "--desktop", "--new-window", "--search", "-h", "--help"] {
+        for o in ["--select", "/select,", "--profile", "--new-tab", "-t", "--register", "--unregister", "--install", "--uninstall", "--import-explorer", "--overwrite", "--recover", "--elevated", "--desktop", "--desktop-icons", "--new-window", "--search", "-h", "--help"] {
             assert!(u.contains(o), "{o}");
         }
     }

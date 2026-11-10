@@ -3,7 +3,8 @@
 
 use super::*;
 use crate::source::Source;
-use crate::ui::Entry;
+use crate::ui::{Entry, hinted};
+use rexplorer_core::i18n::{tr, trf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -342,7 +343,7 @@ pub(crate) unsafe fn on_enum_done(app: *mut App, done: Box<EnumDone>) {
             } else if let Some(s) = source(app) {
                 set_text((*app).addr, &s.editing_name());
             }
-            message(hwnd, &format!("Cannot open {}\n\n{err}", crate::connect::redact(&name)));
+            message(hwnd, &trf("err.open", &[("name", &crate::connect::redact(&name)), ("error", &err)]));
             return;
         }
         Ok(loaded) => loaded,
@@ -660,8 +661,18 @@ pub(crate) unsafe fn update_chrome(app: *mut App) {
     ui::update_status(app);
 }
 
-pub(crate) const DATE_GROUPS: [&str; 9] =
-    ["In the future", "Today", "Yesterday", "Earlier this week", "Last week", "Earlier this month", "Last month", "Earlier this year", "A long time ago"];
+/// Keys; the draw sites translate.
+pub(crate) const DATE_GROUPS: [&str; 9] = [
+    "group.date.future",
+    "group.date.today",
+    "group.date.yesterday",
+    "group.date.earlier_week",
+    "group.date.last_week",
+    "group.date.earlier_month",
+    "group.date.last_month",
+    "group.date.earlier_year",
+    "group.date.long_ago",
+];
 
 /// Days since 1601-01-01 to (year, month, day): Howard Hinnant's civil_from_days, moved to that epoch.
 fn civil(day: i64) -> (i64, i64, i64) {
@@ -712,14 +723,14 @@ fn week_start() -> i64 {
 }
 
 pub(crate) const SIZE_GROUPS: [&str; 8] = [
-    "Gigantic (> 4 GB)",
-    "Huge (1 - 4 GB)",
-    "Large (128 MB - 1 GB)",
-    "Medium (1 - 128 MB)",
-    "Small (16 KB - 1 MB)",
-    "Tiny (0 - 16 KB)",
-    "Empty (0 KB)",
-    "Unspecified",
+    "group.size.gigantic",
+    "group.size.huge",
+    "group.size.large",
+    "group.size.medium",
+    "group.size.small",
+    "group.size.tiny",
+    "group.size.empty",
+    "group.unspecified",
 ];
 
 /// The SIZE_GROUPS index Explorer puts an item in (0 is the largest, as 0 is the newest date).
@@ -742,16 +753,17 @@ fn name_group(name: &str) -> String {
     match name.chars().next() {
         Some(c) if c.is_ascii_digit() => "0 - 9".to_string(),
         Some(c) if c.is_alphabetic() => c.to_uppercase().collect(),
-        _ => "Other".to_string(),
+        _ => tr("group.other").to_string(),
     }
 }
 
 /// Ranks for text group labels: (rank per label, the distinct labels in rank order). An empty label is "Unspecified";
 /// that and "Other" go last.
 fn text_ranks(labels: Vec<String>) -> (Vec<usize>, Vec<String>) {
-    let labels: Vec<String> = labels.into_iter().map(|l| if l.is_empty() { "Unspecified".to_string() } else { l }).collect();
+    let (unspecified, other) = (tr("group.unspecified"), tr("group.other"));
+    let labels: Vec<String> = labels.into_iter().map(|l| if l.is_empty() { unspecified.to_string() } else { l }).collect();
     let mut table = labels.clone();
-    table.sort_by_cached_key(|l| (l == "Unspecified" || l == "Other", l.to_lowercase()));
+    table.sort_by_cached_key(|l| (l == unspecified || l == other, l.to_lowercase()));
     table.dedup();
     (labels.iter().map(|l| table.iter().position(|t| t == l).unwrap_or(0)).collect(), table)
 }
@@ -769,11 +781,11 @@ unsafe fn group_ranks(folder: &ShellFolder, c: &Column, items: &[ShellItem]) -> 
         let (today, week) = (local_day(GetSystemTimeAsFileTime()).unwrap_or_default(), week_start());
         // An item without that date goes with the oldest.
         let ranks = items.iter().map(|it| it.property_time(&key).and_then(local_day).map_or(8, |d| date_group(d, today, week))).collect();
-        return Some((ranks, DATE_GROUPS.iter().map(|s| s.to_string()).collect()));
+        return Some((ranks, DATE_GROUPS.iter().map(|s| tr(s).to_string()).collect()));
     }
     if panes::size_and_type_columns(&folder.folder).0 == Some(c.index) {
         let ranks = items.iter().map(|it| size_group(it.is_folder(), it.size())).collect();
-        return Some((ranks, SIZE_GROUPS.iter().map(|s| s.to_string()).collect()));
+        return Some((ranks, SIZE_GROUPS.iter().map(|s| tr(s).to_string()).collect()));
     }
     // shortcut: text groups read every row's cell on the UI thread; move to the worker if a big folder stalls
     Some(text_ranks(items.iter().map(|it| if c.index == 0 { name_group(&it.display_name()) } else { it.detail(c.index) }).collect()))
@@ -1276,18 +1288,21 @@ fn to_close(n: usize, i: usize, others: bool) -> Vec<usize> {
 }
 
 /// TN_CONTEXT: the tab's right-click menu.
-pub(crate) unsafe fn tab_menu(app: *mut App, i: usize) {
+pub(crate) unsafe fn tab_menu(app: *mut App, i: usize, at: Option<POINT>) {
     let n = (*app).tabs.len();
     let Some(name) = (&(*app).tabs).get(i).map(|t| t.name.clone()) else { return };
     let entries = [
-        Entry::new(TAB_DUPLICATE, "Duplicate tab", 0).enabled(!name.is_empty()),
+        Entry::new(TAB_DUPLICATE, tr("tabs.duplicate"), 0).enabled(!name.is_empty()),
         Entry::sep(),
-        Entry::new(TAB_CLOSE, "Close tab\tCtrl+W", 0),
-        Entry::new(TAB_CLOSE_OTHERS, "Close other tabs", 0).enabled(n > 1),
-        Entry::new(TAB_CLOSE_RIGHT, "Close tabs to the right", 0).enabled(i + 1 < n),
+        Entry::new(TAB_CLOSE, &hinted("tabs.close", "Ctrl+W"), 0),
+        Entry::new(TAB_CLOSE_OTHERS, tr("tabs.close_others"), 0).enabled(n > 1),
+        Entry::new(TAB_CLOSE_RIGHT, tr("tabs.close_right"), 0).enabled(i + 1 < n),
     ];
-    let mut pt = POINT::default();
-    let _ = GetCursorPos(&mut pt);
+    let pt = at.unwrap_or_else(|| {
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        pt
+    });
     match ui::pick_entries(app, &entries, pt.x, pt.y) {
         // Same place, without the history: the copy sits next to its source.
         Some(TAB_DUPLICATE) => {
@@ -1513,7 +1528,7 @@ mod tests {
     #[test]
     fn date_groups_like_explorer() {
         let today = day(2026, 10, 13); // a Tuesday
-        let g = |y, m, d, week_start| DATE_GROUPS[date_group(day(y, m, d), today, week_start)];
+        let g = |y, m, d, week_start| tr(DATE_GROUPS[date_group(day(y, m, d), today, week_start)]);
         let monday = [
             ((2026, 10, 14), "In the future"),
             ((2026, 10, 13), "Today"),
@@ -1539,7 +1554,7 @@ mod tests {
 
     #[test]
     fn date_group_edges() {
-        let g = |d, today| DATE_GROUPS[date_group(d, today, 0)];
+        let g = |d, today| tr(DATE_GROUPS[date_group(d, today, 0)]);
         // Today starts the week: the day before is Yesterday, the one before that last week.
         assert_eq!(g(day(2026, 10, 11), day(2026, 10, 12)), "Yesterday");
         assert_eq!(g(day(2026, 10, 10), day(2026, 10, 12)), "Last week");
@@ -1590,7 +1605,7 @@ mod tests {
 
     #[test]
     fn size_groups_like_explorer() {
-        let g = |folder, b| SIZE_GROUPS[size_group(folder, b)];
+        let g = |folder, b| tr(SIZE_GROUPS[size_group(folder, b)]);
         assert_eq!(g(false, Some(0)), "Empty (0 KB)");
         for b in [1, 16 * 1024 - 1] {
             assert_eq!(g(false, Some(b)), "Tiny (0 - 16 KB)");

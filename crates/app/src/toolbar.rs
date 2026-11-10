@@ -9,10 +9,12 @@ use std::ffi::c_void;
 use std::mem::size_of;
 use std::sync::Once;
 
+use rexplorer_core::access;
 use rexplorer_core::settings::Theme;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Accessibility::{ROLE_SYSTEM_BUTTONMENU, ROLE_SYSTEM_PUSHBUTTON, ROLE_SYSTEM_TOOLBAR, STATE_SYSTEM_HASPOPUP};
 use windows::Win32::UI::Controls::*;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
@@ -71,6 +73,7 @@ struct State {
     /// The labels' font, set with WM_SETFONT; not owned.
     ui_font: HFONT,
     tip: HWND,
+    acc: Option<access::Server>,
 }
 
 fn scale(px: i32, dpi: u32) -> i32 {
@@ -189,6 +192,7 @@ pub fn create(parent: HWND, id: usize, buttons: &[(u32, u16, &str)]) -> Result<H
             font_dpi: 0,
             ui_font: HFONT::default(),
             tip: HWND::default(),
+            acc: None,
         }));
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -246,10 +250,13 @@ pub fn set_group(hwnd: HWND, cmds: &[u16]) {
 pub fn set_checked(hwnd: HWND, cmd: u16, checked: bool) {
     unsafe {
         if let Some(s) = state(hwnd) {
-            for b in s.buttons.iter_mut().filter(|b| b.cmd == cmd && b.checked != checked) {
+            let mut changed = Vec::new();
+            for (i, b) in s.buttons.iter_mut().enumerate().filter(|(_, b)| b.cmd == cmd && b.checked != checked) {
                 b.checked = checked;
+                changed.push(i);
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
+            state_changed(hwnd, &changed);
         }
     }
 }
@@ -266,11 +273,71 @@ pub fn set_theme(hwnd: HWND, t: &Theme) {
 pub fn set_enabled(hwnd: HWND, cmd: u16, enabled: bool) {
     unsafe {
         if let Some(s) = state(hwnd) {
-            for b in s.buttons.iter_mut().filter(|b| b.cmd == cmd && b.enabled != enabled) {
+            let mut changed = Vec::new();
+            for (i, b) in s.buttons.iter_mut().enumerate().filter(|(_, b)| b.cmd == cmd && b.enabled != enabled) {
                 b.enabled = enabled;
+                changed.push(i);
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
+            state_changed(hwnd, &changed);
         }
+    }
+}
+
+/// Index of the k-th button that sends a command (separators and the spacer are no accessible items).
+fn nth_button(buttons: &[Button], k: usize) -> Option<usize> {
+    buttons.iter().enumerate().filter(|(_, b)| b.cmd != 0).nth(k).map(|(i, _)| i)
+}
+
+/// Raises STATECHANGE for the buttons at `indexes` (button indexes, mapped to item indexes), after the change is done.
+fn state_changed(hwnd: HWND, indexes: &[usize]) {
+    let Some(s) = (unsafe { state(hwnd) }) else { return };
+    for &i in indexes {
+        if s.buttons[i].cmd != 0 {
+            let item = s.buttons[..i].iter().filter(|b| b.cmd != 0).count();
+            access::event(EVENT_OBJECT_STATECHANGE, hwnd, Some(item));
+        }
+    }
+}
+
+unsafe fn acc_tree(hwnd: HWND, s: &State, t: &mut access::Tree) {
+    let mut buf = [0u16; 64];
+    let n = GetWindowTextW(hwnd, &mut buf) as usize;
+    t.name = String::from_utf16_lossy(&buf[..n]);
+    t.role = ROLE_SYSTEM_TOOLBAR;
+    for (i, b) in s.buttons.iter().enumerate().filter(|(_, b)| b.cmd != 0) {
+        let tip = String::from_utf16_lossy(b.tip.split(|&c| c == 0).next().unwrap_or_default());
+        // "Back (Alt+Left)": a reader says the name, and the key hint only as the shortcut.
+        let (name, shortcut) = match tip.strip_suffix(')').and_then(|t| t.rsplit_once(" (")) {
+            Some((n, k)) => (n.to_string(), k.to_string()),
+            None => (tip, String::new()),
+        };
+        let mut state = 0;
+        if !b.enabled {
+            state |= STATE_SYSTEM_UNAVAILABLE.0;
+        }
+        if b.checked {
+            state |= STATE_SYSTEM_CHECKED;
+        }
+        if b.dropdown {
+            state |= STATE_SYSTEM_HASPOPUP;
+        }
+        t.items.push(access::Item {
+            name,
+            role: if b.dropdown { ROLE_SYSTEM_BUTTONMENU } else { ROLE_SYSTEM_PUSHBUTTON },
+            state,
+            rect: rect(hwnd, s, i),
+            action: rexplorer_core::i18n::tr("tb.action_press"),
+            shortcut,
+            ..Default::default()
+        });
+    }
+}
+
+/// What a click on a button does; no state reference may be used after it (the parent may destroy us).
+unsafe fn command(hwnd: HWND, cmd: u16) {
+    if let Ok(parent) = GetParent(hwnd) {
+        SendMessageW(parent, WM_COMMAND, Some(WPARAM(cmd as usize)), Some(LPARAM(hwnd.0 as isize)));
     }
 }
 
@@ -378,9 +445,20 @@ unsafe fn paint(hwnd: HWND, s: &mut State) {
         if let Some(c) = fill {
             // Inside a segment the fill is inset on every side; a lone button's fill is the whole pill.
             let (my, rad) = if b.group.is_some() { (m, inner) } else { (0, radius) };
-            theme::fill_round(dc, &RECT { left: r.left + m, top: r.top + my, right: r.right - m, bottom: r.bottom - my }, c, rad);
+            let fr = RECT { left: r.left + m, top: r.top + my, right: r.right - m, bottom: r.bottom - my };
+            theme::fill_round(dc, &fr, c, rad);
+            if b.enabled && s.hover == Some(i) && s.pressed != Some(i) {
+                theme::hot_outline(dc, &fr, t, rad, dpi);
+            }
         }
-        SetTextColor(dc, COLORREF(if b.enabled { t.text } else { theme::blend(t.background, t.secondary_text, 0.5) }));
+        let lit = fill == Some(t.selection); // glyph on a selection fill (pressed is selection too in contrast)
+        let text = match t.contrast {
+            Some(c) if !b.enabled => c.gray,
+            _ if !b.enabled => theme::blend(t.background, t.secondary_text, 0.5),
+            _ if lit => theme::on_selection(t, t.text),
+            _ => t.text,
+        };
+        SetTextColor(dc, COLORREF(text));
         let glyph = |c: u32| -> Vec<u16> { char::from_u32(c).map(|c| c.to_string()).unwrap_or_default().encode_utf16().collect() };
         let mut g = glyph(b.glyph);
         let flags = DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX;
@@ -449,6 +527,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     let Some(s) = state(hwnd) else { return DefWindowProcW(hwnd, msg, wparam, lparam) };
     match msg {
         WM_ERASEBKGND => return LRESULT(1),
+        WM_GETOBJECT if access::is_client(lparam) => return s.acc.get_or_insert_with(|| access::Server::new(hwnd)).answer(wparam),
+        access::WM_ACC_ITEMS => {
+            acc_tree(hwnd, s, &mut *(lparam.0 as *mut access::Tree));
+            return LRESULT(1);
+        }
+        access::WM_ACC_INVOKE => {
+            let cmd = nth_button(&s.buttons, wparam.0).map(|i| &s.buttons[i]).filter(|b| b.enabled).map(|b| b.cmd);
+            if let Some(cmd) = cmd {
+                command(hwnd, cmd);
+            }
+        }
         WM_PAINT => paint(hwnd, s),
         WM_SETFONT => {
             s.ui_font = HFONT(wparam.0 as *mut c_void);
@@ -498,8 +587,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let _ = ReleaseCapture();
             let _ = InvalidateRect(Some(hwnd), None, false);
             // No state reference is used after this: the parent may do anything, including destroying us.
-            if let (Some(cmd), Ok(parent)) = (cmd, GetParent(hwnd)) {
-                SendMessageW(parent, WM_COMMAND, Some(WPARAM(cmd as usize)), Some(LPARAM(hwnd.0 as isize)));
+            if let Some(cmd) = cmd {
+                command(hwnd, cmd);
             }
         }
         WM_CAPTURECHANGED => {
@@ -670,5 +759,71 @@ mod tests {
             assert!(button_rect(tb, 9).is_none());
             DestroyWindow(parent).unwrap();
         }
+    }
+
+    static ACC_CMD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    unsafe extern "system" fn acc_parent_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        if msg == WM_COMMAND {
+            ACC_CMD.store(wparam.0, std::sync::atomic::Ordering::SeqCst);
+            return LRESULT(0);
+        }
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+
+    #[test]
+    fn accessible_buttons() {
+        use crate::acc_test::*;
+        use rexplorer_core::com::ComInit;
+        use std::sync::atomic::Ordering::SeqCst;
+        use windows::Win32::Foundation::{CO_E_OBJNOTCONNECTED, DISP_E_MEMBERNOTFOUND};
+        let _com = ComInit::sta();
+        unsafe {
+            let hinst = GetModuleHandleW(None).unwrap().into();
+            let wc = WNDCLASSW { lpfnWndProc: Some(acc_parent_proc), hInstance: hinst, lpszClassName: w!("RexToolbarAccParent"), ..Default::default() };
+            RegisterClassW(&wc);
+            let parent = CreateWindowExW(WINDOW_EX_STYLE(0), w!("RexToolbarAccParent"), PCWSTR::null(), WS_OVERLAPPEDWINDOW, 0, 0, 800, 200, None, None, Some(hinst), None).unwrap();
+            let tb = create(parent, 7, &[(0xE72B, 11, "Back (Alt+Left)"), SEPARATOR, (0xE72A, 12, "Forward"), SPACER, (0xE7B3, 13, "Preview")]).unwrap();
+            let _ = MoveWindow(tb, 0, 0, 600, 32, false);
+            let _ = SetWindowTextW(tb, w!("Navigation"));
+            set_label(tb, 13, "Preview", true);
+            let acc = object(tb);
+            let k = kids(&acc);
+            // The tooltip's key hint is the item's shortcut, not part of its name.
+            assert_eq!(k.iter().map(|k| k.name.as_str()).collect::<Vec<_>>(), ["Back", "Forward", "Preview"]);
+            let v = |n: i32| windows::Win32::System::Variant::VARIANT::from(n);
+            assert_eq!(acc.get_accKeyboardShortcut(&v(1)).unwrap().to_string(), "Alt+Left");
+            assert_eq!(acc.get_accKeyboardShortcut(&v(2)).unwrap_err().code(), DISP_E_MEMBERNOTFOUND);
+            assert_eq!(k.iter().map(|k| k.role).collect::<Vec<_>>(), [ROLE_SYSTEM_PUSHBUTTON, ROLE_SYSTEM_PUSHBUTTON, ROLE_SYSTEM_BUTTONMENU]);
+            assert_ne!(k[2].state & STATE_SYSTEM_HASPOPUP, 0);
+            let r = button_rect(tb, 13).unwrap();
+            assert_eq!((k[2].rect.left, k[2].rect.top, k[2].rect.right, k[2].rect.bottom), (r.left, r.top, r.right, r.bottom));
+            set_checked(tb, 11, true);
+            assert_ne!(kid(&acc, 1).state & STATE_SYSTEM_CHECKED, 0);
+            set_enabled(tb, 12, false);
+            assert_ne!(kid(&acc, 2).state & STATE_SYSTEM_UNAVAILABLE.0, 0);
+            let r0 = root(&acc);
+            assert_eq!(r0.name, "Navigation");
+            assert_eq!(r0.role, ROLE_SYSTEM_TOOLBAR);
+            ACC_CMD.store(0, SeqCst);
+            invoke(&acc, 1).unwrap();
+            assert_eq!(ACC_CMD.load(SeqCst), 11, "the same command a click sends");
+            ACC_CMD.store(0, SeqCst);
+            assert_eq!(invoke(&acc, 2).unwrap_err().code(), DISP_E_MEMBERNOTFOUND);
+            assert_eq!(ACC_CMD.load(SeqCst), 0);
+            let hk = hook();
+            set_enabled(tb, 12, true);
+            assert!(hk.take().contains(&(EVENT_OBJECT_STATECHANGE, tb, 2)));
+            drop(hk);
+            DestroyWindow(parent).unwrap();
+            assert_eq!(acc.accChildCount().unwrap_err().code(), CO_E_OBJNOTCONNECTED);
+        }
+    }
+
+    #[test]
+    fn nth_button_skips_separators_and_spacer() {
+        let b = |glyph, cmd| Button { glyph, cmd, tip: vec![0], enabled: true, checked: false, group: None, label: vec![], dropdown: false };
+        let v = [b(1, 11), b(0, 0), b(2, 12), b(1, 0), b(3, 13)];
+        assert_eq!([0, 1, 2, 3].map(|k| nth_button(&v, k)), [Some(0), Some(2), Some(4), None]);
     }
 }

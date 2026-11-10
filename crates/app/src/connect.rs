@@ -5,6 +5,7 @@ use std::ffi::c_void;
 use std::path::Path;
 use std::sync::Once;
 
+use rexplorer_core::i18n::tr;
 use rexplorer_core::settings::Theme;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
@@ -122,7 +123,7 @@ pub fn cloud_roots() -> Vec<(String, String)> {
 // ---- dialog ----
 
 const ID_HOST: i32 = 101; // edits are ID_HOST..ID_HOST+5 in label order
-const LABELS: [PCWSTR; 5] = [w!("Host"), w!("Port (optional)"), w!("User"), w!("Password"), w!("Path")];
+const LABELS: [&str; 5] = ["conn.host", "conn.port", "conn.user", "conn.password", "conn.path"];
 const DM_GETDEFID: u32 = 0x0400; // WM_USER
 const DC_HASDEFID: isize = 0x534B;
 
@@ -220,15 +221,17 @@ unsafe fn create_children(hwnd: HWND, st: &mut State) {
         h
     };
     for i in 0..5 {
-        st.labels[i] = mk(w!("STATIC"), LABELS[i], 0x200 /* SS_CENTERIMAGE */, WINDOW_EX_STYLE(0), -1);
+        let label = HSTRING::from(tr(LABELS[i]));
+        st.labels[i] = mk(w!("STATIC"), PCWSTR(label.as_ptr()), 0x200 /* SS_CENTERIMAGE */, WINDOW_EX_STYLE(0), -1);
         let pw = if i == 3 { ES_PASSWORD as u32 } else { 0 };
         let style = WS_TABSTOP.0 | ES_AUTOHSCROLL as u32 | pw;
         st.edits[i] = mk(w!("EDIT"), PCWSTR::null(), style, WINDOW_EX_STYLE(0), ID_HOST + i as i32);
         crate::edit::attach(st.edits[i]);
     }
     // Pills drawn on WM_DRAWITEM; Enter still means Connect through DM_GETDEFID.
-    st.ok = mk(w!("BUTTON"), w!("Connect"), WS_TABSTOP.0 | BS_OWNERDRAW as u32, WINDOW_EX_STYLE(0), IDOK.0);
-    st.cancel = mk(w!("BUTTON"), w!("Cancel"), WS_TABSTOP.0 | BS_OWNERDRAW as u32, WINDOW_EX_STYLE(0), IDCANCEL.0);
+    let (connect, cancel) = (HSTRING::from(tr("conn.connect")), HSTRING::from(tr("conn.cancel")));
+    st.ok = mk(w!("BUTTON"), PCWSTR(connect.as_ptr()), WS_TABSTOP.0 | BS_OWNERDRAW as u32, WINDOW_EX_STYLE(0), IDOK.0);
+    st.cancel = mk(w!("BUTTON"), PCWSTR(cancel.as_ptr()), WS_TABSTOP.0 | BS_OWNERDRAW as u32, WINDOW_EX_STYLE(0), IDCANCEL.0);
 }
 
 unsafe fn layout_of(hwnd: HWND) -> Layout {
@@ -271,12 +274,19 @@ unsafe fn draw_button(st: &State, di: &DRAWITEMSTRUCT) {
     let surface = CreateSolidBrush(COLORREF(t.surface));
     FillRect(dc, &di.rcItem, surface);
     let _ = DeleteObject(surface.into());
-    theme::fill_round(dc, &di.rcItem, fill, 8 * GetDpiForWindow(di.hwndItem) as i32 / 96);
+    let dpi = GetDpiForWindow(di.hwndItem) as i32;
+    let focus = di.itemState.0 & ODS_FOCUS.0 != 0;
+    // One pixel in: the outline includes its right and bottom edge.
+    let inner = RECT { right: di.rcItem.right - 1, bottom: di.rcItem.bottom - 1, ..di.rcItem };
+    let contrast = theme::contrast_button(dc, &inner, t, di.itemState.0 & ODS_SELECTED.0 != 0, focus, false, 8 * dpi / 96);
+    if contrast.is_none() {
+        theme::fill_round(dc, &di.rcItem, fill, 8 * dpi / 96);
+    }
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, COLORREF(if ok { 0x00FF_FFFF } else { t.text }));
+    SetTextColor(dc, COLORREF(contrast.unwrap_or(if ok { 0x00FF_FFFF } else { t.text })));
     let old = SelectObject(dc, st.font.into());
     let mut r = di.rcItem;
-    let mut text: Vec<u16> = if ok { "Connect" } else { "Cancel" }.encode_utf16().collect();
+    let mut text: Vec<u16> = tr(if ok { "conn.connect" } else { "conn.cancel" }).encode_utf16().collect();
     DrawTextW(dc, &mut text, &mut r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     SelectObject(dc, old);
 }
@@ -306,7 +316,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             FillRect(dc, &rc, st.bg);
             let radius = 8 * GetDpiForWindow(hwnd) as i32 / 96;
             for (x, y, w, h) in layout_of(hwnd).edits {
-                theme::fill_round(dc, &RECT { left: x, top: y, right: x + w, bottom: y + h }, st.theme.background, radius);
+                let field = RECT { left: x, top: y, right: x + w, bottom: y + h };
+                theme::fill_round(dc, &field, st.theme.background, radius);
+                if st.theme.contrast.is_some() {
+                    theme::outline_round(dc, &field, st.theme.text, radius, 1);
+                }
             }
             LRESULT(1)
         }
@@ -378,7 +392,7 @@ pub fn dialog(parent: HWND, t: &Theme, font: HFONT) -> Option<String> {
         let created = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             w!("RexConnect"),
-            w!("Connect to FTP"),
+            &HSTRING::from(tr("conn.title")),
             WS_POPUP | WS_CAPTION | WS_SYSMENU,
             x,
             y,
@@ -391,11 +405,14 @@ pub fn dialog(parent: HWND, t: &Theme, font: HFONT) -> Option<String> {
         );
         let result = match created {
             Ok(hwnd) => {
-                let dark = t.dark as i32;
-                let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const i32 as *const c_void, 4);
-                // The title bar and frame merge into the card.
-                for attr in [DWMWA_CAPTION_COLOR, DWMWA_BORDER_COLOR] {
-                    let _ = DwmSetWindowAttribute(hwnd, attr, &t.surface as *const u32 as *const c_void, 4);
+                // A contrast theme keeps the system's caption and frame.
+                if t.contrast.is_none() {
+                    let dark = t.dark as i32;
+                    let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const i32 as *const c_void, 4);
+                    // The title bar and frame merge into the card.
+                    for attr in [DWMWA_CAPTION_COLOR, DWMWA_BORDER_COLOR] {
+                        let _ = DwmSetWindowAttribute(hwnd, attr, &t.surface as *const u32 as *const c_void, 4);
+                    }
                 }
                 create_children(hwnd, &mut st);
                 place(hwnd, &st);

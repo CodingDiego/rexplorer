@@ -72,6 +72,16 @@ fn parse_bool(s: &str) -> Option<bool> {
     }
 }
 
+/// System colors a Windows contrast theme needs beyond the `Theme` palette (COLORREFs).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Contrast {
+    pub highlight_text: u32,
+    pub hot: u32,
+    pub gray: u32,
+    pub button_face: u32,
+    pub button_text: u32,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Theme {
     pub name: String,
@@ -88,6 +98,8 @@ pub struct Theme {
     pub icon_theme: Option<String>,
     pub font: String,
     pub font_size: i32,
+    /// Some only while a Windows contrast theme is on; never read from or written to a theme file.
+    pub contrast: Option<Contrast>,
 }
 
 /// Mix `a` toward `b` by `t` (0..1), per 0x00BBGGRR channel.
@@ -117,6 +129,7 @@ impl Theme {
             icon_theme: None,
             font: "Segoe UI Variable Text".into(),
             font_size: 10,
+            contrast: None,
         }
     }
 
@@ -333,11 +346,13 @@ pub struct Settings {
     pub themes: Vec<Theme>,
     /// The `[keys]` section: `cmd.name=Ctrl+T` accelerator overrides, kept as written.
     pub keys: Vec<(String, String)>,
+    /// `[general] language=`: `system`, or a code with a table (`en`, `es`, a `lang\<code>.ini`). Applies at the next start.
+    pub language: String,
 }
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { active: "default".into(), profiles: vec![Profile::default_profile()], themes: vec![Theme::light(), Theme::dark()], keys: Vec::new() }
+        Settings { active: "default".into(), profiles: vec![Profile::default_profile()], themes: vec![Theme::light(), Theme::dark()], keys: Vec::new(), language: "system".into() }
     }
 }
 
@@ -385,6 +400,9 @@ impl Settings {
             .and_then(|(_, k)| k.iter().find(|(k, _)| k == "profile"))
             .map_or_else(|| s.profiles[0].name.clone(), |(_, v)| v.clone());
 
+        if let Some((_, v)) = sections.iter().filter(|(n, _)| n == "general").flat_map(|(_, k)| k).find(|(k, _)| k == "language") {
+            s.language = v.clone();
+        }
         s.keys = sections.iter().filter(|(n, _)| n == "keys").flat_map(|(_, k)| k.clone()).collect();
 
         let mut files: Vec<PathBuf> = std::fs::read_dir(dir.join("themes"))
@@ -420,7 +438,10 @@ impl Settings {
     }
 
     fn settings_text(&self) -> String {
-        let mut sections = vec![("general".to_string(), vec![("profile".to_string(), self.active.clone())])];
+        let mut sections = vec![(
+            "general".to_string(),
+            vec![("profile".to_string(), self.active.clone()), ("language".to_string(), self.language.clone())],
+        )];
         sections.extend(self.profiles.iter().map(Profile::to_section));
         if !self.keys.is_empty() {
             sections.push(("keys".to_string(), self.keys.clone()));
@@ -452,6 +473,8 @@ impl Settings {
                 .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()));
         };
         write_new(dir.join("settings.ini"), d.settings_text());
+        // Only the folder: a copy of a built-in language here would shadow the text of every later version.
+        let _ = std::fs::create_dir_all(dir.join("lang"));
         for t in &d.themes {
             let p = theme_path(dir, &t.name);
             if std::fs::read_to_string(&p).is_ok_and(|text| Theme::is_legacy_default(&text)) {
@@ -475,6 +498,17 @@ mod tests {
 
     fn cleanup(tag: &str) {
         let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("rexplorer-settings-{}", std::process::id())).join(tag));
+    }
+
+    #[test]
+    fn contrast_never_read_or_written() {
+        assert_eq!(Theme::light().contrast, None);
+        assert_eq!(Theme::from_ini("x", "[theme]
+dark=false").contrast, None);
+        let c = Contrast { highlight_text: 1, hot: 2, gray: 3, button_face: 4, button_text: 5 };
+        let ini = Theme { contrast: Some(c), ..Theme::light() }.to_ini();
+        assert!(!ini.contains("hot") && !ini.contains("contrast"), "{ini}");
+        assert_eq!(Theme::from_ini("x", &ini).contrast, None);
     }
 
     #[test]
@@ -546,6 +580,7 @@ mod tests {
         });
         s.active = "work".into();
         s.keys = vec![("cmd.new_tab".into(), "Ctrl+Y".into())];
+        s.language = "es".into();
         s.save_to(&d).unwrap();
         let back = Settings::load_from(&d);
         assert_eq!(back, s);
@@ -599,6 +634,31 @@ mod tests {
         assert_eq!(Settings::load_from(&d).theme("dark"), &Theme::dark());
         assert_eq!(std::fs::read_to_string(d.join("themes/light.ini")).unwrap(), edited);
         cleanup("legacy");
+    }
+
+    #[test]
+    fn language_defaults_to_system() {
+        let d = tmp("lang");
+        assert_eq!(Settings::default().language, "system");
+        assert_eq!(Settings::load_from(&d).language, "system");
+        std::fs::write(d.join("settings.ini"), "[general]
+language=es
+").unwrap();
+        assert_eq!(Settings::load_from(&d).language, "es");
+        cleanup("lang");
+    }
+
+    #[test]
+    fn ensure_files_leaves_languages_to_the_user() {
+        let d = tmp("langfiles");
+        Settings::ensure_files(&d);
+        // A copy written here would shadow the built-in text of every later version.
+        assert!(d.join("lang").is_dir());
+        assert!(!d.join("lang/en.ini").exists() && !d.join("lang/es.ini").exists());
+        std::fs::write(d.join("lang/es.ini"), "x").unwrap();
+        Settings::ensure_files(&d);
+        assert_eq!(std::fs::read_to_string(d.join("lang/es.ini")).unwrap(), "x");
+        cleanup("langfiles");
     }
 
     #[test]

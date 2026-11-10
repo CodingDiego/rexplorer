@@ -377,4 +377,22 @@ mod tests {
         // Root of the namespace: This PC's parent is the desktop, whose parent is None.
         assert!(pc.parent().unwrap().parent().is_none());
     }
+
+    /// Read only: the shell's desktop root shows what is in the user's and in the public Desktop folder.
+    #[test]
+    fn desktop_root_merges_user_and_public_desktops() {
+        use windows::Win32::UI::Shell::{FOLDERID_Desktop, FOLDERID_PublicDesktop};
+        let _c = ComInit::sta();
+        let shown: Vec<String> = ShellFolder::desktop().unwrap().enumerate().unwrap().iter().map(|i| i.parsing_name().to_lowercase()).collect();
+        for id in [&FOLDERID_Desktop, &FOLDERID_PublicDesktop] {
+            let dir = crate::install::known_folder(id).unwrap();
+            for e in std::fs::read_dir(&dir).unwrap().flatten() {
+                let attrs = std::os::windows::fs::MetadataExt::file_attributes(&e.metadata().unwrap());
+                if attrs & (2 | 4) == 0 {
+                    let p = e.path().display().to_string().to_lowercase();
+                    assert!(shown.contains(&p), "{p} missing from the desktop root: {shown:?}");
+                }
+            }
+        }
+    }
 }

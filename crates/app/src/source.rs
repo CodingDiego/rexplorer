@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::archive_view::ArchiveListing;
+use rexplorer_core::i18n::{tr, trf};
 use crate::nav::{Crumb, Listing, Loaded, Show, Target, cur, go, source};
 use rexplorer_core::archive::{self, Entry};
 use rexplorer_core::browser::{self, EmbeddedBrowser};
@@ -223,10 +224,19 @@ impl Source {
         match self {
             Source::Shell(l) => l.columns.iter().map(|c| col(c.index, &c.title, c.width_chars, c.right_align)).collect(),
             Source::Archive(_) => {
-                vec![col(0, "Name", 40, false), col(1, "Date modified", 20, false), col(2, "Type", 20, false), col(3, "Size", 12, true)]
+                vec![col(0, tr("col.name"), 40, false), col(1, tr("col.date_modified"), 20, false), col(2, tr("col.type"), 20, false), col(3, tr("col.size"), 12, true)]
             }
-            Source::Search(_) => vec![col(0, "Name", 40, false), col(1, "Folder", 60, false), col(2, "Type", 20, false), col(3, "Size", 12, true)],
+            Source::Search(_) => vec![col(0, tr("col.name"), 40, false), col(1, tr("col.folder"), 60, false), col(2, tr("col.type"), 20, false), col(3, tr("col.size"), 12, true)],
             Source::Browser(_) => Vec::new(),
+        }
+    }
+
+    /// `columns().len()` without building them (asked per tile paint).
+    pub fn column_count(&self) -> usize {
+        match self {
+            Source::Shell(l) => l.columns.len(),
+            Source::Archive(_) | Source::Search(_) => 4,
+            Source::Browser(_) => 0,
         }
     }
 
@@ -234,7 +244,7 @@ impl Source {
         match self {
             Source::Shell(l) => l.folder.name.clone(),
             Source::Archive(a) => a.listing.title(),
-            Source::Search(s) => format!("Search: {}", s.needle),
+            Source::Search(s) => trf("tabs.search", &[("needle", &s.needle)]),
             Source::Browser(b) => b.name.clone(),
         }
     }
@@ -383,7 +393,7 @@ pub(crate) unsafe fn small_icon(app: *mut App, i: usize) -> i32 {
 pub(crate) unsafe fn archive_menu(app: *mut App, pt: POINT) {
     let Some(Source::Archive(a)) = source(app) else { return };
     let archive = a.listing.archive.clone();
-    let entries = [(1, "Extract all to...".to_string()), (2, "Extract here".to_string())];
+    let entries = [(1, tr("menu.source.extract_all_to").to_string()), (2, tr("menu.source.extract_here").to_string())];
     let dest = match ui::popup(app, &entries, &[], pt.x, pt.y) {
         1 => pick_folder((*app).hwnd),
         2 => archive.parent().map(|p| p.to_path_buf()),
@@ -393,17 +403,18 @@ pub(crate) unsafe fn archive_menu(app: *mut App, pt: POINT) {
     let hwnd = (*app).hwnd.0 as isize;
     std::thread::spawn(move || {
         if let Err(e) = archive::extract_all(&archive, &dest) {
-            post_error(hwnd, format!("Cannot extract {}\n\n{e}", archive.display()));
+            post_error(hwnd, trf("err.extract", &[("name", &archive.display()), ("error", &e)]));
         }
     });
 }
 
 unsafe fn pick_folder(owner: HWND) -> Option<PathBuf> {
     let mut name = [0u16; 260];
+    let title = HSTRING::from(tr("dlg.extract_title"));
     let bi = BROWSEINFOW {
         hwndOwner: owner,
         pszDisplayName: PWSTR(name.as_mut_ptr()),
-        lpszTitle: w!("Extract all to"),
+        lpszTitle: PCWSTR(title.as_ptr()),
         ulFlags: BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE,
         ..Default::default()
     };
@@ -457,7 +468,7 @@ pub(crate) unsafe fn activate(app: *mut App, index: usize) {
                 let _com = ComInit::sta();
                 let opened = archive_view::open(&archive, "").and_then(|l| l.extract_for_open(&e)).and_then(|p| instance::open_default_app(&p));
                 if let Err(err) = opened {
-                    post_error(h, format!("Cannot open {}\n\n{err}", e.name));
+                    post_error(h, trf("err.open", &[("name", &e.name), ("error", &err)]));
                 }
             });
         }
@@ -522,7 +533,7 @@ pub(crate) unsafe fn start_search(app: *mut App, t: usize, needle: &str, push: b
     drop(old); // stops a previous search
     let cancel = Arc::new(AtomicBool::new(false));
     tab.crumbs = root_crumbs.clone();
-    tab.crumbs.push(Crumb { name: format!("Search: {needle}"), parsing: String::new(), pidl: None });
+    tab.crumbs.push(Crumb { name: trf("tabs.search", &[("needle", &needle)]), parsing: String::new(), pidl: None });
     tab.name = root_parsing.clone();
     let drive = (usn::is_elevated() && root_parsing.len() == 3 && root_parsing.ends_with(":\\")).then(|| root_parsing.chars().next().unwrap());
     let s = SearchListing {
@@ -538,7 +549,7 @@ pub(crate) unsafe fn start_search(app: *mut App, t: usize, needle: &str, push: b
         running: true,
         cancel: cancel.clone(),
     };
-    tabs::set_title((*app).strip, t, &format!("Search: {needle}"));
+    tabs::set_title((*app).strip, t, &trf("tabs.search", &[("needle", &needle)]));
     tab.source = Some(Source::Search(s));
     if t == (*app).active {
         nav::show(app, Show::Fresh(Vec::new()));
@@ -883,7 +894,7 @@ pub(crate) unsafe fn enter_browser(app: *mut App, place: &BrowserPlace) {
 
 unsafe fn explorer_fallback(app: *mut App, parsing: &str, err: Error) {
     if open_in_explorer(parsing).is_err() {
-        message((*app).hwnd, &format!("Cannot open {parsing}\n\n{err}"));
+        message((*app).hwnd, &trf("err.open", &[("name", &parsing), ("error", &err)]));
     }
 }
 

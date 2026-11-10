@@ -4,36 +4,41 @@
 
 use super::*;
 use crate::nav::{cur, listing};
+use crate::ui::tip;
+use rexplorer_core::i18n::{tr, trf};
 use rexplorer_core::undo::Op;
 use std::collections::HashSet;
 use windows::Win32::System::DataExchange::{IsClipboardFormatAvailable, RegisterClipboardFormatW};
 
 pub(crate) unsafe fn create(hwnd: HWND) -> Result<HWND> {
+    let (cut, copy, paste, rename, delete, preview) =
+        (tip("tb.cut", "Ctrl+X"), tip("tb.copy", "Ctrl+C"), tip("tb.paste", "Ctrl+V"), tip("tb.rename", "F2"), tip("tb.delete", "Del"), tip("tb.preview", "Alt+P"));
     let bar = toolbar::create(
         hwnd,
         ID_CMDBAR,
         &[
-            (0xE710, CMD_NEW, "New folder or file"),
+            (0xE710, CMD_NEW, tr("tb.new")),
             toolbar::SEPARATOR,
-            (0xE8C6, CMD_CUT, "Cut (Ctrl+X)"),
-            (0xE8C8, CMD_COPY, "Copy (Ctrl+C)"),
-            (0xE77F, CMD_PASTE, "Paste (Ctrl+V)"),
-            (0xE8AC, CMD_RENAME, "Rename (F2)"),
-            (0xE72D, CMD_SHARE, "Share"),
-            (0xE74D, CMD_DELETE, "Delete (Del)"),
+            (0xE8C6, CMD_CUT, &cut),
+            (0xE8C8, CMD_COPY, &copy),
+            (0xE77F, CMD_PASTE, &paste),
+            (0xE8AC, CMD_RENAME, &rename),
+            (0xE72D, CMD_SHARE, tr("tb.share")),
+            (0xE74D, CMD_DELETE, &delete),
             toolbar::SEPARATOR,
-            (0xE8CB, CMD_SORT, "Sort"),
-            (0xE8A9, CMD_VIEW_MENU, "View and panes"),
+            (0xE8CB, CMD_SORT, tr("tb.sort")),
+            (0xE8A9, CMD_VIEW_MENU, tr("tb.view")),
             toolbar::SEPARATOR,
-            (0xE712, CMD_MORE, "More"),
+            (0xE712, CMD_MORE, tr("tb.more")),
             toolbar::SPACER,
-            (0xE7B3, CMD_TOGGLE_PREVIEW, "Preview pane (Alt+P)"),
+            (0xE7B3, CMD_TOGGLE_PREVIEW, &preview),
         ],
     )?;
-    toolbar::set_label(bar, CMD_NEW, "New", true);
-    toolbar::set_label(bar, CMD_SORT, "Sort", true);
-    toolbar::set_label(bar, CMD_VIEW_MENU, "View", true);
-    toolbar::set_label(bar, CMD_TOGGLE_PREVIEW, "Preview", false);
+    let _ = SetWindowTextW(bar, &HSTRING::from(tr("tb.cmdbar_name"))); // the accessible name
+    toolbar::set_label(bar, CMD_NEW, tr("tb.new_label"), true);
+    toolbar::set_label(bar, CMD_SORT, tr("tb.sort_label"), true);
+    toolbar::set_label(bar, CMD_VIEW_MENU, tr("tb.view_label"), true);
+    toolbar::set_label(bar, CMD_TOGGLE_PREVIEW, tr("tb.preview_label"), false);
     Ok(bar)
 }
 
@@ -117,7 +122,7 @@ unsafe fn share_files(hwnd: HWND, paths: Vec<String>) -> windows::core::Result<(
         let data = args.ok()?.Request()?.Data()?;
         let title = match &paths[..] {
             [one] => std::path::Path::new(one).file_name().map_or(one.clone(), |n| n.to_string_lossy().into_owned()),
-            many => format!("{} items", many.len()),
+            many => rexplorer_core::i18n::trn("status.items", many.len() as u64),
         };
         data.Properties()?.SetTitle(&HSTRING::from(title))?;
         let mut items = Vec::new();
@@ -143,7 +148,7 @@ pub(crate) unsafe fn new_menu(app: *mut App) {
     let Some(menu) = listing(app).and_then(|l| ContextMenu::for_background(&l.folder, hwnd).ok()) else { return };
     // shortcut: an empty list when the New submenu cannot be found; "Folder" still works through the verb
     let types = menu.new_items().unwrap_or_default();
-    let mut entries = vec![(1, "Folder".to_string())];
+    let mut entries = vec![(1, tr("menu.new.folder").to_string())];
     if !types.is_empty() {
         entries.push((0, String::new()));
     }
@@ -219,9 +224,9 @@ const GROUP_BASE: usize = 0x200;
 pub(crate) unsafe fn sort_entries(app: *mut App) -> (Vec<(usize, String)>, Vec<usize>) {
     let Some(l) = listing(app) else { return (Vec::new(), Vec::new()) };
     let mut entries: Vec<(usize, String)> = l.columns.iter().enumerate().map(|(i, c)| (i + 1, c.title.clone())).collect();
-    entries.extend([(0, String::new()), (SORT_ASC, "Ascending".to_string()), (SORT_DESC, "Descending".to_string())]);
-    entries.extend([(0, String::new()), (GROUP_NONE, "No groups".to_string())]);
-    entries.extend(l.columns.iter().enumerate().map(|(p, c)| (GROUP_BASE + p, format!("Group by {}", c.title))));
+    entries.extend([(0, String::new()), (SORT_ASC, tr("menu.sort.ascending").to_string()), (SORT_DESC, tr("menu.sort.descending").to_string())]);
+    entries.extend([(0, String::new()), (GROUP_NONE, tr("menu.sort.no_groups").to_string())]);
+    entries.extend(l.columns.iter().enumerate().map(|(p, c)| (GROUP_BASE + p, trf("menu.sort.group_by", &[("column", &c.title)]))));
     let active = l.columns.iter().position(|c| c.index == l.sort_col).map(|i| i + 1);
     let checked = active
         .into_iter()
@@ -322,23 +327,33 @@ pub(crate) unsafe fn sort_menu(app: *mut App) {
     pick_sort(app, ui::popup(app, &entries, &checked, x, y));
 }
 
-/// View entries: the three list views, then the panes, each checked when it is on. (entries, checked).
+/// The View menu's list views, in Explorer's order, then Thumbnails (ours). The chords are the default ACCELS.
+/// (command, name key, key hint); the hint is code so it survives translation.
+const VIEW_MENU: [(u16, &str, &str); 9] = [
+    (CMD_VIEW_XL, "menu.view.extra_large", "Ctrl+Shift+1"),
+    (CMD_VIEW1 + 1, "menu.view.large", "Ctrl+Shift+2"),
+    (CMD_VIEW_MEDIUM, "menu.view.medium", "Ctrl+Shift+3"),
+    (CMD_VIEW_SMALL, "menu.view.small", "Ctrl+Shift+4"),
+    (CMD_VIEW_LIST, "menu.view.list", "Ctrl+Shift+5"),
+    (CMD_VIEW1, "menu.view.details", "Ctrl+Shift+6"),
+    (CMD_VIEW_TILES, "menu.view.tiles", "Ctrl+Shift+7"),
+    (CMD_VIEW_CONTENT, "menu.view.content", "Ctrl+Shift+8"),
+    (CMD_VIEW1 + 2, "menu.view.thumbnails", ""),
+];
+
+/// View entries: the list views, then the panes, each checked when it is on. (entries, checked).
 pub(crate) unsafe fn view_entries(app: *mut App) -> (Vec<(usize, String)>, Vec<usize>) {
     let s = &(*app).session;
-    let entries = vec![
-        (CMD_VIEW_XL as usize, "Extra large icons".to_string()),
-        (CMD_VIEW1 as usize + 1, "Large icons\tCtrl+Shift+2".to_string()),
-        (CMD_VIEW_MEDIUM as usize, "Medium icons".to_string()),
-        (CMD_VIEW_SMALL as usize, "Small icons\tCtrl+Shift+4".to_string()),
-        (CMD_VIEW1 as usize, "Details\tCtrl+Shift+1".to_string()),
-        (CMD_VIEW1 as usize + 2, "Thumbnails\tCtrl+Shift+3".to_string()),
+    let mut entries: Vec<(usize, String)> = VIEW_MENU.iter().map(|&(id, key, hint)| (id as usize, if hint.is_empty() { tr(key).to_string() } else { ui::hinted(key, hint) })).collect();
+    entries.extend([
         (0, String::new()),
-        (CMD_TOGGLE_SIDEBAR as usize, "Sidebar\tCtrl+B".to_string()),
-        (CMD_FOLDER_TREE as usize, "Folder tree".to_string()),
-        (CMD_TOGGLE_PREVIEW as usize, "Preview pane\tAlt+P".to_string()),
-    ];
+        (CMD_TOGGLE_SIDEBAR as usize, ui::hinted("menu.view.sidebar", "Ctrl+B")),
+        (CMD_FOLDER_TREE as usize, tr("menu.view.folder_tree").to_string()),
+        (CMD_TOGGLE_PREVIEW as usize, ui::hinted("menu.view.preview_pane", "Alt+P")),
+        (CMD_TOGGLE_DETAILS as usize, ui::hinted("menu.view.details_pane", "Alt+Shift+P")),
+    ]);
     let mut checked = vec![(*app).views.view.command() as usize];
-    for (on, cmd) in [(s.show_sidebar && !s.show_tree, CMD_TOGGLE_SIDEBAR), (s.show_tree, CMD_FOLDER_TREE), (s.show_preview, CMD_TOGGLE_PREVIEW)] {
+    for (on, cmd) in [(s.show_sidebar && !s.show_tree, CMD_TOGGLE_SIDEBAR), (s.show_tree, CMD_FOLDER_TREE), (s.show_preview, CMD_TOGGLE_PREVIEW), (s.show_details, CMD_TOGGLE_DETAILS)] {
         if on {
             checked.push(cmd as usize);
         }
@@ -361,4 +376,24 @@ pub(crate) unsafe fn view_menu(app: *mut App) {
     let (entries, checked) = view_entries(app);
     let (x, y) = anchor(app, CMD_VIEW_MENU);
     pick_view(app, ui::popup(app, &entries, &checked, x, y));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn view_menu_chords_match_accels() {
+        let ids: Vec<u16> = VIEW_MENU.iter().map(|e| e.0).collect();
+        assert_eq!(ids, [CMD_VIEW_XL, CMD_VIEW1 + 1, CMD_VIEW_MEDIUM, CMD_VIEW_SMALL, CMD_VIEW_LIST, CMD_VIEW1, CMD_VIEW_TILES, CMD_VIEW_CONTENT, CMD_VIEW1 + 2]);
+        for (id, label, hint) in VIEW_MENU {
+            match hint.strip_prefix("Ctrl+Shift+") {
+                Some(n) => {
+                    let key = VK_0.0 + n.parse::<u16>().unwrap();
+                    assert!(ACCELS.iter().any(|a| a.fVirt.0 == FVIRTKEY.0 | FCONTROL.0 | FSHIFT.0 && a.key == key && a.cmd == id), "{label}");
+                }
+                None => assert!(hint.is_empty() && label == "menu.view.thumbnails", "{label}"),
+            }
+        }
+    }
 }

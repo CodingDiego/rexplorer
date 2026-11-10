@@ -14,6 +14,8 @@ pub struct Session {
     /// The places sidebar (when the tree is not shown).
     pub show_sidebar: bool,
     pub show_preview: bool,
+    /// The details pane (never with the preview).
+    pub show_details: bool,
     pub tree_width: i32,
     pub preview_width: i32,
     /// What each folder remembers, most recent first; kept in folders.txt beside session.txt.
@@ -101,6 +103,7 @@ impl Default for Session {
             show_tree: false,
             show_sidebar: true,
             show_preview: false,
+            show_details: false,
             tree_width: 220,
             preview_width: 360,
             folders: Vec::new(),
@@ -123,6 +126,7 @@ pub fn parse(text: &str) -> Session {
                 has_sidebar = true;
             }
             "preview" => s.show_preview = v.trim() != "0",
+            "details" => s.show_details = v.trim() != "0",
             "tree_width" => s.tree_width = v.trim().parse().unwrap_or(s.tree_width),
             "preview_width" => s.preview_width = v.trim().parse().unwrap_or(s.preview_width),
             _ => {}
@@ -132,6 +136,7 @@ pub fn parse(text: &str) -> Session {
     if !has_sidebar {
         s.show_tree = false;
     }
+    s.show_details &= !s.show_preview;
     s.active = s.active.min(s.tabs.len().saturating_sub(1));
     s.tree_width = s.tree_width.clamp(120, 1200);
     s.preview_width = s.preview_width.clamp(120, 1200);
@@ -144,8 +149,8 @@ pub fn format(s: &Session) -> String {
         out.push_str(&format!("tab={}\n", crate::connect::redact(t)));
     }
     out.push_str(&format!(
-        "active={}\nview={}\ntree={}\nsidebar={}\npreview={}\ntree_width={}\npreview_width={}\n",
-        s.active, s.view, s.show_tree as u8, s.show_sidebar as u8, s.show_preview as u8, s.tree_width, s.preview_width
+        "active={}\nview={}\ntree={}\nsidebar={}\npreview={}\ndetails={}\ntree_width={}\npreview_width={}\n",
+        s.active, s.view, s.show_tree as u8, s.show_sidebar as u8, s.show_preview as u8, s.show_details as u8, s.tree_width, s.preview_width
     ));
     out
 }
@@ -220,6 +225,7 @@ mod tests {
             show_tree: true,
             show_sidebar: false,
             show_preview: true,
+            show_details: false,
             tree_width: 300,
             preview_width: 500,
             folders: Vec::new(),
@@ -240,6 +246,16 @@ mod tests {
     fn round_trip_with_equals_in_tab() {
         let s = sample();
         assert_eq!(parse(&format(&s)), s);
+    }
+
+    #[test]
+    fn details_flag_round_trip_and_exclusion() {
+        let s = Session { show_details: true, show_preview: false, ..sample() };
+        assert_eq!(parse(&format(&s)), s);
+        let both = parse("preview=1\ndetails=1\n");
+        assert!(both.show_preview && !both.show_details);
+        assert!(parse("details=1\n").show_details);
+        assert!(!parse("preview=1\n").show_details, "an old file without the key");
     }
 
     #[test]
@@ -287,6 +303,16 @@ mod tests {
         let f = vec![
             ("C:\\a=b".to_string(), fv("icons", (3, true), Some(3), &[(0, 300), (3, 120)])),
             ("::{20D04FE0-3AEA-1069-A2D8-08002B30309D}\\x".to_string(), fv("details", (0, false), None, &[])),
+        ];
+        assert_eq!(parse_folders(&format_folders(&f)), f);
+    }
+
+    #[test]
+    fn folders_keep_new_view_names() {
+        let f = vec![
+            ("C:\\a".to_string(), fv("list", (0, false), None, &[])),
+            ("C:\\b".to_string(), fv("tiles", (2, true), Some(2), &[(0, 280)])),
+            ("C:\\c".to_string(), fv("content", (0, false), None, &[])),
         ];
         assert_eq!(parse_folders(&format_folders(&f)), f);
     }

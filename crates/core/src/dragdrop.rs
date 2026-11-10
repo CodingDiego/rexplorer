@@ -1,13 +1,14 @@
 //! OLE drag and drop through the shell's own data objects and drop targets.
 use std::cell::RefCell;
 
-use windows::Win32::Foundation::{HWND, POINT, POINTL};
+use windows::Win32::Foundation::{GlobalFree, HANDLE, HWND, POINT, POINTL};
+use windows::Win32::System::Threading::Sleep;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, DVASPECT_CONTENT, FORMATETC, IDataObject, TYMED_HGLOBAL};
-use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
-use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData};
+use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock};
 use windows::Win32::System::Ole::{
     DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, DROPEFFECT_NONE,
-    IDropSource, IDropTarget, IDropTarget_Impl, OleGetClipboard, RegisterDragDrop, RevokeDragDrop, CF_HDROP,
+    IDropSource, IDropTarget, IDropTarget_Impl, OleGetClipboard, RegisterDragDrop, RevokeDragDrop, CF_HDROP, CF_UNICODETEXT,
     ReleaseStgMedium,
 };
 use windows::Win32::UI::Shell::{BHID_DataObject, CLSID_DragDropHelper, DROPFILES, DragQueryFileW, HDROP, IDropTargetHelper, IShellFolder, SHBindToParent, SHDoDragDrop};
@@ -105,6 +106,52 @@ pub fn clipboard_cut_paths() -> Vec<String> {
 /// The clipboard's file list (CF_HDROP), copy or cut; empty when it has none or cannot be read.
 pub fn clipboard_paths() -> Vec<String> {
     unsafe { OleGetClipboard() }.map(|d| hdrop_paths(&d)).unwrap_or_default()
+}
+
+/// Opens the clipboard for `owner`, retrying once: a clipboard manager may hold it for a moment.
+fn open_clipboard(owner: HWND) -> bool {
+    unsafe {
+        OpenClipboard(Some(owner)).is_ok() || {
+            Sleep(50);
+            OpenClipboard(Some(owner)).is_ok()
+        }
+    }
+}
+
+/// Replaces the clipboard's content with `text` (CF_UNICODETEXT).
+pub fn set_clipboard_text(owner: HWND, text: &str) -> Result<()> {
+    unsafe {
+        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        let block = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2)?;
+        let p = GlobalLock(block) as *mut u16;
+        if p.is_null() {
+            let _ = GlobalFree(Some(block));
+            return Err(windows::core::Error::from_thread());
+        }
+        std::ptr::copy_nonoverlapping(wide.as_ptr(), p, wide.len());
+        let _ = GlobalUnlock(block);
+        if !open_clipboard(owner) {
+            let _ = GlobalFree(Some(block));
+            return Err(windows::core::Error::from_thread());
+        }
+        let set = EmptyClipboard().and_then(|()| SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(block.0))).map(|_| ()));
+        // The clipboard owns the block once SetClipboardData took it.
+        if set.is_err() {
+            let _ = GlobalFree(Some(block));
+        }
+        let _ = CloseClipboard();
+        set
+    }
+}
+
+/// Empties the clipboard (Esc after a cut); does nothing when it cannot be opened.
+pub fn clear_clipboard(owner: HWND) {
+    unsafe {
+        if open_clipboard(owner) {
+            let _ = EmptyClipboard();
+            let _ = CloseClipboard();
+        }
+    }
 }
 
 /// Runs the shell's modal drag loop for `data`, with its drag image (taken from `hwnd`, a ListView answers
@@ -218,6 +265,34 @@ impl IDropTarget_Impl for DropForwarder_Impl {
             }
         }
     }
+}
+
+/// A drop target that only reports where data was dropped (rearranging icons inside one view): it shows MOVE while
+/// the pointer is over it and ends the drop with NONE, so the drag source never deletes or moves anything.
+#[implement(IDropTarget)]
+struct PositionTarget(Box<dyn Fn(POINTL)>);
+
+impl IDropTarget_Impl for PositionTarget_Impl {
+    fn DragEnter(&self, _: Ref<IDataObject>, _: MODIFIERKEYS_FLAGS, _: &POINTL, pdweffect: *mut DROPEFFECT) -> Result<()> {
+        unsafe { *pdweffect = DROPEFFECT_MOVE };
+        Ok(())
+    }
+    fn DragOver(&self, _: MODIFIERKEYS_FLAGS, _: &POINTL, pdweffect: *mut DROPEFFECT) -> Result<()> {
+        unsafe { *pdweffect = DROPEFFECT_MOVE };
+        Ok(())
+    }
+    fn DragLeave(&self) -> Result<()> {
+        Ok(())
+    }
+    fn Drop(&self, _: Ref<IDataObject>, _: MODIFIERKEYS_FLAGS, pt: &POINTL, pdweffect: *mut DROPEFFECT) -> Result<()> {
+        (self.0)(*pt);
+        unsafe { *pdweffect = DROPEFFECT_NONE };
+        Ok(())
+    }
+}
+
+pub fn position_target(on_drop: Box<dyn Fn(POINTL)>) -> IDropTarget {
+    PositionTarget(on_drop).into()
 }
 
 /// Registers a forwarding drop target on `hwnd`. OLE must be initialized (`ComInit::ole`).
@@ -488,5 +563,24 @@ mod tests {
             fwd.Drop(&data, keys, POINTL { x: 300, y: 0 }, &mut effect).unwrap();
             assert_eq!(effect, DROPEFFECT_NONE);
         }
+    }
+
+    #[test]
+    fn position_target_moves_nothing() {
+        let seen = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let log = seen.clone();
+        let t = position_target(Box::new(move |pt| log.borrow_mut().push((pt.x, pt.y))));
+        let keys = MODIFIERKEYS_FLAGS(0);
+        let mut e = DROPEFFECT_COPY;
+        unsafe {
+            t.DragEnter(None, keys, POINTL { x: 5, y: 6 }, &mut e).unwrap();
+            assert_eq!(e, DROPEFFECT_MOVE);
+            e = DROPEFFECT_COPY;
+            t.DragOver(keys, POINTL { x: 5, y: 6 }, &mut e).unwrap();
+            assert_eq!(e, DROPEFFECT_MOVE);
+            t.Drop(None, keys, POINTL { x: 7, y: 8 }, &mut e).unwrap();
+            assert_eq!(e, DROPEFFECT_NONE);
+        }
+        assert_eq!(*seen.borrow(), [(7, 8)]);
     }
 }

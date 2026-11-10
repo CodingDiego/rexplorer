@@ -4,12 +4,15 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 #![allow(unsafe_op_in_unsafe_fn)]
 
+#[cfg(test)]
+mod acc_test;
 mod archive_view;
 #[allow(dead_code)] // parts of the API are for later steps
 mod breadcrumb;
 mod commands;
 mod connect;
 mod desktop;
+mod desktop_icons;
 mod edit;
 mod folder_options;
 mod home;
@@ -129,7 +132,7 @@ const CMD_TOGGLE_PREVIEW: u16 = 24;
 const CMD_SEARCH: u16 = 28;
 /// More > Folder tree: the tree instead of the sidebar.
 const CMD_FOLDER_TREE: u16 = 30;
-/// Ctrl+Shift+1..3 send CMD_VIEW1..CMD_VIEW1 + 2 (details, icons, thumbnails).
+/// Details, Large icons, Thumbnails: CMD_VIEW1, +1, +2.
 const CMD_VIEW1: u16 = 25;
 /// Ctrl+1..Ctrl+9 send CMD_TAB1..CMD_TAB1 + 8.
 const CMD_TAB1: u16 = 31;
@@ -165,9 +168,18 @@ const CMD_NEW_WINDOW: u16 = 59;
 const CMD_VIEW_XL: u16 = 60;
 const CMD_VIEW_MEDIUM: u16 = 61;
 const CMD_VIEW_SMALL: u16 = 62;
+/// List, Tiles and Content: Ctrl+Shift+5, 7, 8.
+const CMD_VIEW_LIST: u16 = 65;
+const CMD_VIEW_TILES: u16 = 66;
+const CMD_VIEW_CONTENT: u16 = 67;
 /// Ctrl+Z / Ctrl+Y: undo and redo rexplorer's own file operations.
 const CMD_UNDO: u16 = 63;
 const CMD_REDO: u16 = 64;
+/// Alt+Shift+P: the details pane in the preview pane's place.
+const CMD_TOGGLE_DETAILS: u16 = 68;
+/// Ctrl+Shift+C: the selected paths as text. Ctrl+Num+: size all columns to fit.
+const CMD_COPY_PATH: u16 = 69;
+const CMD_FIT_COLUMNS: u16 = 70;
 /// Two crashes this close together (seconds) send the folder to Windows Explorer instead of a third start.
 const CRASH_GUARD_SECS: u64 = 60;
 
@@ -175,7 +187,7 @@ const fn accel(flags: u8, key: VIRTUAL_KEY, cmd: u16) -> ACCEL {
     ACCEL { fVirt: ACCEL_VIRT_FLAGS(FVIRTKEY.0 | flags), key: key.0, cmd }
 }
 
-const ACCELS: [ACCEL; 38] = [
+const ACCELS: [ACCEL; 46] = [
     accel(FALT.0, VK_LEFT, CMD_BACK),
     accel(FALT.0, VK_RIGHT, CMD_FORWARD),
     accel(FALT.0, VK_UP, CMD_UP),
@@ -195,13 +207,17 @@ const ACCELS: [ACCEL; 38] = [
     accel(FCONTROL.0, VK_OEM_3, CMD_TERMINAL),
     accel(FCONTROL.0, VK_B, CMD_TOGGLE_SIDEBAR),
     accel(FALT.0, VK_P, CMD_TOGGLE_PREVIEW),
+    accel(FALT.0 | FSHIFT.0, VK_P, CMD_TOGGLE_DETAILS),
     accel(FCONTROL.0, VK_F, CMD_SEARCH),
     accel(FCONTROL.0, VK_D, CMD_PIN),
-    accel(FCONTROL.0 | FSHIFT.0, VK_1, CMD_VIEW1),
+    accel(FCONTROL.0 | FSHIFT.0, VK_1, CMD_VIEW_XL),
     accel(FCONTROL.0 | FSHIFT.0, VK_2, CMD_VIEW1 + 1),
-    accel(FCONTROL.0 | FSHIFT.0, VK_3, CMD_VIEW1 + 2),
+    accel(FCONTROL.0 | FSHIFT.0, VK_3, CMD_VIEW_MEDIUM),
     accel(FCONTROL.0 | FSHIFT.0, VK_4, CMD_VIEW_SMALL),
+    accel(FCONTROL.0 | FSHIFT.0, VK_5, CMD_VIEW_LIST),
     accel(FCONTROL.0 | FSHIFT.0, VK_6, CMD_VIEW1),
+    accel(FCONTROL.0 | FSHIFT.0, VK_7, CMD_VIEW_TILES),
+    accel(FCONTROL.0 | FSHIFT.0, VK_8, CMD_VIEW_CONTENT),
     accel(FCONTROL.0 | FSHIFT.0, VK_N, CMD_NEW_FOLDER),
     accel(0, VK_F4, CMD_ADDRESS),
     accel(FCONTROL.0, VK_E, CMD_SEARCH),
@@ -214,6 +230,10 @@ const ACCELS: [ACCEL; 38] = [
     accel(FCONTROL.0, VK_N, CMD_NEW_WINDOW),
     accel(FCONTROL.0, VK_Z, CMD_UNDO),
     accel(FCONTROL.0, VK_Y, CMD_REDO),
+    accel(FCONTROL.0 | FSHIFT.0, VK_C, CMD_COPY_PATH),
+    accel(FCONTROL.0, VK_ADD, CMD_FIT_COLUMNS),
+    accel(0, VK_TAB, CMD_FOCUS_NEXT),
+    accel(FSHIFT.0, VK_TAB, CMD_FOCUS_PREV),
 ];
 
 pub(crate) struct App {
@@ -291,6 +311,9 @@ fn main() -> Result<()> {
         // Explorer arguments we do not handle (/idlist, URLs, apps): the real Explorer gets them verbatim.
         std::process::exit(if rexplorer_core::fallback::forward_command_line().is_ok() { 0 } else { 1 });
     }
+    // The register, install and import dialogs speak the user's language too; the usage and argument errors above stay English.
+    // Nothing before this line may call `tr` (the first call freezes English for the process).
+    rexplorer_core::i18n::init(&settings::dir(), &Settings::load().language, &system_language());
     if args.register || args.unregister {
         unsafe { ui::register_flow(None, args.unregister) };
         return Ok(());
@@ -307,11 +330,16 @@ fn main() -> Result<()> {
         std::process::exit(if unsafe { ui::import_explorer_flow(args.profile.as_deref(), args.overwrite) } { 0 } else { 1 });
     }
     // A folder window never runs elevated unless asked (see core::elevation); the registry flows above are HKCU-only.
-    if !args.elevated && rexplorer_core::elevation::is_elevated() && rexplorer_core::elevation::relaunch_unelevated().is_ok() {
+    // The desktop icons view never stays elevated: its icons are files any program can replace.
+    if (!args.elevated || args.desktop_icons) && rexplorer_core::elevation::is_elevated() && rexplorer_core::elevation::relaunch_unelevated().is_ok() {
         return Ok(());
     }
     if args.desktop {
         return desktop::run();
+    }
+    // Opt-in only: no instance claim, no crash relaunch and no session write for the icons view.
+    if args.desktop_icons {
+        return desktop_icons::run();
     }
     if args.recover && !crash::record_recovery(CRASH_GUARD_SECS) {
         // The second crash in a row: show the folder in Windows Explorer rather than crash again.
@@ -376,9 +404,11 @@ fn main() -> Result<()> {
         }
         let profile = settings.active_profile().clone();
         folder_options::sync(&profile);
-        let theme = settings.theme(settings::resolve_theme_name(&profile.theme, rexplorer_core::import_explorer::apps_use_dark())).clone();
+        let base = settings.theme(settings::resolve_theme_name(&profile.theme, rexplorer_core::import_explorer::apps_use_dark())).clone();
+        // The starter PNGs never take contrast colors.
+        views::ensure_starter_theme(&base);
+        let theme = theme::effective_theme(&base, theme::high_contrast_on(), theme::sys_color);
         let brushes = theme::Brushes::new(&theme);
-        views::ensure_starter_theme(&theme);
         let session = startup_session(&profile, args.profile.is_some());
 
         let hinst: HINSTANCE = GetModuleHandleW(None)?.into();
@@ -492,6 +522,7 @@ fn startup_session(profile: &Profile, explicit_profile: bool) -> session::Sessio
         s.tree_width = profile.tree_width;
         s.preview_width = profile.preview_width;
     }
+    s.show_details &= !s.show_preview;
     s.tree_width = panes::clamp_width(s.tree_width);
     s.preview_width = panes::clamp_width(s.preview_width);
     s
@@ -506,7 +537,15 @@ unsafe fn pane_accel(app: *mut App, msg: &MSG, focus: HWND) -> bool {
     let inside = |h: HWND| focus == h || IsChild(h, focus).as_bool();
     // The embedded Explorer view keeps Ctrl+Z / Ctrl+Y for its own undo.
     let undo_key = GetKeyState(VK_CONTROL.0 as i32) < 0 && matches!(VIRTUAL_KEY(msg.wParam.0 as u16), VK_Z | VK_Y);
-    focus == (*app).search || (*app).panes.tree.as_ref().is_some_and(|t| inside(t.hwnd())) || (!undo_key && source::browser_hwnd(app).is_some_and(inside))
+    let panes = (*app).panes.tree.as_ref().is_some_and(|t| inside(t.hwnd())) || (!undo_key && source::browser_hwnd(app).is_some_and(inside));
+    focus == (*app).search || focus == (*app).sidebar || focus == (*app).strip || (panes && !edit_keeps_tab(msg))
+}
+
+/// Tab in an Edit (a rename in the tree or the embedded view) is the Edit's: it commits and edits the next item.
+unsafe fn edit_keeps_tab(msg: &MSG) -> bool {
+    let mut class = [0u16; 16];
+    let n = GetClassNameW(msg.hwnd, &mut class).max(0) as usize;
+    VIRTUAL_KEY(msg.wParam.0 as u16) == VK_TAB && String::from_utf16_lossy(&class[..n]).eq_ignore_ascii_case("Edit")
 }
 
 fn accels(overrides: &[(String, String)]) -> Vec<ACCEL> {
@@ -544,7 +583,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as isize);
         (*app).hwnd = hwnd;
         if let Err(e) = ui::create_children(app) {
-            message(hwnd, &format!("Cannot create controls: {e}"));
+            message(hwnd, &rexplorer_core::i18n::trf("err.controls", &[("error", &e)]));
             return LRESULT(-1);
         }
         return LRESULT(0);
@@ -626,9 +665,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             return LRESULT(1);
         }
-        WM_SETTINGCHANGE => {
-            if lparam.0 != 0 && PCWSTR(lparam.0 as *const u16).to_string().is_ok_and(|s| s == "ImmersiveColorSet") {
-                ui::follow_system_theme(app);
+        WM_SETTINGCHANGE | WM_SYSCOLORCHANGE | WM_THEMECHANGED => {
+            let setting = (msg == WM_SETTINGCHANGE && lparam.0 != 0).then(|| PCWSTR(lparam.0 as *const u16).to_string().ok()).flatten();
+            if theme::is_color_change(msg, wparam.0, setting.as_deref()) {
+                ui::refresh_theme(app);
+            }
+            if msg == WM_SYSCOLORCHANGE {
+                // Common controls cache system colors; they only refresh on this message.
+                unsafe extern "system" fn forward(child: HWND, _: LPARAM) -> windows::core::BOOL {
+                    unsafe { SendMessageW(child, WM_SYSCOLORCHANGE, None, None) };
+                    windows::core::BOOL(1)
+                }
+                let _ = EnumChildWindows(Some(hwnd), Some(forward), LPARAM(0));
             }
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
@@ -779,7 +827,8 @@ unsafe fn on_notify(app: *mut App, lparam: LPARAM) -> LRESULT {
             tabs::TN_CLOSE => nav::close_tab(app, nm.index),
             tabs::TN_NEW => nav::new_start_tab(app),
             tabs::TN_MOVE => nav::tab_moved(app, nm.index, nm.to),
-            tabs::TN_CONTEXT => nav::tab_menu(app, nm.index),
+            tabs::TN_CONTEXT => nav::tab_menu(app, nm.index, None),
+            tabs::TN_CONTEXT_KEY => nav::tab_menu(app, nm.index, Some(tabs::menu_point(from, nm.index))),
             tabs::TN_TEAR => {
                 let name = (&(*app).tabs).get(nm.index).map(|t| t.name.clone()).unwrap_or_default();
                 // Only a place the command line can carry moves out (no FTP password, not empty); the last tab stays.
@@ -821,7 +870,10 @@ unsafe fn on_notify(app: *mut App, lparam: LPARAM) -> LRESULT {
             go(app, nav::Target::Name(target), nav::History::Push);
         }
     } else if from == (*app).sidebar && hdr.code == sidebar::SN_CONTEXT {
-        panes::sidebar_menu(app, (*(lparam.0 as *const sidebar::NmSidebar)).index);
+        panes::sidebar_menu(app, (*(lparam.0 as *const sidebar::NmSidebar)).index, None);
+    } else if from == (*app).sidebar && hdr.code == sidebar::SN_CONTEXT_KEY {
+        let index = (*(lparam.0 as *const sidebar::NmSidebar)).index;
+        panes::sidebar_menu(app, index, Some(sidebar::menu_point(from, index)));
     } else if hdr.idFrom == ID_PALETTE && (hdr.code == palette::PN_PICK || hdr.code == palette::PN_CLOSE) {
         ui::on_palette(app, hdr);
     }
@@ -867,7 +919,9 @@ unsafe fn on_command(app: *mut App, cmd: u16) {
                 // Losing focus hides the Edit and restores its text.
                 let _ = SetFocus(Some(ui::view_hwnd(app)));
             } else {
-                source::cancel_search(app);
+                if !source::cancel_search(app) {
+                    list::cancel_cut(app);
+                }
             }
         }
         CMD_PROPERTIES => {
@@ -903,6 +957,8 @@ unsafe fn on_command(app: *mut App, cmd: u16) {
         CMD_FOCUS_NEXT | CMD_FOCUS_PREV => ui::cycle_focus(app, cmd == CMD_FOCUS_PREV),
         CMD_CUT => list::verb_on_selection(app, "cut", false),
         CMD_COPY => list::verb_on_selection(app, "copy", false),
+        CMD_COPY_PATH => list::copy_as_path(app),
+        CMD_FIT_COLUMNS => list::fit_columns(app),
         CMD_PASTE => list::verb_on_background(app, "paste"),
         CMD_UNDO | CMD_REDO => list::undo_step(app, cmd == CMD_REDO),
         CMD_RENAME => list::begin_rename(app),
@@ -912,7 +968,8 @@ unsafe fn on_command(app: *mut App, cmd: u16) {
         CMD_VIEW_MENU => commands::view_menu(app),
         CMD_TOGGLE_SIDEBAR => panes::toggle_sidebar(app),
         CMD_FOLDER_TREE => panes::toggle_tree(app),
-        CMD_TOGGLE_PREVIEW => panes::toggle_preview(app),
+        CMD_TOGGLE_PREVIEW => panes::toggle_right(app, panes::RightPane::Preview),
+        CMD_TOGGLE_DETAILS => panes::toggle_right(app, panes::RightPane::Details),
         CMD_CONNECT => {
             if let Some(url) = connect::dialog((*app).hwnd, &(*app).theme, (*app).font) {
                 nav::new_tab(app, nav::Target::Name(url), true, None);
@@ -964,6 +1021,15 @@ unsafe fn message(hwnd: HWND, text: &str) {
     MessageBoxW(Some(hwnd), PCWSTR(h.as_ptr()), w!("rexplorer"), MB_OK | MB_ICONERROR);
 }
 
+/// The Windows UI language as a locale name (`es-ES`); `en` when the system gives none.
+fn system_language() -> String {
+    use windows::Win32::Globalization::{GetUserDefaultLocaleName, GetUserDefaultUILanguage, LCIDToLocaleName};
+    let mut buf = [0u16; 85];
+    let n = unsafe { LCIDToLocaleName(GetUserDefaultUILanguage() as u32, Some(&mut buf), 0) };
+    let n = if n > 0 { n } else { unsafe { GetUserDefaultLocaleName(&mut buf) } };
+    if n > 1 { String::from_utf16_lossy(&buf[..n as usize - 1]) } else { "en".into() }
+}
+
 /// A message box before any window exists (--help, bad arguments).
 fn info_box(text: &str, icon: MESSAGEBOX_STYLE) {
     let h = HSTRING::from(text);
@@ -1003,4 +1069,13 @@ unsafe fn restore_placement(hwnd: HWND) -> bool {
         ..Default::default()
     };
     SetWindowPlacement(hwnd, &wp).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn system_language_is_a_locale_name() {
+        let l = super::system_language();
+        assert!(!l.is_empty() && l.is_ascii() && l.contains('-'), "{l}");
+    }
 }

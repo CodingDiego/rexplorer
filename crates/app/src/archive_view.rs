@@ -7,6 +7,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use rexplorer_core::archive::{self, Entry};
+use rexplorer_core::i18n::{tr, trf};
 use windows::core::Result;
 
 pub struct ArchiveListing {
@@ -48,7 +49,7 @@ fn format_size(n: u64) -> String {
         v /= 1024.0;
         i += 1;
     }
-    format!("{v:.1} {}", U[i])
+    format!("{} {}", format!("{v:.1}").replace('.', rexplorer_core::i18n::tr("num.decimal")), U[i])
 }
 
 fn format_date(dos: u32) -> String {
@@ -104,10 +105,10 @@ impl ArchiveListing {
         match column {
             0 => e.name.clone(),
             1 => format_date(e.dos_time),
-            2 if e.is_dir => "File folder".into(),
+            2 if e.is_dir => tr("col.file_folder").into(),
             2 => match Path::new(&e.name).extension() {
-                Some(x) => format!("{} file", x.to_string_lossy().to_uppercase()),
-                None => "File".into(),
+                Some(x) => trf("col.file_kind", &[("ext", &x.to_string_lossy().to_uppercase())]),
+                None => tr("col.file").into(),
             },
             3 if !e.is_dir => format_size(e.size),
             _ => String::new(),

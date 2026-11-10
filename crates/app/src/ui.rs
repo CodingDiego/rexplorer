@@ -6,6 +6,7 @@
 //! `theme.surface`.
 
 use super::*;
+use rexplorer_core::i18n::{tr, trf};
 use crate::nav::{Target, cur, go, listing, source};
 use windows::Win32::Foundation::COLORREF;
 use windows::Win32::Graphics::Gdi::{COLOR_MENUTEXT, CreateCompatibleDC, DT_NOCLIP, DeleteDC, GdiFlush, GetSysColor, HBITMAP};
@@ -16,6 +17,16 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::Storage::FileSystem::GetDriveTypeW;
 use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN};
 use windows::Win32::System::WindowsProgramming::DRIVE_REMOTE;
+
+/// A tooltip: the translated name, then the untranslated key hint in parentheses (the accessible name splits there).
+pub(crate) fn tip(key: &'static str, hint: &str) -> String {
+    format!("{} ({hint})", tr(key))
+}
+
+/// A menu entry's text: the translated name, a tab, then the untranslated key hint.
+pub(crate) fn hinted(key: &'static str, hint: &str) -> String {
+    format!("{}\t{hint}", tr(key))
+}
 
 pub(crate) const THIS_PC: &str = "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}";
 const HEADER_H: i32 = 44;
@@ -57,16 +68,9 @@ pub(crate) unsafe fn create_children(app: *mut App) -> Result<()> {
     let hwnd = (*app).hwnd;
     let hinst: HINSTANCE = GetModuleHandleW(None)?.into();
     (*app).strip = tabs::create(hwnd, ID_TABS)?;
-    (*app).nav = toolbar::create(
-        hwnd,
-        ID_NAV,
-        &[
-            (0xE72B, CMD_BACK, "Back (Alt+Left)"),
-            (0xE72A, CMD_FORWARD, "Forward (Alt+Right)"),
-            (0xE74A, CMD_UP, "Up (Alt+Up)"),
-            (0xE72C, CMD_REFRESH, "Refresh (F5)"),
-        ],
-    )?;
+    let (back, forward, up, refresh) = (tip("tb.back", "Alt+Left"), tip("tb.forward", "Alt+Right"), tip("tb.up", "Alt+Up"), tip("tb.refresh", "F5"));
+    (*app).nav = toolbar::create(hwnd, ID_NAV, &[(0xE72B, CMD_BACK, &back), (0xE72A, CMD_FORWARD, &forward), (0xE74A, CMD_UP, &up), (0xE72C, CMD_REFRESH, &refresh)])?;
+    let _ = SetWindowTextW((*app).nav, &HSTRING::from(tr("tb.nav_name"))); // the accessible name
     toolbar::set_group((*app).nav, &[CMD_BACK, CMD_FORWARD]);
     (*app).crumbs = breadcrumb::create(hwnd, ID_CRUMBS)?;
     // The address Edit sits on top of the breadcrumb while editing; keep the breadcrumb from painting over it.
@@ -101,16 +105,15 @@ pub(crate) unsafe fn create_children(app: *mut App) -> Result<()> {
         None,
     )?;
     // wparam 1: the cue stays visible while the box has the focus and is empty.
-    SendMessageW((*app).search, EM_SETCUEBANNER, Some(WPARAM(1)), Some(LPARAM(w!("Search").as_ptr() as isize)));
+    let cue = HSTRING::from(tr("tb.search_cue"));
+    SendMessageW((*app).search, EM_SETCUEBANNER, Some(WPARAM(1)), Some(LPARAM(cue.as_ptr() as isize)));
     let _ = SetWindowSubclass((*app).search, Some(source::search_subclass), 2, app as usize);
     edit::attach((*app).search);
     let _ = edit::autocomplete((*app).addr); // before attach: the word-delete subclass must stay outermost
     edit::attach((*app).addr);
-    (*app).tools = toolbar::create(
-        hwnd,
-        ID_TOOLS,
-        &[(0xE756, CMD_TERMINAL, "Open terminal here (Ctrl+`)"), (0xE968, CMD_CONNECT, "Connect to server")],
-    )?;
+    let terminal = tip("tb.terminal", "Ctrl+`");
+    (*app).tools = toolbar::create(hwnd, ID_TOOLS, &[(0xE756, CMD_TERMINAL, &terminal), (0xE968, CMD_CONNECT, tr("tb.connect"))])?;
+    let _ = SetWindowTextW((*app).tools, &HSTRING::from(tr("tb.tools_name")));
     (*app).cmdbar = commands::create(hwnd)?;
     let _ = windows::Win32::System::DataExchange::AddClipboardFormatListener(hwnd);
     (*app).sidebar = sidebar::create(hwnd, ID_SIDEBAR)?;
@@ -144,7 +147,7 @@ pub(crate) unsafe fn create_children(app: *mut App) -> Result<()> {
     (*app).home = home::create(hwnd, ID_HOME)?;
     list::register_folder_drops(app);
     panes::create_preview(app)?;
-    if (*app).session.show_preview {
+    if (*app).session.show_preview || (*app).session.show_details {
         let _ = ShowWindow((*app).panes.preview, SW_SHOW);
     }
     (*app).status = statusbar::create(hwnd, ID_STATUS)?;
@@ -205,7 +208,7 @@ unsafe fn check_images(t: &Theme, dpi: i32) -> HIMAGELIST {
             theme::fill_round(dc, &r, t.accent, radius);
             let old_font = SelectObject(dc, glyphs.into());
             SetBkMode(dc, TRANSPARENT);
-            SetTextColor(dc, COLORREF(0x00FF_FFFF));
+            SetTextColor(dc, COLORREF(theme::on_selection(t, 0x00FF_FFFF)));
             let mut gr = r;
             DrawTextW(dc, &mut "\u{E73E}".encode_utf16().collect::<Vec<u16>>(), &mut gr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
             SelectObject(dc, old_font);
@@ -251,18 +254,17 @@ pub(crate) unsafe fn apply_theme(app: *mut App) {
     panes::theme_tree(app);
 }
 
-/// ImmersiveColorSet: with `theme = system`, swaps to the light or dark theme when Windows' app mode changed.
+/// A system color or contrast change (and ImmersiveColorSet): rebuilds the theme from the profile's theme name
+/// (a `system` theme follows Windows' app mode) and the contrast theme, and swaps it in when it differs.
 // shortcut: the icon theme stays what startup loaded and open modal dialogs keep their colours; a restart picks both up.
-pub(crate) unsafe fn follow_system_theme(app: *mut App) {
+pub(crate) unsafe fn refresh_theme(app: *mut App) {
     use windows::Win32::Graphics::Gdi::{RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE, RedrawWindow};
-    if !(*app).profile.theme.eq_ignore_ascii_case(settings::SYSTEM_THEME) {
+    let name = settings::resolve_theme_name(&(*app).profile.theme, rexplorer_core::import_explorer::apps_use_dark());
+    let base = Settings::load().theme(name).clone();
+    let theme = theme::effective_theme(&base, theme::high_contrast_on(), theme::sys_color);
+    if theme == (*app).theme {
         return;
     }
-    let name = settings::resolve_theme_name(settings::SYSTEM_THEME, rexplorer_core::import_explorer::apps_use_dark());
-    if (*app).theme.name == name {
-        return;
-    }
-    let theme = Settings::load().theme(name).clone();
     let brushes = theme::Brushes::new(&theme);
     // The class brush first: the old brushes are deleted when they are replaced below.
     SetClassLongPtrW((*app).hwnd, GCLP_HBRBACKGROUND, brushes.background.0 as isize);
@@ -348,11 +350,14 @@ fn next_pane(at: Option<usize>, n: usize, back: bool) -> usize {
     }
 }
 
-/// Moves the keyboard focus around the view, the address bar, the search box and the folder tree (when shown).
+/// Moves the keyboard focus (F6, Tab) around the view, the address bar, the search box, the left pane (the folder
+/// tree, else the sidebar, when shown) and the tab strip.
 pub(crate) unsafe fn cycle_focus(app: *mut App, back: bool) {
     let view = source::browser_hwnd(app).unwrap_or_else(|| view_hwnd(app));
     let tree = (*app).panes.tree.as_ref().filter(|_| (*app).session.show_tree).map(|t| t.hwnd());
-    let panes: Vec<HWND> = [Some(view), Some((*app).addr), Some((*app).search), tree].into_iter().flatten().collect();
+    let shown = |h: HWND| IsWindowVisible(h).as_bool().then_some(h);
+    let left = tree.or_else(|| shown((*app).sidebar));
+    let panes: Vec<HWND> = [Some(view), Some((*app).addr), Some((*app).search), left, shown((*app).strip)].into_iter().flatten().collect();
     let focus = GetFocus();
     let at = panes.iter().position(|&h| h == focus || IsChild(h, focus).as_bool());
     let h = panes[next_pane(at, panes.len(), back)];
@@ -377,6 +382,9 @@ pub(crate) unsafe fn paint(app: *mut App) {
     if f.right > f.left {
         let dpi = GetDpiForWindow(hwnd);
         theme::fill_round(dc, &f, t.surface, scale(8, dpi));
+        if t.contrast.is_some() {
+            theme::outline_round(dc, &f, t.text, scale(8, dpi), 1);
+        }
         let glyphs = theme::icon_font(dpi, 16);
         let old = SelectObject(dc, glyphs.into());
         SetBkMode(dc, TRANSPARENT);
@@ -606,29 +614,29 @@ pub(crate) unsafe fn crumb_dropdown(app: *mut App, index: usize) {
 pub(crate) unsafe fn more_menu(app: *mut App) {
     let exe = std::env::current_exe().unwrap_or_default();
     let reg = if register::is_registered(register::REAL_BASE, &exe) {
-        (CMD_UNREGISTER as usize, "Unregister as folder handler...".to_string())
+        (CMD_UNREGISTER as usize, tr("menu.more.unregister").to_string())
     } else {
-        (CMD_REGISTER as usize, "Register as folder handler...".to_string())
+        (CMD_REGISTER as usize, tr("menu.more.register").to_string())
     };
-    let tree = if (*app).session.show_tree { "Places sidebar" } else { "Folder tree" };
+    let tree = if (*app).session.show_tree { tr("menu.more.places_sidebar") } else { tr("menu.view.folder_tree") };
     let mut entries = vec![
         (CMD_FOLDER_TREE as usize, tree.to_string()),
         (0, String::new()),
-        (CMD_PIN as usize, "Pin to Home\tCtrl+D".to_string()),
-        (CMD_EXPLORER as usize, "Open in Explorer\tCtrl+Shift+E".to_string()),
+        (CMD_PIN as usize, hinted("menu.more.pin_home", "Ctrl+D")),
+        (CMD_EXPLORER as usize, hinted("menu.more.open_explorer", "Ctrl+Shift+E")),
         reg,
-        (CMD_INSTALL as usize, "Install as default file manager...".to_string()),
-        (CMD_UNINSTALL as usize, "Uninstall...".to_string()),
-        (CMD_FOLDER_OPTIONS as usize, "Folder options...".to_string()),
-        (CMD_SETTINGS as usize, "Settings folder".to_string()),
+        (CMD_INSTALL as usize, tr("menu.more.install").to_string()),
+        (CMD_UNINSTALL as usize, tr("menu.more.uninstall").to_string()),
+        (CMD_FOLDER_OPTIONS as usize, tr("menu.more.folder_options").to_string()),
+        (CMD_SETTINGS as usize, tr("menu.more.settings_folder").to_string()),
         (0, String::new()),
-        (CMD_ABOUT as usize, "About rexplorer".to_string()),
+        (CMD_ABOUT as usize, tr("menu.more.about").to_string()),
     ];
     // Quick access: profile bookmarks, then cloud-sync roots.
     let quick: Vec<(String, String)> = (*app).profile.bookmarks.iter().chain(CLOUD.get().into_iter().flatten()).cloned().collect();
     if !quick.is_empty() {
         entries.push((0, String::new()));
-        entries.push((HEADING, "Quick access".to_string()));
+        entries.push((HEADING, tr("menu.more.quick_access").to_string()));
         entries.extend(quick.iter().enumerate().map(|(i, (label, _))| (QUICK + i, label.clone())));
     }
     let r = toolbar::button_rect((*app).cmdbar, CMD_MORE).unwrap_or_default();
@@ -643,20 +651,11 @@ pub(crate) unsafe fn more_menu(app: *mut App) {
 /// --register / --unregister and the More menu: confirm, change HKCU, report.
 pub(crate) unsafe fn register_flow(owner: Option<HWND>, unregister: bool) {
     let exe = std::env::current_exe().unwrap_or_default();
-    let keys = format!(
-        "HKEY_CURRENT_USER\\Software\\Classes\\{{Folder, Directory, Drive}}\\shell\\open\\command and \
-         ...\\Classes\\CLSID\\{}\\shell\\{{open, opennewwindow}}\\command (File Explorer: Win+E, the taskbar icon)",
-        register::EXPLORER_CLSID
-    );
+    let keys = trf("dlg.register.keys", &[("clsid", &register::EXPLORER_CLSID)]);
     let question = if unregister {
-        format!("Stop opening folders with rexplorer?\n\nThis deletes {keys} (per-user). Windows Explorer opens folders again.")
+        trf("dlg.register.stop", &[("keys", &keys)])
     } else {
-        format!(
-            "Open folders and Win+E with rexplorer?\n\nThis writes {keys} = \"{}\" (per-user only; nothing under HKLM \
-             changes).\n\nUndo with rexplorer --unregister. To copy rexplorer to a fixed place first, use \
-             More > Install as default file manager.",
-            exe.display()
-        )
+        trf("dlg.register.start", &[("keys", &keys), ("exe", &exe.display())])
     };
     let q = HSTRING::from(question);
     if MessageBoxW(owner, PCWSTR(q.as_ptr()), w!("rexplorer"), MB_YESNO | MB_ICONQUESTION) != IDYES {
@@ -664,9 +663,9 @@ pub(crate) unsafe fn register_flow(owner: Option<HWND>, unregister: bool) {
     }
     let r = if unregister { register::unregister(register::REAL_BASE) } else { register::register(register::REAL_BASE, &exe) };
     let (text, icon) = match r {
-        Ok(()) if unregister => ("rexplorer no longer opens folders.".to_string(), MB_ICONINFORMATION),
-        Ok(()) => ("rexplorer now opens folders.".to_string(), MB_ICONINFORMATION),
-        Err(e) => (format!("The registry change failed:\n\n{e}"), MB_ICONERROR),
+        Ok(()) if unregister => (tr("dlg.register.stopped").to_string(), MB_ICONINFORMATION),
+        Ok(()) => (tr("dlg.register.started").to_string(), MB_ICONINFORMATION),
+        Err(e) => (trf("err.registry", &[("error", &e)]), MB_ICONERROR),
     };
     let t = HSTRING::from(text);
     MessageBoxW(owner, PCWSTR(t.as_ptr()), w!("rexplorer"), MB_OK | icon);
@@ -691,20 +690,10 @@ pub(crate) unsafe fn install_flow(owner: Option<HWND>, uninstall: bool, confirm:
                 .lines()
                 .filter_map(|l| l.strip_prefix("value ").map(|k| format!("HKCU\\{k}")).or_else(|| l.strip_prefix("file ").map(str::to_string)))
                 .collect();
-            let listed = if listed.is_empty() { "(nothing: rexplorer is not installed)".to_string() } else { listed.join("\n") };
-            format!(
-                "Stop using rexplorer as the default file manager?\n\nThis reverts what {} lists (values another \
-                 program has changed since are left alone):\n\n{listed}",
-                dir.join("install.txt").display()
-            )
+            let listed = if listed.is_empty() { tr("dlg.uninstall.nothing").to_string() } else { listed.join("\n") };
+            trf("dlg.uninstall.confirm", &[("record", &dir.join("install.txt").display()), ("listed", &listed)])
         } else {
-            format!(
-                "Install rexplorer as your file manager?\n\nThis replaces Windows Explorer for folders, drives, Win+E and \
-                 the taskbar's File Explorer. If rexplorer is already installed and running, the running copy is \
-                 replaced: its open windows keep working until you close them, and anything opened after this uses \
-                 the new copy.\n\n{}",
-                install::plan(&dir, &base)
-            )
+            trf("dlg.install.confirm", &[("plan", &install::plan(&dir, &base))])
         };
         let q = HSTRING::from(question);
         let icon = if uninstall { MB_ICONQUESTION } else { MB_ICONWARNING | MB_DEFBUTTON2 };
@@ -716,6 +705,8 @@ pub(crate) unsafe fn install_flow(owner: Option<HWND>, uninstall: bool, confirm:
     // again afterwards. A test base (REXPLORER_REG_BASE) leaves the real helper alone.
     let real = base == install::REAL_REG_BASE;
     let helper_was_running = real && crate::desktop::stop();
+    // The icons view may hold the installed exe too; it is opt-in, so it is not started again afterwards.
+    let _ = real && crate::desktop_icons::stop();
     let r = if uninstall {
         install::uninstall(&dir).map_err(|e| (e, None))
     } else {
@@ -728,10 +719,8 @@ pub(crate) unsafe fn install_flow(owner: Option<HWND>, uninstall: bool, confirm:
             (None, InstallOutcome::Failed)
         }
         Err((e, _)) => {
-            let what = if uninstall { "Uninstall" } else { "Install" };
-            (Some((format!("{what} failed:
-
-{}", e.message()), MB_ICONERROR)), InstallOutcome::Failed)
+            let key = if uninstall { "err.uninstall" } else { "err.install" };
+            (Some((trf(key, &[("error", &e.message())]), MB_ICONERROR)), InstallOutcome::Failed)
         }
     };
     // After a failure (rolled back or kept), the helper that was running comes back on whichever copy is in place.
@@ -758,13 +747,11 @@ unsafe fn offer_rollback(
     dir: &std::path::Path,
 ) {
     const ROLL_BACK: i32 = 100;
-    let content = HSTRING::from(format!(
-        "{}\n\nRoll back undoes every change this install made and restores your previous setup.",
-        error.message()
-    ));
+    let content = HSTRING::from(trf("dlg.rollback.content", &[("error", &error.message())]));
+    let (roll_text, keep_text, title) = (HSTRING::from(tr("dlg.rollback.roll_back")), HSTRING::from(tr("dlg.rollback.keep")), HSTRING::from(tr("dlg.rollback.title")));
     let buttons = [
-        TASKDIALOG_BUTTON { nButtonID: ROLL_BACK, pszButtonText: w!("Roll back") },
-        TASKDIALOG_BUTTON { nButtonID: 101, pszButtonText: w!("Keep changes\nUndo them later with rexplorer --uninstall") },
+        TASKDIALOG_BUTTON { nButtonID: ROLL_BACK, pszButtonText: PCWSTR(roll_text.as_ptr()) },
+        TASKDIALOG_BUTTON { nButtonID: 101, pszButtonText: PCWSTR(keep_text.as_ptr()) },
     ];
     let config = TASKDIALOGCONFIG {
         cbSize: size_of::<TASKDIALOGCONFIG>() as u32,
@@ -772,7 +759,7 @@ unsafe fn offer_rollback(
         dwFlags: TDF_USE_COMMAND_LINKS,
         pszWindowTitle: w!("rexplorer"),
         Anonymous1: TASKDIALOGCONFIG_0 { pszMainIcon: TD_WARNING_ICON },
-        pszMainInstruction: w!("The install failed"),
+        pszMainInstruction: PCWSTR(title.as_ptr()),
         pszContent: PCWSTR(content.as_ptr()),
         cButtons: buttons.len() as u32,
         pButtons: buttons.as_ptr(),
@@ -783,11 +770,7 @@ unsafe fn offer_rollback(
     let roll_back = if TaskDialogIndirect(&config, Some(&mut picked), None, None).is_ok() {
         picked == ROLL_BACK
     } else {
-        let q = HSTRING::from(format!(
-            "Install failed:\n\n{}\n\nRoll back? Yes undoes every change this install made and restores your previous \
-             setup; No keeps them (undo them later with rexplorer --uninstall).",
-            error.message()
-        ));
+        let q = HSTRING::from(trf("dlg.rollback.question", &[("error", &error.message())]));
         MessageBoxW(owner, PCWSTR(q.as_ptr()), w!("rexplorer"), MB_YESNO | MB_ICONWARNING) == IDYES
     };
     if roll_back {
@@ -819,18 +802,21 @@ pub(crate) unsafe fn import_explorer_flow(profile: Option<&str>, overwrite: bool
     // Never reuse an existing backup: it may predate values set by hand since.
     let bak = (1..).map(|n| dir.join(if n == 1 { day.clone() } else { format!("{day}-{n}") })).find(|b| !b.exists()).unwrap();
     let ok = write.is_empty() || (std::fs::copy(&ini, &bak).is_ok() && views::try_save_profile_keys(&p.name, &write).is_ok());
-    let list = |v: Vec<String>| if v.is_empty() { "  (none)".to_string() } else { v.join("\n") };
+    let list = |v: Vec<String>| if v.is_empty() { format!("  {}", tr("dlg.import.none")) } else { v.join("\n") };
     let text = if !ok {
-        format!("Import failed: could not back up or write {}. Nothing was changed.", ini.display())
+        trf("dlg.import.failed", &[("path", &ini.display())])
     } else {
-        format!(
-            "Imported from Windows Explorer into profile \"{}\" ({} of {} Explorer values were set):\n\n{}\n\nSkipped:\n{}\n\nBackup: {}\nExplorer's settings were only read.",
-            p.name,
-            write.len(),
-            found,
-            list(write.iter().map(|(k, v)| format!("  {k} = {v}")).collect()),
-            list(skip.iter().map(|(k, why)| format!("  {k}: {why}")).collect()),
-            if write.is_empty() { "(not needed, nothing changed)".to_string() } else { bak.display().to_string() },
+        let backup = if write.is_empty() { tr("dlg.import.not_needed").to_string() } else { bak.display().to_string() };
+        trf(
+            "dlg.import.report",
+            &[
+                ("profile", &p.name),
+                ("set", &write.len()),
+                ("found", &found),
+                ("written", &list(write.iter().map(|(k, v)| format!("  {k} = {v}")).collect())),
+                ("skipped", &list(skip.iter().map(|(k, why)| format!("  {k}: {}", tr(why))).collect())),
+                ("backup", &backup),
+            ],
         )
     };
     let h = HSTRING::from(text);
@@ -839,12 +825,9 @@ pub(crate) unsafe fn import_explorer_flow(profile: Option<&str>, overwrite: bool
 }
 
 pub(crate) unsafe fn about(app: *mut App) {
-    let text = format!(
-        "rexplorer {}\nA file manager that hosts the Windows shell namespace.\n\nProfile: {}\nTheme: {}\nSettings: {}",
-        env!("CARGO_PKG_VERSION"),
-        (*app).profile.name,
-        (*app).theme.name,
-        settings::dir().display()
+    let text = trf(
+        "dlg.about",
+        &[("version", &env!("CARGO_PKG_VERSION")), ("profile", &(*app).profile.name), ("theme", &(*app).theme.name), ("dir", &settings::dir().display())],
     );
     let h = HSTRING::from(text);
     MessageBoxW(Some((*app).hwnd), PCWSTR(h.as_ptr()), w!("rexplorer"), MB_OK | MB_ICONINFORMATION);
@@ -910,33 +893,38 @@ pub(crate) unsafe fn toggle_fullscreen(app: *mut App) {
     let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
 }
 
-/// The status bar and the command bar's enabled states.
-pub(crate) unsafe fn update_status(app: *mut App) {
-    commands::update(app);
-    if cur(app).loading.is_some() {
-        return statusbar::set_text((*app).status, "Loading…", &(*app).profile.name);
-    }
-    let count = source(app).map_or(0, |s| s.len());
-    let selected = SendMessageW((*app).list, LVM_GETSELECTEDCOUNT, None, None).0 as usize;
+/// The summed size of the selected files; None when it is not worth asking (see below) or no file has a size.
+pub(crate) unsafe fn selected_bytes(app: *mut App, selected: usize) -> Option<u64> {
     // Remote folders are skipped: sizing up to 500 rows would stall on the network.
-    let bytes = match source(app) {
+    match source(app) {
         Some(Source::Shell(l)) if (1..=500).contains(&selected) && !is_remote(&l.folder.parsing_name) => {
             let sizes: Vec<u64> = list::selected_indices((*app).list).iter().filter_map(|&i| l.items.get(i)).filter(|it| !it.is_folder()).filter_map(|it| it.size()).collect();
             (!sizes.is_empty()).then(|| sizes.iter().sum())
         }
         _ => None,
-    };
-    let mut left = statusbar::summary(count, selected, bytes);
+    }
+}
+
+/// The status bar and the command bar's enabled states.
+pub(crate) unsafe fn update_status(app: *mut App) {
+    commands::update(app);
+    if cur(app).loading.is_some() {
+        return statusbar::set_text((*app).status, tr("status.loading"), &(*app).profile.name);
+    }
+    let count = source(app).map_or(0, |s| s.len());
+    let selected = SendMessageW((*app).list, LVM_GETSELECTEDCOUNT, None, None).0 as usize;
+    let mut left = statusbar::summary(count, selected, selected_bytes(app, selected));
     if let Some(Source::Shell(l)) = source(app) {
         if let Some(e) = &l.denied {
-            left = format!("Access denied: {e} (Ctrl+Shift+E opens it in Explorer)");
+            left = trf("status.access_denied", &[("error", e)]);
         }
     }
     if let Some(Source::Search(s)) = source(app) {
         if s.running && s.rows.is_empty() {
-            left = "Searching…".to_string();
+            left = tr("status.searching").to_string();
         } else {
-            left.push_str(if s.running { "  ·  searching…" } else { "  ·  search done" });
+            left.push_str("  \u{b7}  ");
+            left.push_str(tr(if s.running { "status.search_running" } else { "status.search_done" }));
         }
     }
     statusbar::set_text((*app).status, &left, &(*app).profile.name);

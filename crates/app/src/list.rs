@@ -19,10 +19,7 @@ use windows::Win32::System::Ole::IDropTarget;
 use windows::Win32::UI::Shell::{ILClone, ILFindLastID};
 use windows::core::{GUID, HRESULT, IUnknown, Interface};
 
-/// Our own entry above the shell's in the list's context menu.
-const PIN_TO_HOME: &str = "Pin to Home\tCtrl+D";
-/// The same on the Home page's folders.
-const UNPIN_FROM_HOME: &str = "Unpin from Home";
+use rexplorer_core::i18n::{tr, trf};
 
 pub(crate) unsafe fn on_notify(app: *mut App, lparam: LPARAM) -> LRESULT {
     let hdr = &*(lparam.0 as *const NMHDR);
@@ -110,7 +107,7 @@ pub(crate) unsafe fn on_notify(app: *mut App, lparam: LPARAM) -> LRESULT {
 
 /// Makes `list`'s label edit select only the first `n` UTF-16 units: the first select-all it gets (the list's own,
 /// whenever it comes) becomes (0, n), and a posted select covers a select-all that already happened.
-unsafe fn select_stem_later(list: HWND, n: usize) {
+pub(crate) unsafe fn select_stem_later(list: HWND, n: usize) {
     let edit = HWND(SendMessageW(list, LVM_GETEDITCONTROL, None, None).0 as *mut c_void);
     let _ = SetWindowSubclass(edit, Some(stem_subclass), STEM_ID, n);
     let _ = PostMessageW(Some(edit), EM_SETSEL, WPARAM(0), LPARAM(n as isize));
@@ -134,6 +131,19 @@ pub(crate) fn find_prefix(n: usize, start: usize, wrap: bool, needle: &str, name
     let start = start.min(n);
     let needle = needle.to_lowercase();
     (start..n).chain(if wrap { 0..start } else { 0..0 }).find(|&i| name(i).to_lowercase().starts_with(&needle))
+}
+
+/// Type-ahead for panes that take WM_CHAR themselves: (the new typed buffer, the text to look for), the needle empty
+/// for a control character or a space (ignored). A pause over a second restarts the buffer; the same letter repeated
+/// looks for that one letter again, to cycle through the names starting with it.
+pub(crate) fn type_ahead(buf: &str, last_ms: u32, now_ms: u32, ch: char) -> (String, String) {
+    if ch.is_control() || ch == ' ' {
+        return (buf.to_string(), String::new());
+    }
+    let mut typed = if now_ms.wrapping_sub(last_ms) > 1000 { String::new() } else { buf.to_string() };
+    typed.push(ch);
+    let needle = if typed.chars().all(|c| c == ch) { ch.to_string() } else { typed.clone() };
+    (typed, needle)
 }
 
 /// Whether row `i` is a file on the clipboard's cut; free while nothing is cut.
@@ -168,12 +178,35 @@ unsafe fn fill_dispinfo(app: *mut App, item: &mut LVITEMW) {
     if i >= s.len() {
         return;
     }
+    if item.mask.contains(LVIF_COLUMNS) && item.iSubItem == 0 {
+        put_tile_columns(item, &views::tile_columns((*app).views.view, s.column_count()));
+    }
     if item.mask.contains(LVIF_TEXT) {
         copy_text(&s.text(i, item.iSubItem as usize), item.pszText, item.cchTextMax);
     }
     if item.mask.contains(LVIF_IMAGE) && item.iSubItem == 0 && !icon_view {
         item.iImage = views::tall_icon(app, source::small_icon(app, i));
     }
+}
+
+/// Fills a tile's extra-line request: the header positions, and zero formats when asked for. The list hands over room
+/// for 20 of each.
+fn put_tile_columns(item: &mut LVITEMW, cols: &[u32]) {
+    if item.puColumns.is_null() {
+        item.cColumns = 0;
+        return;
+    }
+    let n = cols.len().min(20);
+    // SAFETY: puColumns (and piColFmt when LVIF_COLFMT is asked) point at the list's 20-slot arrays.
+    unsafe {
+        for (k, &c) in cols[..n].iter().enumerate() {
+            *item.puColumns.add(k) = c;
+            if item.mask.contains(LVIF_COLFMT) && !item.piColFmt.is_null() {
+                *item.piColFmt.add(k) = LIST_VIEW_ITEM_COLUMN_FORMAT_FLAGS(0);
+            }
+        }
+    }
+    item.cColumns = n as u32;
 }
 
 unsafe fn on_column_click(app: *mut App, sub: usize) {
@@ -272,6 +305,7 @@ pub(crate) unsafe fn set_sort_arrow(app: *mut App) {
 /// The active listing's groups on the list (none when `on` is false or it has none). Off before any item-count
 /// change and on after it: the list lays out its groups by their item counts.
 pub(crate) unsafe fn set_groups(app: *mut App, on: bool) {
+    let on = on && (*app).views.view != views::View::List; // comctl32 has no groups in list mode
     let list = (*app).list;
     SendMessageW(list, LVM_REMOVEALLGROUPS, None, None);
     let (groups, rows) = listing(app).filter(|_| on).map_or((&[][..], 0), |l| (&l.groups[..], l.items.len()));
@@ -437,7 +471,7 @@ pub(crate) unsafe fn begin_drag(app: *mut App) {
         Ok(d) => {
             let _ = dragdrop::drag(&d, ui::view_hwnd(app));
         }
-        Err(e) => message((*app).hwnd, &format!("Cannot drag the selection\n\n{e}")),
+        Err(e) => message((*app).hwnd, &trf("err.drag", &[("error", &e)])),
     }
 }
 
@@ -610,7 +644,8 @@ pub(crate) unsafe fn show_menu(app: *mut App, on_item: bool, at: Option<POINT>) 
             sel.iter().filter_map(|&i| l.items.get(i)).any(|i| i.is_folder() && pinned_key(&i.parsing_name()))
         });
     // Pinning applies to the current folder (background) or to selected folders of a shell listing.
-    let pin = if pinned { Entry::new(CMD_PIN as usize, UNPIN_FROM_HOME, 0xE77A) } else { Entry::new(CMD_PIN as usize, PIN_TO_HOME, 0xE718) };
+    // Our own entry above the shell's in the list's context menu; Unpin on the Home page's folders.
+    let pin = if pinned { Entry::new(CMD_PIN as usize, tr("menu.list.unpin_home"), 0xE77A) } else { Entry::new(CMD_PIN as usize, &ui::hinted("menu.more.pin_home", "Ctrl+D"), 0xE718) };
     let mut own: Vec<Entry> = match (home, on_item) {
         (true, true) if folders => vec![pin],
         (true, _) => Vec::new(),
@@ -624,11 +659,11 @@ pub(crate) unsafe fn show_menu(app: *mut App, on_item: bool, at: Option<POINT>) 
         own.splice(
             0..0,
             [
-                Entry::submenu("View", 0xE8A9, &ve, &vc, VIEW_BASE),
-                Entry::submenu("Sort by", 0xE8CB, &se, &sc, SORT_BASE),
+                Entry::submenu(tr("menu.list.view"), 0xE8A9, &ve, &vc, VIEW_BASE),
+                Entry::submenu(tr("menu.list.sort_by"), 0xE8CB, &se, &sc, SORT_BASE),
                 Entry::sep(),
-                Entry::new(CMD_REFRESH as usize, "Refresh\tF5", 0xE72C),
-                Entry::new(CMD_PASTE as usize, "Paste\tCtrl+V", 0xE77F).enabled(commands::clipboard_has_files()),
+                Entry::new(CMD_REFRESH as usize, &ui::hinted("menu.list.refresh", "F5"), 0xE72C),
+                Entry::new(CMD_PASTE as usize, &ui::hinted("menu.list.paste", "Ctrl+V"), 0xE77F).enabled(commands::clipboard_has_files()),
             ],
         );
     }
@@ -678,12 +713,12 @@ const HOME_FREQUENT: usize = 0x3002;
 unsafe fn home_menu(app: *mut App, pt: POINT) {
     let p = &(*app).profile;
     let entries = [
-        Entry::new(CMD_REFRESH as usize, "Refresh\tF5", 0xE72C),
+        Entry::new(CMD_REFRESH as usize, &ui::hinted("menu.list.refresh", "F5"), 0xE72C),
         Entry::sep(),
-        Entry { checked: p.show_recent, ..Entry::new(HOME_RECENT, "Show recently used files", 0) },
-        Entry { checked: p.show_frequent, ..Entry::new(HOME_FREQUENT, "Show frequently used folders", 0) },
+        Entry { checked: p.show_recent, ..Entry::new(HOME_RECENT, tr("menu.list.show_recent"), 0) },
+        Entry { checked: p.show_frequent, ..Entry::new(HOME_FREQUENT, tr("menu.list.show_frequent"), 0) },
         Entry::sep(),
-        Entry::new(CMD_FOLDER_OPTIONS as usize, "Folder options...", 0xE713),
+        Entry::new(CMD_FOLDER_OPTIONS as usize, tr("menu.more.folder_options"), 0xE713),
     ];
     match ui::pick_entries(app, &entries, pt.x, pt.y) {
         Some(HOME_RECENT) => folder_options::toggle(app, true),
@@ -754,7 +789,8 @@ unsafe fn draw_skeleton(app: *mut App, hdc: HDC) {
             cols.push(r);
         }
     }
-    let color = theme::blend(t.selection, t.surface, if (*app).pulse { 0.75 } else { 0.5 });
+    // Contrast: a steady system-color bar, no pulse.
+    let color = t.contrast.map_or_else(|| theme::blend(t.selection, t.surface, if (*app).pulse { 0.75 } else { 0.5 }), |c| c.gray);
     let (row, pad) = (sc(28), sc(12));
     // Name bar up to the second column; detail bars at the second and third (or at 55% / 75% without a header).
     let name_right = cols.get(1).map_or(w, |c| c.left - pad);
@@ -782,11 +818,62 @@ pub(crate) unsafe fn on_key(app: *mut App, key: VIRTUAL_KEY) {
         VK_BACK => go_up(app),
         VK_F2 if matches!(source(app), Some(Source::Shell(_) | Source::Search(_))) => begin_rename(app),
         VK_DELETE => verb_on_selection(app, "delete", shift),
-        VK_C if ctrl => verb_on_selection(app, "copy", false),
+        VK_C if ctrl && !shift => verb_on_selection(app, "copy", false),
         VK_X if ctrl => verb_on_selection(app, "cut", false),
         VK_V if ctrl => verb_on_background(app, "paste"),
         VK_A if ctrl => set_item_state((*app).list, usize::MAX, LVIS_SELECTED, LVIS_SELECTED),
         _ => {}
+    }
+}
+
+/// Explorer's "Copy as path" text: each path in double quotes, one per line.
+/// False for a name that would end the quotes or start a new line when pasted into a terminal; a real file system
+/// path has neither, a folder inside an archive can.
+fn pastable(path: &str) -> bool {
+    !path.chars().any(|c| c == '"' || c.is_control())
+}
+
+fn quoted_paths(paths: &[String]) -> String {
+    paths.iter().map(|p| format!("\"{p}\"")).collect::<Vec<_>>().join("\r\n")
+}
+
+/// Ctrl+Shift+C: the selected rows' paths (the folder's own when nothing is selected) as text on the clipboard.
+pub(crate) unsafe fn copy_as_path(app: *mut App) {
+    let rows = selected_indices((*app).list);
+    let names: Vec<String> = match source(app) {
+        Some(Source::Shell(l)) if !rows.is_empty() => rows.iter().filter_map(|&i| l.items.get(i)).map(|it| it.parsing_name()).collect(),
+        Some(Source::Search(s)) if !rows.is_empty() => rows.iter().filter_map(|&i| s.rows.get(i)).map(|r| r.item.parsing_name()).collect(),
+        Some(src) => vec![src.parsing_name()],
+        None => Vec::new(),
+    };
+    // shortcut: Home's recent files without a path-shaped parsing name are skipped (beep); no core accessor for SIGDN_FILESYSPATH.
+    let paths: Vec<String> = names.into_iter().filter(|p| ui::is_fs_path(p) && pastable(p)).collect();
+    if paths.is_empty() || dragdrop::set_clipboard_text((*app).hwnd, &quoted_paths(&paths)).is_err() {
+        let _ = MessageBeep(MB_OK);
+    }
+}
+
+/// Ctrl+Num+: every column of the details view to the width of its widest text, then the layout is saved.
+pub(crate) unsafe fn fit_columns(app: *mut App) {
+    if (*app).views.view != views::View::Details || !IsWindowVisible((*app).list).as_bool() {
+        return;
+    }
+    let header = HWND(SendMessageW((*app).list, LVM_GETHEADER, None, None).0 as *mut c_void);
+    let n = SendMessageW(header, HDM_GETITEMCOUNT, None, None).0.max(0) as usize;
+    for i in 0..n {
+        SendMessageW((*app).list, LVM_SETCOLUMNWIDTH, Some(WPARAM(i)), Some(LPARAM(LVSCW_AUTOSIZE as isize)));
+    }
+    SetTimer(Some((*app).hwnd), crate::TIMER_COLUMNS, 100, None);
+}
+
+/// Esc: a cut shown in this folder stops being a cut. A cut made elsewhere is left alone.
+pub(crate) unsafe fn cancel_cut(app: *mut App) {
+    // The cached set may be older than the clipboard: never empty something copied elsewhere a moment ago.
+    refresh_cut(app);
+    let shown = listing(app).is_some_and(|l| (0..l.items.len()).any(|i| is_cut(app, i)));
+    if shown {
+        dragdrop::clear_clipboard((*app).hwnd);
+        refresh_cut(app);
     }
 }
 
@@ -1002,9 +1089,12 @@ unsafe fn draw_item(app: *mut App, cd: &mut NMLVCUSTOMDRAW) -> u32 {
         CDDS_ITEMPREPAINT => {
             let (list, t) = ((*app).list, &(*app).theme);
             let i = cd.nmcd.dwItemSpec;
-            let selected = SendMessageW(list, LVM_GETITEMSTATE, Some(WPARAM(i)), Some(LPARAM(LVIS_SELECTED.0 as isize))).0 != 0;
+            let state = SendMessageW(list, LVM_GETITEMSTATE, Some(WPARAM(i)), Some(LPARAM((LVIS_SELECTED.0 | LVIS_FOCUSED.0) as isize))).0 as u32;
+            let selected = state & LVIS_SELECTED.0 != 0;
             let hot = cd.nmcd.uItemState.0 & CDIS_HOT.0 != 0;
-            if selected || hot {
+            // Contrast: the keyboard focus is a rectangle, drawn here since CDIS_FOCUS is stripped below.
+            let focus = t.contrast.is_some() && state & LVIS_FOCUSED.0 != 0 && GetFocus() == list;
+            if selected || hot || focus {
                 // nmcd.rc is the item's rect; asking the list for it here (LVM_GETITEMRECT) stops it drawing the item.
                 let r = cd.nmcd.rc;
                 let mut client = RECT::default();
@@ -1015,12 +1105,21 @@ unsafe fn draw_item(app: *mut App, cd: &mut NMLVCUSTOMDRAW) -> u32 {
                 let details = (*app).views.view == views::View::Details;
                 let (left, right) = if details { (client.left, client.right) } else { (r.left, r.right) };
                 let pill = RECT { left: left + m, top: r.top + v, right: right - m, bottom: r.bottom - v };
-                theme::fill_round(cd.nmcd.hdc, &pill, if selected { t.selection } else { theme::hover(t) }, 6 * dpi / 96);
+                if selected || hot {
+                    theme::fill_round(cd.nmcd.hdc, &pill, if selected { t.selection } else { theme::hover(t) }, 6 * dpi / 96);
+                }
+                if hot && !selected {
+                    theme::hot_outline(cd.nmcd.hdc, &pill, t, 6 * dpi / 96, dpi as u32);
+                }
+                if focus {
+                    let _ = windows::Win32::Graphics::Gdi::DrawFocusRect(cd.nmcd.hdc, &pill);
+                }
             }
             cd.nmcd.uItemState.0 &= !(CDIS_SELECTED.0 | CDIS_HOT.0 | CDIS_FOCUS.0);
             let dim = is_cut(app, i);
             (*app).dim_row = dim.then_some(i);
-            cd.clrText = COLORREF(if dim { t.secondary_text } else { t.text });
+            let ink = if dim { t.secondary_text } else { t.text };
+            cd.clrText = COLORREF(if selected { theme::on_selection(t, ink) } else { ink });
             cd.clrTextBk = COLORREF(CLR_NONE as u32);
             CDRF_NEWFONT | CDRF_NOTIFYSUBITEMDRAW
         }
@@ -1028,7 +1127,10 @@ unsafe fn draw_item(app: *mut App, cd: &mut NMLVCUSTOMDRAW) -> u32 {
         s if s.0 == CDDS_ITEMPREPAINT.0 | CDDS_SUBITEM.0 => {
             cd.nmcd.uItemState.0 &= !(CDIS_SELECTED.0 | CDIS_HOT.0 | CDIS_FOCUS.0);
             let t = &(*app).theme;
-            cd.clrText = COLORREF(if (*app).dim_row == Some(cd.nmcd.dwItemSpec) { t.secondary_text } else { t.text });
+            let ink = if (*app).dim_row == Some(cd.nmcd.dwItemSpec) { t.secondary_text } else { t.text };
+            // Only a contrast theme changes the selected row's text: normal themes skip the query per subitem.
+            let selected = t.contrast.is_some() && SendMessageW((*app).list, LVM_GETITEMSTATE, Some(WPARAM(cd.nmcd.dwItemSpec)), Some(LPARAM(LVIS_SELECTED.0 as isize))).0 != 0;
+            cd.clrText = COLORREF(if selected { theme::on_selection(t, ink) } else { ink });
             cd.clrTextBk = COLORREF(CLR_NONE as u32);
             if cd.iSubItem > 0 {
                 let font = SendMessageW((*app).list, WM_GETFONT, None, None).0;
@@ -1170,6 +1272,9 @@ pub(crate) unsafe extern "system" fn subclass(hwnd: HWND, msg: u32, wparam: WPAR
         crate::panes::stop_hover(app);
     }
     let r = DefSubclassProc(hwnd, msg, wparam, lparam);
+    if msg == WM_SIZE && (*app).views.view == views::View::Content {
+        views::set_tile_info(app); // the tile is as wide as the list
+    }
     theme::card_message(hwnd, msg, (*(data as *mut App)).theme.background);
     r
 }
@@ -1194,7 +1299,9 @@ unsafe fn draw_header(t: &Theme, nm: &NMCUSTOMDRAW) -> u32 {
             fill(&r, t.surface);
             if nm.uItemState.0 & CDIS_HOT.0 != 0 {
                 let m = 4 * dpi / 96;
-                theme::fill_round(nm.hdc, &RECT { left: r.left + m, top: r.top + m, right: r.right - m, bottom: r.bottom - m }, theme::hover(t), 6 * dpi / 96);
+                let hr = RECT { left: r.left + m, top: r.top + m, right: r.right - m, bottom: r.bottom - m };
+                theme::fill_round(nm.hdc, &hr, theme::hover(t), 6 * dpi / 96);
+                theme::hot_outline(nm.hdc, &hr, t, 6 * dpi / 96, dpi as u32);
             }
             let mut buf = [0u16; 260];
             let mut hi = HDITEMW { mask: HDI_TEXT | HDI_FORMAT, pszText: PWSTR(buf.as_mut_ptr()), cchTextMax: buf.len() as i32, ..Default::default() };
@@ -1347,20 +1454,127 @@ mod tests {
             let (parent, list) = test_list(w!("RexRenameTestParent"));
             for view in [LV_VIEW_DETAILS, LV_VIEW_ICON, LV_VIEW_SMALLICON, LV_VIEW_LIST, LV_VIEW_TILE] {
                 SendMessageW(list, LVM_SETVIEW, Some(WPARAM(view as usize)), None);
-                let _ = SetFocus(Some(list));
-                let edit = HWND(SendMessageW(list, LVM_EDITLABELW, Some(WPARAM(0)), None).0 as *mut c_void);
-                assert!(!edit.is_invalid(), "view {view}: the list opened its label edit");
-                let mut msg = MSG::default();
-                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
-                    let _ = TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
-                }
-                let (mut a, mut b) = (0u32, 0u32);
-                SendMessageW(edit, EM_GETSEL, Some(WPARAM(&mut a as *mut u32 as usize)), Some(LPARAM(&mut b as *mut u32 as isize)));
-                assert_eq!((a, b), (0, 6), "view {view}");
-                SendMessageW(list, LVM_CANCELEDITLABEL, None, None);
+                // A foreground change anywhere on the desktop (another test process, the user) takes the focus, and
+                // the list then closes its edit: that run says nothing about the selection, so it is run again.
+                let sel = (0..5).find_map(|_| {
+                    let _ = SetFocus(Some(list));
+                    let edit = HWND(SendMessageW(list, LVM_EDITLABELW, Some(WPARAM(0)), None).0 as *mut c_void);
+                    assert!(!edit.is_invalid(), "view {view}: the list opened its label edit");
+                    let mut msg = MSG::default();
+                    while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                    if !IsWindow(Some(edit)).as_bool() {
+                        return None;
+                    }
+                    let (mut a, mut b) = (0u32, 0u32);
+                    SendMessageW(edit, EM_GETSEL, Some(WPARAM(&mut a as *mut u32 as usize)), Some(LPARAM(&mut b as *mut u32 as isize)));
+                    SendMessageW(list, LVM_CANCELEDITLABEL, None, None);
+                    Some((a, b))
+                });
+                assert_eq!(sel, Some((0, 6)), "view {view}");
             }
             let _ = DestroyWindow(parent);
+        }
+    }
+
+    #[test]
+    fn tile_columns_written_into_the_item() {
+        let mut cols = [99u32; 20];
+        let mut fmts = [99i32; 20];
+        let mut item = LVITEMW { mask: LVIF_COLUMNS | LVIF_COLFMT, puColumns: cols.as_mut_ptr(), piColFmt: fmts.as_mut_ptr() as *mut _, ..Default::default() };
+        put_tile_columns(&mut item, &[1, 2, 3]);
+        assert_eq!((item.cColumns, cols[..4].to_vec(), fmts[..4].to_vec()), (3, vec![1, 2, 3, 99], vec![0, 0, 0, 99]));
+        fmts = [99; 20];
+        let mut only = LVITEMW { mask: LVIF_COLUMNS, puColumns: cols.as_mut_ptr(), piColFmt: fmts.as_mut_ptr() as *mut _, ..Default::default() };
+        put_tile_columns(&mut only, &[1]);
+        assert_eq!((only.cColumns, fmts[0]), (1, 99), "formats untouched without LVIF_COLFMT");
+        let mut none = LVITEMW { mask: LVIF_COLUMNS | LVIF_COLFMT, cColumns: 5, ..Default::default() };
+        put_tile_columns(&mut none, &[1, 2]);
+        assert_eq!(none.cColumns, 0);
+    }
+
+    static TILE_COLUMN_ASKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// A virtual list's parent that answers like fill_dispinfo: the texts, and one extra tile line on request.
+    unsafe extern "system" fn tile_parent(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        if msg == WM_NOTIFY && (*(lparam.0 as *const NMHDR)).code == LVN_GETDISPINFOW {
+            let item = &mut (*(lparam.0 as *mut NMLVDISPINFOW)).item;
+            if item.mask.contains(LVIF_TEXT) {
+                copy_text(if item.iSubItem == 0 { "report.txt" } else { "Text document" }, item.pszText, item.cchTextMax);
+            }
+            if item.mask.contains(LVIF_COLUMNS) && item.iSubItem == 0 {
+                TILE_COLUMN_ASKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);                put_tile_columns(item, &[1]);
+            }
+            return LRESULT(0);
+        }
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+
+    /// Activates a Common Controls 6 context for this thread (the test exe has no manifest: comctl32 5.82). libtest
+    /// runs each test on its own thread, so a context left active by a failed assert ends with that thread.
+    unsafe fn activate_v6() -> (windows::Win32::Foundation::HANDLE, usize) {
+        use windows::Win32::System::ApplicationInstallationAndServicing::{ACTCTXW, ActivateActCtx, CreateActCtxW};
+        let path = std::env::temp_dir().join(format!("rexplorer-cc6-test-{}.manifest", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0"><dependency><dependentAssembly><assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/></dependentAssembly></dependency></assembly>"#,
+        )
+        .unwrap();
+        let wide: Vec<u16> = path.to_string_lossy().encode_utf16().chain([0]).collect();
+        let ctx = ACTCTXW { cbSize: size_of::<ACTCTXW>() as u32, lpSource: PCWSTR(wide.as_ptr()), ..Default::default() };
+        let h = CreateActCtxW(&ctx);
+        let _ = std::fs::remove_file(&path); // read once, at creation
+        let h = h.expect("activation context");
+        let mut cookie = 0usize;
+        ActivateActCtx(Some(h), &mut cookie).unwrap();
+        let _ = windows::Win32::System::LibraryLoader::LoadLibraryW(w!("comctl32.dll"));
+        (h, cookie)
+    }
+
+    /// Proves a virtual (owner-data) tile is asked for its extra lines, which Tiles and Content rely on.
+    #[test]
+    fn owner_data_tile_view_asks_for_columns() {
+        use windows::Win32::Graphics::Gdi::{CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetDC, ReleaseDC, SelectObject};
+        use windows::Win32::System::ApplicationInstallationAndServicing::{DeactivateActCtx, ReleaseActCtx};
+        unsafe {
+            let (ctx, cookie) = activate_v6();
+            let hinst = GetModuleHandleW(None).unwrap().into();
+            let class = w!("RexTileTestParent");
+            RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(tile_parent), hInstance: hinst, lpszClassName: class, ..Default::default() });
+            let parent = CreateWindowExW(WINDOW_EX_STYLE(0), class, PCWSTR::null(), WS_OVERLAPPEDWINDOW, 0, 0, 400, 300, None, None, Some(hinst), None).unwrap();
+            let style = WS_CHILD | WS_VISIBLE | WINDOW_STYLE(LVS_REPORT | LVS_OWNERDATA);
+            let list = CreateWindowExW(WINDOW_EX_STYLE(0), WC_LISTVIEWW, PCWSTR::null(), style, 0, 0, 400, 300, Some(parent), None, Some(hinst), None).unwrap();
+            for i in 0..2 {
+                let col = LVCOLUMNW { mask: LVCF_WIDTH, cx: 200, iSubItem: i, ..Default::default() };
+                SendMessageW(list, LVM_INSERTCOLUMNW, Some(WPARAM(i as usize)), Some(LPARAM(&col as *const _ as isize)));
+            }
+            SendMessageW(list, LVM_SETITEMCOUNT, Some(WPARAM(3)), None);
+            assert_eq!(SendMessageW(list, 0x2008, None, None).0, 6, "CCM_GETVERSION: comctl32 6");
+            let info = LVTILEVIEWINFO {
+                cbSize: size_of::<LVTILEVIEWINFO>() as u32,
+                dwMask: LVTVIM_COLUMNS,
+                dwFlags: LVTVIF_AUTOSIZE,
+                cLines: 1,
+                ..Default::default()
+            };
+            SendMessageW(list, LVM_SETTILEVIEWINFO, None, Some(LPARAM(&info as *const _ as isize)));
+            SendMessageW(list, LVM_SETVIEW, Some(WPARAM(LV_VIEW_TILE as usize)), None);
+            assert_eq!(SendMessageW(list, LVM_GETVIEW, None, None).0 as u32, LV_VIEW_TILE);
+            let screen = GetDC(None);
+            let dc = CreateCompatibleDC(Some(screen));
+            let bmp = CreateCompatibleBitmap(screen, 400, 300);
+            let old = SelectObject(dc, bmp.into());
+            SendMessageW(list, WM_PRINTCLIENT, Some(WPARAM(dc.0 as usize)), Some(LPARAM((PRF_CLIENT | PRF_ERASEBKGND) as isize)));
+            SelectObject(dc, old);
+            let _ = DeleteObject(bmp.into());
+            let _ = DeleteDC(dc);
+            ReleaseDC(None, screen);
+            assert!(TILE_COLUMN_ASKS.load(std::sync::atomic::Ordering::Relaxed) > 0, "the tile asked for its extra lines");
+            let _ = DestroyWindow(parent);
+            let _ = DeactivateActCtx(0, cookie);
+            let _ = ReleaseActCtx(ctx);
         }
     }
 
@@ -1409,5 +1623,33 @@ mod tests {
         assert_eq!(find_prefix(4, 0, false, "BE", name), Some(2));
         assert_eq!(find_prefix(4, 4, true, "s", name), Some(0));
         assert_eq!(find_prefix(0, 0, true, "s", name), None);
+    }
+
+    #[test]
+    fn type_ahead_rules() {
+        let s = |t: (String, String)| (t.0, t.1);
+        assert_eq!(s(type_ahead("", 0, 5000, 'a')), ("a".into(), "a".into()));
+        assert_eq!(s(type_ahead("a", 5000, 5300, 'b')), ("ab".into(), "ab".into()));
+        assert_eq!(s(type_ahead("a", 5000, 5300, 'a')), ("aa".into(), "a".into()));
+        assert_eq!(s(type_ahead("ab", 5000, 6200, 'c')), ("c".into(), "c".into()));
+        assert_eq!(s(type_ahead("a", u32::MAX - 100, 200, 'b')), ("ab".into(), "ab".into()));
+        assert_eq!(s(type_ahead("ab", 5000, 5100, ' ')), ("ab".into(), String::new()));
+        assert_eq!(s(type_ahead("ab", 5000, 5100, '\u{8}')), ("ab".into(), String::new()));
+    }
+
+    #[test]
+    fn quoted_paths_joins_lines() {
+        assert_eq!(quoted_paths(&["C:\\a b.txt".to_string(), "\\\\srv\\s\\x".to_string()]), "\"C:\\a b.txt\"\r\n\"\\\\srv\\s\\x\"");
+        assert_eq!(quoted_paths(&[]), "");
+        assert_eq!(quoted_paths(&["C:\\one".to_string()]), "\"C:\\one\"");
+    }
+
+    #[test]
+    fn copy_as_path_refuses_names_that_break_out_of_the_quotes() {
+        // A folder inside a .rar can be named anything: pasted into a terminal, a quote or a line break runs a command.
+        assert!(pastable("C:\\a b\\c.txt"));
+        assert!(!pastable("C:\\x.rar\\y\" & calc & \""));
+        assert!(!pastable("C:\\x.rar\\y\ncalc"));
+        assert!(!pastable("C:\\x.rar\\y\rcalc"));
     }
 }

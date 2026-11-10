@@ -249,7 +249,7 @@ fn same_file(a: &Path, b: &Path) -> bool {
     matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
 }
 
-fn known_folder(id: &windows::core::GUID) -> Result<PathBuf> {
+pub fn known_folder(id: &windows::core::GUID) -> Result<PathBuf> {
     let p = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None)? };
     Ok(PathBuf::from(unsafe { take_cotaskmem_string(p) }))
 }
