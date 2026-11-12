@@ -1,19 +1,21 @@
 # rexplorer performance budgets (#48). Windows PowerShell 5.1. Times three things from outside the process and
 # exits 1 when a median is over its budget, else 0:
-#   start  process start to its first visible top-level window, on an empty folder       (-StartMs, default 600)
+#   start  process start to its first visible top-level window, on an empty folder       (-StartMs, default 400)
 #   list   an open window sent to %TEMP%\rexplorer-bench (100,000 empty files, made once if missing, shared with
-#          smoke.ps1) until its list holds every file                                   (-ListMs, default 600)
+#          smoke.ps1) until its list holds every file                                   (-ListMs, default 400)
 #   idle   CPU time of the process over -IdleSeconds (default 10) once that listing settled, in % of one core
-#                                                                                        (-IdlePct, default 1)
+#                                                                                        (-IdlePct, default 0.5)
+# The defaults are about twice the medians measured on 2026-11-11 (scripts\bench-results.md: start 185-195 ms,
+# list 181-185 ms, idle 0.0 %; the CPU counter's 15.6 ms tick is 0.16 % of 10 s, so 0.5 % is three ticks).
 #   -Exe <path>  the rexplorer.exe to test (default target\release\rexplorer.exe)
 #   -Runs <n>    timed runs per budget after one warm-up (default 5)
 #   -Focus       brings the window to the front for the idle sample (the budget is for a focused window); it takes
 #                the foreground, so use it only on a machine nobody is typing on
 # The budgets were measured on a 12-core laptop; a shared CI runner is slower, so pass looser values there.
-# Safety: the app runs on a scratch %APPDATA%, scratch install folder and scratch registry base, is driven only by
+# Safety: the app runs on a scratch %APPDATA% and %LOCALAPPDATA%, scratch install folder and scratch registry base, is driven only by
 # window messages to its own window and is killed by pid. No input is sent.
 param([string]$Exe = (Join-Path (Split-Path $PSScriptRoot -Parent) 'target\release\rexplorer.exe'),
-  [int]$Runs = 5, [double]$StartMs = 600, [double]$ListMs = 600, [double]$IdlePct = 1, [int]$IdleSeconds = 10, [switch]$Focus)
+  [int]$Runs = 5, [double]$StartMs = 400, [double]$ListMs = 400, [double]$IdlePct = 0.5, [int]$IdleSeconds = 10, [switch]$Focus)
 $ErrorActionPreference = 'Stop'
 [Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::InvariantCulture
 if (-not (Test-Path $Exe)) { Write-Output "FAIL exe missing: $Exe"; exit 1 }
@@ -43,7 +45,7 @@ public static class B {
 
 $Scratch = Join-Path $env:TEMP "rexplorer-budgets-$PID"
 $Empty = Join-Path $Scratch 'empty'
-New-Item -ItemType Directory -Path $Empty, "$Scratch\appdata" -Force | Out-Null
+New-Item -ItemType Directory -Path $Empty, "$Scratch\appdata", "$Scratch\local" -Force | Out-Null
 $Big = Join-Path $env:TEMP 'rexplorer-bench'
 if (-not (Test-Path $Big)) {
   Write-Host 'creating 100,000 files ...'
@@ -56,6 +58,7 @@ function Start-Rex($folder) {
   $psi = New-Object Diagnostics.ProcessStartInfo $Exe
   $psi.Arguments = '"' + $folder + '"'; $psi.UseShellExecute = $false
   $psi.EnvironmentVariables['APPDATA'] = "$Scratch\appdata"
+  $psi.EnvironmentVariables['LOCALAPPDATA'] = "$Scratch\local"
   $psi.EnvironmentVariables['REXPLORER_INSTALL_DIR'] = "$Scratch\install\app"
   $psi.EnvironmentVariables['REXPLORER_REG_BASE'] = "Software\rexplorer-test\budgets-$PID"
   $psi

@@ -1,5 +1,9 @@
 # Draft for microsoft/winget-pkgs, not submitted yet. Before submitting, replace both InstallerSha256 values with
 # the zip hashes from the release's SHA256SUMS.txt.
+# The exe installs itself as a normal per-user program (rexplorer.exe --install --quiet): it copies itself to
+# %LOCALAPPDATA%\Programs\rexplorer, adds a Start menu shortcut and the Apps and Features entry HKCU\...\Uninstall\rexplorer
+# (ProductCode below), whose UninstallString is "<dir>\rexplorer.exe" --uninstall --quiet. It changes no folder or
+# Explorer key; making it the default file manager is a separate step (rexplorer --register).
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.10.0.schema.json
 
 PackageIdentifier: CodingDiego.rexplorer
@@ -14,6 +18,13 @@ InstallerSwitches:
   Silent: --install --quiet
   SilentWithProgress: --install --quiet
 UpgradeBehavior: install
+ProductCode: rexplorer
+InstallationMetadata:
+  DefaultInstallLocation: '%LOCALAPPDATA%\Programs\rexplorer'
+AppsAndFeaturesEntries:
+  - DisplayName: rexplorer
+    Publisher: CodingDiego
+    ProductCode: rexplorer
 Installers:
   - Architecture: x64
     NestedInstallerFiles:

@@ -1,12 +1,19 @@
-Draft for the next release (the v1 release-candidate work). Not tagged yet; the 0.1.4 notes are in `CHANGELOG.md`.
+rexplorer 0.2.0, the v1 release candidate. The changes since 0.1.4 are listed in full in `CHANGELOG.md`.
 
 **Download.** Two zips: `rexplorer-<version>-x64.zip` and `rexplorer-<version>-arm64.zip`. The arm64 build is
 cross-compiled and has not been tested on ARM hardware yet. `SHA256SUMS.txt` lists both zips and both exes, the exes
 with their folder (`rexplorer-<version>-x64/rexplorer.exe`); check a download with `Get-FileHash` against it.
 
-**Install.** Extract the zip and run `rexplorer.exe` to try it. `rexplorer.exe --install` makes it the default file
-manager for your user, with no administrator rights; `--install --quiet` does it without a dialog. Already
-installed? Run the new `rexplorer.exe --install` to replace the old copy. Undo with
+**Install (changed).** Installing and making rexplorer the default file manager are now two separate steps, so an
+install can no longer take over your folders by itself. Extract the zip and run `rexplorer.exe` to try it.
+`rexplorer.exe --install` installs it as a normal program for your user (Start menu, Settings > Apps, no
+administrator rights); Windows Explorer still opens folders. `rexplorer.exe --register` (or More > Make rexplorer the
+default file manager) then makes it the default, journaled so `--unregister` (More > Give folders back to Windows
+Explorer) and uninstall undo it exactly. The scripts `install.ps1` (program only) and `master-install.ps1` (program,
+then the default, after saving the keys it changes to a `.reg` backup) do the same from PowerShell, and
+`restore-explorer.ps1` puts Windows Explorer back without needing a working rexplorer.exe. Already installed by an
+earlier build? Run the new `rexplorer.exe --install` to replace the copy; folders keep opening in rexplorer until you
+give them back, and uninstall still reverts everything the old install did. Uninstall from Settings > Apps or with
 `%LOCALAPPDATA%\Programs\rexplorer\rexplorer.exe --uninstall`.
 
 **Added.**
@@ -19,7 +26,8 @@ installed? Run the new `rexplorer.exe --install` to replace the old copy. Undo w
 - Search: unelevated searches use the Windows Search index where it covers the folder, and walk what it leaves
   out. The context menu works on results from several folders, and Back returns to the results.
 - Home: a Status column (cloud state) and sorting by column.
-- Archives (.rar): member icons in every view, picture thumbnails, and a preview of pictures and text.
+- Archives (.rar): member icons in every view, picture thumbnails, and a preview of pictures and text; a password
+  prompt for encrypted archives; members can be dragged out to other programs.
 - Undo now also covers drops on the sidebar, crumbs, tabs and Home, the context menu's New submenu, and Delete and
   rename in `--desktop-icons`. A new item from the context menu starts its rename at once.
 - An opt-in update check (Folder options > General, off by default): at most once a day, no telemetry, nothing
@@ -28,6 +36,12 @@ installed? Run the new `rexplorer.exe --install` to replace the old copy. Undo w
   A UI thread blocked for 5 s is logged to `%APPDATA%\rexplorer\rexplorer.log`.
 - rexplorer's own icon and a version resource that names rexplorer only.
 - Paths over 260 characters, where Windows' LongPathsEnabled policy is on.
+- Taskbar: rexplorer's windows group on one button with a jump list (Frequent and Recent folders, New window),
+  installed or not.
+- Paste shortcut in the background menu, and Run as administrator (Ctrl+Shift+Enter) on programs.
+- Breadcrumb dropdowns on every crumb, This PC, Network and shares included, listed in the background; the folder
+  icon on the left lists the desktop's places, Control Panel and Libraries among them.
+- Marks for cloud files that are online-only or always kept on this device.
 
 **Fixes.**
 - Extract here / Extract all to never replace a file already in the target, and never write outside it.
@@ -39,18 +53,23 @@ installed? Run the new `rexplorer.exe --install` to replace the old copy. Undo w
 **Settings format.** Settings files now carry `format=1`. The first start adds that one line to `settings.ini` and
 each theme and changes nothing else; unknown keys are kept. Files from 0.1.x load as they are.
 
-**Known gaps.** Copied from the Known gaps in the README at release time; the full checklist is
-`docs/EXPLORER-PARITY.md`.
-- Dragging files to other programs is unreliable (#75). Each failed drag is now logged to find the cause.
-- Most mouse- and keyboard-driven features added since 0.1.4, and everything in this release, are UNVERIFIED: built
-  and unit-tested, not tried with a real mouse, keyboard or screen reader.
+**Known gaps.** From the Known gaps in the README; the full checklist is `docs/EXPLORER-PARITY.md`, where 61
+behaviours were proven on this build (WORKS) and 3 more on a scratch install base, 44 are built and unit-tested but not yet tried on the exe
+(UNVERIFIED) and 10 are PARTIAL.
+- Not yet tried by a person: Narrator or NVDA, a Windows contrast theme, Text size above 100% and display scales
+  other than this machine's, two monitors, ARM64 hardware, Windows 10, and the taskbar jump list on the taskbar
+  itself (it was checked in its file).
+- Cloud marks were never seen on real OneDrive placeholders, and show only in Details and List. Run as
+  administrator was never invoked in testing.
+- MTP phones open in an embedded Explorer view; rename in search results is unverified.
 - The exe is not code-signed, so SmartScreen may warn.
 - A few internal window messages carry a pointer; another program at the same integrity level can crash
   rexplorer with a bad value. This is a robustness gap, not a privilege boundary.
-- The address and search boxes have no accessible name. The breadcrumb's hidden crumbs are not keyboard stops.
-- Search results have no thumbnails or preview.
-- Archive members cannot be dragged, sorted by column or renamed; encrypted .rar has no password prompt,
-  multi-volume .rar is untested, and only .rar gets the archive view.
+- The breadcrumb's hidden crumbs are not keyboard stops.
+- Sorting, renaming and deleting in search results are untested.
+- Archive members cannot be sorted by column or renamed; an encrypted .rar's password is passed in the ANSI code
+  page, multi-volume .rar is untested, and only .rar gets the archive view.
+- Dragging files into browsers, WhatsApp and VS Code was not tried (#75); drags into other programs work.
 - Undo does not cover pastes staged in %TEMP%, Keep-both copies, or paste and drop on `--desktop-icons`.
 - Fixed widths (sidebar, panes, search field) do not grow with Text size.
 - Not part of 1.0: merging a tab into another window, right-to-left layout, and FTP is present but unverified.

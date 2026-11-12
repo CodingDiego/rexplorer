@@ -14,8 +14,10 @@ LicenseUrl: https://github.com/CodingDiego/rexplorer/blob/master/LICENSE
 ShortDescription: A fast Windows file manager that can replace Windows Explorer.
 Description: |-
   A Windows file manager written in Rust. It shows the Windows shell namespace with plain Win32 controls and hands
-  everything it does not handle itself to the shell. Installing it makes it the default file manager for the current
-  user; no administrator rights are needed. Undo with rexplorer.exe --uninstall.
+  everything it does not handle itself to the shell. It installs per user as a normal program (Start menu, Settings >
+  Apps); no administrator rights are needed, and Windows Explorer still opens folders. To make it the default file
+  manager run rexplorer --register (undo with rexplorer --unregister). Uninstall from Settings > Apps or with
+  rexplorer.exe --uninstall.
 Tags:
   - explorer
   - file-manager

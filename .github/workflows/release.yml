@@ -75,18 +75,19 @@ jobs:
 
           Run rexplorer.exe to try it; nothing is installed.
 
-          Make it the default file manager (no administrator rights needed, everything is per-user):
-            rexplorer.exe --install
-            rexplorer.exe --import-explorer      (optional: copy your Windows Explorer settings)
-          Undo:
-            %LOCALAPPDATA%\Programs\rexplorer\rexplorer.exe --uninstall
+          No administrator rights needed, everything is per-user:
+            powershell -ExecutionPolicy Bypass -File install.ps1          install it as a program (Explorer still opens folders)
+            powershell -ExecutionPolicy Bypass -File master-install.ps1   install it and make it the default file manager
+            powershell -ExecutionPolicy Bypass -File restore-explorer.ps1 put Windows Explorer back, even if rexplorer will not start
+          Or by hand: rexplorer.exe --install, then %LOCALAPPDATA%\Programs\rexplorer\rexplorer.exe --register.
+          Go back: rexplorer.exe --unregister (keeps the program) or --uninstall (also from Settings > Apps).
 
           Docs, source and security policy: https://github.com/${{ github.repository }}
           "@
           $sums = foreach ($a in ([ordered]@{ x64 = 'x86_64-pc-windows-msvc'; arm64 = 'aarch64-pc-windows-msvc' }).GetEnumerator()) {
             $d = "rexplorer-$v-$($a.Key)"
             New-Item -ItemType Directory $d | Out-Null
-            Copy-Item "target\$($a.Value)\release\rexplorer.exe", LICENSE, THIRD-PARTY-NOTICES.md $d
+            Copy-Item "target\$($a.Value)\release\rexplorer.exe", LICENSE, THIRD-PARTY-NOTICES.md, scripts\install.ps1, scripts\master-install.ps1, scripts\restore-explorer.ps1 $d
             $readme.Replace('ARCH', $a.Key) | Set-Content -Encoding utf8 "$d\README.txt"
             Compress-Archive -Path $d -DestinationPath "$d.zip"
             foreach ($f in "$d.zip", "$d/rexplorer.exe") { "{0}  {1}" -f (Get-FileHash $f -Algorithm SHA256).Hash.ToLower(), $f }

@@ -9,7 +9,7 @@
 # Margin: the first 5 minutes (at most a fifth of the run) are warm-up and not judged. Of the judged samples, the
 # baseline is the median of the first fifth and the end value the median of the last fifth; a resource fails when
 # end > baseline * 1.05 + slack, with slack GDI 50, USER 50, handles 200, threads 10, private bytes 50 MB.
-# Safety: the app runs on a scratch %APPDATA%, scratch install folder and scratch registry base, and is driven only
+# Safety: the app runs on a scratch %APPDATA% and %LOCALAPPDATA%, scratch install folder and scratch registry base, and is driven only
 # by window messages to its own window (no keys, no mouse, no foreground needed). Files are created and deleted by
 # this script inside its own temp tree, never through the Recycle Bin: the app's Delete and Undo recycle, so they
 # are not used. Copy and Paste go through the clipboard, which is restored at the end; leave the clipboard alone
@@ -38,7 +38,7 @@ public static class S {
 # ---- scratch tree and profile -----------------------------------------------------------------------
 $Root = Join-Path $env:TEMP "rexplorer-soak-$PID"
 $Docs = Join-Path $Root 'docs'; $Pics = Join-Path $Root 'pics'; $Work = Join-Path $Root 'work'
-foreach ($d in $Docs, $Pics, $Work, "$Root\appdata", "$Root\install") { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+foreach ($d in $Docs, $Pics, $Work, "$Root\appdata", "$Root\local", "$Root\install") { New-Item -ItemType Directory -Path $d -Force | Out-Null }
 for ($i = 0; $i -lt 200; $i++) { [IO.File]::WriteAllText((Join-Path $Docs ('file{0:D3}.txt' -f $i)), "soak line $i") }
 # Pictures, so the thumbnails view has thumbnails to make.
 for ($i = 0; $i -lt 40; $i++) {
@@ -51,6 +51,7 @@ $Keep = Join-Path $Work 'keep.txt'; [IO.File]::WriteAllText($Keep, 'copied and p
 $psi = New-Object Diagnostics.ProcessStartInfo $Exe
 $psi.Arguments = '"' + $Docs + '"'; $psi.UseShellExecute = $false
 $psi.EnvironmentVariables['APPDATA'] = "$Root\appdata"
+$psi.EnvironmentVariables['LOCALAPPDATA'] = "$Root\local"
 $psi.EnvironmentVariables['REXPLORER_INSTALL_DIR'] = "$Root\install\app"
 $psi.EnvironmentVariables['REXPLORER_REG_BASE'] = "Software\rexplorer-test\soak-$PID"
 
@@ -61,17 +62,17 @@ function List { [S]::FindWindowEx($script:main, [IntPtr]::Zero, 'SysListView32',
 function Count { [int][S]::SendMessage((List), 0x1004, [IntPtr]::Zero, [IntPtr]::Zero) }
 function Key($h, $vk) { $null = [S]::PostMessage($h, 0x100, [IntPtr]$vk, [IntPtr]::Zero) }
 # Waits for $cond; a miss is counted, not fatal (the soak judges resources, the smoke test judges behavior).
-function Wait-Until([scriptblock]$cond, $ms) {
+function Wait-Until([scriptblock]$cond, $ms, $what) {
   $sw = [Diagnostics.Stopwatch]::StartNew()
   while ($sw.ElapsedMilliseconds -lt $ms) { Alive; if (& $cond) { return }; Start-Sleep -Milliseconds 50 }
-  $script:misses++
+  $script:misses++; $script:missedBy[$what]++
 }
 # Ctrl+L, the path into the address Edit (ID_ADDR 100), Enter (CMD_ADDRESS 5, CMD_ENTER 7).
 function Go($path, $n) {
   Cmd 5; Start-Sleep -Milliseconds 200
   $null = [S]::SendText([S]::GetDlgItem($script:main, 100), 0x0C, [IntPtr]::Zero, $path)
   Cmd 7
-  Wait-Until { (Count) -eq $n } 10000
+  Wait-Until { (Count) -eq $n } 10000 "open $(Split-Path $path -Leaf)"
 }
 function Iteration {
   # Navigate, then the preview pane (CMD_TOGGLE_PREVIEW 24) over a few selected rows (Home, Down).
@@ -82,26 +83,27 @@ function Iteration {
   # Thumbnails (CMD_VIEW1 + 2), back to Details (CMD_VIEW1).
   Go $Pics 40
   Cmd 27; Start-Sleep -Milliseconds 1500; Cmd 25
-  # Tabs: new (10), next (12), close (11).
-  Cmd 10; Start-Sleep -Milliseconds 500; Cmd 12; Start-Sleep -Milliseconds 300; Cmd 11; Start-Sleep -Milliseconds 300
-  # Search from the search box (ID_SEARCH 109).
+  # Tabs: new (10), next (12) twice, close (11) the new one, so the pictures tab stays (closing it instead left the
+  # window on Home, where the search below found nothing every round).
+  Cmd 10; Start-Sleep -Milliseconds 500; Cmd 12; Start-Sleep -Milliseconds 300; Cmd 12; Start-Sleep -Milliseconds 300; Cmd 11; Start-Sleep -Milliseconds 300
+  # Search the pictures from the search box (ID_SEARCH 109): pic10 to pic19.
   $box = [S]::GetDlgItem($script:main, 109); $t0 = [S]::Title($script:main)
-  $null = [S]::SendText($box, 0x0C, [IntPtr]::Zero, 'file1'); Key $box 0x0D
-  Wait-Until { (Count) -ge 1 -and ([S]::Title($script:main)) -ne $t0 } 5000
+  $null = [S]::SendText($box, 0x0C, [IntPtr]::Zero, 'pic1'); Key $box 0x0D
+  Wait-Until { (Count) -ge 1 -and ([S]::Title($script:main)) -ne $t0 } 5000 'search results'
   Start-Sleep -Milliseconds 500
   # File operations: the app's Copy (43) and Paste (44) of keep.txt, then this script's own churn in the folder.
   Go $Work 1
   # Only in the work folder: after a missed navigation, Copy and Paste would act on whatever folder is showing.
   if ((Count) -ge 1 -and [S]::Title($script:main) -eq "$(Split-Path $Work -Leaf) - rexplorer") {
     Key (List) 0x24; Start-Sleep -Milliseconds 200; Cmd 43; Start-Sleep -Milliseconds 300; Cmd 44
-    Wait-Until { (Count) -ge 2 } 5000
-  } else { $script:misses++ }
+    Wait-Until { (Count) -ge 2 } 5000 'paste'
+  } else { $script:misses++; $script:missedBy['not in the work folder']++ }
   $tag = $script:iterations
   for ($k = 0; $k -lt 20; $k++) { [IO.File]::WriteAllText((Join-Path $Work "churn-$tag-$k.tmp"), 'x') }
   for ($k = 0; $k -lt 20; $k++) { [IO.File]::Move((Join-Path $Work "churn-$tag-$k.tmp"), (Join-Path $Work "churn-$tag-$k.txt")) }
   # A file the app still holds open is left for the next round.
   Get-ChildItem -LiteralPath $Work -File | Where-Object { $_.FullName -ne $Keep } | Remove-Item -Force -ErrorAction SilentlyContinue
-  Wait-Until { (Count) -eq 1 } 5000
+  Wait-Until { (Count) -eq 1 } 5000 'churn removed'
 }
 function Sample {
   $script:p.Refresh()
@@ -131,14 +133,14 @@ function Restore-Clipboard($d) {
 
 # ---- run --------------------------------------------------------------------------------------------
 $clip = Save-Clipboard
-$script:misses = 0; $script:iterations = 0; $samples = New-Object Collections.ArrayList; $died = $null
+$script:misses = 0; $script:missedBy = @{}; $script:iterations = 0; $samples = New-Object Collections.ArrayList; $died = $null
 $script:p = $null
 try {
   $script:p = [Diagnostics.Process]::Start($psi); $null = $script:p.Handle
   $script:main = [IntPtr]::Zero
   for ($i = 0; $i -lt 200 -and $script:main -eq [IntPtr]::Zero; $i++) { Alive; $script:main = $script:p.MainWindowHandle; Start-Sleep -Milliseconds 50 }
   if ($script:main -eq [IntPtr]::Zero) { throw 'no main window within 10 s' }
-  Wait-Until { (Count) -eq 200 } 10000
+  Wait-Until { (Count) -eq 200 } 10000 'first listing'
   $script:clock = [Diagnostics.Stopwatch]::StartNew(); $next = 0
   while ($script:clock.Elapsed.TotalMinutes -lt $Minutes) {
     Iteration; $script:iterations++
@@ -173,6 +175,6 @@ foreach ($m in $slack.Keys) {
   $status = if ($end -gt $limit) { $failed = $true; 'FAIL' } else { 'PASS' }
   Write-Output ("{0} {1}: {2} -> {3} (limit {4:N1})" -f $status, $m, $base, $end, $limit)
 }
-Write-Output "$iterations iterations in $Minutes min, $($script:misses) waits missed; samples in $Csv"
+Write-Output "$iterations iterations in $Minutes min, $($script:misses) waits missed$(if ($script:misses) { ' (' + (($script:missedBy.GetEnumerator() | ForEach-Object { "$($_.Key) x$($_.Value)" }) -join ', ') + ')' }); samples in $Csv"
 if ($failed) { exit 1 }
 exit 0
