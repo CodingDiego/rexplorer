@@ -10,8 +10,10 @@ pub mod desktop;
 pub mod elevation;
 pub mod fallback;
 pub mod folder;
-#[cfg(test)]
-pub(crate) mod fuzz;
+/// The parsers' invariant checks, for the seeded tests and the cargo-fuzz targets in fuzz/ (built with `--cfg fuzzing`).
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod fuzz;
 pub mod fuzzy;
 pub mod i18n;
 pub mod icons;
@@ -19,10 +21,12 @@ pub mod import_explorer;
 pub mod install;
 pub mod images;
 pub mod item;
+pub mod jumplist;
 pub mod menu;
 pub mod notify;
 pub mod packaged;
 pub mod preview;
+pub mod query;
 pub mod register;
 pub mod search;
 pub mod settings;

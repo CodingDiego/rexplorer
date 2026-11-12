@@ -5,13 +5,14 @@
 //! icon, Start's File Explorer) `HKCU\<base>\CLSID\{52205fd8-...}\shell\{open,opennewwindow}\command` = `"<exe>"`
 //! (those verbs carry no argument). Each also gets an empty `DelegateExecute` string, which stops the shell from
 //! using Explorer's DelegateExecute handler. HKLM is never touched. `unregister` deletes the command keys that
-//! still launch rexplorer, and the keys left empty above them up to `<base>`.
+//! still launch rexplorer, and the keys left empty above them up to `<base>`. These are the unjournaled building
+//! blocks: `--register` / `--unregister` go through install.rs (`take_over` / `give_back`), which journals them.
 use std::path::Path;
 
 use windows::Win32::Foundation::{E_FAIL, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, KEY_READ, REG_SZ, RRF_RT_REG_SZ, RegCloseKey, RegDeleteKeyValueW, RegGetValueW,
-    RegOpenKeyExW, RegQueryInfoKeyW, RegSetKeyValueW,
+    HKEY, HKEY_CURRENT_USER, KEY_READ, REG_DWORD, REG_EXPAND_SZ, REG_SZ, REG_VALUE_TYPE, RRF_NOEXPAND, RRF_RT_ANY,
+    RRF_RT_REG_SZ, RegCloseKey, RegDeleteKeyValueW, RegGetValueW, RegOpenKeyExW, RegQueryInfoKeyW, RegSetKeyValueW,
 };
 use windows::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify, SHDeleteEmptyKeyW};
 use windows::core::{Error, HSTRING, PCWSTR, Result, w};
@@ -84,10 +85,7 @@ pub(crate) fn remove_if_ours(key: &HSTRING) -> Result<bool> {
         return Ok(false);
     }
     for name in [PCWSTR::null(), w!("DelegateExecute"), w!("Path")] {
-        let err = unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, key, name) };
-        if err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND {
-            err.ok()?;
-        }
+        delete_value(key, name)?;
     }
     delete_empty(&key.to_string());
     Ok(true)
@@ -122,18 +120,53 @@ pub(crate) fn read_sz(key: &HSTRING, name: PCWSTR) -> Option<String> {
 
 /// REG_SZ write; cbdata counts bytes including the terminating NUL.
 pub(crate) fn set_sz(key: &HSTRING, name: PCWSTR, value: &str) -> Result<()> {
-    let data: Vec<u16> = value.encode_utf16().chain(Some(0)).collect();
-    unsafe {
-        RegSetKeyValueW(
-            HKEY_CURRENT_USER,
-            key,
-            name,
-            REG_SZ.0,
-            Some(data.as_ptr().cast()),
-            (data.len() * 2) as u32,
-        )
+    let (ty, data) = sz(value);
+    set_raw(key, name, ty, &data)
+}
+
+/// A REG_SZ value as (type, bytes with the terminating NUL), for `set_raw`.
+pub(crate) fn sz(value: &str) -> (u32, Vec<u8>) {
+    (REG_SZ.0, value.encode_utf16().chain(Some(0)).flat_map(u16::to_le_bytes).collect())
+}
+
+/// A REG_DWORD value as (type, bytes), for `set_raw`.
+pub(crate) fn dword(value: u32) -> (u32, Vec<u8>) {
+    (REG_DWORD.0, value.to_le_bytes().to_vec())
+}
+
+/// Writes `data` of registry type `ty` as the `name` value of `HKCU\key`, creating the key.
+pub(crate) fn set_raw(key: &HSTRING, name: PCWSTR, ty: u32, data: &[u8]) -> Result<()> {
+    unsafe { RegSetKeyValueW(HKEY_CURRENT_USER, key, name, ty, Some(data.as_ptr().cast()), data.len() as u32) }.ok()
+}
+
+/// The `name` value of `HKCU\key` as it is stored, (type, bytes), so any type can be put back; None when missing.
+pub(crate) fn read_raw(key: &HSTRING, name: PCWSTR) -> Option<(u32, Vec<u8>)> {
+    let (mut ty, mut cb) = (REG_VALUE_TYPE::default(), 0u32);
+    let flags = RRF_RT_ANY | RRF_NOEXPAND;
+    unsafe { RegGetValueW(HKEY_CURRENT_USER, key, name, flags, Some(&mut ty), None, Some(&mut cb)) }.ok().ok()?;
+    let mut buf = vec![0u8; cb as usize];
+    let data = if buf.is_empty() { None } else { Some(buf.as_mut_ptr().cast()) };
+    unsafe { RegGetValueW(HKEY_CURRENT_USER, key, name, flags, Some(&mut ty), data, Some(&mut cb)) }.ok().ok()?;
+    buf.truncate(cb as usize);
+    Some((ty.0, buf))
+}
+
+/// A raw value as text for a message: the string of a REG_SZ / REG_EXPAND_SZ, the number of a REG_DWORD.
+pub(crate) fn show_raw(ty: u32, data: &[u8]) -> String {
+    match ty {
+        t if t == REG_DWORD.0 && data.len() == 4 => u32::from_le_bytes([data[0], data[1], data[2], data[3]]).to_string(),
+        t if t == REG_SZ.0 || t == REG_EXPAND_SZ.0 => {
+            let w: Vec<u16> = data.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).take_while(|&c| c != 0).collect();
+            String::from_utf16_lossy(&w)
+        }
+        _ => format!("<{} bytes>", data.len()),
     }
-    .ok()
+}
+
+/// Deletes the `name` value of `HKCU\key`; a missing key or value is not an error.
+pub(crate) fn delete_value(key: &HSTRING, name: PCWSTR) -> Result<()> {
+    let err = unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, key, name) };
+    if err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND { Ok(()) } else { err.ok() }
 }
 
 pub(crate) fn notify() {
@@ -259,6 +292,27 @@ mod tests {
         unregister(&base).unwrap();
         assert!(read_default(&key).is_none());
         assert!(key_exists(&format!(r"{base}\Folder\shell\open\command")));
+        cleanup(&root);
+    }
+
+    #[test]
+    fn raw_values_round_trip_any_type() {
+        let (base, root) = test_base("raw");
+        let key = HSTRING::from(format!(r"{base}\k"));
+        let (ty, data) = dword(1);
+        set_raw(&key, w!("NoModify"), ty, &data).unwrap();
+        assert_eq!(read_raw(&key, w!("NoModify")), Some(dword(1)));
+        assert_eq!(read_sz(&key, w!("NoModify")), None, "a DWORD is not read as a string");
+        set_sz(&key, w!("Name"), "rexplorer").unwrap();
+        assert_eq!(read_raw(&key, w!("Name")), Some(sz("rexplorer")));
+        let (t, d) = read_raw(&key, w!("Name")).unwrap();
+        assert_eq!((show_raw(t, &d), show_raw(ty, &data)), ("rexplorer".to_string(), "1".to_string()));
+        set_raw(&key, w!("Empty"), REG_SZ.0, &[]).unwrap();
+        assert!(read_raw(&key, w!("Empty")).is_some_and(|(t, d)| t == REG_SZ.0 && show_raw(t, &d).is_empty()));
+        delete_value(&key, w!("NoModify")).unwrap();
+        delete_value(&key, w!("NoModify")).unwrap();
+        assert_eq!(read_raw(&key, w!("NoModify")), None);
+        delete_value(&HSTRING::from(format!(r"{base}\missing")), w!("x")).unwrap();
         cleanup(&root);
     }
 

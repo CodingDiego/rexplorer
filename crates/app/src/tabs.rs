@@ -601,8 +601,7 @@ unsafe fn icon_font(hdc: HDC, height: i32) -> HFONT {
 }
 
 unsafe fn text(hdc: HDC, s: &str, rc: &mut RECT, fmt: DRAW_TEXT_FORMAT) {
-    let mut v: Vec<u16> = s.encode_utf16().collect();
-    DrawTextW(hdc, &mut v, rc, fmt);
+    theme::draw_text(hdc, s, rc, fmt);
 }
 
 unsafe fn paint(hwnd: HWND) {

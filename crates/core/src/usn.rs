@@ -17,6 +17,8 @@ use windows::Win32::System::Ioctl::{
 };
 use windows::core::{HSTRING, Result};
 
+use crate::query::Query;
+
 const FRN_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 const ROOT_INDEX: u64 = 5;
 
@@ -151,14 +153,15 @@ impl VolumeIndex {
         None
     }
 
-    /// Case-insensitive substring match on file names; at most `limit` resolvable paths. Setting `cancel` ends the scan.
-    pub fn search(&self, needle: &str, limit: usize, cancel: &AtomicBool) -> Vec<PathBuf> {
-        let needle = needle.to_lowercase();
+    /// Entries whose file name answers `query` (its filters read from disk); at most `limit` resolvable paths.
+    /// Setting `cancel` ends the scan.
+    pub fn search(&self, query: &Query, limit: usize, cancel: &AtomicBool) -> Vec<PathBuf> {
         self.entries
             .iter()
             .take_while(|_| !cancel.load(Ordering::Relaxed))
-            .filter(|(_, e)| e.name.to_lowercase().contains(&needle))
+            .filter(|(_, e)| query.name_matches(&e.name))
             .filter_map(|(&frn, _)| self.path_of(frn))
+            .filter(|p| !query.needs_meta() || query.path_matches(p))
             .take(limit)
             .collect()
     }
@@ -225,14 +228,15 @@ mod tests {
         }
         let idx = build('C').unwrap();
         assert!(idx.len() > 10_000);
-        assert!(!idx.search("notepad.exe", 5, &AtomicBool::new(false)).is_empty());
+        assert!(!idx.search(&Query::parse("notepad.exe"), 5, &AtomicBool::new(false)).is_empty());
     }
 
     #[test]
     fn search_stops_when_cancelled() {
         let entries = HashMap::from([(5, Entry { parent: 5, name: String::new() }), (10, Entry { parent: 5, name: "a".into() })]);
         let idx = VolumeIndex { drive: 'C', entries };
-        assert_eq!(idx.search("a", 5, &AtomicBool::new(false)), vec![PathBuf::from("C:\\a")]);
-        assert!(idx.search("a", 5, &AtomicBool::new(true)).is_empty());
+        let a = Query::parse("A");
+        assert_eq!(idx.search(&a, 5, &AtomicBool::new(false)), vec![PathBuf::from("C:\\a")]);
+        assert!(idx.search(&a, 5, &AtomicBool::new(true)).is_empty());
     }
 }

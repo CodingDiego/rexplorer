@@ -563,8 +563,7 @@ unsafe fn paint(hwnd: HWND, s: &mut State) {
         }
         SetTextColor(dc, COLORREF(if s.selected == Some(i) { theme::on_selection(t, t.text) } else { t.text }));
         let mut lr = RECT { left: pill.left + inset + icon + inset, top, right: pill.right - inset, bottom };
-        let mut text: Vec<u16> = row.label.encode_utf16().collect();
-        DrawTextW(dc, &mut text, &mut lr, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+        theme::draw_text(dc, &row.label, &mut lr, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
         if focused && s.focus == Some(i) {
             // The system's XOR rectangle shows on any fill, in a contrast theme too (as the folder options list does).
             SetTextColor(dc, COLORREF(t.text));

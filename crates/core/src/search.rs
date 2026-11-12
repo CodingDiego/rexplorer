@@ -2,12 +2,14 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::System::SystemServices::{SFGAO_FOLDER, SFGAO_HIDDEN, SFGAO_LINK, SFGAO_STREAM};
-use windows::core::Result;
+use windows::core::{GUID, Result};
 
 use crate::com::Pidl;
 use crate::folder::ShellFolder;
 use crate::item::ShellItem;
+use crate::query::{Query, local_day};
 
 /// One matching item and the editing name of the folder that contains it.
 pub struct Hit {
@@ -15,11 +17,6 @@ pub struct Hit {
     pub folder: String,
     /// The containing folder's absolute PIDL.
     pub pidl: Pidl,
-}
-
-/// Case-insensitive substring match; an empty needle matches nothing.
-pub fn matches(name: &str, needle: &str) -> bool {
-    !needle.is_empty() && name.to_lowercase().contains(&needle.to_lowercase())
 }
 
 /// What the walk goes into besides plain folders.
@@ -37,14 +34,27 @@ impl Default for Scope {
     }
 }
 
-/// Breadth-first name search below `root`. Call it on a worker thread initialized with `ComInit::mta()`.
+const PKEY_DATE_MODIFIED: PROPERTYKEY = PROPERTYKEY { fmtid: GUID::from_u128(0xB725F130_47EF_101A_A5F1_02608C9EEBAC), pid: 14 };
+
+/// Whether `item` (with `attrs` holding at least SFGAO_FOLDER and SFGAO_STREAM) answers `query`: the words on its
+/// display name, the filters on its file name, size and date, read only when a filter needs them.
+fn hit(item: &ShellItem, attrs: u32, query: &Query) -> bool {
+    query.name_matches(&item.display_name())
+        && (!query.needs_meta() || {
+            // A zip is a folder to the shell but a file to the user.
+            let folder = attrs & SFGAO_FOLDER.0 != 0 && attrs & SFGAO_STREAM.0 == 0;
+            query.meta_matches(&item.file_name(), folder, || item.size(), || item.property_time(&PKEY_DATE_MODIFIED).and_then(local_day))
+        })
+}
+
+/// Breadth-first search below `root` for `query`. Call it on a worker thread initialized with `ComInit::mta()`.
 ///
 /// `sink` gets each folder's hits as soon as that folder is done. `cancel` is checked before every
 /// folder; setting it makes the walk return `Ok(())`. Links are never entered, archives (`SFGAO_STREAM`) and hidden
 /// `C:\$...` system folders only as `scope` says, and subfolders that fail to enumerate are skipped.
 pub fn walk(
     root: &Pidl,
-    needle: &str,
+    query: &Query,
     scope: Scope,
     cancel: &AtomicBool,
     sink: &mut dyn FnMut(Vec<Hit>),
@@ -79,7 +89,7 @@ pub fn walk(
             if attrs & SFGAO_FOLDER.0 != 0 && attrs & skip == 0 && seen.insert(item.parsing_name().to_lowercase()) {
                 queue.push_back(folder.child_pidl(&item));
             }
-            if matches(&item.display_name(), needle) {
+            if hit(&item, attrs, query) {
                 hits.push(Hit { item, folder: folder.editing_name.clone(), pidl: folder.pidl.clone() });
             }
         }
@@ -94,16 +104,6 @@ pub fn walk(
 mod tests {
     use super::*;
     use crate::com::ComInit;
-
-    #[test]
-    fn matches_is_case_insensitive_substring() {
-        assert!(matches("Report.TXT", "report"));
-        assert!(matches("Report.TXT", ".txt"));
-        assert!(!matches("Report.TXT", "pdf"));
-        assert!(!matches("anything", ""));
-        assert!(!matches("", "a"));
-        assert!(matches("Tamaño", "maÑ"));
-    }
 
     fn temp_root(tag: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("rexplorer-search-{tag}-{}", std::process::id()))
@@ -121,7 +121,7 @@ mod tests {
         let want = ShellFolder::parse(dir.join("a").join("b").to_str().unwrap()).unwrap().pidl;
         let mut hits = Vec::new();
         let res = root.and_then(|r| {
-            walk(&r, "needle", Scope::default(), &AtomicBool::new(false), &mut |h| hits.extend(h))
+            walk(&r, &Query::parse("needle"), Scope::default(), &AtomicBool::new(false), &mut |h| hits.extend(h))
         });
         std::fs::remove_dir_all(&dir).unwrap();
         res.unwrap();
@@ -143,9 +143,34 @@ mod tests {
         std::fs::write(dir.join("needle.txt"), b"x").unwrap();
         let root = ShellFolder::parse(dir.to_str().unwrap()).unwrap().pidl;
         let mut calls = 0;
-        let res = walk(&root, "needle", Scope::default(), &AtomicBool::new(true), &mut |_| calls += 1);
+        let res = walk(&root, &Query::parse("needle"), Scope::default(), &AtomicBool::new(true), &mut |_| calls += 1);
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(res.is_ok());
         assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn walk_applies_filters() {
+        let _c = ComInit::mta();
+        let dir = temp_root("filters");
+        std::fs::create_dir_all(dir.join("photos")).unwrap();
+        std::fs::write(dir.join("photos").join("trip.jpg"), vec![0u8; 3000]).unwrap();
+        std::fs::write(dir.join("trip.txt"), b"x").unwrap();
+        std::fs::write(dir.join("Tamaño.txt"), b"").unwrap();
+        let root = ShellFolder::parse(dir.to_str().unwrap()).unwrap().pidl;
+        let names = |q: &str| {
+            let mut out = Vec::new();
+            walk(&root, &Query::parse(q), Scope::default(), &AtomicBool::new(false), &mut |h| out.extend(h.iter().map(|h| h.item.file_name()))).unwrap();
+            out.sort();
+            out
+        };
+        let got = [names("trip"), names("kind:picture"), names("kind:folder"), names("trip size:>2kb"), names("maÑ size:empty"), names("ext:txt date:today")];
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(got[0], ["trip.jpg", "trip.txt"]);
+        assert_eq!(got[1], ["trip.jpg"]);
+        assert_eq!(got[2], ["photos"]);
+        assert_eq!(got[3], ["trip.jpg"]);
+        assert_eq!(got[4], ["Tamaño.txt"]);
+        assert_eq!(got[5], ["Tamaño.txt", "trip.txt"]);
     }
 }

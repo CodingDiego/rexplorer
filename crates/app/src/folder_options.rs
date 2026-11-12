@@ -452,7 +452,7 @@ struct State {
     app: *mut App,
     theme: Theme,
     fonts: Fonts,
-    /// The UI font made for this dialog's monitor after a DPI change (`fonts.ui` is the main window's until then).
+    /// The dialog's own UI font (the same as `fonts.ui`), deleted when it closes or a DPI change replaces it.
     own_ui: HFONT,
     bg: HBRUSH,
     field: HBRUSH,
@@ -876,7 +876,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         // Moved to a monitor of another scale: take the suggested rect (WM_SIZE lays the controls out again).
         WM_DPICHANGED => {
-            // The fonts were sized for the main window's monitor: make both again for this one.
+            // The fonts were sized for the previous monitor: make both again for this one.
             let dpi = (wparam.0 & 0xFFFF) as u32;
             let (ui, glyphs) = (theme::ui_font(&st.theme, dpi), theme::icon_font(theme::text_dpi(dpi), 16));
             for &h in st.hw.iter().chain([&st.ok, &st.cancel, &st.apply]).filter(|h| !h.0.is_null()) {
@@ -1061,14 +1061,15 @@ unsafe fn dialog(app: *mut App) {
     register();
     let (parent, t, p) = ((*app).hwnd, &(*app).theme, (*app).profile.clone());
     let dpi = dpi_of(parent);
-    let ui = if (*app).font.is_invalid() { HFONT(GetStockObject(DEFAULT_GUI_FONT).0) } else { (*app).font };
+    // Its own font: the main window replaces (and deletes) its font on a text size change while this is open.
+    let ui = theme::ui_font(t, GetDpiForWindow(parent));
     let glyphs = theme::icon_font(dpi as u32, 16);
     let start_other = (!p.start.eq_ignore_ascii_case(HOME_START) && !p.start.eq_ignore_ascii_case(THIS_PC)).then(|| p.start.clone());
     let mut st = Box::new(State {
         app,
         theme: t.clone(),
         fonts: Fonts { ui, glyphs },
-        own_ui: HFONT::default(),
+        own_ui: ui,
         bg: CreateSolidBrush(COLORREF(t.background)),
         field: CreateSolidBrush(COLORREF(t.background)),
         hw: vec![HWND::default(); CTLS.len()],

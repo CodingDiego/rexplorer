@@ -340,7 +340,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 WINDOW_EX_STYLE(0), w!("EDIT"), PCWSTR::null(), style, 0, 0, 0, 0,
                 Some(hwnd), None, Some(hinst), None,
             ) {
-                Ok(e) => (*s).edit = e,
+                Ok(e) => {
+                    // The text preview's read-only box has no label (#21).
+                    let _ = rexplorer_core::access::set_name(e, tr("preview.pane_name"));
+                    (*s).edit = e;
+                }
                 Err(_) => return LRESULT(-1),
             }
             LRESULT(0)
@@ -473,13 +477,16 @@ unsafe fn paint(hwnd: HWND, s: *mut State) {
             let fmt = DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX;
             let top = c.top + area_h;
             let mut r1 = RECT { left: c.left, top, right: c.right, bottom: top + half };
-            SetTextColor(mem, COLORREF((*s).text));
-            let mut t: Vec<u16> = (*s).name.encode_utf16().collect();
-            DrawTextW(mem, &mut t, &mut r1, fmt);
             let mut r2 = RECT { left: c.left, top: top + half, right: c.right, bottom: top + cap };
-            SetTextColor(mem, COLORREF((*s).secondary));
-            let mut t: Vec<u16> = (*s).detail.encode_utf16().collect();
-            DrawTextW(mem, &mut t, &mut r2, fmt);
+            // An empty Vec<u16> hands DrawTextW the dangling pointer 0x2, which it read and faulted on (a Home entry
+            // with no detail line crashed the window, 2026-11-11): empty lines are not drawn.
+            for (text, r, color) in [(&(*s).name, &mut r1, (*s).text), (&(*s).detail, &mut r2, (*s).secondary)] {
+                if !text.is_empty() {
+                    SetTextColor(mem, COLORREF(color));
+                    let mut t: Vec<u16> = text.encode_utf16().collect();
+                    DrawTextW(mem, &mut t, r, fmt);
+                }
+            }
             SelectObject(mem, of);
         }
 
@@ -503,6 +510,13 @@ unsafe fn blend(hdc: HDC, mem: HDC, hb: &Bmp, (x, y, dw, dh): (i32, i32, i32, i3
 
 /// Details mode: the picture in a square at the top, then the heading, the line under it and the label/value rows.
 /// Colors come from the theme (text, secondary), so a contrast theme needs nothing here.
+/// Where the details pane's values start: past the widest label (longer in Spanish, #37), between 2/5 and 3/5 of
+/// the width so the values keep room.
+fn label_split(left: i32, right: i32, widest: i32, gap: i32) -> i32 {
+    let w = right - left;
+    (left + widest + gap).clamp(left + w * 2 / 5, left + w * 3 / 5)
+}
+
 unsafe fn paint_details(hwnd: HWND, s: *mut State, hdc: HDC, mem: HDC) {
     let Some(d) = &(*s).details else { return };
     let c = content_rect(hwnd);
@@ -534,7 +548,13 @@ unsafe fn paint_details(hwnd: HWND, s: *mut State, hdc: HDC, mem: HDC) {
     y += h_head;
     line(y, c.left, c.right, h_row, (*s).secondary, &d.sub);
     y += h_row + gap;
-    let split = c.left + (c.right - c.left) * 2 / 5;
+    let widest = d.rows.iter().map(|(label, _)| {
+        let t: Vec<u16> = label.encode_utf16().collect();
+        let mut size = windows::Win32::Foundation::SIZE::default();
+        let _ = windows::Win32::Graphics::Gdi::GetTextExtentPoint32W(mem, &t, &mut size);
+        size.cx
+    });
+    let split = label_split(c.left, c.right, widest.max().unwrap_or(0), gap);
     for (label, value) in &d.rows {
         line(y, c.left, split, h_row, (*s).secondary, label);
         line(y, split, c.right, h_row, (*s).text, value);
@@ -795,6 +815,14 @@ mod tests {
     use super::*;
     use rexplorer_core::com::ComInit;
     use windows::Win32::UI::Shell::SHParseDisplayName;
+
+    #[test]
+    fn details_values_start_past_the_widest_label() {
+        assert_eq!(label_split(0, 500, 60, 8), 200, "short labels: 2/5");
+        assert_eq!(label_split(0, 500, 230, 8), 238);
+        assert_eq!(label_split(0, 500, 400, 8), 300, "at most 3/5");
+        assert_eq!(label_split(100, 600, 230, 8), 338);
+    }
 
     fn pump() {
         let mut m = MSG::default();

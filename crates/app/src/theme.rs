@@ -134,6 +134,19 @@ pub unsafe fn fill_round(dc: HDC, r: &RECT, color: u32, radius: i32) {
     }
 }
 
+/// DrawTextW of `s`, skipped when it is empty: an empty Vec<u16> hands DrawTextW a dangling pointer, which it read
+/// and faulted on (the preview pane crash, 2026-11-11). An empty text measures (DT_CALCRECT) zero wide.
+pub unsafe fn draw_text(dc: HDC, s: &str, r: &mut RECT, flags: DRAW_TEXT_FORMAT) {
+    if s.is_empty() {
+        if flags.0 & DT_CALCRECT.0 != 0 {
+            r.right = r.left;
+        }
+        return;
+    }
+    let mut v: Vec<u16> = s.encode_utf16().collect();
+    unsafe { DrawTextW(dc, &mut v, r, flags) };
+}
+
 /// Share of pixel (x, y) of a corner square `r` px wide that lies inside the quarter circle of radius `r` centered
 /// at (r, r), the square's inner corner: 1 inside the card, 0 in the frame. 4x4 samples per pixel.
 pub fn coverage(x: i32, y: i32, r: i32) -> f32 {

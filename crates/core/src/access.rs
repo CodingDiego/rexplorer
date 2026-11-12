@@ -82,6 +82,17 @@ pub fn event(event: u32, hwnd: HWND, item: Option<usize>) {
     unsafe { NotifyWinEvent(event, hwnd, OBJID_CLIENT.0, child_id(item)) };
 }
 
+/// Names a standard control that has no label (an Edit) for screen readers: an oleacc annotation that lives as
+/// long as the window. COM must be up on the calling thread.
+pub fn set_name(hwnd: HWND, name: &str) -> Result<()> {
+    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+    use windows::Win32::UI::Accessibility::{CAccPropServices, IAccPropServices, PROPID_ACC_NAME};
+    unsafe {
+        let svc: IAccPropServices = CoCreateInstance(&CAccPropServices, None, CLSCTX_INPROC_SERVER)?;
+        svc.SetHwndPropStr(hwnd, OBJID_CLIENT.0 as u32, 0, PROPID_ACC_NAME, &windows::core::HSTRING::from(name))
+    }
+}
+
 pub fn object(hwnd: HWND) -> Result<IAccessible> {
     let mut p = std::ptr::null_mut();
     unsafe { AccessibleObjectFromWindow(hwnd, OBJID_CLIENT.0 as u32, &IAccessible::IID, &mut p)? };
@@ -526,6 +537,19 @@ mod tests {
         assert!(unsafe { acc.accParent() }.is_ok());
         drop(acc);
         unsafe { DestroyWindow(h).unwrap() };
+    }
+
+    #[test]
+    fn set_name_names_a_plain_edit() {
+        let _com = ComInit::sta();
+        let edit = unsafe { CreateWindowExW(WINDOW_EX_STYLE(0), w!("EDIT"), w!(""), WS_POPUP, 0, 0, 100, 20, None, None, None, None) }.unwrap();
+        let acc = object(edit).unwrap();
+        // Not asserted empty: oleacc borrows a nearby label's text, and parallel tests make windows of their own.
+        assert_ne!(name(&acc, 0), "Search");
+        set_name(edit, "Search").unwrap();
+        assert_eq!(name(&object(edit).unwrap(), 0), "Search");
+        drop(acc);
+        unsafe { DestroyWindow(edit).unwrap() };
     }
 
     #[test]

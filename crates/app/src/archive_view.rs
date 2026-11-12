@@ -131,6 +131,29 @@ impl ArchiveListing {
     pub fn extract_all_to(&self, dest: &Path) -> Result<()> {
         archive::extract_all(&self.archive, dest)
     }
+
+    /// `picked` rows extracted under `show_dir` for a drag out: a file as itself, a directory with every file below
+    /// it. Returns the paths to offer, in `picked` order.
+    /// shortcut: extracts before the drag starts, on the calling thread; a delayed-render data object (as Explorer's
+    /// zip folder) if large members stall the window.
+    pub fn extract_for_drag(&self, picked: &[Entry]) -> Result<Vec<PathBuf>> {
+        let root = show_dir(&self.archive);
+        let mut out = Vec::new();
+        for e in picked {
+            if e.is_dir {
+                let below = format!("{}\\", e.path.to_lowercase());
+                for f in self.entries.iter().filter(|f| !f.is_dir && f.path.to_lowercase().starts_with(&below)) {
+                    extract_into(&self.archive, f, &root)?;
+                }
+                let dir = root.join(&e.path);
+                std::fs::create_dir_all(&dir)?;
+                out.push(dir);
+            } else {
+                out.push(extract_into(&self.archive, e, &root)?);
+            }
+        }
+        Ok(out)
+    }
 }
 
 pub fn extract_dir() -> PathBuf {
@@ -150,6 +173,7 @@ pub fn extract_into(archive: &Path, e: &Entry, root: &Path) -> Result<PathBuf> {
     // check above, and other threads extracting the same member (thumbnail, preview), never see a partial one.
     static PART: AtomicU64 = AtomicU64::new(0);
     let part = dest.join(format!(".part-{}-{}", std::process::id(), PART.fetch_add(1, Ordering::Relaxed)));
+    let _ = std::fs::remove_dir_all(&part); // left by an earlier process with the same id: extract needs it empty
     let done = archive::extract(archive, &e.path, &part).and_then(|p| Ok(std::fs::rename(p, &target)?));
     let _ = std::fs::remove_dir_all(&part);
     match done {
@@ -316,6 +340,25 @@ mod tests {
         assert!(inside && p1 == p2);
         assert_eq!(beside, 1);
         assert_eq!(text.unwrap(), "hello");
+    }
+
+    #[test]
+    fn drag_out_extracts_files_and_folders_under_the_show_dir() {
+        let dir = std::env::temp_dir().join(format!("rexplorer-archive_view-drag-{}", std::process::id()));
+        let rar = fixture(&dir);
+        let l = open(&rar, "").unwrap();
+        let docs = l.rows()[0].clone();
+        let file = l.entries.iter().find(|e| !e.is_dir).cloned().unwrap();
+        let paths = l.extract_for_drag(&[docs, file]);
+        let root = show_dir(&rar);
+        let text = paths.as_ref().ok().map(|p| (std::fs::read_to_string(p[0].join("a.txt")).ok(), std::fs::read_to_string(&p[1]).ok()));
+        let _ = std::fs::remove_dir_all(&root);
+        // The app removes the per-process folder at exit; the test process must too.
+        let _ = std::fs::remove_dir(session_dir());
+        let _ = std::fs::remove_dir_all(&dir);
+        let paths = paths.unwrap();
+        assert_eq!(paths, [root.join("docs"), root.join("docs").join("a.txt")]);
+        assert_eq!(text, Some((Some("hello".into()), Some("hello".into()))));
     }
 
     #[test]

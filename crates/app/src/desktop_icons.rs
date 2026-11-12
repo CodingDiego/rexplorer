@@ -28,7 +28,6 @@ use windows::Win32::Graphics::Gdi::{
     ClientToScreen, DeleteObject, FillRect, GetMonitorInfoW, GetSysColorBrush, HDC, HFONT, InvalidateRect, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
     PaintDesktop, ScreenToClient, CreateFontIndirectW, LOGFONTW, COLOR_DESKTOP, COLOR_WINDOWTEXT,
 };
-use windows::Win32::System::Com::IDataObject;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Ole::IDropTarget;
 use windows::Win32::System::SystemServices::SFGAO_CANRENAME;
@@ -708,7 +707,7 @@ unsafe fn register_drop(list: HWND) {
         *last.borrow_mut() = Some((key, target.clone()));
         Some(target)
     };
-    let _ = dragdrop::register(list, Box::new(pick), None::<Box<dyn Fn(POINTL, &IDataObject)>>);
+    let _ = dragdrop::register(list, Box::new(pick), None::<dragdrop::OnDrop>);
 }
 
 // ---- menu ---------------------------------------------------------------------------------------------------------

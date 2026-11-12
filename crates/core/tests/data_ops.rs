@@ -12,14 +12,16 @@ use rexplorer_core::ShellFolder;
 use rexplorer_core::com::ComInit;
 use rexplorer_core::menu::ContextMenu;
 use rexplorer_core::undo::{self, Op};
-use windows::Win32::Foundation::{E_ABORT, HWND};
+use windows::Win32::Foundation::{E_ABORT, HWND, LPARAM, WPARAM};
+use windows::Win32::UI::Controls::TDM_CLICK_BUTTON;
+use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetClassNameW, GetWindowThreadProcessId, IsWindowVisible, PostMessageW};
 use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::Win32::UI::Shell::{
     FILEOPERATION_FLAGS, FOF_NO_UI, FOF_RENAMEONCOLLISION, FileOperation, IFileOperation, IFileOperationProgressSink,
     IFileOperationProgressSink_Impl, IShellItem, SHCreateItemFromParsingName,
 };
-use windows::core::{HRESULT, HSTRING, PCWSTR, Ref, Result, implement};
+use windows::core::{BOOL, HRESULT, HSTRING, PCWSTR, Ref, Result, implement};
 
 static SHELL: Mutex<()> = Mutex::new(());
 
@@ -73,6 +75,36 @@ fn op(flags: FILEOPERATION_FLAGS, sink: Option<&IFileOperationProgressSink>, add
         let aborted = o.GetAnyOperationsAborted().map(|b| b.as_bool()).unwrap_or(false);
         r.map(|_| aborted)
     }
+}
+
+/// Clicks button `id` (6 = Yes, 7 = No) of the first dialog this process shows within 10 s: the shell's own
+/// confirmation, which would otherwise wait for a person. True when it found one.
+fn answer_dialog(id: usize) -> std::thread::JoinHandle<bool> {
+    unsafe extern "system" fn ours(h: HWND, found: LPARAM) -> BOOL {
+        let mut pid = 0;
+        let mut class = [0u16; 8];
+        let n = unsafe {
+            GetWindowThreadProcessId(h, Some(&mut pid));
+            GetClassNameW(h, &mut class)
+        } as usize;
+        if pid == std::process::id() && String::from_utf16_lossy(&class[..n]) == "#32770" && unsafe { IsWindowVisible(h) }.as_bool() {
+            unsafe { *(found.0 as *mut isize) = h.0 as isize };
+            return BOOL(0);
+        }
+        BOOL(1)
+    }
+    std::thread::spawn(move || {
+        for _ in 0..100 {
+            let mut found = 0isize;
+            let _ = unsafe { EnumWindows(Some(ours), LPARAM(&mut found as *mut isize as isize)) };
+            if found != 0 {
+                let h = HWND(found as *mut _);
+                return unsafe { PostMessageW(Some(h), TDM_CLICK_BUTTON.0 as u32, WPARAM(id), LPARAM(0)) }.is_ok();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
+    })
 }
 
 fn copy(from: &Path, to_dir: &Path, flags: FILEOPERATION_FLAGS) -> Result<bool> {
@@ -174,12 +206,20 @@ fn rename_onto_an_existing_name_loses_nothing() {
     std::fs::write(d.join("a.txt"), "a").unwrap();
     std::fs::write(d.join("b.txt"), "b").unwrap();
     // Refused or renamed to a free name: either way b.txt keeps its content and a's content is still there.
-    let _ = op(FOF_NO_UI, None, |o| unsafe { o.RenameItem(&item(&d.join("a.txt")), &HSTRING::from("b.txt"), None) });
+    // F2 renames through ShellItem::rename (IShellFolder::SetNameOf), not IFileOperation: FOF_NO_UI would answer
+    // the collision with "Yes to all" and overwrite b.txt, which the app never asks for. The shell asks, as Explorer
+    // does, whether to rename to "b (2).txt"; the helper answers Yes.
+    let (_, mut items) = rexplorer_core::folder::list(d.to_str().unwrap()).unwrap();
+    let a_item = items.iter_mut().find(|i| i.parsing_name().to_lowercase().ends_with("a.txt")).unwrap();
+    let answer = answer_dialog(6);
+    let _ = a_item.rename(HWND::default(), "b.txt", true);
+    let asked = answer.join().unwrap_or(false);
     let t = tree(&d);
     assert_eq!(t.get("b.txt").map(String::as_str), Some("b"));
     assert!(t.values().any(|v| v == "a"), "{t:?}");
     // Undo of a rename never lands on a taken name either.
     let a = d.join("a.txt").to_string_lossy().into_owned();
+    assert!(!asked || !Path::new(&a).exists(), "Yes renames to a free name: {t:?}");
     if !Path::new(&a).exists() {
         let to = t.keys().find(|k| t[*k] == "a").map(|k| d.join(k).to_string_lossy().into_owned()).unwrap();
         std::fs::write(&a, "taken").unwrap();

@@ -425,6 +425,13 @@ fn is_under(path: &str, dir: &str) -> bool {
     p == d || p.starts_with(&format!("{d}\\"))
 }
 
+/// Quick Access's frequent (not pinned) folders, as Explorer's jump list shows them. Slow: call off the UI thread.
+pub(crate) fn frequent_folders() -> Vec<String> {
+    let Ok(qa) = ShellFolder::parse(&format!("shell:{}", nav::QUICK_ACCESS)) else { return Vec::new() };
+    let items = qa.enumerate().unwrap_or_default();
+    items.iter().filter(|i| i.is_folder() && i.property_bool(&home::IS_PINNED) == Some(false)).map(|i| i.parsing_name()).collect()
+}
+
 fn sidebar_rows(bookmarks: &[(String, String)]) -> SidebarRows {
     let mut b = SidebarRows::default();
     if let Ok(home) = ShellFolder::parse(settings::HOME_START) {
@@ -636,11 +643,31 @@ pub(crate) unsafe fn update_preview(app: *mut App) {
         if let Some(Source::Archive(a)) = source(app) {
             return member_subject(app, a, focused_selected(app)?);
         }
+        if let Some(Source::Search(_)) = source(app) {
+            return search_subject(app, focused_selected(app)?).map(|(_, s)| s);
+        }
         let l = listing(app)?;
         let item = l.items.get(focused_selected(app)?)?;
         Some(subject_of(l, item))
     })();
     preview_pane::show((*app).panes.preview, subject);
+}
+
+/// Search row `i` as its item (parsed again on this thread) and what the panes show of it.
+unsafe fn search_subject(app: *mut App, i: usize) -> Option<(ShellItem, preview_pane::Subject)> {
+    let Some(Source::Search(s)) = source(app) else { return None };
+    let r = s.rows.get(i)?;
+    let item = source::search_item(app, i)?;
+    let parsing = item.parsing_name();
+    let subject = preview_pane::Subject {
+        path: ui::is_fs_path(&parsing).then(|| PathBuf::from(&parsing)),
+        abs_pidl: source::row_pidl(r),
+        name: item.display_name(),
+        is_folder: r.is_folder,
+        size: r.bytes,
+        type_text: r.kind.clone(),
+    };
+    Some((item, subject))
 }
 
 /// Archive row `i` once extracted under `archive_view::show_dir`: pictures and text only. One not extracted yet is
@@ -728,12 +755,20 @@ pub(crate) unsafe fn update_details(app: *mut App) {
     }
     let selected = SendMessageW((*app).list, LVM_GETSELECTEDCOUNT, None, None).0 as usize;
     let l = listing(app);
-    let one = if selected == 1 { l.and_then(|l| Some((l, l.items.get(focused_selected(app)?)?))) } else { None };
+    // A folder's item, or a search result's; with whether its folder is on the network.
+    let one = if selected == 1 {
+        focused_selected(app).and_then(|i| match source(app) {
+            Some(Source::Shell(l)) => l.items.get(i).map(|it| (it.clone(), subject_of(l, it), ui::is_remote(&l.folder.parsing_name))),
+            Some(Source::Search(_)) => search_subject(app, i).map(|(it, s)| (it, s, false)),
+            _ => None,
+        })
+    } else {
+        None
+    };
     let (info, subject, dims) = if selected >= 2 {
         (Info::Many { count: selected, bytes: ui::selected_bytes(app, selected) }, None, false)
-    } else if let Some((l, item)) = one {
-        let sub = subject_of(l, item);
-        let remote = ui::is_remote(&l.folder.parsing_name) || ui::is_remote(&item.parsing_name());
+    } else if let Some((item, sub, remote_folder)) = one {
+        let remote = remote_folder || ui::is_remote(&item.parsing_name());
         let dims = !sub.is_folder && !remote && sub.path.as_ref().is_some_and(|p| rexplorer_core::preview::is_image(p.extension().and_then(|e| e.to_str()).unwrap_or("")));
         let time = |key| item.property_time(key).and_then(|t| format_time(&t));
         let info = Info::One {

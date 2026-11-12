@@ -75,6 +75,26 @@ pub fn write_ini(sections: &[Section]) -> String {
     s
 }
 
+/// The seeded tests' and fuzz/'s checks on any text as an ini file: trimmed names, keys and values split on the
+/// first `=`; a settings file that always has a profile; a theme that round-trips but for its kept unknown keys
+/// (a kept `[a=]` line rereads as a section header); a color that is in range or none.
+#[cfg(any(test, fuzzing))]
+pub fn fuzz_check(text: &str) {
+    for (name, keys) in parse_ini(text) {
+        assert_eq!(name, name.trim(), "{text:?}");
+        assert!(!name.contains('\n'), "{text:?}");
+        for (k, v) in keys {
+            assert!(k == k.trim() && v == v.trim() && !k.contains('='), "{text:?}: {k:?}={v:?}");
+        }
+    }
+    assert!(!Settings::from_ini(text).profiles.is_empty(), "{text:?}");
+    let t = Theme::from_ini("fuzz", text);
+    assert_eq!(t.name, "fuzz", "{text:?}");
+    let back = Theme::from_ini("fuzz", &t.to_ini());
+    assert_eq!(Theme { extra: Vec::new(), ..back }, Theme { extra: Vec::new(), ..t }, "{text:?}");
+    assert!(parse_color(text).is_none_or(|v| v <= 0xFF_FFFF), "{text:?}");
+}
+
 /// `#RRGGBB` to a COLORREF (`0x00BBGGRR`).
 pub fn parse_color(s: &str) -> Option<u32> {
     let h = s.trim().strip_prefix('#')?;
@@ -583,12 +603,16 @@ mod tests {
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("rexplorer-settings-{}", std::process::id())).join(tag);
         let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
+        // Another test's cleanup can remove the shared parent between the two steps of create_dir_all: try again.
+        assert!((0..5).any(|_| std::fs::create_dir_all(&d).is_ok()), "{}", d.display());
         d
     }
 
     fn cleanup(tag: &str) {
-        let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("rexplorer-settings-{}", std::process::id())).join(tag));
+        let base = std::env::temp_dir().join(format!("rexplorer-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(base.join(tag));
+        // Only succeeds once the last test's folder is gone, so the per-process folder does not pile up in %TEMP%.
+        let _ = std::fs::remove_dir(base);
     }
 
     #[test]
@@ -868,14 +892,7 @@ language=es
     #[test]
     fn fuzz_parse_ini_trims_and_splits_on_the_first_equals() {
         for seed in 0..400 {
-            let text = crate::fuzz::Rng::new(seed).text(crate::fuzz::TOKENS, 80);
-            for (name, keys) in parse_ini(&text) {
-                assert_eq!(name, name.trim(), "seed {seed}");
-                assert!(!name.contains('\n'), "seed {seed}");
-                for (k, v) in keys {
-                    assert!(k == k.trim() && v == v.trim() && !k.contains('='), "seed {seed}: {k:?}={v:?}");
-                }
-            }
+            fuzz_check(&crate::fuzz::Rng::new(seed).text(crate::fuzz::TOKENS, 80));
         }
     }
 
@@ -885,22 +902,7 @@ language=es
         for _ in 0..500 {
             let c = (r.step() & 0xFF_FFFF) as u32;
             assert_eq!(parse_color(&format_color(c)), Some(c));
-            let s = r.text(crate::fuzz::TOKENS, 4);
-            assert!(parse_color(&s).is_none_or(|v| v <= 0xFF_FFFF), "{s:?}");
-        }
-    }
-
-    #[test]
-    fn fuzz_settings_and_theme_files_keep_their_invariants() {
-        for seed in 0..300 {
-            let text = crate::fuzz::Rng::new(seed).text(crate::fuzz::TOKENS, 80);
-            let s = Settings::from_ini(&text);
-            assert!(!s.profiles.is_empty(), "seed {seed}");
-            let t = Theme::from_ini("fuzz", &text);
-            assert_eq!(t.name, "fuzz", "seed {seed}");
-            // Everything but the kept unknown keys round-trips (a kept `[a=]` line rereads as a section header).
-            let back = Theme::from_ini("fuzz", &t.to_ini());
-            assert_eq!(Theme { extra: Vec::new(), ..back }, Theme { extra: Vec::new(), ..t }, "seed {seed}");
+            fuzz_check(&r.text(crate::fuzz::TOKENS, 4));
         }
     }
 }

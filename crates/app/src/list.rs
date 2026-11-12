@@ -464,6 +464,36 @@ pub(crate) unsafe fn begin_drag(app: *mut App) {
             }
             dragdrop::data_object_of_paths(&paths)
         }
+        // RAR members are extracted first (a password is asked for if needed) and offered as copies of those files.
+        Some(Source::Archive(a)) => {
+            let picked: Vec<rexplorer_core::archive::Entry> = sel.iter().filter_map(|&i| a.rows.get(i)).cloned().collect();
+            if picked.is_empty() {
+                return;
+            }
+            let archive = a.listing.archive.clone();
+            let extracted = source::with_password(app, &archive, || match source(app) {
+                Some(Source::Archive(a)) => a.listing.extract_for_drag(&picked),
+                _ => Err(windows::Win32::Foundation::E_ABORT.into()),
+            });
+            let paths = match extracted {
+                Some(Ok(p)) => p,
+                None => return,
+                Some(Err(e)) => {
+                    message((*app).hwnd, &trf("err.drag", &[("error", &e)]));
+                    return;
+                }
+            };
+            let strings: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+            match dragdrop::data_object_of_paths(&strings) {
+                Ok(d) => {
+                    if let Err(e) = dragdrop::drag_with(&d, ui::view_hwnd(app), windows::Win32::System::Ole::DROPEFFECT_COPY) {
+                        message((*app).hwnd, &trf("err.drag", &[("error", &e)]));
+                    }
+                }
+                Err(e) => message((*app).hwnd, &trf("err.drag", &[("error", &e)])),
+            }
+            return;
+        }
         _ => return,
     };
     let d = match data {
@@ -480,7 +510,7 @@ pub(crate) unsafe fn begin_drag(app: *mut App) {
     let start = std::time::Instant::now();
     let r = dragdrop::drag(&d, ui::view_hwnd(app));
     // Every drag that moved nothing is logged, so the next live run can say why a target never got it.
-    if let Some(note) = dragdrop::drag_note(&r, button_down, start.elapsed().as_millis()) {
+    if let Some(note) = dragdrop::drag_note(&r, dragdrop::performed_effect(&d), button_down, start.elapsed().as_millis()) {
         rexplorer_core::crash::log(&note);
     }
     // A refused or cancelled drop is a success code (Ok, effect NONE) and shows nothing, as in Explorer.
@@ -502,11 +532,19 @@ pub(crate) fn plan_transfer(sources: &[String], dest: &str) -> Vec<(String, Stri
     if !ui::is_fs_path(dest) {
         return Vec::new();
     }
-    // Not files a zip folder extracted to %TEMP% for the transfer: once cleaned up, undo would take the copy for a
-    // move and put it back in %TEMP%.
     let temp = std::env::temp_dir().to_string_lossy().to_lowercase();
-    let sources: Vec<String> = sources.iter().filter(|s| !s.to_lowercase().starts_with(&temp)).cloned().collect();
+    let sources: Vec<String> = sources.iter().filter(|s| !extracted_for_transfer(&s.to_lowercase(), &temp)).cloned().collect();
     undo::plan_transfer(&sources, dest, |p| std::path::Path::new(p).exists())
+}
+
+/// Files an archive was extracted to for a transfer (the zip folder's `%TEMP%\Temp1_x.zip`, our own archive
+/// folders): once cleaned up, undo would take the copy for a move and put it back there. Other files under %TEMP%
+/// are ordinary files. Both arguments lowercase.
+fn extracted_for_transfer(path: &str, temp: &str) -> bool {
+    let Some(rest) = path.strip_prefix(temp.trim_end_matches('\\')).and_then(|r| r.strip_prefix('\\')) else { return false };
+    let top = rest.split('\\').next().unwrap_or("");
+    let zip = top.strip_prefix("temp").and_then(|t| t.split_once('_')).is_some_and(|(n, _)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    zip || top.starts_with("rexplorer-archive") || top.starts_with("rexplorer-show-")
 }
 
 /// Drops land on the folder item under the cursor, else on the current folder.
@@ -539,15 +577,39 @@ pub(crate) unsafe fn register_drop(app: *mut App) {
     // Called before the shell runs the drop, while the destination names are still free.
     let on_drop = move |pt: POINTL, data: &IDataObject| unsafe {
         let app = ptr as *mut App;
-        let Some(l) = listing(app) else { return };
+        let l = listing(app)?;
         let dest = usize::try_from(row_at((*app).list, pt))
             .ok()
             .and_then(|i| l.items.get(i))
             .filter(|it| it.is_folder())
             .map_or_else(|| l.folder.parsing_name.clone(), |it| it.parsing_name());
-        (*app).undo.record(Op::Transfer(plan_transfer(&dragdrop::hdrop_paths(data), &dest)));
+        Some(record_drop(ptr, data, dest))
     };
     let _ = dragdrop::register((*app).list, Box::new(pick), Some(Box::new(on_drop)));
+}
+
+/// Plans a drop into `dest` before it runs, and records it for undo once the target says what it did: copies and
+/// moves as a transfer, shortcuts ("Create shortcuts here", Alt or a system folder) as the .lnk files that appeared.
+fn record_drop(app: usize, data: &IDataObject, dest: String) -> dragdrop::AfterDrop {
+    let pairs = plan_transfer(&dragdrop::hdrop_paths(data), &dest);
+    let links = shortcut_names(&dest);
+    Box::new(move |effect| unsafe {
+        let op = if effect == windows::Win32::System::Ole::DROPEFFECT_LINK { Op::Created(new_shortcuts(&dest, &links)) } else { Op::Transfer(pairs) };
+        (*(app as *mut App)).undo.record(op);
+    })
+}
+
+/// The .lnk file names in `dir`.
+fn shortcut_names(dir: &str) -> std::collections::HashSet<String> {
+    let Ok(rd) = std::fs::read_dir(dir) else { return Default::default() };
+    rd.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.to_lowercase().ends_with(".lnk")).collect()
+}
+
+/// Full paths of the .lnk files in `dir` that `before` did not list.
+fn new_shortcuts(dir: &str, before: &std::collections::HashSet<String>) -> Vec<String> {
+    let mut v: Vec<String> = shortcut_names(dir).into_iter().filter(|n| !before.contains(n)).map(|n| std::path::Path::new(dir).join(n).to_string_lossy().into_owned()).collect();
+    v.sort();
+    v
 }
 
 /// Drops on `window` go into the folder `at` names under the screen point: a key for it (its parsing name) and
@@ -574,13 +636,10 @@ pub(crate) unsafe fn register_folder_drop(app: *mut App, window: HWND, at: impl 
         t
     };
     // The forwarder calls this only while a target is current, which is the one picked for the last key.
-    let on_drop = move |_: POINTL, data: &IDataObject| unsafe {
-        let Some(dest) = seen.borrow().as_ref().map(|(k, _)| k.clone()) else { return };
+    let on_drop = move |_: POINTL, data: &IDataObject| {
+        let dest = seen.borrow().as_ref().map(|(k, _)| k.clone())?;
         // A Home tile can be a file: a drop on it opens the file with the dropped items and copies nothing.
-        if !std::path::Path::new(&dest).is_dir() {
-            return;
-        }
-        (*(ptr as *mut App)).undo.record(Op::Transfer(plan_transfer(&dragdrop::hdrop_paths(data), &dest)));
+        std::path::Path::new(&dest).is_dir().then(|| record_drop(ptr, data, dest))
     };
     let _ = dragdrop::register(window, Box::new(pick), Some(Box::new(on_drop)));
 }
@@ -658,7 +717,7 @@ pub(crate) unsafe fn show_menu(app: *mut App, on_item: bool, at: Option<POINT>) 
     } else {
         listing(app).and_then(|l| ContextMenu::for_background(&l.folder, hwnd).ok())
     };
-    let Some(menu) = menu else { return };
+    let Some(mut menu) = menu else { return };
     let home = listing(app).is_some_and(nav::is_home);
     let folders = listing(app).is_some_and(|l| sel.iter().filter_map(|&i| l.items.get(i)).any(|i| i.is_folder()));
     // On Home a selection with a pinned folder offers Unpin; frequent folders offer Pin.
@@ -689,12 +748,32 @@ pub(crate) unsafe fn show_menu(app: *mut App, on_item: bool, at: Option<POINT>) 
                 Entry::sep(),
                 Entry::new(CMD_REFRESH as usize, &ui::hinted("menu.list.refresh", "F5"), 0xE72C),
                 Entry::new(CMD_PASTE as usize, &ui::hinted("menu.list.paste", "Ctrl+V"), 0xE77F).enabled(commands::clipboard_has_files()),
+                Entry::new(CMD_PASTE_SHORTCUT as usize, tr("menu.list.paste_shortcut"), 0).enabled(commands::clipboard_has_files()),
             ],
         );
+        menu.hide_verb("paste");
+        menu.hide_verb("pastelink");
+    }
+    // A program: Explorer's "Run as administrator" (the shell's runas verb) as our entry, with its shield.
+    if on_item && !home && let [i] = sel[..] && listing(app).and_then(|l| l.items.get(i)).is_some_and(|it| runs_elevated(&it.file_name())) {
+        own.insert(0, Entry::new(CMD_RUN_AS as usize, &ui::hinted("menu.list.run_as_admin", "Ctrl+Shift+Enter"), 0xEA18));
+        menu.hide_verb("runas");
+    }
+    // Our pin entry stands for the shell's own, which would show the same words twice.
+    if own.iter().any(|e| e.id == CMD_PIN as usize) {
+        menu.hide_verb(if pinned { "unpinfromhome" } else { "pintohome" });
     }
     if !own.is_empty() {
         own.push(Entry::sep());
     }
+    // The shell's Paste runs inside show_in, into the one selected folder or the background's folder: what it may
+    // create is read now, while the names are still free.
+    let paste_dest = listing(app).and_then(|l| match (on_item, sel.as_slice()) {
+        (true, [i]) => l.items.get(*i).filter(|it| it.is_folder()).map(|it| it.parsing_name()),
+        (true, _) => None,
+        (false, _) => Some(l.folder.parsing_name.clone()),
+    });
+    let paste_pairs = paste_dest.map(|d| plan_transfer(&dragdrop::clipboard_paths(), &d)).unwrap_or_default();
     let mut bitmaps = Vec::new();
     let hmenu = ui::build_menu(hwnd, &own, &mut bitmaps);
     let at = GetMenuItemCount(Some(hmenu)).max(0) as u32;
@@ -726,6 +805,12 @@ pub(crate) unsafe fn show_menu(app: *mut App, on_item: bool, at: Option<POINT>) 
         }
         // No load started meanwhile: the listing is still the one without the new item.
         Ok(Picked::New) if (*app).generation == generation => commands::new_item_made(app),
+        Ok(Picked::Invoked(verb)) if verb.eq_ignore_ascii_case("paste") => {
+            (*app).undo.record(Op::Transfer(paste_pairs));
+            if home {
+                SetTimer(Some(hwnd), TIMER_REFRESH, 300, None);
+            }
+        }
         // The shell's own entries can change Home (add to or remove from Favorites, remove from the list).
         Ok(Picked::Invoked(_)) if home => {
             SetTimer(Some(hwnd), TIMER_REFRESH, 300, None);
@@ -854,6 +939,25 @@ pub(crate) unsafe fn on_key(app: *mut App, key: VIRTUAL_KEY) {
     }
 }
 
+/// File types Explorer offers "Run as administrator" on (their classes carry the runas verb).
+fn runs_elevated(name: &str) -> bool {
+    std::path::Path::new(name).extension().and_then(|e| e.to_str()).is_some_and(|e| ["exe", "bat", "cmd", "com", "msi", "msc"].iter().any(|x| e.eq_ignore_ascii_case(x)))
+}
+
+/// Ctrl+Shift+Enter and the menu entry: the shell's runas verb on the one selected program; beeps otherwise.
+pub(crate) unsafe fn run_as_admin(app: *mut App) {
+    let rows = selected_indices((*app).list);
+    let program = matches!(rows[..], [i] if listing(app).and_then(|l| l.items.get(i)).is_some_and(|it| runs_elevated(&it.file_name())));
+    if !program {
+        let _ = MessageBeep(MB_OK);
+        return;
+    }
+    // A "No" at the consent prompt comes back as an error: nothing to report.
+    if let Some(m) = selection_menu(app, &rows) {
+        let _ = m.invoke_verb((*app).hwnd, "runas", false);
+    }
+}
+
 /// Explorer's "Copy as path" text: each path in double quotes, one per line.
 /// False for a name that would end the quotes or start a new line when pasted into a terminal; a real file system
 /// path has neither, a folder inside an archive can.
@@ -906,6 +1010,14 @@ pub(crate) unsafe fn cancel_cut(app: *mut App) {
 }
 
 /// The shell context menu for rows of the active tab: shell items, or search results (from one folder or several).
+/// Copy and Cut in a file system folder, without the shell's verb (`dragdrop::to_clipboard`). False when it does not
+/// apply or failed: the caller runs the verb instead.
+unsafe fn to_clipboard(app: *mut App, rows: &[usize], cut: bool) -> bool {
+    let Some(Source::Shell(l)) = source(app) else { return false };
+    let items: Vec<&ShellItem> = rows.iter().filter_map(|&i| l.items.get(i)).collect();
+    !items.is_empty() && std::path::Path::new(&l.folder.parsing_name).is_absolute() && dragdrop::to_clipboard(&l.folder, &items, (*app).hwnd, cut).is_ok()
+}
+
 pub(crate) unsafe fn selection_menu(app: *mut App, rows: &[usize]) -> Option<ContextMenu> {
     match source(app)? {
         Source::Shell(l) => {
@@ -962,6 +1074,9 @@ pub(crate) unsafe fn verb_on_selection(app: *mut App, verb: &str, shift: bool) {
             source::prune_search(app, &rows);
             return;
         }
+    if matches!(verb, "copy" | "cut") && to_clipboard(app, &rows, verb == "cut") {
+        return;
+    }
     if let Some(menu) = selection_menu(app, &rows) {
         let _ = menu.invoke_verb(hwnd, verb, shift);
         // The verb has finished when it returns (no async flag); a no-op outside search results.
@@ -977,12 +1092,31 @@ pub(crate) unsafe fn verb_on_background(app: *mut App, verb: &str) {
         let Some(l) = listing(app) else { return };
         // Read before the shell runs it: only destination names free now.
         let pairs = if verb == "paste" { plan_transfer(&dragdrop::clipboard_paths(), &l.folder.parsing_name) } else { Vec::new() };
-        (ContextMenu::for_background(&l.folder, hwnd), pairs)
+        let builtin = (verb == "paste" && std::path::Path::new(&l.folder.parsing_name).is_absolute()).then(|| ContextMenu::builtin(&l.folder, &[], hwnd));
+        (builtin.unwrap_or_else(|| ContextMenu::for_background(&l.folder, hwnd)), pairs)
     };
     if let Ok(menu) = menu
         && menu.invoke_verb(hwnd, verb, false).is_ok() {
             (*app).undo.record(Op::Transfer(pairs));
         }
+}
+
+/// Paste shortcut: the shell makes and names (localized, numbered) a .lnk per clipboard item in this folder; in a
+/// file system folder the new ones are found by difference and recorded for Ctrl+Z. Beeps when nothing was pasted.
+pub(crate) unsafe fn paste_shortcut(app: *mut App) {
+    let made = {
+        let Some(l) = listing(app) else { return };
+        let dir = std::path::Path::new(&l.folder.parsing_name).is_absolute().then(|| l.folder.parsing_name.clone());
+        let before = dir.as_deref().map(shortcut_names);
+        dragdrop::paste_link(&l.folder, (*app).hwnd).map(|()| dir.zip(before).map(|(d, b)| new_shortcuts(&d, &b)))
+    };
+    match made {
+        Ok(Some(made)) => (*app).undo.record(Op::Created(made)),
+        Ok(None) => {}
+        Err(_) => {
+            let _ = MessageBeep(MB_OK);
+        }
+    }
 }
 
 /// Ctrl+Z / Ctrl+Y: reverses the newest entry of the log; in the address bar and the search box Ctrl+Z undoes
@@ -1077,11 +1211,18 @@ pub(crate) unsafe fn rename_item(app: *mut App, index: usize, name: &str, cell: 
                 }
                 return;
             }
-            // The row asks the shell for its text again instead of showing the old name from the cache.
-            if let Some(Source::Shell(l)) = &mut cur(app).source
-                && let Some(row) = l.cells.get_mut(index) {
+            // The row asks the shell for its text again instead of showing the old name from the cache. The reload
+            // waits while a Tab-chained edit is open, so the row takes the renamed item now (Shift+Tab edits it).
+            if let Some(Source::Shell(l)) = &mut cur(app).source {
+                if let Some(row) = l.cells.get_mut(index) {
                     row.take();
                 }
+                if done.is_ok()
+                    && let Some(it) = l.items.get_mut(index)
+                {
+                    *it = target;
+                }
+            }
             SetTimer(Some((*app).hwnd), TIMER_REFRESH, 150, None);
         }
     }
@@ -1191,7 +1332,42 @@ unsafe fn draw_group(app: *mut App, cd: &NMLVCUSTOMDRAW) -> u32 {
 const MARQUEE_TIMER: usize = 0x5258;
 
 /// The header is 32 px high (96 DPI) whatever the font asks for.
+/// Window property on the header: the hovered column + 1 (0 none). The header never reports CDIS_HOT to a
+/// custom draw that skips its default painting, so the hover is tracked here (#79).
+const HEADER_HOT: PCWSTR = w!("RexHeaderHot");
+
+/// The header item a hit test names as hovered: + 1, or 0 for none (empty space right of the last column).
+fn hot_slot(flags: u32, item: i32) -> usize {
+    use windows::Win32::UI::Controls::HHT_NOWHERE;
+    if item < 0 || flags & HHT_NOWHERE.0 != 0 { 0 } else { item as usize + 1 }
+}
+
+unsafe fn set_header_hot(hwnd: HWND, slot: usize) {
+    use windows::Win32::UI::WindowsAndMessaging::{GetPropW, SetPropW};
+    if GetPropW(hwnd, HEADER_HOT).0 as usize != slot {
+        let _ = SetPropW(hwnd, HEADER_HOT, Some(windows::Win32::Foundation::HANDLE(slot as *mut c_void)));
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+}
+
 pub(crate) unsafe extern "system" fn header_subclass(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM, _id: usize, _data: usize) -> LRESULT {
+    use windows::Win32::UI::Controls::{HDHITTESTINFO, HDM_HITTEST, WM_MOUSELEAVE};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
+    use windows::Win32::UI::WindowsAndMessaging::RemovePropW;
+    match msg {
+        WM_MOUSEMOVE => {
+            let mut ht = HDHITTESTINFO { pt: POINT { x: lparam.0 as i16 as i32, y: (lparam.0 >> 16) as i16 as i32 }, ..Default::default() };
+            SendMessageW(hwnd, HDM_HITTEST, None, Some(LPARAM(&mut ht as *mut _ as isize)));
+            set_header_hot(hwnd, hot_slot(ht.flags.0, ht.iItem));
+            let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
+            let _ = TrackMouseEvent(&mut tme);
+        }
+        WM_MOUSELEAVE => set_header_hot(hwnd, 0),
+        WM_NCDESTROY => {
+            let _ = RemovePropW(hwnd, HEADER_HOT);
+        }
+        _ => {}
+    }
     let r = DefSubclassProc(hwnd, msg, wparam, lparam);
     if msg == HDM_LAYOUT {
         let l = &*(lparam.0 as *const HDLAYOUT);
@@ -1322,7 +1498,8 @@ unsafe fn draw_header(t: &Theme, nm: &NMCUSTOMDRAW) -> u32 {
         CDDS_ITEMPREPAINT => {
             let r = nm.rc;
             fill(&r, t.surface);
-            if nm.uItemState.0 & CDIS_HOT.0 != 0 {
+            let hot = windows::Win32::UI::WindowsAndMessaging::GetPropW(header, HEADER_HOT).0 as usize == nm.dwItemSpec + 1;
+            if hot || nm.uItemState.0 & CDIS_HOT.0 != 0 {
                 let m = 4 * dpi / 96;
                 let hr = RECT { left: r.left + m, top: r.top + m, right: r.right - m, bottom: r.bottom - m };
                 theme::fill_round(nm.hdc, &hr, theme::hover(t), 6 * dpi / 96);
@@ -1404,6 +1581,44 @@ unsafe fn copy_text(text: &str, dst: PWSTR, max: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_shortcuts_lists_only_lnk_files_made_since() {
+        let dir = std::env::temp_dir().join(format!("rexplorer-newlnk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Old.lnk"), b"x").unwrap();
+        std::fs::write(dir.join("a.txt"), b"x").unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let before = shortcut_names(&d);
+        assert_eq!(before.len(), 1);
+        std::fs::write(dir.join("a.txt - Shortcut.lnk"), b"x").unwrap();
+        std::fs::write(dir.join("b.txt"), b"x").unwrap();
+        assert_eq!(new_shortcuts(&d, &before), [dir.join("a.txt - Shortcut.lnk").to_string_lossy().into_owned()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_archive_extractions_in_temp_skip_undo() {
+        let t = r"c:\users\u\appdata\local\temp\";
+        assert!(extracted_for_transfer(r"c:\users\u\appdata\local\temp\temp1_photos.zip\a.jpg", t));
+        assert!(extracted_for_transfer(r"c:\users\u\appdata\local\temp\temp12_x.zip\d\b.txt", t));
+        assert!(extracted_for_transfer(r"c:\users\u\appdata\local\temp\rexplorer-archive\a.txt", t));
+        assert!(extracted_for_transfer(r"c:\users\u\appdata\local\temp\rexplorer-show-42\a.txt", t));
+        assert!(!extracted_for_transfer(r"c:\users\u\appdata\local\temp\work\a.txt", t), "an ordinary folder in %TEMP%");
+        assert!(!extracted_for_transfer(r"c:\users\u\appdata\local\temp\template_x\a.txt", t));
+        assert!(!extracted_for_transfer(r"c:\users\u\appdata\local\temp\temp_\a.txt", t));
+        assert!(!extracted_for_transfer(r"d:\data\temp1_a.zip\a.txt", t), "outside %TEMP%");
+        assert!(!extracted_for_transfer(r"c:\users\u\appdata\local\tempx\temp1_a.zip\a.txt", r"c:\users\u\appdata\local\temp"));
+    }
+
+    #[test]
+    fn header_hot_slot() {
+        use windows::Win32::UI::Controls::{HHT_NOWHERE, HHT_ONDIVIDER, HHT_ONHEADER};
+        assert_eq!(hot_slot(HHT_ONHEADER.0, 0), 1);
+        assert_eq!(hot_slot(HHT_ONDIVIDER.0, 2), 3);
+        assert_eq!(hot_slot(HHT_NOWHERE.0, -1), 0, "right of the last column");
+        assert_eq!(hot_slot(HHT_ONHEADER.0, -1), 0);
+    }
 
     unsafe extern "system" fn rename_parent(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         if msg == WM_NOTIFY && (*(lparam.0 as *const NMHDR)).code == LVN_BEGINLABELEDITW {
@@ -1660,6 +1875,16 @@ mod tests {
         assert_eq!(s(type_ahead("a", u32::MAX - 100, 200, 'b')), ("ab".into(), "ab".into()));
         assert_eq!(s(type_ahead("ab", 5000, 5100, ' ')), ("ab".into(), String::new()));
         assert_eq!(s(type_ahead("ab", 5000, 5100, '\u{8}')), ("ab".into(), String::new()));
+    }
+
+    #[test]
+    fn run_as_is_offered_on_programs_only() {
+        for yes in ["setup.exe", "A.EXE", "x.bat", "y.Cmd", "z.msi", "c.msc", "old.com"] {
+            assert!(runs_elevated(yes), "{yes}");
+        }
+        for no in ["a.txt", "exe", "a.exe.txt", "a.lnk", "folder", "a.ps1", ""] {
+            assert!(!runs_elevated(no), "{no}");
+        }
     }
 
     #[test]

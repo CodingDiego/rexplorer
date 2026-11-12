@@ -1,12 +1,111 @@
 //! RAR listing and extraction on top of the bundled unrar library (zip is handled by the shell).
 
 use std::collections::HashSet;
+use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use unrar_ng::Archive;
-use windows::Win32::Foundation::E_FAIL;
-use windows::core::{Error, Result};
+use unrar_ng::error::{Code, UnrarError};
+use windows::Win32::Foundation::{E_FAIL, ERROR_INVALID_PASSWORD, ERROR_NOT_AUTHENTICATED};
+use windows::Win32::Globalization::{CP_ACP, WideCharToMultiByte};
+use windows::core::{Error, HRESULT, Result};
+
+/// The archive needs a password and none is known for it.
+pub const E_PASSWORD_MISSING: HRESULT = ERROR_NOT_AUTHENTICATED.to_hresult();
+/// The password known for the archive is not its password.
+pub const E_PASSWORD_WRONG: HRESULT = ERROR_INVALID_PASSWORD.to_hresult();
+
+/// A password typed for an archive. It lives only in memory and is overwritten with zeros when dropped.
+pub struct Password(Vec<u16>);
+
+impl Password {
+    /// Takes the UTF-16 text (no terminator) as it is, without a copy.
+    pub fn from_wide(text: Vec<u16>) -> Password {
+        Password(text)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+fn wipe<T: Default>(v: &mut [T]) {
+    for x in v.iter_mut() {
+        // Volatile, so the compiler cannot drop the writes to memory about to be freed.
+        unsafe { std::ptr::write_volatile(x, T::default()) };
+    }
+}
+
+impl Drop for Password {
+    fn drop(&mut self) {
+        wipe(&mut self.0);
+    }
+}
+
+/// Passwords typed for archives in this session, by archive path. Never written anywhere.
+static PASSWORDS: Mutex<Vec<(PathBuf, Password)>> = Mutex::new(Vec::new());
+
+fn same(a: &Path, b: &Path) -> bool {
+    a.as_os_str().eq_ignore_ascii_case(b.as_os_str())
+}
+
+/// Remembers `password` for `archive` until `forget_password` (or the end of the process).
+pub fn set_password(archive: &Path, password: Password) {
+    let mut all = PASSWORDS.lock().unwrap_or_else(|e| e.into_inner());
+    all.retain(|(a, _)| !same(a, archive));
+    all.push((archive.to_path_buf(), password));
+}
+
+/// Drops (and zeroes) the password known for `archive`.
+pub fn forget_password(archive: &Path) {
+    PASSWORDS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(a, _)| !same(a, archive));
+}
+
+/// Drops every password; on exit.
+pub fn forget_passwords() {
+    PASSWORDS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+/// Some(wrong) when `e` means `archive` needs a password: none was known, or (`wrong`) the known one was refused.
+pub fn password_needed(e: &Error) -> Option<bool> {
+    match e.code() {
+        c if c == E_PASSWORD_MISSING => Some(false),
+        c if c == E_PASSWORD_WRONG => Some(true),
+        _ => None,
+    }
+}
+
+/// `f` gets the archive, opened with the password known for it if any. unrar takes the password in the ANSI code
+/// page (its RARSetPassword) and copies it; the bytes made here are zeroed when `f` returns.
+/// shortcut: a character outside the ANSI code page cannot be passed this way (it becomes '?'); unrar's
+/// UCM_NEEDPASSWORDW callback takes UTF-16 if that is ever needed.
+fn with_archive<T>(archive: &Path, f: impl FnOnce(Archive) -> T) -> T {
+    let all = PASSWORDS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((_, pw)) = all.iter().find(|(a, _)| same(a, archive)) else {
+        drop(all);
+        return f(Archive::new(archive));
+    };
+    let mut bytes = vec![0u8; pw.0.len() * 4 + 1];
+    let n = unsafe { WideCharToMultiByte(CP_ACP, 0, &pw.0, Some(&mut bytes), None, None) }.max(0) as usize;
+    drop(all);
+    let out = f(Archive::with_password(archive, &bytes[..n]));
+    wipe(&mut bytes);
+    out
+}
+
+/// unrar's error, with its password codes kept apart. A refused password is forgotten, so the next try asks again.
+fn rar_err(archive: &Path, e: UnrarError) -> Error {
+    match e.code {
+        Code::MissingPassword => Error::new(E_PASSWORD_MISSING, crate::i18n::tr("err.password_missing")),
+        Code::BadPassword => {
+            forget_password(archive);
+            Error::new(E_PASSWORD_WRONG, crate::i18n::tr("err.password_wrong"))
+        }
+        _ => err(e),
+    }
+}
 
 /// One archive member. `path` uses backslashes, without leading or trailing separator.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,14 +125,68 @@ fn err(e: impl std::fmt::Display) -> Error {
     Error::new(E_FAIL, format!("{e}"))
 }
 
+/// What any member name keeps through `norm`, `split` and `escapes` (the seeded test and fuzz/'s target): no
+/// slash or edge backslash, a split that joins back, and a non-escaping name that stays under the destination.
+#[cfg(any(test, fuzzing))]
+pub fn fuzz_check(raw: &str) {
+    let dest = Path::new("C:\\dest");
+    let n = norm(Path::new(raw));
+    assert!(!n.contains('/') && !n.starts_with('\\') && !n.ends_with('\\'), "{raw:?} -> {n:?}");
+    let (dir, name) = split(&n);
+    assert!(!name.contains('\\'), "{raw:?}");
+    assert_eq!(if dir.is_empty() { name.to_string() } else { format!("{dir}\\{name}") }, n, "{raw:?}");
+    if !escapes(&n) {
+        let p = dest.join(&n);
+        assert!(p.starts_with(dest), "{raw:?}: {p:?}");
+        assert!(!p.components().any(|c| matches!(c, std::path::Component::ParentDir)), "{raw:?}: {p:?}");
+    }
+}
+
 fn norm(p: &Path) -> String {
     p.to_string_lossy().replace('/', "\\").trim_matches('\\').to_string()
 }
 
-/// An entry that climbs out of the extraction directory: a ".." step, or a drive or stream colon (Path::join
-/// replaces the base with "C:x", and "a:s" writes a hidden stream).
+/// An entry that could land outside the extraction directory or on a device: a drive or stream colon (Path::join
+/// replaces the base with "C:x", and "a:s" writes a hidden stream); a step Windows reads as "." or ".." once it
+/// strips trailing dots and spaces (".. " is ".."); a name ending in a dot or a space (Windows writes another
+/// name); a DOS device name, with or without an extension (CON, com1.jpg, CONIN$).
 fn escapes(path: &str) -> bool {
-    path.contains(':') || path.split('\\').any(|c| c == "..")
+    path.contains(':') || path.split('\\').any(|c| c.trim_end_matches(['.', ' ']).is_empty() || c.ends_with(['.', ' ']) || is_device_name(c))
+}
+
+/// A DOS device name, with or without an extension (CON, com1.jpg, CONIN$): Windows opens the device, not a file.
+pub(crate) fn is_device_name(c: &str) -> bool {
+    const DEVICES: [&str; 8] = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "CLOCK$", "KEYBD$"];
+    let base = c.split('.').next().unwrap_or("").trim_end_matches(' ').to_uppercase();
+    let numbered = (base.starts_with("COM") || base.starts_with("LPT"))
+        && base[3..].chars().count() == 1
+        && base[3..].chars().all(|d| d.is_ascii_digit() || matches!(d, '¹' | '²' | '³'));
+    DEVICES.contains(&base.as_str()) || numbered
+}
+
+/// Whether `p` is a link (symbolic link, junction, any reparse point), without following it.
+fn is_link(p: &Path) -> bool {
+    std::fs::symlink_metadata(p).is_ok_and(|m| m.file_attributes() & 0x400 != 0)
+}
+
+/// Whether `p` is a plain file and its only name: not a link, and not a hard link sharing a file with another name.
+fn single_file(p: &Path) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle};
+    if is_link(p) || !p.is_file() {
+        return false;
+    }
+    let Ok(f) = std::fs::File::open(p) else { return false };
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(HANDLE(f.as_raw_handle()), &mut info) }.is_ok() && info.nNumberOfLinks == 1
+}
+
+/// Removes the link at `p` itself, never what it points to.
+fn remove_link(p: &Path) {
+    if std::fs::remove_dir(p).is_err() {
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 /// The name unrar falls back to when Windows refuses the entry's own (its MakeNameUsable): without this check
@@ -64,8 +217,8 @@ pub fn is_rar(path: &Path) -> bool {
 pub fn list(archive: &Path) -> Result<Vec<Entry>> {
     let mut out: Vec<Entry> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    for h in Archive::new(archive).open_for_listing().map_err(err)? {
-        let h = h.map_err(err)?;
+    for h in with_archive(archive, |a| a.open_for_listing()).map_err(|e| rar_err(archive, e))? {
+        let h = h.map_err(|e| rar_err(archive, e))?;
         let path = norm(&h.filename);
         if path.is_empty() || escapes(&path) || !seen.insert(path.to_lowercase()) {
             continue;
@@ -109,40 +262,92 @@ pub fn children<'a>(entries: &'a [Entry], parent: &str) -> Vec<&'a Entry> {
     entries.iter().filter(|e| e.parent.eq_ignore_ascii_case(parent)).collect()
 }
 
+/// Extracts member `entry_path` (a file) under `dest_dir`, which must be new or empty, at the member's own path, and
+/// returns where it landed. A member whose name `escapes`, or that unrar makes into a link (symbolic link, junction,
+/// hard link), is refused: nothing of it stays.
 pub fn extract(archive: &Path, entry_path: &str, dest_dir: &Path) -> Result<PathBuf> {
-    std::fs::create_dir_all(dest_dir).map_err(err)?;
     let want = entry_path.replace('/', "\\");
     let want = want.trim_matches('\\');
-    let mut cur = Archive::new(archive).open_for_processing().map_err(err)?;
-    while let Some(h) = cur.read_header().map_err(err)? {
+    if escapes(want) {
+        return Err(err(format!("entry not found in archive: {entry_path}")));
+    }
+    std::fs::create_dir_all(dest_dir).map_err(err)?;
+    // unrar resolves a hard-link or file-copy member's target inside dest_dir: empty, it holds nothing of the user's.
+    if std::fs::read_dir(dest_dir).map_err(err)?.next().is_some() {
+        return Err(err(format!("extraction folder is not empty: {}", dest_dir.display())));
+    }
+    let fail = |e| rar_err(archive, e);
+    let mut cur = with_archive(archive, |a| a.open_for_processing()).map_err(fail)?;
+    while let Some(h) = cur.read_header().map_err(fail)? {
         let path = norm(&h.entry().filename);
         if !escapes(&path) && path.eq_ignore_ascii_case(want) && !h.entry().is_directory() {
-            let target = dest_dir.join(split(&path).1);
-            h.extract_to(&target).map_err(err)?;
-            inherit_motw(archive, &target);
-            return Ok(target);
+            // The base-path form: with a whole destination name unrar has no base to keep a link's target inside
+            // (dll.cpp DllDestName) and resolves it against the working directory.
+            h.extract_with_base(dest_dir).map_err(fail)?;
+            let at = [dest_dir.join(&path), dest_dir.join(usable(&path))];
+            return match at.into_iter().find(|p| p.symlink_metadata().is_ok()) {
+                Some(target) if single_file(&target) => {
+                    inherit_motw(archive, &target);
+                    Ok(target)
+                }
+                made => {
+                    made.iter().for_each(|p| remove_link(p));
+                    Err(err(crate::i18n::tr("err.archive_link")))
+                }
+            };
         }
-        cur = h.skip().map_err(err)?;
+        cur = h.skip().map_err(fail)?;
     }
     Err(err(format!("entry not found in archive: {entry_path}")))
 }
 
+/// The password error, if any, before anything is written: the first encrypted member is test-decrypted (nothing
+/// lands on disk), so a missing or wrong password stops "Extract all" before the plain members before it are out.
+fn check_password(archive: &Path) -> Result<()> {
+    let fail = |e| rar_err(archive, e);
+    let mut cur = with_archive(archive, |a| a.open_for_processing()).map_err(fail)?;
+    while let Some(h) = cur.read_header().map_err(fail)? {
+        if h.entry().is_encrypted() && h.entry().is_file() {
+            h.test().map_err(fail)?;
+            return Ok(());
+        }
+        cur = h.skip().map_err(fail)?;
+    }
+    Ok(())
+}
+
+/// Extracts every member under `dest_dir`, at its own path. Never replaces a file already there, never writes a
+/// member whose name `escapes`, and removes any link (symbolic link, junction, hard link) unrar creates as soon as it
+/// is made, so no later member goes through it. Each one left out is counted in the error.
 pub fn extract_all(archive: &Path, dest_dir: &Path) -> Result<()> {
+    check_password(archive)?;
     std::fs::create_dir_all(dest_dir).map_err(err)?;
-    let mut cur = Archive::new(archive).open_for_processing().map_err(err)?;
+    let fail = |e| rar_err(archive, e);
+    let mut cur = with_archive(archive, |a| a.open_for_processing()).map_err(fail)?;
     let (mut written, mut kept) = (Vec::new(), 0usize);
-    while let Some(h) = cur.read_header().map_err(err)? {
+    while let Some(h) = cur.read_header().map_err(fail)? {
         let path = norm(&h.entry().filename);
-        let refused = h.entry().is_file() && escapes(&path);
+        let refused = escapes(&path);
         let file = h.entry().is_file() && !refused;
         // unrar overwrites without asking; Explorer asks, and leaving the file there is the answer that loses nothing.
-        let taken = file && (dest_dir.join(&path).exists() || dest_dir.join(usable(&path)).exists());
+        let taken = file && (dest_dir.join(&path).symlink_metadata().is_ok() || dest_dir.join(usable(&path)).symlink_metadata().is_ok());
         kept += usize::from(taken || refused);
         cur = if file && !taken {
-            written.push(path);
-            h.extract_with_base(dest_dir).map_err(err)?
+            let next = h.extract_with_base(dest_dir).map_err(fail)?;
+            let at = [dest_dir.join(&path), dest_dir.join(usable(&path))];
+            let made: Vec<&PathBuf> = at.iter().filter(|p| p.symlink_metadata().is_ok()).collect();
+            if made.is_empty() {
+                kept += 1; // unrar skipped it without an error (a link it judged unsafe)
+            } else if !made.iter().all(|p| single_file(p)) {
+                // A hard link can be a second name for a file that was already in dest_dir.
+                made.iter().for_each(|p| remove_link(p));
+                kept += 1;
+            } else {
+                written.push(path);
+            }
+            next
         } else {
-            h.skip().map_err(err)?
+            h.skip().map_err(fail)?
         };
     }
     // Only what this call wrote: "Extract here" lands next to files that were already there.
@@ -244,6 +449,215 @@ mod tests {
         std::env::temp_dir().join(format!("rexplorer-archive-{}-{tag}", std::process::id()))
     }
 
+    /// A RAR5 member: a stored file, or a link entry (redirection record: 1 Unix symlink, 2 Windows symlink,
+    /// 3 junction) to `target`, `dir` saying the target is a directory.
+    enum M<'a> {
+        File(&'a str, &'a [u8]),
+        Link(&'a str, u64, &'a str, bool),
+    }
+
+    fn rar_of(dir: &Path, members: &[M]) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let mut rar = vec![0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00];
+        rar.extend(header(&[1, 0, 0]));
+        for m in members {
+            let (name, data, extra, attr) = match m {
+                M::File(name, data) => (*name, *data, Vec::new(), 0x20),
+                M::Link(name, kind, target, is_dir) => {
+                    let mut rec = vec![5];
+                    for v in [*kind, u64::from(*is_dir), target.len() as u64] {
+                        rec.extend(vint(v));
+                    }
+                    rec.extend_from_slice(target.as_bytes());
+                    let mut extra = vint(rec.len() as u64);
+                    extra.extend(rec);
+                    (*name, &[][..], extra, if *is_dir { 0x10 } else { 0x20 })
+                }
+            };
+            let mut f = vec![2, if extra.is_empty() { 0x02 } else { 0x01 }];
+            if extra.is_empty() {
+                f.extend(vint(data.len() as u64));
+            } else {
+                f.extend(vint(extra.len() as u64));
+            }
+            for v in [0, data.len() as u64, attr, 0, 0, name.len() as u64] {
+                f.extend(vint(v));
+            }
+            f.extend_from_slice(name.as_bytes());
+            f.extend(extra);
+            rar.extend(header(&f));
+            rar.extend_from_slice(data);
+        }
+        rar.extend(header(&[5, 0, 0]));
+        let p = dir.join("t.rar");
+        std::fs::write(&p, rar).unwrap();
+        p
+    }
+
+    /// Every path below `root`, links included (not followed).
+    fn tree(root: &Path) -> Vec<(String, bool)> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                let p = e.path();
+                let link = is_link(&p);
+                out.push((p.strip_prefix(root).unwrap().display().to_string(), link));
+                if !link && p.is_dir() {
+                    stack.push(p);
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn dos_names_and_dotted_steps_never_land_anywhere() {
+        let dir = tmp("dosnames");
+        let rar = rar_of(
+            &dir.join("src"),
+            &[
+                M::File("a/.. /.. /evil1.txt", b"x"),
+                M::File(".. /evil2.txt", b"x"),
+                M::File("a/... /evil3.txt", b"x"),
+                M::File("CON", b"x"),
+                M::File("con.txt", b"x"),
+                M::File("COM1.jpg", b"x"),
+                M::File("d/lpt3/x.txt", b"x"),
+                M::File("CONIN$", b"x"),
+                M::File("notes.txt.", b"x"),
+                M::File("trail ", b"x"),
+                M::File("ok.txt", b"fine"),
+            ],
+        );
+        let names: Vec<String> = list(&rar).unwrap().into_iter().map(|e| e.path).collect();
+        let out = dir.join("out").join("deep");
+        let all = extract_all(&rar, &out);
+        let one = ["a/.. /.. /evil1.txt", "CON", "COM1.jpg", "notes.txt."].map(|n| extract(&rar, n, &out.join("one")).is_err());
+        let written = tree(&dir.join("out"));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(names, ["ok.txt"], "listed: only the safe member");
+        assert_eq!(all.unwrap_err().message(), crate::i18n::trf("err.extract_kept", &[("count", &10)]));
+        assert_eq!(one, [true; 4]);
+        assert_eq!(written, [("deep".to_string(), false), (r"deep\ok.txt".to_string(), false)], "nothing else, anywhere");
+    }
+
+    #[test]
+    fn link_entries_are_never_left_behind() {
+        let dir = tmp("links");
+        let rar = rar_of(
+            &dir.join("src"),
+            &[
+                M::File("ok.txt", b"fine"),
+                M::File("sub/inner.txt", b"in"),
+                M::Link("jabs", 3, r"\??\C:\Windows", true),
+                M::Link("x/jup", 3, r"..\..\..", true),
+                M::Link("srel", 2, r"..\outside.txt", false),
+                M::Link("usafe", 1, "ok.txt", false),
+                M::Link("jsafe", 3, "sub", true),
+                M::File("x/jup/evil.txt", b"x"),
+                M::File("jsafe/through.txt", b"t"),
+            ],
+        );
+        std::fs::write(dir.join("outside.txt"), b"mine").unwrap();
+        let out = dir.join("out").join("deep");
+        let all = extract_all(&rar, &out);
+        let one = extract(&rar, "usafe", &out.join("one"));
+        let written = tree(&dir.join("out"));
+        let outside = std::fs::read(dir.join("outside.txt")).unwrap();
+        let evil = ["evil.txt", r"out\evil.txt", r"src\evil.txt"].map(|p| dir.join(p).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+        // All five links: the ones unrar refuses quietly and the ones it makes and we remove.
+        assert_eq!(all.unwrap_err().message(), crate::i18n::trf("err.extract_kept", &[("count", &5)]));
+        assert!(one.is_err());
+        assert!(written.iter().all(|(_, link)| !link), "no link stays: {written:?}");
+        assert!(written.iter().all(|(p, _)| p.starts_with("deep")), "{written:?}");
+        assert!(written.iter().any(|(p, _)| p == r"deep\ok.txt") && written.iter().any(|(p, _)| p == r"deep\sub\inner.txt"));
+        assert_eq!(outside, b"mine");
+        assert_eq!(evil, [false; 3]);
+    }
+
+    fn fixture_copy(name: &str, tag: &str) -> PathBuf {
+        let dir = tmp(tag);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join(name);
+        let p = dir.join(name);
+        std::fs::copy(src, &p).unwrap();
+        p
+    }
+
+    fn pw(s: &str) -> Password {
+        Password::from_wide(s.encode_utf16().collect())
+    }
+
+    #[test]
+    fn encrypted_members_ask_for_the_password_and_take_only_the_right_one() {
+        let rar = fixture_copy("enc-files.rar", "encfiles");
+        let dir = rar.parent().unwrap().to_path_buf();
+        let names: Vec<String> = list(&rar).unwrap().into_iter().map(|e| e.path).collect();
+        let plain = extract(&rar, "readme.txt", &dir.join("a")).map(|p| std::fs::read(p).unwrap());
+        let missing = extract(&rar, "secret.txt", &dir.join("b")).map_err(|e| password_needed(&e));
+        let all_missing = extract_all(&rar, &dir.join("none")).map_err(|e| password_needed(&e));
+        set_password(&rar, pw("not it"));
+        let all_wrong = extract_all(&rar, &dir.join("none")).map_err(|e| password_needed(&e));
+        let none_written = !dir.join("none").join("readme.txt").exists();
+        set_password(&rar, pw("not it"));
+        let wrong = extract(&rar, "secret.txt", &dir.join("c")).map_err(|e| password_needed(&e));
+        let after_wrong = extract(&rar, "secret.txt", &dir.join("d")).map_err(|e| password_needed(&e));
+        set_password(&rar, pw("rexplorer-pw"));
+        let right = extract(&rar, "secret.txt", &dir.join("e")).map(|p| std::fs::read(p).unwrap());
+        let all = extract_all(&rar, &dir.join("all"));
+        let all_secret = std::fs::read(dir.join("all").join("secret.txt"));
+        forget_password(&rar);
+        let forgotten = extract(&rar, "secret.txt", &dir.join("f")).map_err(|e| password_needed(&e));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(names, ["readme.txt", "secret.txt"], "the names are not encrypted");
+        assert_eq!(plain.unwrap(), b"plain");
+        assert_eq!(missing.unwrap_err(), Some(false));
+        assert_eq!((all_missing.unwrap_err(), all_wrong.unwrap_err()), (Some(false), Some(true)));
+        assert!(none_written, "Extract all asks before writing the plain member");
+        assert_eq!(wrong.unwrap_err(), Some(true));
+        assert_eq!(after_wrong.unwrap_err(), Some(false), "a refused password is forgotten");
+        assert_eq!(right.unwrap(), b"top secret\r\n");
+        assert!(all.is_ok(), "{all:?}");
+        assert_eq!(all_secret.unwrap(), b"top secret\r\n");
+        assert_eq!(forgotten.unwrap_err(), Some(false));
+    }
+
+    #[test]
+    fn encrypted_headers_ask_before_listing() {
+        let rar = fixture_copy("enc-headers.rar", "encheaders");
+        let dir = rar.parent().unwrap().to_path_buf();
+        let missing = list(&rar).map_err(|e| password_needed(&e));
+        set_password(&rar, pw("contrasena"));
+        let wrong = list(&rar).map_err(|e| password_needed(&e));
+        set_password(&rar, pw("contraseña"));
+        let names = list(&rar).map(|l| l.into_iter().map(|e| e.path).collect::<Vec<_>>());
+        let data = extract(&rar, r"docs\hidden.txt", &dir.join("x")).map(|p| std::fs::read(p).unwrap());
+        // Not forget_passwords: tests run side by side and share the store.
+        forget_password(&rar);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(missing.unwrap_err(), Some(false));
+        assert_eq!(wrong.unwrap_err(), Some(true));
+        // "ñ" goes through the ANSI code page: on one without it the password cannot be typed (see with_archive).
+        let mut acp = [0u8; 8];
+        let mut lost = windows::core::BOOL(0);
+        unsafe { WideCharToMultiByte(CP_ACP, 0, &[0xF1], Some(&mut acp), None, Some(&mut lost)) };
+        if lost.as_bool() {
+            return;
+        }
+        assert_eq!(names.unwrap(), [r"docs\hidden.txt", "docs"], "the member, then its synthesized folder");
+        assert_eq!(data.unwrap(), b"hidden name, hidden data");
+    }
+
+    #[test]
+    fn passwords_are_wiped() {
+        let mut v = vec![1u16, 2, 3];
+        wipe(&mut v);
+        assert_eq!(v, [0, 0, 0]);
+    }
+
     #[test]
     fn list_and_children() {
         let dir = tmp("list");
@@ -265,10 +679,35 @@ mod tests {
         let rar = fixture(&dir);
         let out = extract(&rar, "docs\\a.txt", &dir.join("out")).unwrap();
         let text = std::fs::read_to_string(&out).unwrap();
-        let missing = extract(&rar, "nope", &dir.join("out")).is_err();
+        let missing = extract(&rar, "nope", &dir.join("out2")).is_err();
+        let not_empty = extract(&rar, "docs\\a.txt", &dir.join("out")).is_err();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(text, "hello");
-        assert!(missing);
+        assert_eq!(out, dir.join("out").join("docs").join("a.txt"), "at the member's own path");
+        assert!(missing && not_empty);
+    }
+
+    #[test]
+    fn hard_link_and_copy_members_reach_no_other_file() {
+        let dir = tmp("hardlinks");
+        // Relative targets: before the base-path form, unrar resolved them against the working directory (the crate).
+        let one = rar_of(&dir.join("one"), &[M::Link("hl", 4, "Cargo.toml", false), M::Link("cp", 5, "Cargo.toml", false)]);
+        let refused = ["hl", "cp"].map(|n| extract(&one, n, &dir.join("x").join(n)).is_err());
+        let left = tree(&dir.join("x"));
+        let all = rar_of(&dir.join("all"), &[M::File("ok.txt", b"fine"), M::Link("hl", 4, "mine.txt", false), M::Link("hl2", 4, "ok.txt", false)]);
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("mine.txt"), b"mine").unwrap();
+        let kept = extract_all(&all, &out);
+        let written = tree(&out);
+        let singles = ["mine.txt", "ok.txt"].map(|n| single_file(&out.join(n)));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(refused, [true; 2]);
+        assert!(left.iter().all(|(p, _)| !p.contains('\\')), "nothing inside the folders: {left:?}");
+        assert!(single_file(Path::new("Cargo.toml")));
+        assert_eq!(kept.unwrap_err().message(), crate::i18n::trf("err.extract_kept", &[("count", &2)]));
+        assert_eq!(written, [("mine.txt".to_string(), false), ("ok.txt".to_string(), false)]);
+        assert_eq!(singles, [true; 2]);
     }
 
     #[test]
@@ -276,6 +715,12 @@ mod tests {
         assert!(escapes("..\\..\\x") && escapes("a\\..\\b") && escapes(".."));
         assert!(escapes("C:x") && escapes("C:\\Windows\\x") && escapes("a.txt:stream"));
         assert!(!escapes("a\\..b\\c") && !escapes("docs\\a.txt"));
+        for bad in [".. ", "a\\.. \\b", "...", "a\\.\\b", "a\\\\b", "a.txt.", "a ", "CON", "con.txt", "Aux .log", "COM1.jpg", "x\\lpt9", "COM¹", "CONIN$", "nul"] {
+            assert!(escapes(bad), "{bad:?}");
+        }
+        for good in ["CONSOLE.txt", "COM10.txt", "COMX", "lpt", "..b", "a..b", "a. b", ".gitignore", "café\\ñ.txt"] {
+            assert!(!escapes(good), "{good:?}");
+        }
     }
 
     #[test]
@@ -340,19 +785,8 @@ mod tests {
 
     #[test]
     fn fuzz_member_paths_never_escape_the_destination() {
-        let dest = Path::new("C:\\dest");
         for seed in 0..500 {
-            let raw = crate::fuzz::Rng::new(seed).text(crate::fuzz::TOKENS, 20);
-            let n = norm(Path::new(&raw));
-            assert!(!n.contains('/') && !n.starts_with('\\') && !n.ends_with('\\'), "seed {seed}: {n:?}");
-            let (dir, name) = split(&n);
-            assert!(!name.contains('\\'), "seed {seed}");
-            assert_eq!(if dir.is_empty() { name.to_string() } else { format!("{dir}\\{name}") }, n, "seed {seed}");
-            if !escapes(&n) {
-                let p = dest.join(&n);
-                assert!(p.starts_with(dest), "seed {seed}: {p:?}");
-                assert!(!p.components().any(|c| matches!(c, std::path::Component::ParentDir)), "seed {seed}: {p:?}");
-            }
+            fuzz_check(&crate::fuzz::Rng::new(seed).text(crate::fuzz::TOKENS, 20));
         }
     }
 }

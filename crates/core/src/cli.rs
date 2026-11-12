@@ -1,7 +1,7 @@
 //! Command-line parsing for the app, and the payload sent to an already running instance
 //! (WM_COPYDATA). Pure Rust, no shell or Win32 calls (it only asks the filesystem whether a path is a file).
 //!
-//! Once installed, rexplorer is launched as `explorer.exe` too, so it takes Explorer's arguments: `/select,<path>`
+//! Once it is the default file manager (`--register`), rexplorer is launched as `explorer.exe` too, so it takes Explorer's arguments: `/select,<path>`
 //! (or `/select,` then the path), `/e,<path>`, `/root,<path>`, `/n`, `/separate` (switches may be chained with
 //! commas), a file path (its folder opens with it selected), and paths with a trailing backslash or with the
 //! trailing quote some callers leave (`"C:\"` arrives as `C:"`). Anything else Explorer-style (`/idlist,...`,
@@ -21,9 +21,11 @@ pub struct Args {
     pub recover: bool,
     pub search: Option<String>,
     pub help: bool,
+    /// A standalone install: the program only, Explorer still opens folders.
     pub install: bool,
     pub uninstall: bool,
-    /// With `--install` / `--uninstall`: no dialogs (for package managers); the exit code is the result.
+    /// With `--install` / `--uninstall` / `--register` / `--unregister`: no dialogs (package managers, the install
+    /// scripts); the exit code is the result.
     pub quiet: bool,
     pub import_explorer: bool,
     /// With `--import-explorer`: also replace values the profile already changed.
@@ -210,13 +212,15 @@ const OPTS: [(&str, &str); 17] = [
 ];
 
 /// Names a description may mention; they are never translated.
-const NAMES: [(&str, &dyn std::fmt::Display); 8] = [
+const NAMES: [(&str, &dyn std::fmt::Display); 10] = [
     ("path", &"<path>"),
     ("select", &"/select,<path>"),
     ("text", &"<text>"),
     ("programs", &r"%LOCALAPPDATA%\Programs"),
     ("install", &"--install"),
     ("uninstall", &"--uninstall"),
+    ("register", &"--register"),
+    ("unregister", &"--unregister"),
     ("import", &"--import-explorer"),
     ("ini", &"settings.ini"),
 ];
@@ -258,6 +262,18 @@ pub fn payload(args: &Args) -> String {
         s.push_str("newtab=1\n");
     }
     s
+}
+
+/// The seeded test's and fuzz/'s checks: `tail`, `parse` and `parse_payload` never panic on junk, and a payload
+/// made from `values` (line breaks dropped: the payload is line-based) reads back as the same arguments.
+#[cfg(any(test, fuzzing))]
+pub fn fuzz_check(line: &str, args: &[String], values: &[String], new_tab: bool) {
+    assert!(line.ends_with(tail(line)), "{line:?}");
+    let _ = parse(args.to_vec());
+    let _ = parse_payload(line);
+    let v = |i: usize| values.get(i).map_or_else(String::new, |s| s.replace(['\n', '\r'], ""));
+    let a = Args { paths: vec![v(0), v(1)], select: Some(v(2)), search: Some(v(3)), new_tab, ..Args::default() };
+    assert_eq!(parse_payload(&payload(&a)), Some(a), "{values:?}");
 }
 
 /// None when the sender speaks another protocol version; a payload without a version line (an older build) is
@@ -540,6 +556,21 @@ mod tests {
         }
     }
 
+    /// The help says which flag only installs the program and which one takes Explorer's place.
+    #[test]
+    fn help_separates_install_from_taking_over() {
+        let u = usage();
+        let line = |opt: &str| u.lines().find(|l| l.trim_start().starts_with(opt)).unwrap().to_string();
+        assert!(line("--install").contains("Explorer still opens folders"), "{u}");
+        assert!(line("--register").contains("default file manager"), "{u}");
+        assert!(line("--unregister").contains("back to Windows Explorer") && line("--unregister").contains("--register"), "{u}");
+        assert!(line("--uninstall ").contains("back to Explorer"), "{u}");
+        let quiet = line("--quiet");
+        assert!(["--install", "--uninstall", "--register", "--unregister"].iter().all(|f| quiet.contains(f)), "{quiet}");
+        let a = p(&["--register", "--quiet"]).unwrap();
+        assert!(a.register && a.quiet && !a.install);
+    }
+
     #[test]
     fn argument_errors_carry_the_option() {
         assert_eq!(p(&["--select"]).unwrap_err(), "--select needs a value");
@@ -551,14 +582,9 @@ mod tests {
         for seed in 0..500 {
             let mut r = crate::fuzz::Rng::new(seed);
             let line = r.text(crate::fuzz::TOKENS, 20);
-            assert!(line.ends_with(tail(&line)), "seed {seed}");
             let args: Vec<String> = (0..r.below(6)).map(|_| r.text(crate::fuzz::TOKENS, 6)).collect();
-            let _ = parse(args);
-            // The payload is line-based: a value with a line break is out of its contract.
-            let _ = parse_payload(&line);
-            let mut v = || r.text(crate::fuzz::TOKENS, 6).replace(['\n', '\r'], "");
-            let a = Args { paths: vec![v(), v()], select: Some(v()), search: Some(v()), new_tab: seed % 2 == 0, ..Args::default() };
-            assert_eq!(parse_payload(&payload(&a)), Some(a), "seed {seed}");
+            let values: Vec<String> = (0..4).map(|_| r.text(crate::fuzz::TOKENS, 6)).collect();
+            fuzz_check(&line, &args, &values, seed % 2 == 0);
         }
     }
 }

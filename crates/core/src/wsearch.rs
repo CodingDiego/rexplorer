@@ -11,10 +11,10 @@ use windows::Win32::System::Search::{
     IDBCreateCommand, IDBCreateSession, IDBInitialize, IDataInitialize, IRowset, ISearchCrawlScopeManager,
     ISearchManager, MSDAINITIALIZE,
 };
-use windows::core::{GUID, HSTRING, IUnknown, Interface, Result, w};
+use windows::core::{Error, GUID, HSTRING, IUnknown, Interface, Result, w};
 
 use crate::com::take_cotaskmem_string;
-use crate::search;
+use crate::query::Query;
 
 /// The OLE DB command dialect "provider default" (oledb.h); the windows crate does not carry it.
 const DBGUID_DEFAULT: GUID = GUID::from_u128(0xc8b521fb_5cf3_11ce_ade5_00aa0044773d);
@@ -72,9 +72,9 @@ impl Index {
         Ok(outermost(dirs.collect()))
     }
 
-    /// Paths below folder `root` whose file name contains `needle` (as `search::matches`), in batches. `cancel` is
-    /// checked before every row.
-    pub fn query(&self, root: &str, needle: &str, cancel: &AtomicBool, sink: &mut dyn FnMut(Vec<String>)) -> Result<()> {
+    /// Paths below folder `root` that answer `query` (its words on the file name, its filters on the file), in
+    /// batches. `cancel` is checked before every row.
+    pub fn query(&self, root: &str, query: &Query, cancel: &AtomicBool, sink: &mut dyn FnMut(Vec<String>)) -> Result<()> {
         unsafe {
             let init: IDataInitialize = CoCreateInstance(&MSDAINITIALIZE, None, CLSCTX_INPROC_SERVER)?;
             let mut source: Option<IUnknown> = None;
@@ -83,7 +83,7 @@ impl Index {
             source.Initialize()?;
             let session: IDBCreateCommand = source.cast::<IDBCreateSession>()?.CreateSession(None, &IDBCreateCommand::IID)?.cast()?;
             let text: ICommandText = session.CreateCommand(None, &ICommandText::IID)?.cast()?;
-            text.SetCommandText(&DBGUID_DEFAULT, &HSTRING::from(sql(root, needle)))?;
+            text.SetCommandText(&DBGUID_DEFAULT, &HSTRING::from(sql(root, &query.words)))?;
             let mut rowset: Option<IUnknown> = None;
             text.cast::<ICommand>()?.Execute(None, &IRowset::IID, None, None, Some(&mut rowset))?;
             let rowset: IRowset = rowset.ok_or(E_FAIL)?.cast()?;
@@ -105,6 +105,7 @@ impl Index {
             let mut row = Box::new(Row { status: 0, len: 0, value: [0; PATH_MAX] });
             let mut batch = Vec::new();
             let mut result = Ok(());
+            let mut strays = 0usize;
             while !cancel.load(Ordering::Relaxed) {
                 let (mut hrow, mut got) = (0usize, 0usize);
                 // The binding passes this slice's length as the row count and its first element as the HROW array.
@@ -119,8 +120,10 @@ impl Index {
                 let _ = rowset.ReleaseRows(1, &hrow, std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut());
                 if read.is_ok() && row.status == DBSTATUS_S_OK.0 as u32 {
                     let path = String::from_utf16_lossy(&row.value[..(row.len / 2).min(PATH_MAX)]);
-                    if within(root, &path, needle) {
-                        batch.push(path);
+                    match classify(root, &path, query) {
+                        None => strays += 1,
+                        Some(true) => batch.push(path),
+                        Some(false) => {}
                     }
                 }
                 if batch.len() >= 256 {
@@ -130,6 +133,11 @@ impl Index {
             let _ = accessor.ReleaseAccessor(handle, None);
             if !batch.is_empty() {
                 sink(batch);
+            }
+            // SCOPE can resolve through a known folder to another place (Documents moved to "Documentos", with the
+            // old folder still indexed): rows outside the root mean the index does not answer for this folder.
+            if result.is_ok() && strays > 0 {
+                return Err(Error::new(E_FAIL, format!("{strays} index rows outside {root}")));
             }
             result
         }
@@ -160,23 +168,24 @@ fn literal(text: &str, like: bool) -> String {
     out
 }
 
-/// The query: items below `root` whose file name contains `needle`. User text only ever goes in as an escaped literal.
-fn sql(root: &str, needle: &str) -> String {
+/// The query: items below `root` whose file name contains every word (all items without words: the filters are
+/// checked on each row). User text only ever goes in as an escaped literal.
+fn sql(root: &str, words: &[String]) -> String {
     let mut scope = root.trim_end_matches('\\').to_string();
     if scope.ends_with(':') {
         scope.push('\\');
     }
-    format!(
-        "SELECT System.ItemPathDisplay FROM SystemIndex WHERE SCOPE='file:{}' AND System.FileName LIKE '%{}%'",
-        literal(&scope, false),
-        literal(needle, true)
-    )
+    let mut sql = format!("SELECT System.ItemPathDisplay FROM SystemIndex WHERE SCOPE='file:{}'", literal(&scope, false));
+    for w in words {
+        sql.push_str(&format!(" AND System.FileName LIKE '%{}%'", literal(w, true)));
+    }
+    sql
 }
 
-/// The index's SCOPE and LIKE are its own rules: keep only what the walk would have found, strictly below `root`.
-fn within(root: &str, path: &str, needle: &str) -> bool {
-    let name = path.rsplit('\\').next().unwrap_or_default();
-    below(path, root) && search::matches(name, needle)
+/// An index row for a search of `root`: whether it answers `query` (its name and filters, as the walk would), or
+/// None when it is not strictly below `root` (the index's SCOPE has its own rules).
+fn classify(root: &str, path: &str, query: &Query) -> Option<bool> {
+    below(path, root).then(|| query.path_matches(std::path::Path::new(path)))
 }
 
 /// Whether `path` is strictly below folder `root`, ignoring case.
@@ -237,21 +246,25 @@ mod tests {
     #[test]
     fn wsearch_sql_escapes_user_text() {
         assert_eq!(
-            sql(r"C:\Users\o'neil\", "50%_[x]'; DROP"),
-            r"SELECT System.ItemPathDisplay FROM SystemIndex WHERE SCOPE='file:C:\Users\o''neil' AND System.FileName LIKE '%50[%][_][[]x]''; DROP%'"
+            sql(r"C:\Users\o'neil\", &["50%_[x]';".into(), "drop".into()]),
+            r"SELECT System.ItemPathDisplay FROM SystemIndex WHERE SCOPE='file:C:\Users\o''neil' AND System.FileName LIKE '%50[%][_][[]x]'';%' AND System.FileName LIKE '%drop%'"
         );
-        assert!(sql(r"C:\", "a").contains(r"SCOPE='file:C:\'"));
+        assert!(sql(r"C:\", &["a".into()]).contains(r"SCOPE='file:C:\'"));
+        assert!(sql(r"C:\x", &[]).ends_with(r"SCOPE='file:C:\x'"), "filters only: every item, checked row by row");
         assert_eq!(folder_url(r"C:\"), r"file:///C:\");
         assert_eq!(folder_url(r"C:\Users\me\AppData"), r"file:///C:\Users\me\AppData\");
     }
 
     #[test]
     fn wsearch_keeps_matches_strictly_below_root() {
-        assert!(within(r"C:\Users\me", r"C:\Users\me\Docs\Report.txt", "report"));
-        assert!(within(r"C:\", r"C:\a\report.txt", "report"));
-        assert!(!within(r"C:\Users\me", r"C:\Users\meow\report.txt", "report"), "a sibling with the same prefix");
-        assert!(!within(r"C:\Users\me", r"C:\Users\me\report-dir\other.txt", "report"), "only the name matches");
-        assert!(!within(r"C:\Users\me", r"C:\Users\me", "me"));
+        let q = Query::parse("report");
+        assert_eq!(classify(r"C:\Users\me", r"C:\Users\me\Docs\Report.txt", &q), Some(true));
+        assert_eq!(classify(r"C:\", r"C:\a\report.txt", &q), Some(true));
+        assert_eq!(classify(r"C:\Users\me", r"C:\Users\meow\report.txt", &q), None, "a sibling with the same prefix");
+        assert_eq!(classify(r"C:\Users\me\Documentos", r"C:\Users\me\Documents\report.txt", &q), None, "SCOPE resolved elsewhere");
+        assert_eq!(classify(r"C:\Users\me", r"C:\Users\me\report-dir\other.txt", &q), Some(false), "only the name matches");
+        assert_eq!(classify(r"C:\Users\me", r"C:\Users\me", &Query::parse("me")), None);
+        assert_eq!(classify(r"C:\Users\me", r"C:\Users\me\Docs\Report.txt", &Query::parse("report kind:picture")), Some(false), "the filters too");
     }
 
     #[test]
@@ -281,7 +294,7 @@ mod tests {
         let Ok(index) = Index::open() else { return };
         let root = std::env::temp_dir().join(format!("rexplorer-wsearch-{}", std::process::id()));
         let mut found = Vec::new();
-        let _ = index.query(&root.display().to_string(), "needle", &AtomicBool::new(false), &mut |p| found.extend(p));
+        let _ = index.query(&root.display().to_string(), &Query::parse("needle"), &AtomicBool::new(false), &mut |p| found.extend(p));
         assert!(found.is_empty(), "{found:?}");
     }
 }

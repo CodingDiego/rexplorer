@@ -1,9 +1,11 @@
-use windows::Win32::Foundation::HWND;
-use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
+use std::os::windows::ffi::OsStrExt;
+
+use windows::Win32::Foundation::{ERROR_INVALID_NAME, HWND};
+use windows::Win32::Storage::FileSystem::{FILE_FLAGS_AND_ATTRIBUTES, MOVE_FILE_FLAGS, MoveFileExW};
 use windows::Win32::Foundation::{FILETIME, PROPERTYKEY};
 use windows::Win32::System::Registry::{RRF_RT_ANY, RegCloseKey, RegGetValueW};
 use windows::Win32::System::SystemServices::{SFGAO_FOLDER, SFGAO_HIDDEN};
-use windows::Win32::System::Variant::{PSTF_UTC, VariantToBoolean, VariantToFileTime, VariantToStringAlloc, VariantToUInt64};
+use windows::Win32::System::Variant::{PSTF_UTC, VariantToBoolean, VariantToFileTime, VariantToStringAlloc, VariantToUInt32, VariantToUInt64};
 use windows::Win32::UI::Shell::Common::{SHELLDETAILS, STRRET};
 use windows::Win32::UI::Shell::{
     ASSOCF_NONE, ASSOCKEY_CLASS, AssocQueryKeyW, ILCombine, IShellFolder, IShellFolder2, IShellIconOverlay, SHFILEINFOW, SHGDN_FORPARSING, SHGDN_INFOLDER,
@@ -23,6 +25,31 @@ pub struct ShellItem {
 /// System image list index and the shell's overlay (0 none, 1-15) from one packed value; bit 31 stays clear, so ICON_UNKNOWN (i32::MIN) never collides.
 pub fn split_icon(packed: i32) -> (i32, u32) {
     (packed & 0x00FF_FFFF, (packed as u32 >> 24) & 0xF)
+}
+
+/// A cloud file's sync state from the attributes the cloud files API sets (OneDrive Files On-Demand): 0 none or
+/// unknown, `CLOUD_ONLINE` online-only (a placeholder that downloads when opened), `CLOUD_PINNED` "Always keep on
+/// this device". A downloaded but unpinned file has neither bit, like a plain local file: no mark.
+pub fn cloud_state(attrs: u32) -> u32 {
+    const OFFLINE: u32 = 0x1000;
+    const RECALL_ON_OPEN: u32 = 0x0004_0000;
+    const PINNED: u32 = 0x0008_0000;
+    const RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+    if attrs & PINNED != 0 {
+        CLOUD_PINNED
+    } else if attrs & (RECALL_ON_DATA_ACCESS | RECALL_ON_OPEN | OFFLINE) != 0 {
+        CLOUD_ONLINE
+    } else {
+        0
+    }
+}
+
+pub const CLOUD_ONLINE: u32 = 1;
+pub const CLOUD_PINNED: u32 = 2;
+
+/// The cloud state `icon_index` packs in bits 28-29 when the shell gave no overlay of its own.
+pub fn cloud_of(packed: i32) -> u32 {
+    (packed as u32 >> 28) & 3
 }
 
 /// The shell's overlay slot (1-15; 0 none) for `child` of `parent`: shortcut arrow, sync state, shared.
@@ -162,13 +189,34 @@ impl ShellItem {
                 SHGFI_PIDL | SHGFI_SYSICONINDEX | SHGFI_SMALLICON,
             );
             // The parsing name keeps the extension that "hide extensions" strips from the display name.
-            (himl, crate::icons::app_fallback(info.iIcon, || self.name(SHGDNF(SHGDN_INFOLDER.0 | SHGDN_FORPARSING.0))) | (overlay_slot(&self.parent, self.pidl.as_ptr()) << 24) as i32)
+            let icon = crate::icons::app_fallback(info.iIcon, || self.name(SHGDNF(SHGDN_INFOLDER.0 | SHGDN_FORPARSING.0)));
+            let overlay = overlay_slot(&self.parent, self.pidl.as_ptr());
+            // No sync engine overlay (OneDrive not running, or its handlers out of the 15 slots): our own mark.
+            let cloud = if overlay == 0 { self.file_attributes().map_or(0, cloud_state) } else { 0 };
+            (himl, icon | (overlay << 24) as i32 | (cloud << 28) as i32)
+        }
+    }
+
+    /// FILE_ATTRIBUTE_* from PKEY_FileAttributes (the folder's cached data, no disk read for file system items).
+    pub fn file_attributes(&self) -> Option<u32> {
+        const PKEY_FILE_ATTRIBUTES: PROPERTYKEY = PROPERTYKEY { fmtid: GUID::from_u128(0xB725F130_47EF_101A_A5F1_02608C9EEBAC), pid: 13 };
+        let f2 = self.parent.cast::<IShellFolder2>().ok()?;
+        unsafe {
+            let v = f2.GetDetailsEx(self.pidl.as_ptr(), &PKEY_FILE_ATTRIBUTES).ok()?;
+            VariantToUInt32(&v).ok()
         }
     }
 
     /// Renames the item in place; the shell shows its own error UI on failure. `literal` takes `new_name` as the
     /// whole file name; otherwise it is a display name the shell puts a hidden extension back on.
     pub fn rename(&mut self, hwnd: HWND, new_name: &str, literal: bool) -> Result<()> {
+        let path = self.parsing_name();
+        // shell32's SetNameOf stays MAX_PATH-bound (ERROR_FILENAME_EXCED_RANGE) even in a longPathAware process.
+        let long = |p: &std::path::Path| p.as_os_str().encode_wide().count() >= 260;
+        let old = std::path::Path::new(&path);
+        if old.is_absolute() && (long(old) || long(&old.with_file_name(new_name))) {
+            return self.rename_long(&path, new_name, literal);
+        }
         let wide = HSTRING::from(new_name);
         let mut out = std::ptr::null_mut();
         unsafe {
@@ -184,6 +232,46 @@ impl ShellItem {
             }
         }
         Ok(())
+    }
+
+    /// Renames a file system item whose path is over MAX_PATH, never replacing an existing name.
+    // shortcut: no conflict or error dialog here (an existing name just fails); add one if long paths get common.
+    fn rename_long(&mut self, path: &str, new_name: &str, literal: bool) -> Result<()> {
+        // A \\?\ path keeps trailing dots and spaces literally; Explorer drops them (and so "." and ".." go empty).
+        let new_name = new_name.trim_end_matches(['.', ' ']);
+        if new_name.is_empty()
+            || crate::archive::is_device_name(new_name)
+            || new_name.contains(['\\', '/', ':', '*', '?', '"', '<', '>', '|'])
+        {
+            return Err(ERROR_INVALID_NAME.to_hresult().into());
+        }
+        let old = std::path::Path::new(path);
+        let mut name = new_name.to_string();
+        // A display name: the shell keeps the extension it hides.
+        if !literal
+            && self.display_name() != self.file_name()
+            && let Some(ext) = old.extension()
+        {
+            name = format!("{name}.{}", ext.to_string_lossy());
+        }
+        let to = old.with_file_name(&name);
+        unsafe {
+            MoveFileExW(&HSTRING::from(verbatim(old)), &HSTRING::from(verbatim(&to)), MOVE_FILE_FLAGS(0))?;
+            let mut child = std::ptr::null_mut();
+            self.parent.ParseDisplayName(HWND::default(), None, &HSTRING::from(name), None, &mut child, std::ptr::null_mut())?;
+            self.pidl = Pidl::from_raw(child);
+        }
+        Ok(())
+    }
+}
+
+/// `\\?\C:\x` or `\\?\UNC\server\share\x`: the form Win32 file calls take past MAX_PATH.
+fn verbatim(p: &std::path::Path) -> String {
+    let s = p.to_string_lossy();
+    match s.strip_prefix(r"\\") {
+        Some(_) if s.starts_with(r"\\?\") => s.into_owned(),
+        Some(unc) => format!(r"\\?\UNC\{unc}"),
+        None => format!(r"\\?\{s}"),
     }
 }
 
@@ -204,10 +292,36 @@ mod tests {
     use crate::folder::ShellFolder;
 
     #[test]
+    fn verbatim_paths_for_drives_and_shares() {
+        use std::path::Path;
+        assert_eq!(verbatim(Path::new(r"C:\a\b.txt")), r"\\?\C:\a\b.txt");
+        assert_eq!(verbatim(Path::new(r"\\srv\share\b.txt")), r"\\?\UNC\srv\share\b.txt");
+        assert_eq!(verbatim(Path::new(r"\\?\C:\a")), r"\\?\C:\a");
+    }
+
+    #[test]
     fn split_icon_round_trip() {
         assert_eq!(split_icon(5 | (2 << 24)), (5, 2));
         assert_eq!(split_icon(0x00FF_FFFF), (0xFF_FFFF, 0));
         assert!((15u32 << 24) as i32 > 0);
+    }
+
+    #[test]
+    fn cloud_states_from_attributes_and_their_packing() {
+        // FILE_ATTRIBUTE_ARCHIVE alone, a pinned file, online-only placeholders (data access, open, offline), and
+        // pinned winning over a recall bit while it downloads.
+        assert_eq!(cloud_state(0x20), 0);
+        assert_eq!(cloud_state(0x20 | 0x0008_0000), CLOUD_PINNED);
+        assert_eq!(cloud_state(0x20 | 0x0040_0000), CLOUD_ONLINE);
+        assert_eq!(cloud_state(0x10 | 0x0004_0000), CLOUD_ONLINE);
+        assert_eq!(cloud_state(0x1000), CLOUD_ONLINE);
+        assert_eq!(cloud_state(0x0008_0000 | 0x0040_0000), CLOUD_PINNED);
+        // An unpinned (being freed) file with its data still local: no mark.
+        assert_eq!(cloud_state(0x0010_0000), 0);
+        // Bits 28-29 carry it next to the index and overlay; bit 31 stays clear.
+        let packed = 0x00AB_CDEF | (3 << 24) | (CLOUD_PINNED << 28) as i32;
+        assert_eq!((split_icon(packed), cloud_of(packed)), ((0xAB_CDEF, 3), CLOUD_PINNED));
+        assert!(packed > 0 && cloud_of(5) == 0);
     }
 
     #[test]

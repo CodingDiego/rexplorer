@@ -435,11 +435,6 @@ unsafe extern "system" fn edit_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
     DefSubclassProc(hwnd, msg, wparam, lparam)
 }
 
-unsafe fn draw_text(hdc: HDC, s: &str, rc: &mut RECT, flags: DRAW_TEXT_FORMAT) {
-    let mut v: Vec<u16> = s.encode_utf16().collect();
-    DrawTextW(hdc, &mut v, rc, flags);
-}
-
 unsafe fn fill(hdc: HDC, rc: &RECT, color: u32) {
     let b = CreateSolidBrush(COLORREF(color));
     FillRect(hdc, rc, b);
@@ -475,13 +470,13 @@ unsafe fn paint(hwnd: HWND, st: *mut State) {
         let selected = i == s.model.selected();
         SetTextColor(mem, COLORREF(if selected { on_sel } else { text }));
         let mut measure = name;
-        draw_text(mem, &c.text, &mut measure, flags | DT_CALCRECT);
-        draw_text(mem, &c.text, &mut name, flags | DT_END_ELLIPSIS);
+        theme::draw_text(mem, &c.text, &mut measure, flags | DT_CALCRECT);
+        theme::draw_text(mem, &c.text, &mut name, flags | DT_END_ELLIPSIS);
         let left = pad + (measure.right - measure.left) + pad;
         if c.target != c.text && left < cw - pad {
             let mut tr = RECT { left, right: cw - pad, ..row };
             SetTextColor(mem, COLORREF(if selected && s.contrast { on_sel } else { secondary }));
-            draw_text(mem, &c.target, &mut tr, flags | DT_RIGHT | DT_PATH_ELLIPSIS);
+            theme::draw_text(mem, &c.target, &mut tr, flags | DT_RIGHT | DT_PATH_ELLIPSIS);
         }
     }
     if s.contrast {

@@ -38,6 +38,17 @@ fn unescape(v: &str) -> String {
     out
 }
 
+/// The seeded test's and fuzz/'s check: a language file of any text keeps every English key, and placeholder
+/// substitution on it as a template does not panic.
+#[cfg(any(test, fuzzing))]
+pub fn fuzz_check(text: &str) {
+    let t = Table::new(Some(text));
+    assert!(Table::parse(EN).keys().all(|k| t.map.contains_key(k)), "{text:?}");
+    let mut junk = Table::new(None);
+    junk.map.insert("k".into(), text.to_string());
+    let _ = junk.fmt("k", &[("a", &1), ("b", &"x")]);
+}
+
 impl Table {
     /// All sections flattened, last duplicate wins.
     pub fn parse(text: &str) -> HashMap<String, String> {
@@ -163,12 +174,16 @@ mod tests {
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("rexplorer-i18n-{}", std::process::id())).join(tag);
         let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
+        // Another test's cleanup can remove the shared parent between the two steps of create_dir_all: try again.
+        assert!((0..5).any(|_| std::fs::create_dir_all(&d).is_ok()), "{}", d.display());
         d
     }
 
     fn cleanup(tag: &str) {
-        let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("rexplorer-i18n-{}", std::process::id())).join(tag));
+        let base = std::env::temp_dir().join(format!("rexplorer-i18n-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(base.join(tag));
+        // Only succeeds once the last test's folder is gone, so the per-process folder does not pile up in %TEMP%.
+        let _ = std::fs::remove_dir(base);
     }
 
     fn key_shape(k: &str) -> bool {
@@ -402,15 +417,8 @@ mod tests {
 
     #[test]
     fn fuzz_language_files_never_drop_the_english_keys() {
-        let en = Table::parse(EN);
         for seed in 0..300 {
-            let text = crate::fuzz::Rng::new(seed).text(crate::fuzz::TOKENS, 80);
-            let t = Table::new(Some(&text));
-            assert!(en.keys().all(|k| t.map.contains_key(k)), "seed {seed}");
-            // Placeholder substitution on junk templates must not panic either.
-            let mut junk = Table::new(None);
-            junk.map.insert("k".into(), text.clone());
-            let _ = junk.fmt("k", &[("a", &1), ("b", &"x")]);
+            fuzz_check(&crate::fuzz::Rng::new(seed).text(crate::fuzz::TOKENS, 80));
         }
     }
 }

@@ -74,6 +74,8 @@ const WM_ENUM_DONE: u32 = WM_APP + 1;
 const WM_SHELL_CHANGE: u32 = WM_APP + 2;
 /// The update check found a newer release: lparam is a Box<String> with its version.
 const WM_UPDATE_FOUND: u32 = WM_APP + 11;
+/// A breadcrumb dropdown's folders are listed: lparam is a Box<ui::CrumbItems>.
+const WM_CRUMB_ITEMS: u32 = WM_APP + 13;
 /// That version, for the status bar and the More menu.
 static UPDATE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 const TIMER_REFRESH: usize = 1;
@@ -187,6 +189,10 @@ const CMD_COPY_PATH: u16 = 69;
 const CMD_FIT_COLUMNS: u16 = 70;
 /// Opens the release page the update notice names.
 const CMD_UPDATE: u16 = 71;
+/// Paste shortcut: .lnk files to the clipboard's files, in the current folder.
+const CMD_PASTE_SHORTCUT: u16 = 72;
+/// Ctrl+Shift+Enter: the selected program through the shell's runas verb.
+const CMD_RUN_AS: u16 = 73;
 /// Two crashes this close together (seconds) send the folder to Windows Explorer instead of a third start.
 const CRASH_GUARD_SECS: u64 = 60;
 
@@ -194,7 +200,7 @@ const fn accel(flags: u8, key: VIRTUAL_KEY, cmd: u16) -> ACCEL {
     ACCEL { fVirt: ACCEL_VIRT_FLAGS(FVIRTKEY.0 | flags), key: key.0, cmd }
 }
 
-const ACCELS: [ACCEL; 46] = [
+const ACCELS: [ACCEL; 47] = [
     accel(FALT.0, VK_LEFT, CMD_BACK),
     accel(FALT.0, VK_RIGHT, CMD_FORWARD),
     accel(FALT.0, VK_UP, CMD_UP),
@@ -230,6 +236,7 @@ const ACCELS: [ACCEL; 46] = [
     accel(FCONTROL.0, VK_E, CMD_SEARCH),
     accel(0, VK_F3, CMD_SEARCH),
     accel(FCONTROL.0, VK_RETURN, CMD_OPEN_TAB),
+    accel(FCONTROL.0 | FSHIFT.0, VK_RETURN, CMD_RUN_AS),
     accel(0, VK_F11, CMD_FULLSCREEN),
     accel(FCONTROL.0, VK_I, CMD_INVERT),
     accel(0, VK_F6, CMD_FOCUS_NEXT),
@@ -309,6 +316,8 @@ pub(crate) struct App {
 }
 
 fn main() -> Result<()> {
+    // Before any window, so the taskbar groups them and finds the jump list (no install needed).
+    let _ = rexplorer_core::jumplist::set_process_app_id();
     // Before the usage and argument-error boxes, so they speak the user's language too. Reads settings.ini only (a
     // missing or unreadable file means `system`); nothing may call `tr` before this line: the first call freezes English.
     rexplorer_core::i18n::init(&settings::dir(), &Settings::load().language, &system_language());
@@ -327,18 +336,18 @@ fn main() -> Result<()> {
         // Explorer arguments we do not handle (/idlist, URLs, apps): the real Explorer gets them verbatim.
         std::process::exit(if rexplorer_core::fallback::forward_command_line().is_ok() { 0 } else { 1 });
     }
+    // Exit code of the install and register flows: 0 done, 1 failed, 2 cancelled.
+    let code = |o: ui::InstallOutcome| match o {
+        ui::InstallOutcome::Done => 0,
+        ui::InstallOutcome::Cancelled => 2,
+        ui::InstallOutcome::Failed => 1,
+    };
     if args.register || args.unregister {
-        unsafe { ui::register_flow(None, args.unregister) };
-        return Ok(());
+        std::process::exit(code(unsafe { ui::register_flow(None, args.unregister, args.quiet) }));
     }
     if args.install || args.uninstall {
-        // Every install asks first (it replaces Explorer and any running copy) unless --quiet; --uninstall stays
-        // unconfirmed. Exit code: 0 done, 1 failed, 2 cancelled.
-        std::process::exit(match unsafe { ui::install_flow(None, args.uninstall, !args.uninstall, args.quiet) } {
-            ui::InstallOutcome::Done => 0,
-            ui::InstallOutcome::Cancelled => 2,
-            ui::InstallOutcome::Failed => 1,
-        });
+        // Every install asks first (it replaces any running copy) unless --quiet; --uninstall stays unconfirmed.
+        std::process::exit(code(unsafe { ui::install_flow(None, args.uninstall, !args.uninstall, args.quiet) }));
     }
     if args.import_explorer {
         std::process::exit(if unsafe { ui::import_explorer_flow(args.profile.as_deref(), args.overwrite) } { 0 } else { 1 });
@@ -496,6 +505,7 @@ fn main() -> Result<()> {
             Some(hinst),
             Some(app as *const c_void),
         )?;
+        let _ = rexplorer_core::jumplist::set_window_app_id(hwnd, false);
         // Unmarked, later launches and Win+E still go to the first window; the system cascades this one.
         if !args.new_window {
             instance::mark(hwnd);
@@ -541,6 +551,39 @@ fn check_updates(hwnd: HWND) {
         ui::background_priority();
         if let Some(v) = rexplorer_core::update::check(&settings::dir(), env!("CARGO_PKG_VERSION")) {
             let _ = unsafe { PostMessageW(Some(HWND(hwnd as *mut c_void)), WM_UPDATE_FOUND, WPARAM(0), LPARAM(Box::into_raw(Box::new(v)) as isize)) };
+        }
+    });
+}
+
+/// Rebuilds the taskbar jump list on a worker: Quick Access's frequent folders and `recent`. A call made while one
+/// runs leaves its list for that worker, so a burst of navigations rebuilds it once or twice, not once each.
+fn refresh_jump_list(recent: Vec<String>) {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static NEXT: Mutex<Option<Vec<String>>> = Mutex::new(None);
+    static BUSY: AtomicBool = AtomicBool::new(false);
+    let next = || NEXT.lock().unwrap_or_else(|e| e.into_inner()).take();
+    *NEXT.lock().unwrap_or_else(|e| e.into_inner()) = Some(recent);
+    if BUSY.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    std::thread::spawn(move || {
+        ui::background_priority();
+        let _com = ComInit::sta();
+        let exe = std::env::current_exe().unwrap_or_default();
+        let tr = |k: &'static str| rexplorer_core::i18n::tr(k).to_string();
+        let labels = rexplorer_core::jumplist::Labels { frequent: tr("menu.jump.frequent"), recent: tr("menu.jump.recent"), new_window: tr("menu.jump.new_window") };
+        loop {
+            while let Some(recent) = next() {
+                if let Err(e) = rexplorer_core::jumplist::update(&exe, &panes::frequent_folders(), &recent, &labels) {
+                    crash::log(&format!("jump list: {e}"));
+                }
+            }
+            BUSY.store(false, Ordering::Release);
+            // A call between the last take and the store saw BUSY and left its list: take the work back for it.
+            if NEXT.lock().unwrap_or_else(|e| e.into_inner()).is_none() || BUSY.swap(true, Ordering::AcqRel) {
+                break;
+            }
         }
     });
 }
@@ -725,6 +768,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_CONTEXTMENU if HWND(wparam.0 as *mut c_void) == (*app).nav => nav::on_nav_context(app, lparam),
         WM_ENUM_DONE => nav::on_enum_done(app, Box::from_raw(lparam.0 as *mut nav::EnumDone)),
+        WM_CRUMB_ITEMS => ui::on_crumb_items(app, *Box::from_raw(lparam.0 as *mut ui::CrumbItems)),
         WM_UPDATE_FOUND => {
             let _ = UPDATE.set(*Box::from_raw(lparam.0 as *mut String));
             ui::update_status(app);
@@ -732,6 +776,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         source::WM_SEARCH_BATCH => source::on_search_batch(app, Box::from_raw(lparam.0 as *mut source::SearchBatch)),
         source::WM_BROWSER_NAV => source::on_browser_nav(app, Box::from_raw(lparam.0 as *mut Pidl)),
         source::WM_WORKER_ERROR => message(hwnd, &Box::from_raw(lparam.0 as *mut String)),
+        source::WM_ARCHIVE_PASSWORD => source::on_archive_password(app, Box::from_raw(lparam.0 as *mut _)),
         panes::WM_SIDEBAR_ROWS => panes::on_sidebar_rows(app, Box::from_raw(lparam.0 as *mut panes::SidebarRows)),
         panes::WM_TREE_SELECT => panes::on_tree_select(app, Box::from_raw(lparam.0 as *mut Pidl)),
         panes::WM_QUICK_ACCESS_DONE => {
@@ -836,7 +881,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             views::destroy(app);
             let _ = std::fs::remove_dir_all(archive_view::session_dir());
+            rexplorer_core::archive::forget_passwords();
             (*app).panes.tree = None;
+            // The shell asks for a window's properties to be cleared before it goes.
+            let _ = rexplorer_core::jumplist::set_window_app_id(hwnd, true);
             PostQuitMessage(0);
         }
         _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -942,10 +990,11 @@ unsafe fn on_command(app: *mut App, cmd: u16) {
             if GetFocus() == addr {
                 let text = window_text(addr);
                 let current = nav::source(app).map(|s| s.editing_name()).unwrap_or_default();
-                if text.trim().is_empty() || text == current {
+                let searching = matches!(nav::source(app), Some(source::Source::Search(_)));
+                if address_refreshes(&text, &current, searching) {
                     nav::refresh(app);
                 } else {
-                    go(app, nav::Target::Name(text.trim().to_string()), nav::History::Push);
+                    go(app, nav::Target::Name(nav::expand_env(text.trim(), |n| std::env::var(n).ok())), nav::History::Push);
                 }
                 let _ = SetFocus(Some(ui::view_hwnd(app)));
             } else {
@@ -1002,6 +1051,8 @@ unsafe fn on_command(app: *mut App, cmd: u16) {
         CMD_COPY_PATH => list::copy_as_path(app),
         CMD_FIT_COLUMNS => list::fit_columns(app),
         CMD_PASTE => list::verb_on_background(app, "paste"),
+        CMD_PASTE_SHORTCUT => list::paste_shortcut(app),
+        CMD_RUN_AS => list::run_as_admin(app),
         CMD_UNDO | CMD_REDO => list::undo_step(app, cmd == CMD_REDO),
         CMD_RENAME => list::begin_rename(app),
         CMD_SHARE => commands::share(app),
@@ -1013,7 +1064,7 @@ unsafe fn on_command(app: *mut App, cmd: u16) {
         CMD_TOGGLE_PREVIEW => panes::toggle_right(app, panes::RightPane::Preview),
         CMD_TOGGLE_DETAILS => panes::toggle_right(app, panes::RightPane::Details),
         CMD_CONNECT => {
-            if let Some(url) = connect::dialog((*app).hwnd, &(*app).theme, (*app).font) {
+            if let Some(url) = connect::dialog((*app).hwnd, &(*app).theme) {
                 nav::new_tab(app, nav::Target::Name(url), true, None);
             }
         }
@@ -1022,7 +1073,9 @@ unsafe fn on_command(app: *mut App, cmd: u16) {
             SendMessageW((*app).search, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
         }
         CMD_MORE => ui::more_menu(app),
-        CMD_REGISTER | CMD_UNREGISTER => ui::register_flow(Some((*app).hwnd), cmd == CMD_UNREGISTER),
+        CMD_REGISTER | CMD_UNREGISTER => {
+            ui::register_flow(Some((*app).hwnd), cmd == CMD_UNREGISTER, false);
+        }
         CMD_INSTALL | CMD_UNINSTALL => {
             ui::install_flow(Some((*app).hwnd), cmd == CMD_UNINSTALL, true, false);
         }
@@ -1117,8 +1170,23 @@ unsafe fn restore_placement(hwnd: HWND) -> bool {
     SetWindowPlacement(hwnd, &wp).is_ok()
 }
 
+/// Enter in the address box refreshes on an empty box or the place's own name; on search results the name is the
+/// searched folder's, and entering it goes to that folder (as in Explorer) instead of searching again.
+fn address_refreshes(text: &str, current: &str, searching: bool) -> bool {
+    text.trim().is_empty() || (text == current && !searching)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn address_enter_refreshes_only_the_place_shown() {
+        use super::address_refreshes;
+        assert!(address_refreshes("C:\\a", "C:\\a", false));
+        assert!(address_refreshes("  ", "C:\\a", true));
+        assert!(!address_refreshes("C:\\a", "C:\\a", true));
+        assert!(!address_refreshes("C:\\b", "C:\\a", false));
+    }
+
     #[test]
     fn system_language_is_a_locale_name() {
         let l = super::system_language();

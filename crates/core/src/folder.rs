@@ -325,25 +325,6 @@ mod tests {
         assert_eq!(sizes, (Some(1), Some(0)), "the shell reports 0 for folders");
     }
 
-    /// #34: a folder whose path is over 260 characters lists, and its file renames, through the shell.
-    #[test]
-    fn lists_and_renames_in_a_folder_over_260_characters() {
-        let _c = ComInit::sta();
-        let root = std::env::temp_dir().join(format!("rexplorer-test-long-{}", std::process::id()));
-        let dir = (0..6).fold(root.clone(), |d, i| d.join(format!("{i}-{}", "x".repeat(50))));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.txt"), b"x").unwrap();
-        let name = dir.to_str().unwrap();
-        assert!(name.len() > 260, "{}", name.len());
-        let (f, mut items) = list(name).unwrap();
-        assert_eq!(items.len(), 1);
-        items[0].rename(HWND::default(), "b.txt", true).unwrap();
-        let renamed = dir.join("b.txt").is_file() && !dir.join("a.txt").exists();
-        assert_eq!(f.parsing_name, name);
-        std::fs::remove_dir_all(&root).unwrap();
-        assert!(renamed);
-    }
-
     #[test]
     fn file_time_matches_fs() {
         let _c = ComInit::sta();

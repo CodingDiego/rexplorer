@@ -3,7 +3,7 @@ use std::cell::RefCell;
 
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HWND, POINT, POINTL};
 use windows::Win32::System::Threading::Sleep;
-use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, DVASPECT_CONTENT, FORMATETC, IDataObject, TYMED_HGLOBAL};
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, DVASPECT_CONTENT, FORMATETC, IDataObject, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL};
 use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData};
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock};
 use windows::Win32::System::Ole::{
@@ -56,24 +56,65 @@ fn is_move(effect: u32) -> bool {
     effect & DROPEFFECT_MOVE.0 != 0 && effect & DROPEFFECT_COPY.0 == 0
 }
 
-/// Paths a cut put on data: its CF_HDROP files when "Preferred DropEffect" says move.
-pub fn cut_paths(data: &IDataObject) -> Vec<String> {
-    let fmt = |cf: u16| FORMATETC { cfFormat: cf, ptd: std::ptr::null_mut(), dwAspect: DVASPECT_CONTENT.0, lindex: -1, tymed: TYMED_HGLOBAL.0 as u32 };
+/// The DWORD `data` carries in the registered format `name`; None when absent or not a memory block of 4 bytes.
+fn dword_format(data: &IDataObject, name: windows::core::PCWSTR) -> Option<u32> {
     unsafe {
-        let Ok(mut m) = data.GetData(&fmt(RegisterClipboardFormatW(w!("Preferred DropEffect")) as u16)) else { return Vec::new() };
+        let fmt = FORMATETC { cfFormat: RegisterClipboardFormatW(name) as u16, ptd: std::ptr::null_mut(), dwAspect: DVASPECT_CONTENT.0, lindex: -1, tymed: TYMED_HGLOBAL.0 as u32 };
+        let mut m = data.GetData(&fmt).ok()?;
         // The data comes from any program: only a memory block of at least the 4 bytes is read.
-        let mut moved = false;
+        let mut v = None;
         if m.tymed == TYMED_HGLOBAL.0 as u32 && GlobalSize(m.u.hGlobal) >= 4 {
             let p = GlobalLock(m.u.hGlobal) as *const u32;
-            moved = !p.is_null() && is_move(p.read_unaligned());
+            v = (!p.is_null()).then(|| p.read_unaligned());
             let _ = GlobalUnlock(m.u.hGlobal);
         }
         ReleaseStgMedium(&mut m);
-        if !moved {
-            return Vec::new();
-        }
-        hdrop_paths(data)
+        v
     }
+}
+
+/// Stores `value` in `data` as the registered format `name` (a 4-byte memory block).
+fn set_dword_format(data: &IDataObject, name: windows::core::PCWSTR, value: u32) -> Result<()> {
+    unsafe {
+        let fmt = FORMATETC { cfFormat: RegisterClipboardFormatW(name) as u16, ptd: std::ptr::null_mut(), dwAspect: DVASPECT_CONTENT.0, lindex: -1, tymed: TYMED_HGLOBAL.0 as u32 };
+        let h = GlobalAlloc(GMEM_MOVEABLE, 4)?;
+        let p = GlobalLock(h) as *mut u32;
+        if p.is_null() {
+            let _ = GlobalFree(Some(h));
+            return Err(windows::core::Error::from_thread());
+        }
+        p.write_unaligned(value);
+        let _ = GlobalUnlock(h);
+        let medium = STGMEDIUM { tymed: TYMED_HGLOBAL.0 as u32, u: STGMEDIUM_0 { hGlobal: h }, pUnkForRelease: std::mem::ManuallyDrop::new(None) };
+        // fRelease: the data object owns the block once SetData succeeds; after a failure it is still ours to free.
+        data.SetData(&fmt, &medium, true).inspect_err(|_| {
+            let _ = GlobalFree(Some(h));
+        })
+    }
+}
+
+/// Ctrl+C / Ctrl+X: the items' data object on the clipboard, its "Preferred DropEffect" 5 (copy | link) or 2 (move),
+/// as Explorer puts them. The shell's copy verb would do the same but loads context-menu handlers on the way, and the
+/// Work Folders one (Windows 11) leaves a thread behind each time.
+pub fn to_clipboard(folder: &ShellFolder, items: &[&ShellItem], owner: HWND, cut: bool) -> Result<()> {
+    let data = data_object(folder, items, owner)?;
+    let effect = if cut { DROPEFFECT_MOVE.0 } else { DROPEFFECT_COPY.0 | DROPEFFECT_LINK.0 };
+    set_dword_format(&data, w!("Preferred DropEffect"), effect)?;
+    unsafe { windows::Win32::System::Ole::OleSetClipboard(&data) }
+}
+
+/// Paths a cut put on data: its CF_HDROP files when "Preferred DropEffect" says move.
+pub fn cut_paths(data: &IDataObject) -> Vec<String> {
+    if !dword_format(data, w!("Preferred DropEffect")).is_some_and(is_move) {
+        return Vec::new();
+    }
+    hdrop_paths(data)
+}
+
+/// What a drop target says it did with our data ("Performed DropEffect"): a shell folder that moves the files
+/// itself (an optimized move) ends the drag with DROPEFFECT_NONE and reports the move only here. 0 when unset.
+pub fn performed_effect(data: &IDataObject) -> u32 {
+    dword_format(data, w!("Performed DropEffect")).unwrap_or(0)
 }
 
 /// The CF_HDROP paths `data` carries; none when it has no file list.
@@ -102,6 +143,38 @@ pub fn hdrop_paths(data: &IDataObject) -> Vec<String> {
 /// The clipboard's cut files, from any program; none on a copy or when it cannot be read.
 pub fn clipboard_cut_paths() -> Vec<String> {
     unsafe { OleGetClipboard() }.map(|d| cut_paths(&d)).unwrap_or_default()
+}
+
+/// Paste shortcut as Explorer does it: the clipboard's data dropped on `folder` with only the link effect, so the
+/// shell makes and names the shortcuts. Err when the clipboard holds nothing the folder can link to.
+pub fn paste_link(folder: &ShellFolder, hwnd: HWND) -> Result<()> {
+    let data = unsafe { OleGetClipboard()? };
+    let target = folder_drop_target(folder, hwnd)?;
+    if drop_link(&target, &data)? {
+        return Ok(());
+    }
+    // A bare file list (another program's copy) has no shell ID list for the shell to link: build one from its paths.
+    let paths = hdrop_paths(&data);
+    if !paths.is_empty() && drop_link(&target, &data_object_of_paths(&paths)?)? {
+        return Ok(());
+    }
+    Err(windows::Win32::Foundation::E_FAIL.into())
+}
+
+/// What SHSimulateDrop does (the crate does not export it): enter, then drop if the target takes a link.
+fn drop_link(target: &IDropTarget, data: &IDataObject) -> Result<bool> {
+    let (keys, pt) = (MODIFIERKEYS_FLAGS(0), POINTL::default());
+    let mut effect = DROPEFFECT_LINK;
+    unsafe {
+        target.DragEnter(data, keys, pt, &mut effect)?;
+        if effect & DROPEFFECT_LINK == DROPEFFECT_NONE {
+            let _ = target.DragLeave();
+            return Ok(false);
+        }
+        effect = DROPEFFECT_LINK;
+        target.Drop(data, keys, pt, &mut effect)?;
+    }
+    Ok(true)
 }
 
 /// The clipboard's file list (CF_HDROP), copy or cut; empty when it has none or cannot be read.
@@ -158,15 +231,21 @@ pub fn clear_clipboard(owner: HWND) {
 /// Runs the shell's modal drag loop for `data`, with its drag image (taken from `hwnd`, a ListView answers
 /// DI_GETDRAGIMAGE) and its drop source; returns the effect the target applied (NONE if cancelled).
 pub fn drag(data: &IDataObject, hwnd: HWND) -> Result<DROPEFFECT> {
-    unsafe { SHDoDragDrop(Some(hwnd), data, None::<&IDropSource>, DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK) }
+    drag_with(data, hwnd, DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK)
+}
+
+/// `drag` offering only `effects` (copies of archive members: a move or a link would point at a temporary file).
+pub fn drag_with(data: &IDataObject, hwnd: HWND, effects: DROPEFFECT) -> Result<DROPEFFECT> {
+    unsafe { SHDoDragDrop(Some(hwnd), data, None::<&IDropSource>, effects) }
 }
 
 /// The log line for a drag that changed nothing, so a later run can tell why: `Ok(NONE)` is a drop nowhere, a
 /// refusal or a cancel (the loop's DRAGDROP_S_* success codes); `Err` is a failure of the loop itself. None when a
-/// target applied an effect. `button_down`: whether a mouse button was still down when the loop started.
-pub fn drag_note(r: &Result<DROPEFFECT>, button_down: bool, ms: u128) -> Option<String> {
+/// target applied an effect, by the result or by `performed` (`performed_effect`). `button_down`: whether a mouse
+/// button was still down when the loop started.
+pub fn drag_note(r: &Result<DROPEFFECT>, performed: u32, button_down: bool, ms: u128) -> Option<String> {
     let what = match r {
-        Ok(e) if *e != DROPEFFECT_NONE => return None,
+        Ok(e) if *e != DROPEFFECT_NONE || performed != 0 => return None,
         Ok(_) => "no effect".to_string(),
         Err(e) => format!("failed: {e}"),
     };
@@ -174,8 +253,10 @@ pub fn drag_note(r: &Result<DROPEFFECT>, button_down: bool, ms: u128) -> Option<
 }
 
 type Pick = Box<dyn Fn(POINTL) -> Option<IDropTarget>>;
-/// Called with the dropped data just before the target runs the drop.
-pub type OnDrop = Box<dyn Fn(POINTL, &IDataObject)>;
+/// Called with the dropped data just before the target runs the drop; what it returns runs after the drop with the
+/// effect the target reported (a right-drag menu's choice is known only then).
+pub type OnDrop = Box<dyn Fn(POINTL, &IDataObject) -> Option<AfterDrop>>;
+pub type AfterDrop = Box<dyn FnOnce(DROPEFFECT)>;
 
 /// One drop target registered on a window; forwards to whichever shell target `pick` returns.
 #[implement(IDropTarget)]
@@ -268,16 +349,21 @@ impl IDropTarget_Impl for DropForwarder_Impl {
         *self.data.borrow_mut() = None;
         let current = self.current.take();
         // Before the target runs: the hook reads which destination names are free.
-        if let (Some(_), Some(f), Some(d)) = (&current, &self.on_drop, pdataobj.as_ref()) {
-            f(*pt, d);
-        }
-        match current {
+        let after = match (&current, &self.on_drop, pdataobj.as_ref()) {
+            (Some(_), Some(f), Some(d)) => f(*pt, d),
+            _ => None,
+        };
+        let r = match current {
             Some(t) => unsafe { t.Drop(pdataobj.as_ref(), grfkeystate, *pt, pdweffect) },
             None => {
                 unsafe { *pdweffect = DROPEFFECT_NONE };
                 Ok(())
             }
+        };
+        if let Some(a) = after {
+            a(if r.is_ok() { unsafe { *pdweffect } } else { DROPEFFECT_NONE });
         }
+        r
     }
 }
 
@@ -325,8 +411,6 @@ pub fn unregister(hwnd: HWND) {
 mod tests {
     use super::*;
     use crate::com::ComInit;
-    use windows::Win32::System::Com::{STGMEDIUM, STGMEDIUM_0};
-    use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc};
     use windows::Win32::System::SystemServices::MK_LBUTTON;
 
     struct Fixture(std::path::PathBuf);
@@ -431,7 +515,12 @@ mod tests {
         let inner: IDropTarget = Recorder(log.clone()).into();
         let log2 = log.clone();
         let fwd: IDropTarget = DropForwarder {
-            on_drop: Some(Box::new(move |_, _| log2.borrow_mut().push("hook"))),
+            on_drop: Some(Box::new(move |_, _| {
+                log2.borrow_mut().push("hook");
+                let log3 = log2.clone();
+                // Runs after the target, with the effect it left.
+                Some(Box::new(move |e: DROPEFFECT| log3.borrow_mut().push(if e == DROPEFFECT_LINK { "after link" } else { "after" })) as AfterDrop)
+            })),
             ..DropForwarder::new(HWND::default(), Box::new(move |p| (p.x < 100).then(|| inner.clone())))
         }
         .into();
@@ -439,9 +528,10 @@ mod tests {
         let mut effect = DROPEFFECT_COPY;
         unsafe {
             fwd.DragEnter(&data, keys, POINTL { x: 0, y: 0 }, &mut effect).unwrap();
+            effect = DROPEFFECT_LINK;
             fwd.Drop(&data, keys, POINTL { x: 0, y: 0 }, &mut effect).unwrap();
         }
-        assert_eq!(*log.borrow(), ["hook", "target"]);
+        assert_eq!(*log.borrow(), ["hook", "target", "after link"]);
         log.borrow_mut().clear();
         unsafe {
             fwd.DragEnter(&data, keys, POINTL { x: 300, y: 0 }, &mut effect).unwrap();
@@ -485,9 +575,11 @@ mod tests {
 
     #[test]
     fn drag_note_skips_applied_drops() {
-        assert_eq!(drag_note(&Ok(DROPEFFECT_COPY), true, 5), None);
-        assert_eq!(drag_note(&Ok(DROPEFFECT_NONE), false, 3).as_deref(), Some("drag no effect; button down at start: false; 3 ms"));
-        let n = drag_note(&Err(windows::Win32::Foundation::E_UNEXPECTED.into()), true, 9).unwrap();
+        assert_eq!(drag_note(&Ok(DROPEFFECT_COPY), 0, true, 5), None);
+        assert_eq!(drag_note(&Ok(DROPEFFECT_NONE), 0, false, 3).as_deref(), Some("drag no effect; button down at start: false; 3 ms"));
+        // An optimized move: the target moved the files and said so only in "Performed DropEffect".
+        assert_eq!(drag_note(&Ok(DROPEFFECT_NONE), DROPEFFECT_MOVE.0, true, 3), None);
+        let n = drag_note(&Err(windows::Win32::Foundation::E_UNEXPECTED.into()), DROPEFFECT_MOVE.0, true, 9).unwrap();
         assert!(n.starts_with("drag failed: ") && n.contains("0x8000FFFF") && n.ends_with("; button down at start: true; 9 ms"), "{n}");
     }
 
@@ -500,24 +592,23 @@ mod tests {
         let file = items.iter().find(|i| !i.is_folder()).unwrap();
         let data = data_object(&f, &[file], HWND::default()).unwrap();
         assert!(cut_paths(&data).is_empty(), "no effect means not a cut");
-        let fmt = FORMATETC {
-            cfFormat: unsafe { RegisterClipboardFormatW(w!("Preferred DropEffect")) } as u16,
-            ptd: std::ptr::null_mut(),
-            dwAspect: DVASPECT_CONTENT.0,
-            lindex: -1,
-            tymed: TYMED_HGLOBAL.0 as u32,
-        };
-        let set = |effect: u32| unsafe {
-            let h = GlobalAlloc(GMEM_MOVEABLE, 4).unwrap();
-            (GlobalLock(h) as *mut u32).write(effect);
-            let _ = GlobalUnlock(h);
-            let medium = STGMEDIUM { tymed: TYMED_HGLOBAL.0 as u32, u: STGMEDIUM_0 { hGlobal: h }, pUnkForRelease: std::mem::ManuallyDrop::new(None) };
-            data.SetData(&fmt, &medium, true).unwrap();
-        };
-        set(2);
+        // The effects to_clipboard writes for a cut and a copy.
+        set_dword_format(&data, w!("Preferred DropEffect"), DROPEFFECT_MOVE.0).unwrap();
         assert_eq!(cut_paths(&data), [fx.0.join("a.txt").to_str().unwrap()]);
-        set(5);
+        set_dword_format(&data, w!("Preferred DropEffect"), DROPEFFECT_COPY.0 | DROPEFFECT_LINK.0).unwrap();
         assert!(cut_paths(&data).is_empty());
+    }
+
+    #[test]
+    fn performed_effect_reads_the_target_report() {
+        let _c = ComInit::ole();
+        let fx = fixture("performed");
+        let f = ShellFolder::parse(fx.0.to_str().unwrap()).unwrap();
+        let items = f.enumerate().unwrap();
+        let data = data_object(&f, &[items.iter().find(|i| !i.is_folder()).unwrap()], HWND::default()).unwrap();
+        assert_eq!(performed_effect(&data), 0, "nothing reported yet");
+        set_dword_format(&data, w!("Performed DropEffect"), DROPEFFECT_MOVE.0).unwrap();
+        assert_eq!(performed_effect(&data), DROPEFFECT_MOVE.0);
     }
 
     #[test]

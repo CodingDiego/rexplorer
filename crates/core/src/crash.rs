@@ -32,11 +32,35 @@ unsafe impl Sync for CmdLine {}
 
 static CMDLINE: OnceLock<CmdLine> = OnceLock::new();
 
-/// Builds a command line: every part double-quoted, embedded quotes escaped as `\"`, NUL-terminated.
+/// One argument double-quoted so `CommandLineToArgvW` gives it back unchanged: backslashes before a quote, and
+/// before the closing quote (`C:\` would otherwise escape it), are doubled.
+fn quote_arg(s: &str) -> String {
+    let mut out = String::from("\"");
+    let mut slashes = 0;
+    for c in s.chars() {
+        match c {
+            '\\' => slashes += 1,
+            '"' => {
+                out.push_str(&"\\".repeat(slashes * 2 + 1));
+                out.push('"');
+                slashes = 0;
+            }
+            c => {
+                out.push_str(&"\\".repeat(slashes));
+                out.push(c);
+                slashes = 0;
+            }
+        }
+    }
+    out.push_str(&"\\".repeat(slashes * 2));
+    out.push('"');
+    out
+}
+
+/// Builds a command line: the exe quoted as is (argv[0] has no escapes), every argument by `quote_arg`, NUL-terminated.
 pub fn command_line(exe: &Path, args: &[String]) -> Vec<u16> {
-    let quote = |s: &str| format!("\"{}\"", s.replace('"', "\\\""));
-    let mut parts = vec![quote(&exe.to_string_lossy())];
-    parts.extend(args.iter().map(|a| quote(a)));
+    let mut parts = vec![format!("\"{}\"", exe.to_string_lossy())];
+    parts.extend(args.iter().map(|a| quote_arg(a)));
     let mut v: Vec<u16> = parts.join(" ").encode_utf16().collect();
     v.push(0);
     v
@@ -271,6 +295,18 @@ mod tests {
         assert_eq!(*v.last().unwrap(), 0);
         let s = String::from_utf16(&v[..v.len() - 1]).unwrap();
         assert_eq!(s, r#""C:\a b\x.exe" "--recover" "C:\p q""#);
+    }
+
+    #[test]
+    fn command_line_round_trips_through_argv() {
+        let args: Vec<String> = [r"C:\", r"D:\a b\", r#"x"y"#, r#"a\"b"#, r"a\\b", "", r"\\server\share\"].map(String::from).into();
+        let v = command_line(Path::new(r"C:\a b\x.exe"), &args);
+        let mut n = 0;
+        let argv = unsafe { windows::Win32::UI::Shell::CommandLineToArgvW(PCWSTR(v.as_ptr()), &mut n) };
+        let got: Vec<String> = (0..n as usize).map(|i| unsafe { (*argv.add(i)).to_string().unwrap() }).collect();
+        unsafe { windows::Win32::Foundation::LocalFree(Some(windows::Win32::Foundation::HLOCAL(argv as _))) };
+        assert_eq!(got[0], r"C:\a b\x.exe");
+        assert_eq!(&got[1..], &args[..]);
     }
 
     #[test]

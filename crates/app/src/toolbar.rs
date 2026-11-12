@@ -47,9 +47,15 @@ struct Button {
     label: Vec<u16>,
     /// A chevron after the label: the button opens a menu.
     dropdown: bool,
+    /// Opens a menu without a chevron (More): Down opens it, screen readers hear a menu button.
+    menu: bool,
 }
 
 impl Button {
+    fn opens_menu(&self) -> bool {
+        self.dropdown || self.menu
+    }
+
     fn is_separator(&self) -> bool {
         self.cmd == 0 && self.glyph == SEPARATOR.0
     }
@@ -183,6 +189,7 @@ pub fn create(parent: HWND, id: usize, buttons: &[(u32, u16, &str)]) -> Result<H
                     group: None,
                     label: Vec::new(),
                     dropdown: false,
+                    menu: false,
                 })
                 .collect(),
             groups: 0,
@@ -221,6 +228,15 @@ pub fn create(parent: HWND, id: usize, buttons: &[(u32, u16, &str)]) -> Result<H
 /// Width that shows every button.
 pub fn width(hwnd: HWND) -> i32 {
     unsafe { state(hwnd).map_or(0, |s| geometry(hwnd, s).2) }
+}
+
+/// Marks the button that sends `cmd` as one that opens a menu, without a chevron.
+pub fn set_menu(hwnd: HWND, cmd: u16) {
+    unsafe {
+        if let Some(s) = state(hwnd) {
+            s.buttons.iter_mut().filter(|b| b.cmd == cmd).for_each(|b| b.menu = true);
+        }
+    }
 }
 
 /// Gives the button that sends `cmd` a text label after its glyph, and a dropdown chevron when `dropdown`.
@@ -348,12 +364,12 @@ unsafe fn acc_tree(hwnd: HWND, s: &State, t: &mut access::Tree) {
         if b.checked {
             state |= STATE_SYSTEM_CHECKED;
         }
-        if b.dropdown {
+        if b.opens_menu() {
             state |= STATE_SYSTEM_HASPOPUP;
         }
         t.items.push(access::Item {
             name,
-            role: if b.dropdown { ROLE_SYSTEM_BUTTONMENU } else { ROLE_SYSTEM_PUSHBUTTON },
+            role: if b.opens_menu() { ROLE_SYSTEM_BUTTONMENU } else { ROLE_SYSTEM_PUSHBUTTON },
             state,
             rect: rect(hwnd, s, i),
             action: rexplorer_core::i18n::tr("tb.action_press"),
@@ -604,7 +620,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                 }
                 VK_DOWN => {
-                    if let Some(cmd) = cur.filter(|b| b.dropdown).map(|b| b.cmd) {
+                    if let Some(cmd) = cur.filter(|b| b.opens_menu()).map(|b| b.cmd) {
                         command(hwnd, cmd);
                     }
                 }
@@ -955,6 +971,10 @@ mod tests {
             assert_eq!(KEY_CMD.load(SeqCst), 0, "Down opens dropdown buttons only");
             key(VK_RETURN, WM_KEYDOWN);
             assert_eq!(KEY_CMD.load(SeqCst), 12);
+            KEY_CMD.store(0, SeqCst);
+            set_menu(tb, 12);
+            key(VK_DOWN, WM_KEYDOWN);
+            assert_eq!(KEY_CMD.load(SeqCst), 12, "Down opens a menu button without a chevron (More)");
             key(VK_END, WM_KEYDOWN);
             KEY_CMD.store(0, SeqCst);
             key(VK_SPACE, WM_KEYDOWN);
@@ -974,7 +994,7 @@ mod tests {
 
     #[test]
     fn nth_button_skips_separators_and_spacer() {
-        let b = |glyph, cmd| Button { glyph, cmd, tip: vec![0], enabled: true, checked: false, group: None, label: vec![], dropdown: false };
+        let b = |glyph, cmd| Button { glyph, cmd, tip: vec![0], enabled: true, checked: false, group: None, label: vec![], dropdown: false, menu: false };
         let v = [b(1, 11), b(0, 0), b(2, 12), b(1, 0), b(3, 13)];
         assert_eq!([0, 1, 2, 3].map(|k| nth_button(&v, k)), [Some(0), Some(2), Some(4), None]);
     }

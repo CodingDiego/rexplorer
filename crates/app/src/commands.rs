@@ -39,6 +39,7 @@ pub(crate) unsafe fn create(hwnd: HWND) -> Result<HWND> {
     toolbar::set_label(bar, CMD_SORT, tr("tb.sort_label"), true);
     toolbar::set_label(bar, CMD_VIEW_MENU, tr("tb.view_label"), true);
     toolbar::set_label(bar, CMD_TOGGLE_PREVIEW, tr("tb.preview_label"), false);
+    toolbar::set_menu(bar, CMD_MORE);
     Ok(bar)
 }
 

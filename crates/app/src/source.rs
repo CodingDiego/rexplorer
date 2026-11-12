@@ -7,6 +7,7 @@ use rexplorer_core::i18n::{tr, trf};
 use crate::nav::{Crumb, Listing, Loaded, Show, Target, cur, go, source};
 use rexplorer_core::archive::{self, Entry};
 use rexplorer_core::browser::{self, EmbeddedBrowser};
+use rexplorer_core::query::Query;
 use rexplorer_core::search::{self, Hit};
 use rexplorer_core::usn::{self, VolumeIndex};
 use rexplorer_core::wsearch;
@@ -402,12 +403,81 @@ pub(crate) unsafe fn archive_menu(app: *mut App, pt: POINT) {
         _ => None,
     };
     let Some(dest) = dest else { return };
-    let hwnd = (*app).hwnd.0 as isize;
+    run_job((*app).hwnd.0 as isize, archive, ArchiveJob::Extract(dest));
+}
+
+/// Work on an archive that may need its password: open a member with its app, or extract everything.
+pub(crate) enum ArchiveJob {
+    Open(Entry),
+    Extract(PathBuf),
+}
+
+/// lparam = Box<(PathBuf, bool, ArchiveJob)>: the job needs the archive's password (the bool: the one given was
+/// wrong); the UI thread asks for it and runs the job again.
+pub(crate) const WM_ARCHIVE_PASSWORD: u32 = WM_APP + 12;
+
+/// Runs `job` on a worker; an error goes back to window `hwnd` as a message box, a missing or wrong password as
+/// WM_ARCHIVE_PASSWORD.
+pub(crate) fn run_job(hwnd: isize, archive: PathBuf, job: ArchiveJob) {
     std::thread::spawn(move || {
-        if let Err(e) = archive::extract_all(&archive, &dest) {
-            post_error(hwnd, trf("err.extract", &[("name", &archive.display()), ("error", &e)]));
+        let _com = ComInit::sta();
+        let r = match &job {
+            ArchiveJob::Open(e) => archive_view::open(&archive, "").and_then(|l| l.extract_for_open(e)).and_then(|p| instance::open_default_app(&p)),
+            ArchiveJob::Extract(dest) => archive::extract_all(&archive, dest),
+        };
+        let Err(err) = r else { return };
+        if let Some(wrong) = archive::password_needed(&err) {
+            let b = Box::into_raw(Box::new((archive, wrong, job)));
+            if unsafe { PostMessageW(Some(HWND(hwnd as *mut c_void)), WM_ARCHIVE_PASSWORD, WPARAM(0), LPARAM(b as isize)) }.is_err() {
+                drop(unsafe { Box::from_raw(b) });
+            }
+            return;
         }
+        let text = match &job {
+            ArchiveJob::Open(e) => trf("err.open", &[("name", &e.name), ("error", &err)]),
+            ArchiveJob::Extract(_) => trf("err.extract", &[("name", &archive.display()), ("error", &err)]),
+        };
+        post_error(hwnd, text);
     });
+}
+
+/// WM_ARCHIVE_PASSWORD: asks, and runs the job again with the password typed; Cancel drops it.
+#[allow(clippy::boxed_local)] // the Box is the posted message payload
+pub(crate) unsafe fn on_archive_password(app: *mut App, ask: Box<(PathBuf, bool, ArchiveJob)>) {
+    let (archive, wrong, job) = *ask;
+    if let Some(pw) = ask_password(app, &archive, wrong) {
+        archive::set_password(&archive, pw);
+        run_job((*app).hwnd.0 as isize, archive, job);
+    }
+}
+
+/// The themed password prompt for `archive` (`wrong`: the last one was refused). The typed text goes straight
+/// into the `Password`, which zeroes it when dropped; None when cancelled or left empty.
+pub(crate) unsafe fn ask_password(app: *mut App, archive: &Path, wrong: bool) -> Option<archive::Password> {
+    let name = archive.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let form = crate::connect::Form {
+        title: tr("dlg.password_title").into(),
+        note: Some(trf(if wrong { "dlg.password_wrong" } else { "dlg.password_note" }, &[("name", &name)])),
+        labels: &["dlg.password_label"],
+        masked: Some(0),
+        ok: tr("dlg.password_ok").into(),
+    };
+    let text = crate::connect::form((*app).hwnd, &(*app).theme, &form)?.into_iter().next()?;
+    let pw = archive::Password::from_wide(text);
+    (!pw.is_empty()).then_some(pw)
+}
+
+/// `op` on this (UI) thread, asking for `archive`'s password while it needs one; None when the user cancels.
+pub(crate) unsafe fn with_password<T>(app: *mut App, archive: &Path, op: impl Fn() -> Result<T>) -> Option<Result<T>> {
+    loop {
+        match op() {
+            Err(e) if archive::password_needed(&e).is_some() => {
+                let pw = ask_password(app, archive, archive::password_needed(&e) == Some(true))?;
+                archive::set_password(archive, pw);
+            }
+            r => return Some(r),
+        }
+    }
 }
 
 unsafe fn pick_folder(owner: HWND) -> Option<PathBuf> {
@@ -463,14 +533,7 @@ pub(crate) unsafe fn activate(app: *mut App, index: usize) {
                 go(app, Target::Name(format!("{}\\{}", archive.display(), e.path)), nav::History::Push);
                 return;
             }
-            let h = hwnd.0 as isize;
-            std::thread::spawn(move || {
-                let _com = ComInit::sta();
-                let opened = archive_view::open(&archive, "").and_then(|l| l.extract_for_open(&e)).and_then(|p| instance::open_default_app(&p));
-                if let Err(err) = opened {
-                    post_error(h, trf("err.open", &[("name", &e.name), ("error", &err)]));
-                }
-            });
+            run_job(hwnd.0 as isize, archive, ArchiveJob::Open(e));
         }
         Some(Source::Search(s)) => {
             let Some(r) = s.rows.get(index) else { return };
@@ -512,7 +575,8 @@ pub(crate) unsafe fn start_search(app: *mut App, t: usize, needle: &str, push: b
         nav::save_view_state(app);
     }
     let Some(tab) = (&mut (*app).tabs).get_mut(t) else { return };
-    if needle.is_empty() {
+    let query = Query::parse(&needle);
+    if query.is_empty() {
         return;
     }
     let (root, root_parsing, root_editing, root_crumbs) = match &tab.source {
@@ -584,7 +648,7 @@ pub(crate) unsafe fn start_search(app: *mut App, t: usize, needle: &str, push: b
             }
             post(rows_of(hits), false)
         };
-        let indexed = drive.is_some_and(|d| usn_search(&usn_cache, d, &needle, &cancel, &mut sink).is_ok());
+        let indexed = drive.is_some_and(|d| usn_search(&usn_cache, d, &query, &cancel, &mut sink).is_ok());
         if !indexed {
             // When the Windows Search index covers the folder, it answers, and only the folders its rules leave out
             // below (AppData in a profile) are walked. Archives are walked into, which the index does not do. Any
@@ -592,14 +656,14 @@ pub(crate) unsafe fn start_search(app: *mut App, t: usize, needle: &str, push: b
             let mut found = HashSet::new();
             let index = (ui::is_fs_path(&root_path) && !scope.archives).then(wsearch::Index::open).and_then(|r| r.ok()).filter(|ix| ix.covers(&root_path));
             let left_out = index.and_then(|ix| {
-                ix.query(&root_path, &needle, &cancel, &mut |paths| sink(index_hits(paths, &mut found))).and_then(|()| ix.excluded_below(&root_path)).ok()
+                ix.query(&root_path, &query, &cancel, &mut |paths| sink(index_hits(paths, &mut found))).and_then(|()| ix.excluded_below(&root_path)).ok()
             });
             let roots = match left_out {
                 Some(dirs) => dirs.iter().filter_map(|d| ShellFolder::parse(d).ok()).map(|f| f.pidl).collect(),
                 None => vec![root],
             };
             for r in &roots {
-                let _ = search::walk(r, &needle, scope, &cancel, &mut |hits| sink(new_hits(hits, &found)));
+                let _ = search::walk(r, &query, scope, &cancel, &mut |hits| sink(new_hits(hits, &found)));
             }
         }
         post(Vec::new(), true);
@@ -620,7 +684,7 @@ fn new_hits(hits: Vec<Hit>, found: &HashSet<String>) -> Vec<Hit> {
 }
 
 /// Elevated search of a whole NTFS volume through its MFT index (built once per drive, kept for the session).
-fn usn_search(cache: &UsnCache, drive: char, needle: &str, cancel: &AtomicBool, sink: &mut dyn FnMut(Vec<Hit>)) -> Result<()> {
+fn usn_search(cache: &UsnCache, drive: char, query: &Query, cancel: &AtomicBool, sink: &mut dyn FnMut(Vec<Hit>)) -> Result<()> {
     let slot = cache.lock().unwrap_or_else(|e| e.into_inner()).entry(drive).or_default().clone();
     let index = {
         let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
@@ -635,7 +699,7 @@ fn usn_search(cache: &UsnCache, drive: char, needle: &str, cancel: &AtomicBool, 
         return Ok(());
     }
     let mut batch = Vec::new();
-    for path in index.search(needle, USN_LIMIT, cancel) {
+    for path in index.search(query, USN_LIMIT, cancel) {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
@@ -821,6 +885,11 @@ pub(crate) unsafe fn prune_search(app: *mut App, rows: &[usize]) {
     }
     views::reset(app, len);
     ui::update_status(app);
+}
+
+/// A search row's absolute PIDL.
+pub(crate) fn row_pidl(r: &SearchRow) -> Pidl {
+    unsafe { Pidl::from_raw(windows::Win32::UI::Shell::ILCombine(Some(r.folder_pidl.as_ptr()), Some(r.item.pidl.as_ptr()))) }
 }
 
 /// Search row `i` as an item of its folder parsed again on this thread (the walk's folder objects belong to a worker apartment).
@@ -1030,6 +1099,44 @@ mod tests {
         assert_eq!(stem_len(&shown, "report v1.2.txt"), Some(11));
     }
 
+    /// #34: a folder whose path is over 260 characters lists, and its file renames, through the shell. It lives in
+    /// the app's tests because only this exe carries app.manifest's longPathAware; it needs LongPathsEnabled=1.
+    #[test]
+    fn lists_and_renames_in_a_folder_over_260_characters() {
+        let _c = ComInit::sta();
+        let root = std::env::temp_dir().join(format!("rexplorer-test-long-{}", std::process::id()));
+        let dir = (0..6).fold(root.clone(), |d, i| d.join(format!("{i}-{}", "x".repeat(50))));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"x").unwrap();
+        let name = dir.to_str().unwrap();
+        assert!(name.len() > 260, "{}", name.len());
+        let (f, mut items) = rexplorer_core::folder::list(name).unwrap();
+        assert_eq!(items.len(), 1);
+        let renamed = items[0].rename(HWND::default(), "b.txt", true);
+        let moved = dir.join("b.txt").is_file() && !dir.join("a.txt").exists();
+        let new_name = items[0].parsing_name();
+        // Onto a taken name: refused, both files kept.
+        std::fs::write(dir.join("c.txt"), b"c").unwrap();
+        let onto_c = items[0].rename(HWND::default(), "c.txt", true);
+        let kept = (std::fs::read(dir.join("b.txt")).ok(), std::fs::read(dir.join("c.txt")).ok());
+        let bad = items[0].rename(HWND::default(), r"..\escape.txt", true);
+        // Trailing dots and spaces go, as in Explorer; what is left must be a usable file name.
+        let trimmed = items[0].rename(HWND::default(), "d.txt. .", true).is_ok() && dir.join("d.txt").is_file();
+        let refused = [".", "..", "...", " ", "CON", "nul.txt", "com1"].map(|n| items[0].rename(HWND::default(), n, true).is_err());
+        let only = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect::<Vec<_>>();
+        std::fs::remove_dir_all(&root).unwrap();
+        renamed.unwrap();
+        assert!(moved);
+        assert_eq!(f.parsing_name, name);
+        assert_eq!(new_name, dir.join("b.txt").to_str().unwrap(), "the item follows its new name");
+        assert!(onto_c.is_err());
+        assert_eq!(kept, (Some(b"x".to_vec()), Some(b"c".to_vec())));
+        assert!(bad.is_err());
+        assert!(trimmed);
+        assert_eq!(refused, [true; 7]);
+        assert_eq!(only, ["c.txt", "d.txt"]);
+    }
+
     #[test]
     fn search_rows_from_walker_and_paths() {
         let _com = ComInit::mta();
@@ -1038,7 +1145,7 @@ mod tests {
         std::fs::write(dir.join("needle.txt"), b"12345").unwrap();
         let root = ShellFolder::parse(dir.to_str().unwrap()).unwrap().pidl;
         let mut rows = Vec::new();
-        search::walk(&root, "needle", search::Scope::default(), &AtomicBool::new(false), &mut |h| rows.extend(rows_of(h))).unwrap();
+        search::walk(&root, &Query::parse("needle"), search::Scope::default(), &AtomicBool::new(false), &mut |h| rows.extend(rows_of(h))).unwrap();
         let by_path = hit_for_path(&dir.join("needle.txt")).map(|h| rows_of(vec![h]));
         std::fs::remove_dir_all(&dir).unwrap();
         // Folders first. The file's name follows the user's "hide extensions for known file types" setting.
@@ -1118,7 +1225,7 @@ mod tests {
         let from_index = index_hits(vec![a.clone(), a.to_uppercase()], &mut found);
         let root = ShellFolder::parse(dir.to_str().unwrap()).unwrap().pidl;
         let mut walked = Vec::new();
-        search::walk(&root, "needle", search::Scope::default(), &AtomicBool::new(false), &mut |h| walked.extend(new_hits(h, &found))).unwrap();
+        search::walk(&root, &Query::parse("needle"), search::Scope::default(), &AtomicBool::new(false), &mut |h| walked.extend(new_hits(h, &found))).unwrap();
         let walked: Vec<String> = walked.iter().map(|h| h.item.parsing_name()).collect();
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(from_index.len(), 1);

@@ -130,9 +130,8 @@ pub fn set_text(hwnd: HWND, left: &str, right: &str) {
 unsafe fn text_rects(dc: HDC, st: &State, w: i32, h: i32, dpi: u32) -> (RECT, RECT) {
     let pad = scale(PAD, dpi);
     let flags = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS;
-    let mut right: Vec<u16> = st.right.encode_utf16().collect();
     let mut rr = RECT { left: pad, top: 0, right: w - pad, bottom: h };
-    DrawTextW(dc, &mut right, &mut rr, flags | DT_RIGHT | DT_CALCRECT);
+    crate::theme::draw_text(dc, &st.right, &mut rr, flags | DT_RIGHT | DT_CALCRECT);
     let rw = rr.right - rr.left;
     let rr = RECT { left: (w - pad - rw).max(pad), top: 0, right: w - pad, bottom: h };
     // Centered in the width the right text leaves free on both sides.
@@ -193,10 +192,8 @@ unsafe fn paint(hwnd: HWND, st: &State) {
     SetTextColor(mem, COLORREF(st.theme.secondary_text));
     let flags = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS;
     let (mut lr, mut rr) = text_rects(mem, st, w, h, dpi);
-    let mut right: Vec<u16> = st.right.encode_utf16().collect();
-    DrawTextW(mem, &mut right, &mut rr, flags | DT_RIGHT);
-    let mut left: Vec<u16> = st.left.encode_utf16().collect();
-    DrawTextW(mem, &mut left, &mut lr, flags | DT_CENTER);
+    crate::theme::draw_text(mem, &st.right, &mut rr, flags | DT_RIGHT);
+    crate::theme::draw_text(mem, &st.left, &mut lr, flags | DT_CENTER);
 
     let _ = BitBlt(hdc, 0, 0, w, h, Some(mem), 0, 0, SRCCOPY);
     SelectObject(mem, old_font);

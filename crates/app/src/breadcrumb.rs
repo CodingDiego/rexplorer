@@ -33,6 +33,9 @@ pub const CN_DROPDOWN: u32 = 0x9013;
 /// A dropdown asked by keyboard for crumb `index`; place it with `menu_point`.
 pub const CN_DROPDOWN_KEY: u32 = 0x9014;
 
+/// The `CN_DROPDOWN` index of the folder icon left of the crumbs: the desktop's places (Explorer's root chevron).
+pub const ROOT: usize = usize::MAX;
+
 #[repr(C)]
 pub struct NmCrumb {
     pub hdr: NMHDR,
@@ -394,6 +397,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             WM_LBUTTONDOWN => {
                 let x = (lparam.0 & 0xFFFF) as i16 as i32;
                 match st.layout.hit(x - st.origin) {
+                    // The icon, when it shows (not on an archive or search page).
+                    Hit::Empty if x < st.origin && st.icon.is_some() => notify(hwnd, CN_DROPDOWN, ROOT),
                     Hit::Crumb(i) => notify(hwnd, CN_CRUMB, i),
                     Hit::Chevron(i) => notify(hwnd, CN_DROPDOWN, i),
                     Hit::Overflow => notify(hwnd, CN_DROPDOWN, 0),

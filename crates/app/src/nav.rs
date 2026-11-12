@@ -163,6 +163,7 @@ pub(crate) struct Loading {
     pub name: String,
     pub parsing: String,
     since: Instant,
+    history: History,
 }
 
 /// How the active tab's source is put into the ListView.
@@ -210,7 +211,7 @@ pub(crate) unsafe fn navigate(app: *mut App, t: usize, target: Target, history: 
         (*app).new_item = None;
         let (name, parsing) = destination(&target);
         tabs::set_title((*app).strip, t, &name);
-        tab.loading = Some(Loading { name, parsing, since: Instant::now() });
+        tab.loading = Some(Loading { name, parsing, since: Instant::now(), history });
         if t == (*app).active {
             present_loading(app);
         }
@@ -255,6 +256,25 @@ pub(crate) unsafe fn go(app: *mut App, target: Target, history: History) {
 }
 
 /// Where to go when `name` does not parse: Windows without Home (older Windows 10 builds) starts at This PC.
+/// `%NAME%` references in a typed address, expanded as Explorer does; an unknown name stays as typed.
+pub(crate) fn expand_env(s: &str, get: impl Fn(&str) -> Option<String>) -> String {
+    let (mut out, mut rest) = (String::new(), s);
+    while let Some(a) = rest.find('%') {
+        let after = &rest[a + 1..];
+        let Some(b) = after.find('%').filter(|&b| b > 0) else { break };
+        match get(&after[..b]) {
+            Some(v) => {
+                out.push_str(&rest[..a]);
+                out.push_str(&v);
+            }
+            None => out.push_str(&rest[..a + b + 2]),
+        }
+        rest = &after[b + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn fallback_of(name: &str) -> Option<&'static str> {
     name.eq_ignore_ascii_case(settings::HOME_START).then_some("shell:MyComputerFolder")
 }
@@ -357,8 +377,13 @@ pub(crate) fn crumbs_of(folder: &ShellFolder) -> Vec<Crumb> {
     out
 }
 
+/// The position of the tab whose `latest` counter is `id`, if it is still open (each tab has its own counter).
+fn find_tab<'a>(mut latests: impl Iterator<Item = &'a Arc<AtomicU64>>, id: &Arc<AtomicU64>) -> Option<usize> {
+    latests.position(|l| Arc::ptr_eq(l, id))
+}
+
 pub(crate) unsafe fn on_enum_done(app: *mut App, done: Box<EnumDone>) {
-    let Some(t) = (*app).tabs.iter().position(|x| x.pending == done.generation) else { return };
+    let Some(mut t) = (*app).tabs.iter().position(|x| x.pending == done.generation) else { return };
     (&mut (*app).tabs)[t].pending = 0;
     let was_loading = (&mut (*app).tabs)[t].loading.take().is_some();
     let hwnd = (*app).hwnd;
@@ -366,6 +391,26 @@ pub(crate) unsafe fn on_enum_done(app: *mut App, done: Box<EnumDone>) {
     let active = t == (*app).active;
     let loaded = match done.result {
         Err(LoadError { name, err }) => {
+            // An archive with encrypted names: ask for its password and load it again. The prompt is modal over the
+            // window; the tab is looked at again after it.
+            let archive = archive_view::split_archive_path(&name).map(|(a, _)| a);
+            let mut cancelled = false;
+            if let (Some(wrong), Some(archive)) = (rexplorer_core::archive::password_needed(&err), archive) {
+                let id = (&(*app).tabs)[t].latest.clone();
+                let asked = source::ask_password(app, &archive, wrong);
+                // The prompt pumps messages: a tab may have closed meanwhile and moved this one, or closed it.
+                let Some(now) = find_tab((*app).tabs.iter().map(|x| &x.latest), &id) else { return };
+                t = now;
+                match asked {
+                    Some(pw) => {
+                        rexplorer_core::archive::set_password(&archive, pw);
+                        navigate(app, t, Target::Name(name), done.history);
+                        return;
+                    }
+                    None => cancelled = true,
+                }
+            }
+            let active = t == (*app).active;
             // Decide about the tab before the message box: it pumps messages and other loads may land meanwhile.
             if (&mut (*app).tabs)[t].source.is_none() && (*app).tabs.len() > 1 {
                 close_tab(app, t);
@@ -383,7 +428,9 @@ pub(crate) unsafe fn on_enum_done(app: *mut App, done: Box<EnumDone>) {
             } else if let Some(s) = source(app) {
                 set_text((*app).addr, &s.editing_name());
             }
-            message(hwnd, &trf("err.open", &[("name", &crate::connect::redact(&name)), ("error", &err)]));
+            if !cancelled {
+                message(hwnd, &trf("err.open", &[("name", &crate::connect::redact(&name)), ("error", &err)]));
+            }
             return;
         }
         Ok(loaded) => loaded,
@@ -398,6 +445,10 @@ pub(crate) unsafe fn on_enum_done(app: *mut App, done: Box<EnumDone>) {
     }
     let tab = &mut (&mut (*app).tabs)[t];
     let old = tab.source.take();
+    let left_archive = match &old {
+        Some(Source::Archive(a)) => Some(a.listing.archive.clone()),
+        _ => None,
+    };
     let mut sort = None;
     let mut carry = None;
     let mut keep: Vec<String> = Vec::new();
@@ -463,9 +514,19 @@ pub(crate) unsafe fn on_enum_done(app: *mut App, done: Box<EnumDone>) {
         (*app).recent.push(&crate::connect::redact(&tab.name)); // recents are saved to disk
         if !(*app).secondary {
             (*app).recent.save();
+            // Tests drive windows too, and the test scripts run on a scratch profile (they always set both
+            // variables): neither may rewrite the user's jump list.
+            let scratch = ["REXPLORER_REG_BASE", "REXPLORER_INSTALL_DIR"].iter().any(|v| std::env::var_os(v).is_some());
+            if !cfg!(test) && !scratch {
+                crate::refresh_jump_list((*app).recent.items().to_vec());
+            }
         }
     }
     tab.source = Some(src);
+    // An archive left for somewhere else: its password goes once no tab shows it (Back asks again).
+    if let Some(a) = left_archive {
+        forget_unshown(app, &a);
+    }
     if active {
         show(app, if refresh { Show::Restore { top, selected: keep, columns: false } } else { Show::Fresh(keep) });
         commands::rename_new_item(app);
@@ -1043,7 +1104,37 @@ pub(crate) unsafe fn mark_changed(app: *mut App, items: &[Pidl]) -> bool {
 }
 
 pub(crate) unsafe fn go_back(app: *mut App) {
+    // Back while a new place is still loading returns to the place it left, as in Explorer: the chrome already shows
+    // the new place, but its history entry is only pushed when the load lands, so a plain jump would skip a step.
+    let tab = cur(app);
+    if back_cancels_load(tab.loading.as_ref().map(|l| l.history), tab.source.is_some()) {
+        return cancel_load(app);
+    }
     jump(app, true, 1);
+}
+
+/// Back cancels the load in flight when that load is a step forward into a new place (not a refresh, Back or
+/// Forward, whose history is already moved) and there is a place on screen to stay on.
+fn back_cancels_load(loading: Option<History>, has_source: bool) -> bool {
+    loading == Some(History::Push) && has_source
+}
+
+/// Drops the active tab's load in flight and shows the place it was leaving again, as a failed load does.
+unsafe fn cancel_load(app: *mut App) {
+    (*app).generation += 1;
+    let t = (*app).active;
+    let tab = cur(app);
+    // The worker gives up, and a result that still arrives no longer matches the tab.
+    tab.pending = 0;
+    tab.latest.store((*app).generation, Ordering::Relaxed);
+    tab.loading = None;
+    if let Some(s) = &tab.source {
+        tabs::set_title((*app).strip, t, &s.title());
+    }
+    save_view_state(app);
+    let tab = cur(app);
+    let (top, selected) = (tab.top, std::mem::take(&mut tab.selected));
+    show(app, Show::Restore { top, selected, columns: true });
 }
 
 pub(crate) unsafe fn go_forward(app: *mut App) {
@@ -1342,12 +1433,22 @@ pub(crate) unsafe fn close_tab(app: *mut App, t: usize) {
     } else if t == active {
         show_tab(app, t.min(n - 2), true);
     }
-    // Members extracted to show them; another tab on the same archive extracts again as it needs.
+    // Members extracted to show them; another tab on the same archive extracts again as it needs. Its password
+    // goes too, once no other tab shows the archive.
     if let Some(Source::Archive(a)) = &removed.source {
         let _ = std::fs::remove_dir_all(archive_view::show_dir(&a.listing.archive));
+        forget_unshown(app, &a.listing.archive);
     }
     drop(removed);
     session_changed(app);
+}
+
+/// Drops the password typed for `archive` unless a tab still shows it.
+unsafe fn forget_unshown(app: *mut App, archive: &std::path::Path) {
+    let shown = (*app).tabs.iter().any(|t| matches!(&t.source, Some(Source::Archive(b)) if b.listing.archive.as_path() == archive));
+    if !shown {
+        rexplorer_core::archive::forget_password(archive);
+    }
 }
 
 /// TN_MOVE: the strip already moved its title; the tab, the active index and the session follow.
@@ -1496,6 +1597,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn find_tab_follows_the_tab_not_its_old_index() {
+        let tabs: Vec<Arc<AtomicU64>> = (0..3).map(|_| Arc::default()).collect();
+        let id = tabs[2].clone();
+        assert_eq!(find_tab(tabs.iter(), &id), Some(2));
+        let after_close: Vec<_> = tabs[1..].to_vec();
+        assert_eq!(find_tab(after_close.iter(), &id), Some(1), "a tab before it closed");
+        assert_eq!(find_tab(tabs[..2].iter(), &id), None, "it closed");
+    }
+
+    #[test]
     fn history_jump_keeps_order() {
         let mut b = vec!["A", "B", "D", "E"];
         assert_eq!(take_steps(&mut b, 3), Some(("B", vec!["E", "D"])));
@@ -1506,6 +1617,17 @@ mod tests {
         assert_eq!(take_steps(&mut b, 0), None);
         assert_eq!(take_steps(&mut b, 9), None);
         assert_eq!(b, ["A"]);
+    }
+
+    #[test]
+    fn back_cancels_only_a_forward_step_in_flight() {
+        assert!(back_cancels_load(Some(History::Push), true));
+        // Nothing on screen to stay on, nothing loading, or a load whose history already moved: a normal Back.
+        assert!(!back_cancels_load(Some(History::Push), false));
+        assert!(!back_cancels_load(None, true));
+        for h in [History::Back, History::Forward, History::Refresh] {
+            assert!(!back_cancels_load(Some(h), true));
+        }
     }
 
     #[test]
@@ -1536,6 +1658,22 @@ mod tests {
         assert_eq!(destination(&Target::Name(typed.clone())), (typed.clone(), typed));
         let bad = "shell:NoSuchFolder".to_string();
         assert_eq!(destination(&Target::Name(bad.clone())), (bad.clone(), bad));
+    }
+
+    #[test]
+    fn typed_addresses_expand_environment_names() {
+        let get = |n: &str| match n.to_ascii_uppercase().as_str() {
+            "TEMP" => Some(r"C:\T".to_string()),
+            "USERPROFILE" => Some(r"C:\Users\u".to_string()),
+            _ => None,
+        };
+        assert_eq!(expand_env("%TEMP%", get), r"C:\T");
+        assert_eq!(expand_env(r"%userprofile%\Documents", get), r"C:\Users\u\Documents");
+        assert_eq!(expand_env(r"%TEMP%\%USERPROFILE%", get), r"C:\T\C:\Users\u");
+        assert_eq!(expand_env(r"%NOPE%\x", get), r"%NOPE%\x", "unknown names stay");
+        assert_eq!(expand_env("100% sure", get), "100% sure");
+        assert_eq!(expand_env("a%%b", get), "a%%b");
+        assert_eq!(expand_env(r"C:\plain", get), r"C:\plain");
     }
 
     #[test]

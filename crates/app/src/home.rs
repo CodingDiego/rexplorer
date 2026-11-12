@@ -1246,8 +1246,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_MOUSEMOVE => {
             if let Some((px, py)) = s.press {
                 let (x, y) = (lparam.0 as i16 as i32, (lparam.0 >> 16) as i16 as i32);
-                // MK_LBUTTON: the button is still down.
-                if wparam.0 & 1 != 0 && ((x - px).abs() > GetSystemMetrics(SM_CXDRAG) || (y - py).abs() > GetSystemMetrics(SM_CYDRAG)) {
+                // MK_LBUTTON or MK_RBUTTON: the button is still down (a right drag gets the shell's Copy / Move menu).
+                if wparam.0 & 3 != 0 && ((x - px).abs() > GetSystemMetrics(SM_CXDRAG) || (y - py).abs() > GetSystemMetrics(SM_CYDRAG)) {
                     s.press = None;
                     cancel_rename(hwnd, s);
                     notify(hwnd, HN_DRAG, 0);
@@ -1312,7 +1312,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 _ if ctrl => {}
                 _ => select_only(s, hit),
             }
-            if msg == WM_LBUTTONDOWN && !ctrl && hit.is_some() {
+            if !ctrl && hit.is_some() {
                 s.press = Some((cx, cy));
             }
             let _ = InvalidateRect(Some(hwnd), None, false);
@@ -1347,6 +1347,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             notify(hwnd, HN_CONTEXT_KEY, index);
         }
         WM_RBUTTONUP => {
+            s.press = None;
             let index = entry_at(hwnd, s, lparam).and_then(|e| s.entry(e)).map_or(usize::MAX, |x| x.index);
             notify(hwnd, HN_CONTEXT, index);
         }
@@ -1881,19 +1882,24 @@ mod tests {
             assert_eq!(SendMessageW(h, HM_SELECT_NAMED, None, None).0, 0);
             assert_eq!(selection(h).0, vec![100]);
             // A press on an entry, then the pointer moving past the drag size with the button down, starts a drag.
-            let drag = |dx: i32, keys: usize| {
+            let drag_with = |dx: i32, keys: usize, right: bool| {
                 let l = current_layout(h, state(h).unwrap());
                 let r = l.tiles[0];
                 let (x, y) = (r.left + 10, r.top + 10);
-                SendMessageW(h, WM_LBUTTONDOWN, Some(WPARAM(1)), Some(LPARAM(((y as isize) << 16) | x as isize)));
+                let (down, up) = if right { (WM_RBUTTONDOWN, WM_RBUTTONUP) } else { (WM_LBUTTONDOWN, WM_LBUTTONUP) };
+                SendMessageW(h, down, Some(WPARAM(if right { 2 } else { 1 })), Some(LPARAM(((y as isize) << 16) | x as isize)));
                 LAST.lock().unwrap().clear();
                 SendMessageW(h, WM_MOUSEMOVE, Some(WPARAM(keys)), Some(LPARAM(((y as isize) << 16) | (x + dx) as isize)));
-                SendMessageW(h, WM_LBUTTONUP, None, None);
+                SendMessageW(h, up, None, None);
                 LAST.lock().unwrap().contains(&(HN_DRAG, 0))
             };
+            let drag = |dx: i32, keys: usize| drag_with(dx, keys, false);
             assert!(drag(40, 1), "far with the button down");
             assert!(!drag(1, 1), "within the drag size");
             assert!(!drag(40, 0), "button up");
+            // The right button drags too (the shell then shows its Copy / Move menu); a right click stays a click.
+            assert!(drag_with(40, 2, true), "far with the right button down");
+            assert!(!drag_with(1, 2, true), "right button within the drag size");
             // A reload between the press and the move drops the press: the entry under it may be another item now.
             let r = current_layout(h, state(h).unwrap()).tiles[0];
             let (x, y) = (r.left + 10, r.top + 10);

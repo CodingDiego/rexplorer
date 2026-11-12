@@ -1,5 +1,9 @@
 //! Deterministic fuzz input for the parser tests: a seeded xorshift generator, no dependency. A failing case
-//! reproduces from its seed alone.
+//! reproduces from its seed alone. The checks both the seeded tests and fuzz/'s cargo-fuzz targets run:
+pub use crate::archive::fuzz_check as archive_member;
+pub use crate::cli::fuzz_check as command_line;
+pub use crate::i18n::fuzz_check as language_file;
+pub use crate::settings::fuzz_check as ini_file;
 
 pub struct Rng(u64);
 
