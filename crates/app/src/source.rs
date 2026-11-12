@@ -1101,10 +1101,16 @@ mod tests {
 
     /// #34: a folder whose path is over 260 characters lists, and its file renames, through the shell. It lives in
     /// the app's tests because only this exe carries app.manifest's longPathAware; it needs LongPathsEnabled=1.
+    /// %TEMP% with long names: the shell answers with them, and %TEMP% can be a short one (RUNNER~1 on CI).
+    fn long_temp() -> std::path::PathBuf {
+        let long = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        std::path::PathBuf::from(long.to_string_lossy().trim_start_matches(r"\\?\"))
+    }
+
     #[test]
     fn lists_and_renames_in_a_folder_over_260_characters() {
         let _c = ComInit::sta();
-        let root = std::env::temp_dir().join(format!("rexplorer-test-long-{}", std::process::id()));
+        let root = long_temp().join(format!("rexplorer-test-long-{}", std::process::id()));
         let dir = (0..6).fold(root.clone(), |d, i| d.join(format!("{i}-{}", "x".repeat(50))));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.txt"), b"x").unwrap();
@@ -1214,7 +1220,7 @@ mod tests {
     #[test]
     fn index_and_walk_hits_merge_without_duplicates() {
         let _com = ComInit::mta();
-        let dir = std::env::temp_dir().join(format!("rexplorer-merge-{}", std::process::id()));
+        let dir = long_temp().join(format!("rexplorer-merge-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         for n in ["needle-a.txt", "needle-b.txt"] {
             std::fs::write(dir.join(n), b"x").unwrap();

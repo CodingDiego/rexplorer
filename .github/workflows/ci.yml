@@ -48,7 +48,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.1
       - name: THIRD-PARTY-NOTICES.md lists exactly the crates in the exe
         run: |
-          diff <(cargo tree --locked -e normal,no-proc-macro --prefix none --format '{p}' \
+          diff <(cargo tree --color never --locked -e normal,no-proc-macro --prefix none --format '{p}' \
                    --target x86_64-pc-windows-msvc --target aarch64-pc-windows-msvc |
                  sed 's/ (\*)$//' | grep -v -e ' (' -e '^$' | sed 's/ v/ /' | sort -u) \
                <(sed -nE 's/^\| `([^`]+)` \| ([^ |]+) \|.*/\1 \2/p' THIRD-PARTY-NOTICES.md | sort -u)
