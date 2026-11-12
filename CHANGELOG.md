@@ -6,8 +6,22 @@ a line under Unreleased. Sections up to 0.1.4 were rebuilt from git history and 
 
 ## Unreleased
 
-Changes on `master` since 0.1.4. Several of the mouse-driven items are built and unit-tested but not yet tried with
-a real mouse; `docs/EXPLORER-PARITY.md` marks them UNVERIFIED.
+Nothing yet.
+
+## 0.2.0 - 2026-11-11
+
+Changes since 0.1.4. The release notes of this version (`.github/release-notes.md` at the tag) carry its Known gaps;
+`docs/EXPLORER-PARITY.md` marks what was proven on the exe (WORKS) and what is built but not yet tried (UNVERIFIED).
+
+**Changed.**
+- `--install` is a standalone install: the program, a Start menu shortcut and a Settings > Apps entry, and no folder,
+  drive, App Paths or Startup change. Making rexplorer the default file manager is `--register` (More > Make
+  rexplorer the default file manager), journaled in `takeover.txt`; `--unregister` (More > Give folders back to
+  Windows Explorer) and uninstall revert it. `--register` and `--unregister` take `--quiet` and exit 0, 1 or 2, and
+  honour the test registry base.
+- `scripts\install.ps1` installs the program only; new `scripts\master-install.ps1` installs and makes rexplorer the
+  default after a `.reg` backup of the keys it changes; new `scripts\restore-explorer.ps1` puts Windows Explorer back
+  without a working rexplorer.exe. All three take `-Quiet` and `-WhatIf`.
 
 **Added.**
 - Undo and redo (Ctrl+Z, Ctrl+Y) of rename, new items, delete to the Recycle Bin, paste and drops on the list.
@@ -25,6 +39,18 @@ a real mouse; `docs/EXPLORER-PARITY.md` marks them UNVERIFIED.
 - `--desktop-icons`: an opt-in view of the desktop's icons in a rexplorer window.
 - Spanish, chosen by Windows' language or `language=es`.
 - Desktop menu: right-drag on desktop icons, and Shift+F10 or the Menu key on the desktop.
+- Taskbar: one AppUserModelID (`CodingDiego.rexplorer`) for the process, its windows and the installed Start
+  shortcut, and a jump list with Frequent and Recent folders and a New window task.
+- Paste shortcut in the background menu; Run as administrator (and Ctrl+Shift+Enter) on programs.
+- Breadcrumb dropdowns for every shell folder (This PC, Network, shares, Control Panel), listed in the background,
+  and the folder icon's dropdown of the desktop's places, which reaches Control Panel and Libraries.
+- Cloud file marks from the file attributes: online-only and always kept on this device.
+- cargo-fuzz targets for the settings, theme, language, command-line and archive-name parsers in `fuzz/`.
+- Search filters in Explorer's syntax, with English and Spanish keys: `kind:`, `date:`, `size:`, `ext:` and quoted
+  phrases, for the walk, the Windows Search index and the volume index alike.
+- Encrypted .rar: a password prompt (kept in memory only while the archive is shown, never written to disk).
+- Archive members can be dragged out to other programs (extracted to a per-process temp folder first).
+- `%ENV%` names in the address bar.
 
 **Fixes.**
 - Rename selects the name without its extension.
@@ -35,6 +61,39 @@ a real mouse; `docs/EXPLORER-PARITY.md` marks them UNVERIFIED.
   reloads about once a second.
 - Refresh and sort keep the selection on the exact same names and keep the Shift+click anchor on the focused item.
 - The volume index is built per drive outside the cache lock.
+- Back while a folder is still loading returns to the folder you were on; it used to do nothing.
+- On search results, entering the searched folder's path in the address bar opens that folder instead of searching
+  again.
+- The preview pane no longer crashes the window when the selected entry has no detail line (seen on Home).
+- Folder options and Connect make their own font: a text size change while they are open no longer leaves them
+  with the main window's deleted one.
+- Copy, Cut and Paste no longer leave a thread behind each time (the Work Folders context-menu handler on Windows 11
+  started one per use; a 15-minute soak grew from 50 to 144 threads).
+- Rename: after Tab renamed one row and moved on, Shift+Tab back edited the old name.
+- Undo: Ctrl+Z after a paste from a folder row's menu, after any paste from a folder under %TEMP%, and after
+  Create shortcuts here did nothing.
+- The first click on a Date or Size header sorts newest or largest first, as Explorer, and headers show a hover
+  fill (#76, #79).
+- Home: a right-button press never started a drag.
+- Down on the toolbar's More button did nothing.
+- The item menu listed rexplorer's pin entry and the shell's own.
+- Properties on search results from several folders did nothing; it opens one sheet for all of them.
+- An indexed search in a moved Documents folder found nothing.
+- Paths over 260 characters: rename failed (the shell's rename stops there) and Delete failed without asking;
+  Delete there now asks to delete permanently, since the Recycle Bin cannot take such paths.
+- The address box, search box, file list and text preview had no accessible name.
+- A crash relaunch split an argument that ended in a backslash.
+- Extraction counted a link entry that unrar refused without an error as extracted.
+- Spanish: four Folder options labels were clipped, and the details pane's values overlapped long labels.
+
+**Known gaps.** As in the release notes: 61 behaviours of `docs/EXPLORER-PARITY.md` were proven on this build (and
+3 more on a scratch install base), 44 are built and unit-tested but not yet tried on the exe, 10 are partial.
+- Not yet tried by a person: Narrator or NVDA, a Windows contrast theme, Text size above 100% and other display
+  scales, two monitors, ARM64 hardware, Windows 10, and the jump list on the taskbar itself (checked in its file).
+- Cloud marks were never seen on real OneDrive placeholders, and show only in Details and List. Run as
+  administrator was never invoked in testing.
+- MTP phones open in an embedded Explorer view; rename in search results is unverified.
+- The exe is not code-signed, so SmartScreen may warn.
 
 ## 0.1.4 - 2026-10-11
 

@@ -11,14 +11,16 @@ rexplorer installs for your user only. It does not need an administrator and doe
 
 1. Get `rexplorer.exe` (or build it: `cargo build --release`).
 2. Run it once to try it. Nothing is changed on your PC yet.
-3. To install, run `rexplorer.exe --install`, or open **More > Install as default file manager...** in the app.
+3. To install it as a program, run `rexplorer.exe --install`, or open **More > Install rexplorer...** in the app.
    You can also run `powershell -ExecutionPolicy Bypass -File scripts\install.ps1`.
 
-Install copies the program to `%LOCALAPPDATA%\Programs\rexplorer\rexplorer.exe`. Windows may show a SmartScreen
-warning the first time you run a file that is not signed. Choose to run it only if you trust where you got it.
+Install copies the program to `%LOCALAPPDATA%\Programs\rexplorer\rexplorer.exe`, adds it to the Start menu and to
+Settings > Apps (where you can uninstall it). It does **not** change which program opens folders: Windows Explorer
+still does, and you start rexplorer yourself. Windows may show a SmartScreen warning the first time you run a file
+that is not signed. Choose to run it only if you trust where you got it.
 
-Install first warns you that it replaces Explorer's folder windows and any running rexplorer, and quits with code 2
-if you say No. If it fails halfway, a dialog offers **Roll back** (puts everything back) or **Keep changes**.
+Install asks first and quits with code 2 if you say No. If it fails halfway, a dialog offers **Roll back** (puts
+everything back) or **Keep changes**.
 
 The install can also copy your Windows Explorer settings (hidden files, extensions, status bar, start folder and
 a few more). You can do this any time with `rexplorer.exe --import-explorer`. It keeps a backup named
@@ -26,7 +28,15 @@ a few more). You can do this any time with `rexplorer.exe --import-explorer`. It
 
 ## Make it the default, and what that changes
 
-After install, these open in rexplorer:
+Making rexplorer the default file manager is a separate step, which you can undo at any time:
+
+- In rexplorer: **More > Make rexplorer the default file manager...**, or run `rexplorer.exe --register`.
+- Or install and make it the default in one go:
+  `powershell -ExecutionPolicy Bypass -File scripts\master-install.ps1`. Before it changes anything it saves the
+  keys it is about to change to `%LOCALAPPDATA%\rexplorer\backup\explorer-keys-<date>.reg` and prints where that
+  file is and how to go back.
+
+After that, these open in rexplorer:
 
 - Opening a folder or drive from the desktop, a shortcut or another program.
 - Win+E, the taskbar's File Explorer icon and Start's File Explorer (they open at Home).
@@ -38,22 +48,47 @@ These stay Windows Explorer's: the desktop itself, the taskbar, Start, other pro
 Explorer windows that were already open, and programs that start `C:\Windows\explorer.exe` by its full path
 (many "Show in folder" buttons).
 
-Everything install created is listed in `%LOCALAPPDATA%\Programs\rexplorer\install.txt`.
+Everything install created is listed in `%LOCALAPPDATA%\Programs\rexplorer\install.txt`, and what making it the
+default changed in `takeover.txt` next to it.
 
 ## Go back to Explorer
 
-Three ways, from nicest to last resort.
+To keep rexplorer as a program but have folders open in Windows Explorer again:
 
-1. In rexplorer: **More > Uninstall...**.
-2. From a terminal or Win+R: `%LOCALAPPDATA%\Programs\rexplorer\rexplorer.exe --uninstall`.
-   If you still have the scripts: `powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Uninstall`.
-3. If rexplorer will not start at all, Windows Explorer is still there. Press Win+R, type
-   `C:\Windows\explorer.exe` and press Enter to get an Explorer window. Then press Win+R again and run the
-   command in step 2.
+1. In rexplorer: **More > Give folders back to Windows Explorer...**.
+2. Or from a terminal or Win+R: `%LOCALAPPDATA%\Programs\rexplorer\rexplorer.exe --unregister`.
 
-Uninstall shows a summary and removes the registry values that still name rexplorer, the Start shortcut, the
-Startup shortcut for the desktop menu and the program copy. A value another program changed since is left alone.
-Your settings in `%APPDATA%\rexplorer` stay, and an import from Explorer is not undone.
+To remove rexplorer completely (this gives folders back first): **More > Uninstall...**, Settings > Apps >
+rexplorer > Uninstall, `%LOCALAPPDATA%\Programs\rexplorer\rexplorer.exe --uninstall`, or
+`powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Uninstall`.
+
+Both remove only the registry values that still name rexplorer (a value another program changed since is left
+alone) and the Startup shortcut for the desktop menu; uninstall also removes the Start shortcut, the Apps entry and
+the program copy. Your settings in `%APPDATA%\rexplorer` stay, and an import from Explorer is not undone.
+
+Windows Explorer windows that are already open, and the taskbar, may keep the old setting until you sign out and
+back in.
+
+## When rexplorer will not start
+
+Windows Explorer is still there. Press Win+R, type `C:\Windows\explorer.exe` and press Enter to get an Explorer
+window. Then put Explorer back with the restore script, which does not need rexplorer to work:
+
+```
+powershell -ExecutionPolicy Bypass -File scripts\restore-explorer.ps1
+```
+
+It closes rexplorer windows that run from the install folder, removes every setting that makes rexplorer open
+folders (it reads the install records when they are there and otherwise uses its own list), and keeps rexplorer
+installed as a program. Add `-RemoveProgram` to remove the program too; this happens anyway when rexplorer.exe is
+already missing. It is safe to run more than once. Add `-WhatIf` to see what it would do first.
+
+At the end it reminds you that the running Explorer shell may still hold the old setting. Sign out and back in, or
+run it again with `-RestartShell`: that restarts `explorer.exe`, but only when no Explorer window and no file copy is
+open.
+
+After a master install you can also put the saved keys back exactly as they were:
+`reg import %LOCALAPPDATA%\rexplorer\backup\explorer-keys-<date>.reg`.
 
 If rexplorer crashes, it restarts itself and restores your tabs. If it crashes again within 60 seconds, it opens
 the folder in Windows Explorer instead, so a crash loop ends in Explorer.
@@ -74,7 +109,8 @@ These are the defaults, taken from the key table in the app. Where a key is rebo
 | Ctrl+F, Ctrl+E, F3 | Search box (Enter searches, Esc stops) |
 | Ctrl+P | Palette: recent places, bookmarks and subfolders, fuzzy matched |
 | Ctrl+D | Pin the selected folders (or this folder) to Home |
-| F6, Shift+F6 (also Tab, Shift+Tab) | Next, previous pane |
+| F6, Shift+F6 (also Tab, Shift+Tab) | Next, previous pane, the three toolbars included |
+| Left, Right, Home, End; Enter, Space, Down (in a toolbar) | Move between buttons; press one or open its menu; Esc returns to the files |
 | Ctrl+Shift+E | Open this folder in Windows Explorer |
 | Esc | Stop a search, or cancel a cut |
 
@@ -94,7 +130,9 @@ These are the defaults, taken from the key table in the app. Where a key is rebo
 | Keys | Action |
 |---|---|
 | F2, Delete, Shift+Delete, Ctrl+C, Ctrl+X, Ctrl+V, Ctrl+A, Alt+Enter | The usual verbs on the selection (Alt+Enter is Properties) |
+| F2, or click the name of a selected item again | Rename (the name is selected without its extension); Tab and Shift+Tab rename the next or previous item |
 | Ctrl+Shift+N | New folder, then rename it |
+| Ctrl+Shift+Enter | Run the selected program as administrator |
 | Ctrl+Z, Ctrl+Y | Undo, redo |
 | Ctrl+I | Invert the selection |
 | Ctrl+Shift+C | Copy the selected paths as text |
@@ -217,6 +255,11 @@ icons there in the background the first time; it never overwrites a PNG, so you 
 When Windows is in a high contrast theme, rexplorer uses the system colors instead of the theme file. This has not
 been tested under a contrast theme yet; see the release notes.
 
+Windows' **Settings > Accessibility > Text size** (up to 225%) grows rexplorer's text and the bars and rows that
+hold it, live, without a restart. Fixed widths (the sidebar, the panes, the search box) do not grow, so long text
+there ends in "...". Folder options and Connect pick up a new size the next time they open. This was not yet
+checked by eye above 100%.
+
 ## Languages
 
 rexplorer speaks English and Spanish. With `language=system` it follows Windows. Set `language=en` or
@@ -234,11 +277,11 @@ rexplorer [options] [folder...]
   --new-window        open a second window (it saves no tabs, placement or recents)
   --desktop-icons     show the desktop's icons in a rexplorer window (opt-in, primary monitor)
   --search <text>     search the (first) folder opened for <text>
-  --register          open folders and Win+E with this exe (per user; asks first)
-  --unregister        undo --register
-  --install           copy rexplorer to %LOCALAPPDATA%\Programs and make it the default file manager
-  --uninstall         undo --install
-  --quiet             with --install or --uninstall: no dialogs; a failed install rolls back
+  --register          make rexplorer the default file manager (folders, drives, Win+E; asks first)
+  --unregister        give folders back to Windows Explorer (undo --register)
+  --install           copy rexplorer to %LOCALAPPDATA%\Programs as a normal program; Explorer still opens folders
+  --uninstall         give folders back to Explorer, then undo --install
+  --quiet             with --install, --uninstall, --register or --unregister: no dialogs; a failure rolls back
   --import-explorer   copy Windows Explorer's settings into the active profile (backs up settings.ini)
   --overwrite         with --import-explorer: also replace values you changed in rexplorer
   --recover           restore the previous session after a crash
@@ -247,8 +290,8 @@ rexplorer [options] [folder...]
   -h, --help          show this help
 ```
 
-`--install` and `--uninstall` exit with 0 when done, 1 when failed and 2 when cancelled at the confirmation. With
-`--quiet` nothing is asked, so the result is the exit code alone.
+`--install`, `--uninstall`, `--register` and `--unregister` exit with 0 when done, 1 when failed and 2 when
+cancelled at the confirmation. With `--quiet` nothing is asked, so the result is the exit code alone.
 
 Folders can be paths, `shell:` names, `::{CLSID}` strings, UNC paths or .rar paths. Explorer-style arguments work
 too: `/select,<path>`, `/e,<path>`, `/root,<path>`, `/n` and `/separate`. A second launch passes its folders to
@@ -257,8 +300,8 @@ the window that is already running and exits. Arguments rexplorer does not under
 
 ## Troubleshooting
 
-**I want Explorer back right now.** See "Go back to Explorer" above. If nothing starts, Win+R, then
-`C:\Windows\explorer.exe`.
+**I want Explorer back right now.** See "Go back to Explorer" above. If nothing starts, see "When rexplorer will
+not start": Win+R, `C:\Windows\explorer.exe`, then `scripts\restore-explorer.ps1`.
 
 **A folder seems to hang.** After about 120 ms a folder that is still loading shows a placeholder with its name
 and "Loading..." in the status bar, so the window is not frozen. Big folders, network drives and slow shell
@@ -267,7 +310,7 @@ extensions can take a while. Wait, or press Back or open another folder. F5 trie
 
 **Double-clicking a folder does nothing.** Try Enter. If a folder opened from another program does nothing,
 rexplorer may not be reaching the running window. Check that the app is not stuck, then try Ctrl+Shift+E to open
-the folder in Explorer. If this keeps happening, uninstall (see above).
+the folder in Explorer. If this keeps happening, give folders back to Explorer (see above).
 
 **Dragging files to other programs does not work.** This is a known problem; see the release notes and
 `docs/EXPLORER-PARITY.md`. Copy and paste (Ctrl+C, Ctrl+V) works.

@@ -111,8 +111,7 @@ SOFTWARE.
 
 ## Assets
 
-- App icon (`crates/app/app.ico`, the only file embedded as a resource): see the release notes for its current
-  source. Until rexplorer has its own icon ([#18](https://github.com/CodingDiego/rexplorer/issues/18)) it is
-  Windows Explorer's icon, Microsoft's artwork.
+- App icon (`crates/app/app.ico`, the only image embedded as a resource): rexplorer's own artwork, drawn by
+  `scripts/make-icon.py`, under rexplorer's MIT license.
 - The English and Spanish text (`crates/core/src/lang/*.ini`) is rexplorer's own.
 - No fonts or other images are bundled. Fonts, file icons and thumbnails come from Windows at run time.

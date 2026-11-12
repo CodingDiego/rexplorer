@@ -11,9 +11,11 @@ Legend: **[blocker]** must be done for 1.0 · **[should]** expected for 1.0 unle
 the release notes · **[later]** fine for 1.x.
 
 A box is ticked only when the code or text that meets its "done when" was read in the tree. *Status 2026-11-10*
-lines record the v1 release-candidate round (branch `ADD/v1-release-candidate`, uncommitted): what exists and what
-is left. "Compiled only" means its tests build and were not run; [HANDOFF.md](HANDOFF.md) lists every check still
-to run.
+lines record what the v1 release-candidate round (branch `ADD/v1-release-candidate`) built; *Status 2026-11-11*
+lines record what was then run: the whole test suite (233 app, 214 core and 7 data-operation tests, three runs in a
+row), clippy, `scripts/smoke.ps1` (0 FAIL, 2 SKIP that need `-UserState`), and live checks on a copy of the exe,
+many with real keyboard and mouse input. [docs/EXPLORER-PARITY.md](docs/EXPLORER-PARITY.md) has the evidence per
+behaviour.
 
 ## 1. Legal and branding
 
@@ -24,6 +26,7 @@ to run.
   *Status 2026-11-10:* an original icon (`scripts/make-icon.py`, standard library only; 8 sizes in `app.ico`),
   `extract-icon.py` deleted, README updated. Left: commit it, the user approves the artwork, and
   `THIRD-PARTY-NOTICES.md`'s Assets line still calls the icon Explorer's.
+  *Status 2026-11-11:* `THIRD-PARTY-NOTICES.md` Assets now names the icon as rexplorer's own. Left: the user approves the artwork.
 - [x] **[blocker] Complete third-party notices.** ([#19](https://github.com/CodingDiego/rexplorer/issues/19)) *Done when:* `THIRD-PARTY-NOTICES.md` covers every bundled crate
   license (generated, for example with `cargo about`) and every asset in the binary.
   *Status 2026-11-10:* the 20 crates in the exe (x64 and arm64), UnRAR and Intel's Slicing-by-8 notice, an Assets
@@ -34,6 +37,7 @@ to run.
   *Status 2026-11-10:* README non-affiliation line, a VERSIONINFO resource naming rexplorer only (`app.rc:4-27`), a
   localized shortcut description. Left: the icon line in `THIRD-PARTY-NOTICES.md`; the winget locale manifest is
   the first store listing to review.
+  *Status 2026-11-11:* the icon line is fixed. Left: a person reviews the winget locale text.
 
 ## 2. Accessibility
 
@@ -47,23 +51,34 @@ Automation clients read through Windows' bridge. None of it has been tried with 
   a pane named after the file, one text line per caption or details row, name-change events. Left: Narrator and
   NVDA by hand; the address and search Edits have no accessible name; while a text or handler preview shows, the
   pane lists no child windows (pure-MSAA clients may lose the Edit or the handler).
+  *Status 2026-11-11:* the address box, search box, file list and text preview now have names; smoke `accessibility` walks every
+  visible child window on Home and on a folder with the preview pane and finds no unnamed focusable or interactive
+  object. Left: Narrator and NVDA (a person, with a speaker); the preview's child windows.
 - [ ] **[blocker] Full keyboard reach.** ([#22](https://github.com/CodingDiego/rexplorer/issues/22)) *Done when:* every control is reachable with Tab/F6 and operable without a
   mouse, the sidebar included. The focus is always visible, and the README's keyboard section covers each control.
   *Status 2026-11-10:* F6 and Tab now also reach the navigation toolbar, the tools bar and the command bar
   (`toolbar.rs:579-620`, focus rectangle `:522`; `main.rs:566` `pane_accel` keeps F6 and Tab working from them).
   Left on the first shown crumb opens the "..." overflow menu. README keys updated. Left: a real keyboard run; the
   overflow opens the root's subfolder menu, not a list of the hidden crumbs (as by mouse).
+  *Status 2026-11-11:* real F6, Tab and their Shift forms walk every pane and the three toolbars with no trap; arrows, Home, End,
+  Enter, Space, Down, Alt+Down and Esc work in the toolbars (Down on More fixed); the focus rectangle shows; arrows
+  move on the tab strip. Left: the sidebar and Home keys pressed for real, the focus rectangle under a contrast theme.
 - [ ] **[blocker] High contrast.** ([#23](https://github.com/CodingDiego/rexplorer/issues/23)) *Done when:* with a Windows contrast theme on, rexplorer uses system colors
   instead of its themes, and nothing is invisible.
   *Status 2026-11-10:* built (`theme.rs` `effective_theme`); never seen under a real contrast theme.
+  *Status 2026-11-11:* unchanged. Only a person can switch Windows to a contrast theme.
 - [ ] **[should] Text scaling.** ([#24](https://github.com/CodingDiego/rexplorer/issues/24)) *Done when:* Windows "Text size" (Accessibility > Text size) up to 225% gives no clipped or
   overlapping text.
   *Status 2026-11-10:* fonts and text-holding metrics follow `TextScaleFactor` (`theme.rs:275-308`), live on
   `WM_SETTINGCHANGE`. Left: the visual check at 150/200/225%; fixed or user-set widths do not grow (ellipsis).
-- [ ] **[should] An accessibility check in the smoke test.** ([#25](https://github.com/CodingDiego/rexplorer/issues/25)) *Done when:* an automated pass walks the UIA tree and fails on unnamed
+  *Status 2026-11-11:* not checked by eye: Windows' Text size is the user's setting. Folder options and Connect keep a live font
+  of their own while the main window replaces its font (checked by WM_GETFONT).
+- [x] **[should] An accessibility check in the smoke test.** ([#25](https://github.com/CodingDiego/rexplorer/issues/25)) *Done when:* an automated pass walks the UIA tree and fails on unnamed
   interactive elements.
   *Status 2026-11-10:* `scripts/smoke.ps1` check `accessibility` (`:1172`), with a commented exclusion list. Never
   run, so the exclusions are untuned.
+  *Status 2026-11-11:* ticked. The check walks the MSAA tree (the managed UIA client read an empty tree) and passes on this
+  build; a throwaway build with the custom controls' names blanked made it fail with 12 unnamed objects.
 
 ## 3. Data safety and reliability
 
@@ -74,11 +89,19 @@ Automation clients read through Windows' bridge. None of it has been tried with 
   rename onto a taken name, cancel, New folder) compiled only. Extraction never replaces an existing file and never
   writes outside the target (`archive.rs:35`, `:124-150`). Left: run the tests; Skip as an answer, end-to-end paste
   and drop, New > text document.
+  *Status 2026-11-11:* `data_ops.rs` runs and passes (7 tests, three suite runs in a row; the rename test answers the
+  shell's real conflict question). Extract here next to an older extraction kept the old files and reported the
+  skipped ones; paste, cut and drop with Explorer were driven live. Left: Skip as an answer, New > text document,
+  and a Replace / Keep both comparison with Explorer side by side.
 - [ ] **[blocker] Undo and redo.** ([#27](https://github.com/CodingDiego/rexplorer/issues/27)) Explorer users rely on Ctrl+Z. *Done when:* Ctrl+Z undoes the last copy, move, rename,
   delete-to-Recycle-Bin and new item through the shell's undo (or an equivalent), and Ctrl+Y redoes.
   *Status 2026-11-10:* now also recorded: drops on the sidebar, crumbs, tabs and Home (`list.rs:545-572`), the
   shell's New submenu, and Delete and rename in `--desktop-icons` (`desktop_icons.rs:600`). Not recorded: pastes
   staged in %TEMP%, Keep-both copies, paste or drop on `--desktop-icons`. Needs a real-mouse run.
+  *Status 2026-11-11:* real-mouse and real-key runs undid and redid rename, New folder, Delete, copy and move pastes (Explorer's
+  too), menu pastes, drops on the list, a folder row, a sidebar row, a crumb and a tab, and right-drag copy, move and
+  shortcut. Fixed: paste from a folder row's menu, pastes from %TEMP%, Create shortcuts here. Left: drops on Home, the
+  New submenu, `--desktop-icons` (never run from a session) and Keep-both copies.
 - [ ] **[blocker] Panic audit.** ([#28](https://github.com/CodingDiego/rexplorer/issues/28)) *Done when:* no `unwrap`/`expect` remains on any shell, filesystem, registry or
   window result outside tests, and every fallible path degrades: a beep, a message, or the embedded Explorer view.
   *Status 2026-11-10:* COM/OLE init, the menu verb string, USN parsing and the mutex locks no longer panic; a scan
@@ -89,16 +112,24 @@ Automation clients read through Windows' bridge. None of it has been tried with 
   a stated margin. The test runs before every release.
   *Status 2026-11-10:* `scripts/soak.ps1` (margin: end median ≤ baseline median × 1.05 + slack). Never run; the
   8-hour run needs an idle machine. It leaves out the app's Delete and Undo (both recycle).
+  *Status 2026-11-11:* three 15-minute runs (`scripts/bench-results.md`) found a thread leak per Copy, Cut and Paste and two app
+  bugs, all fixed; GDI still grows about 0.7 per paste inside the Windows copy engine. Left: the 8-hour run on an idle
+  machine (the user), and a decision on that GDI growth.
 - [ ] **[should] Crash reports users can send.** ([#30](https://github.com/CodingDiego/rexplorer/issues/30)) Crash recovery exists (`--recover`, a second crash opens Explorer).
   *Done when:* a crash also writes a minidump and a short text report under `%LOCALAPPDATA%\rexplorer\crashes`, and
   `SECURITY.md`/README say how to send them (no telemetry).
   *Status 2026-11-10:* minidump per crash, the newest 10 kept (`crash.rs:86-160`); a panic also writes a `.txt`
   with message and backtrace; the recovered window offers to open the folder (`main.rs:509`). README says how to
   send them. Left: `SECURITY.md` text; native (SEH) crashes get the dump only, no `.txt`.
+  *Status 2026-11-11:* a live crash left a minidump and relaunched with `--recover` on the same folder (also from a folder whose
+  name has a space; smoke `crash-recovery` PASS); Yes on the notice opened the crashes folder. `SECURITY.md` now says
+  where reports live and how to send them. Left: SEH crashes still get no `.txt`.
 - [x] **[should] Hang watchdog.** ([#31](https://github.com/CodingDiego/rexplorer/issues/31)) *Done when:* a UI thread blocked for more than N seconds is detected and logged
   with the operation it was running.
   *Status 2026-11-10:* `crates/app/src/watchdog.rs`: N = 5 s, `hang:` and `answered again` lines in
   `rexplorer.log`, operation labels for navigate and the context menu. Tests compiled only.
+  *Status 2026-11-11:* with the UI thread suspended 7 s, `rexplorer.log` got the hang line and the "answered again" line; an
+  11 s modal box logged nothing. The tests pass.
 
 ## 4. Compatibility
 
@@ -107,10 +138,12 @@ Automation clients read through Windows' bridge. None of it has been tried with 
   Windows 11 10.0.26200 is tested. Home already falls back to This PC where it does not exist.
   *Status 2026-11-10:* README names Windows 10 22H2 and 11; the Home fallback is `nav.rs` `fallback_of` with a test.
   Left: smoke runs on Windows 10 22H2 and two Windows 11 releases, a tested-on table.
+  *Status 2026-11-11:* smoke ran on this Windows 11 machine only. Left: Windows 10 22H2 and two Windows 11 releases (VMs).
 - [ ] **[blocker] Display scaling and multi-monitor.** ([#33](https://github.com/CodingDiego/rexplorer/issues/33)) *Done when:* everything is checked at 100/125/150/200/250% and on mixed-DPI multi-monitor
   setups (drag between monitors), in light and dark mode.
   *Status 2026-11-10:* the main window, Folder options and Connect rebuild their fonts on `WM_DPICHANGED`. Left:
   the whole matrix by hand.
+  *Status 2026-11-11:* unchanged; display scale and monitors are the user's settings and hardware.
 - [ ] **[blocker] Every place Explorer users browse.** ([#34](https://github.com/CodingDiego/rexplorer/issues/34)) *Done when:* each of these is verified:
   - mapped drives and UNC shares, both reachable and unreachable (no hang);
   - OneDrive placeholders (online-only, always-keep, sync errors);
@@ -119,10 +152,14 @@ Automation clients read through Windows' bridge. None of it has been tried with 
 
   *Status 2026-11-10:* the exe declares `longPathAware` (`crates/app/app.manifest`), the folder picker has no
   260-character buffer, and navigation parses only on its worker. Every place above still needs real hardware.
+  *Status 2026-11-11:* with LongPathsEnabled on, a 304-character folder lists, real F2 renames in it (rename uses MoveFileExW
+  there) and Delete asks to delete permanently; breadcrumb dropdowns list a share over SMB without blocking the
+  window. Left: mapped drives, OneDrive, MTP, WSL, BitLocker and removable media.
 - [ ] **[should] ARM64 build.** ([#35](https://github.com/CodingDiego/rexplorer/issues/35)) *Done when:* releases include a native arm64 zip that passes the smoke test on ARM
   hardware.
   *Status 2026-11-10:* the release job cross-compiles `rexplorer-<v>-arm64.zip` and CI runs clippy for arm64.
   Never built or run; needs ARM hardware.
+  *Status 2026-11-11:* not built here (no aarch64 target installed). Left: the first release run and ARM hardware.
 - [ ] **[should] FTP verified or dropped.** ([#36](https://github.com/CodingDiego/rexplorer/issues/36)) The README calls it untested against a live server. *Done when:* it is tested against one, or removed
   from the docs.
   *Status 2026-11-10:* deferred: README "Not part of 1.0" says FTP is present but unverified, with the reason.
@@ -137,6 +174,8 @@ Spanish dialogs have not been checked for clipped text; #37 stays open until tha
   missing translation falls back to English.
   *Status 2026-11-10:* two more strings moved (the desktop icons window name, the Start menu shortcut
   description). The sweep was grep-based. Left: the Spanish clipped-text check.
+  *Status 2026-11-11:* Spanish checked on screenshots at 100%: four clipped Folder options labels and the details pane's overlap
+  fixed; the i18n parity tests pass. Left: a proofreader, and the check at a larger Text size.
 - [x] **[should] First translations.** ([#38](https://github.com/CodingDiego/rexplorer/issues/38)) *Done when:* Spanish ships in addition to English, and the process to add a
   language is documented in CONTRIBUTING.md.
   *Status 2026-11-10:* CONTRIBUTING.md "Translations". Spanish still wants a proofreader.
@@ -148,13 +187,18 @@ Spanish dialogs have not been checked for clipped text; #37 stays open until tha
 Each gap below is either closed, or explicitly accepted for 1.0 and listed under "Known gaps" in the release notes.
 The row-by-row status of every Explorer behaviour is in [docs/EXPLORER-PARITY.md](docs/EXPLORER-PARITY.md).
 
-- [ ] **[blocker] No BROKEN or REPORTED BROKEN rows in the parity checklist.** As of 2026-11-09: dragging files
+- [x] **[blocker] No BROKEN or REPORTED BROKEN rows in the parity checklist.** As of 2026-11-09: dragging files
   to other programs ([#75](https://github.com/CodingDiego/rexplorer/issues/75)) is broken; F2 rename and click-again
   rename were reported broken and pass when driven with window messages. *Done when:* each is proven with a real
   keyboard and mouse on the built exe, and the checklist row reads WORKS.
   *Status 2026-11-10 (#75):* cause still unknown. A refused or cancelled drag no longer shows an error box, and each
   drag that applied nothing is logged to `rexplorer.log` with the button state and duration
   (`dragdrop.rs:167`), to find the cause on the next real-mouse run.
+  *Status 2026-11-11:* ticked: the checklist has no BROKEN or REPORTED BROKEN row. On the final build, with real
+  input guarded to rexplorer's own window: F2 rename 5 of 5 and click-again rename 5 of 5 in a folder (renamed on
+  disk) and on Home (edit opened, stayed, Esc); dragging out to another program 5 of 5 from a folder and 5 of 5 from
+  Home tiles. #75 did not reproduce on OLE, WM_DROPFILES and Explorer targets; browsers, WhatsApp and VS Code (the
+  user's apps) were not tried, so #75 stays open until the user drags into one of them.
 - [ ] **[blocker] Daily-use rows of the parity checklist.** *Done when:* every MISSING or PARTIAL row in its
   sections 1 to 7 and 10 is WORKS, or accepted for 1.0 with a reason in the release notes.
 
@@ -167,23 +211,34 @@ The row-by-row status of every Explorer behaviour is in [docs/EXPLORER-PARITY.md
   *Status 2026-11-10:* `crates/core/src/wsearch.rs` queries the index for a covered root and walks the folders its
   rules leave out (`excluded_below`); anything else falls back to the walk. Left: thumbnails and preview for result
   rows, and a live run with the WSearch service on.
+  *Status 2026-11-11:* live with WSearch on: result counts in an indexed folder equal a walk for five queries; the filters
+  (`kind:`, `date:`, `size:`, `ext:`, Spanish keys) return exactly the expected files; thumbnails, preview and
+  details pane work for results; a moved Documents folder falls back to the walk. Left: sort, rename and delete in
+  results.
 - [x] **[should] Search results context menu and Back** ([#42](https://github.com/CodingDiego/rexplorer/issues/42)) across results from different folders, and Back returns to the results.
   *Status 2026-11-10:* `menu.rs:72` `for_scattered`; `nav.rs:29-41` keeps the last 4 results per tab. Not run on
   the exe.
+  *Status 2026-11-11:* proven live: one menu and one Properties sheet for results from two folders; Back returns to the results.
 - [ ] **[should] Archive view.** ([#43](https://github.com/CodingDiego/rexplorer/issues/43)) *Done when:* archive members get icons, thumbnails and preview in all views;
   multi-volume and encrypted RAR are tested; zip either goes through the same view or the difference is documented.
   *Status 2026-11-10:* member icons, picture thumbnails and a preview up to 32 MB (`archive_view.rs:142-169`). Left:
   encrypted RAR (no password prompt) and multi-volume fixtures, which need WinRAR.
+  *Status 2026-11-11:* a password prompt for encrypted RAR5 (headers or members), proven live on fixtures built by
+  `scripts/make-rar-fixtures.ps1`; members drag out to other programs (live); crafted names and links are refused
+  (live). Left: thumbnails checked by eye, multi-volume archives.
 - [x] **[should] Themed embedded Explorer view** ([#44](https://github.com/CodingDiego/rexplorer/issues/44)) follows the theme, or the difference is documented.
   *Status:* documented in the README Known gaps (it keeps Windows' own colors).
 - [x] **[should] Home page completeness.** ([#45](https://github.com/CodingDiego/rexplorer/issues/45)) *Done when:* the location-status column exists, sort works, and the undocumented
   `System.Home.Grouping` value is guarded (a missing value degrades quietly).
   *Status 2026-11-10:* Status column (`home.rs:161`), header and Sort-menu sorting (`home.rs:392`), `is_shared`
   guard (`home.rs:155`). Not run on the exe; the sort is not saved across restarts.
+  *Status 2026-11-11:* not driven live (Home lists the user's real places); smoke `home-page` PASS.
 - [ ] **[should] Send to, Properties on multiple selections, file conflict dialogs and progress** ([#46](https://github.com/CodingDiego/rexplorer/issues/46)) behave exactly as in
   Explorer (all from the shell; verified, not reimplemented).
   *Status 2026-11-10:* a test opens one Properties sheet for three files (`menu.rs:395`); no app path silences the
   shell's conflict or progress UI. Left: the on-screen comparison with Explorer.
+  *Status 2026-11-11:* Properties on three files and on results from several folders opens one sheet (live). Left: Send to, and
+  the on-screen comparison with Explorer.
 - [ ] **[later] Tab drag and drop.** ([#47](https://github.com/CodingDiego/rexplorer/issues/47)) Drag a tab to a new window, and drag files onto a tab.
   *Status 2026-11-10:* tear-out and drops on a tab are built; merging a tab into another window is deferred (README
   "Not part of 1.0").
@@ -201,6 +256,8 @@ Measured on 2026-10-11 with the 0.1.4 work, on a 12-core laptop:
   session.
   *Status 2026-11-10:* `scripts/budgets.ps1` checks start (to the first visible window), the 100k listing and idle
   CPU. Never run, not in CI. Left: first ink, churn reloads and UI-thread calls need hooks in the app.
+  *Status 2026-11-11:* measured on this machine: PASS at 400 ms start, 400 ms for 100k files and 0.5% idle
+  (`scripts/bench-results.md`). Left: budgets for a CI runner, and the in-app hooks.
 - [x] **[should] UI-thread budget tooling.** ([#49](https://github.com/CodingDiego/rexplorer/issues/49)) *Done when:* a debug build logs every UI-thread message that takes over 50 ms,
   with its source.
   *Status 2026-11-10:* `watchdog::dispatch` (`main.rs:531`) logs `slow:` lines in debug builds. Nested modal loops
@@ -217,6 +274,7 @@ From 1.0, breaking any of these needs 2.0:
   documented as stable, with a test per flag (`cli.rs` already checks that usage lists all of them).
   *Status 2026-11-10:* README Command line lists the frozen set; `cli.rs` `each_flag_sets_exactly_its_field` (compiled
   on x64, not yet run). `--new-window`, `--desktop-icons`, `--desktop` and the new `--quiet` are not frozen.
+  *Status 2026-11-11:* the test runs and passes.
 - [ ] **[blocker] Settings format versioned.** ([#51](https://github.com/CodingDiego/rexplorer/issues/51)) `settings.ini`, `themes\*.ini`, `icons\<name>\`, `[keys]` overrides
   and `session.txt`. *Done when:* the files carry a format version, every older format is migrated on load (tested
   with fixtures from each 0.x release), and unknown keys are preserved, not dropped.
@@ -224,10 +282,13 @@ From 1.0, breaking any of these needs 2.0:
   on the first v1 start; unknown keys kept; one 0.1.x fixture per file (0.1.0 to 0.1.3 are byte-identical). README
   records that `icons\<name>\` has no version (the PNG layout is the format). Left: run the tests, and the user
   approves that icons decision.
+  *Status 2026-11-11:* live on a 0.1.x profile: only `format=1` added; comments, CRLF and unknown keys kept; a second start
+  changes nothing. The tests pass. Left: the user approves the icons decision.
 - [x] **[blocker] Cross-version hand-off.** ([#52](https://github.com/CodingDiego/rexplorer/issues/52)) *Done when:* the `WM_COPYDATA` payload between a running instance and a new
   launch is versioned, so an upgraded exe never mis-hands off to an older running one (or the reverse).
   *Status 2026-11-10:* `v=1` first line (`cli.rs:243`), a receiver answers 0 for another version and the sender
   opens its own window (`instance.rs:95-106`). The live two-build check is still to do.
+  *Status 2026-11-11:* live: a second copy handed off in either start order; `v=2` is refused, `v=1` and none are taken.
 - [x] **[should] Deprecation policy** ([#53](https://github.com/CodingDiego/rexplorer/issues/53)) written in the README: how long a deprecated key or flag keeps working.
 
 ## 9. Testing and engineering
@@ -238,19 +299,25 @@ From 1.0, breaking any of these needs 2.0:
   *Status 2026-11-10:* keyboard, address, hotkey and tab checks now drive the app with window messages; `-NoSkip`
   fails on any SKIP; scratch install dir and registry base for the whole run. Left: never run; no CI job; share
   and dnd still need an interactive desktop.
+  *Status 2026-11-11:* full local run 0 FAIL, 2 SKIP (pin and home-open need `-UserState`); CI `build-test` runs `-Hosted`.
+  Left: the first run on a hosted runner; `-NoSkip -UserState` on a test account.
 - [ ] **[blocker] Data-operation tests** ([#55](https://github.com/CodingDiego/rexplorer/issues/55)) from section 3, in CI.
   *Status 2026-11-10:* `crates/core/tests/data_ops.rs`, picked up by CI's `cargo test`. Never run.
+  *Status 2026-11-11:* 7 of 7 pass locally, three runs in a row. Left: the first CI run.
 - [ ] **[should] Clippy clean** ([#56](https://github.com/CodingDiego/rexplorer/issues/56)) with `-D warnings` in CI, plus a stated minimum supported Rust version, checked in CI.
   *Status 2026-11-10:* clippy with `-D warnings` was clean on the x64 host (`cargo check` and `cargo clippy` only; the tests were
   written but not run, and arm64 was never built) and runs in CI (`ci.yml:25-37`, pinned 1.99.1);
   `rust-version = "1.88"` (`Cargo.toml:7`), stated in the README. Left: a CI job on 1.88; 1.88 was never built here.
+  *Status 2026-11-11:* clippy clean with `-D warnings` on x64. Left: a 1.88 CI job and a 1.88 build.
 - [x] **[should] Fuzzing** ([#57](https://github.com/CodingDiego/rexplorer/issues/57)) of path handling, archive path splitting and `settings.ini`/theme parsing.
   *Status 2026-11-10:* deterministic `fuzz_` unit tests on a seeded generator (`crates/core/src/fuzz.rs`) for
   settings, themes, language files, archive paths, the command line and the session. No cargo-fuzz campaign.
+  *Status 2026-11-11:* cargo-fuzz targets in `fuzz/` (outside the workspace); not run (needs nightly).
 - [ ] **[should] Reproducible releases.** ([#58](https://github.com/CodingDiego/rexplorer/issues/58)) Release binaries are built only by CI from the tag, as today, and the build
   embeds no local paths.
   *Status 2026-11-10:* the release job pins Rust, remaps paths, links with `/Brepro`, builds twice and fails on a
   hash difference or a local path in the exe (`release.yml:24-50`). Never run.
+  *Status 2026-11-11:* not run (needs a tag).
 
 ## 10. Security
 
@@ -273,19 +340,27 @@ The whole project was reviewed on 2026-10-10 and every finding was fixed. These 
   *Status 2026-11-10:* draft manifests under `manifests/c/CodingDiego/rexplorer/0.2.0/` (id
   `CodingDiego.rexplorer`, placeholder hashes) and `--install --quiet`. Left: `--install` writes no Add/Remove
   Programs entry, so winget would not see the package as installed; the hashes; the winget-pkgs PR.
+  *Status 2026-11-11:* `--install` now writes the Settings > Apps entry (checked on a scratch base: UninstallString, NoModify,
+  NoRepair). Left: the hashes, the winget-pkgs PR, a clean-VM install and upgrade (the user).
 - [ ] **[blocker] Upgrade path.** ([#64](https://github.com/CodingDiego/rexplorer/issues/64)) *Done when:* installing a new version over a running one is tested: the old copy is
   moved aside, the next launch runs the new one, settings carry over, and nothing is left elevated.
   *Status 2026-11-10:* `install.rs:630` installs, updates over a mapped exe and uninstalls under a scratch base
   (compiled only). Left: settings carry-over and "nothing elevated" are argued, not tested; a real upgrade between
   two releases.
+  *Status 2026-11-11:* the update-over-a-running-copy test passes; scratch `--install --quiet` then `--uninstall --quiet` leave
+  the registry export as before. Left: a real upgrade between two releases.
 - [ ] **[blocker] Uninstall restores Explorer completely.** ([#65](https://github.com/CodingDiego/rexplorer/issues/65)) *Done when:* every registry key, App Paths entry, Start
   menu shortcut and Startup entry is removed. It is tested on a clean VM.
   *Status 2026-11-10:* uninstall now also removes `rexplorer.old` and the empty parent folders install created.
   Left: the clean-VM run.
+  *Status 2026-11-11:* on a scratch base, uninstall, the UninstallString run alone and `restore-explorer.ps1 -RemoveProgram`
+  each left a `reg export` identical to before. Left: the clean-VM run.
 - [x] **[should] In-app update notice.** ([#66](https://github.com/CodingDiego/rexplorer/issues/66)) *Done when:* there is an opt-in check of the GitHub releases feed, with no
   telemetry.
   *Status 2026-11-10:* `crates/core/src/update.rs`, off by default, at most one HTTPS GET a day, no redirects,
   1 MiB cap. Never run against the network.
+  *Status 2026-11-11:* live: off makes no request; on makes one real request; a newer version shows the status bar notice and
+  the More entry.
 - [x] **[should] Full changelog.** ([#67](https://github.com/CodingDiego/rexplorer/issues/67)) *Done when:* `CHANGELOG.md` keeps every release's notes, not only the latest in
   `.github/release-notes.md`.
 
@@ -296,10 +371,14 @@ The whole project was reviewed on 2026-10-10 and every finding was fixed. These 
   *Status 2026-11-10:* [docs/USER-GUIDE.md](docs/USER-GUIDE.md), linked from the README. Left: it predates this
   round (it says rexplorer keeps no log files; no `--quiet`, update check, text size or crash dumps); a cold read and
   the revert steps on a VM.
+  *Status 2026-11-11:* the guide now covers logs, crash dumps, `--quiet`, the update check, Text size, toolbar keys and
+  rename. Left: a cold read and the revert steps on a VM.
 - [x] **[should] Architecture overview** ([#69](https://github.com/CodingDiego/rexplorer/issues/69)) for contributors: the core/app split, threads and apartments, and the
   timers and messages.
   *Status 2026-11-10:* [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Line numbers drift; `wsearch` and the
   watchdog thread came after it.
+  *Status 2026-11-11:* line references checked against the code; the thread table now lists the index search, archive job,
+  breadcrumb, jump list and watchdog threads, and the message table the newer messages.
 - [x] **[should] Known gaps in release notes** ([#70](https://github.com/CodingDiego/rexplorer/issues/70)) kept current in every release's notes.
 
 ## 13. Exit criteria for 1.0

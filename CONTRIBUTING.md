@@ -14,14 +14,20 @@ cargo test --release
 The core crate's tests run against the real shell. Tests that touch the registry use a throwaway key under
 `HKCU\Software\rexplorer-test-<pid>-...` and remove it; keep new tests that way.
 
-`scripts\smoke.ps1` drives the real `target\release\rexplorer.exe` (about five minutes, `-Only <regex>` for a
-subset). It runs every instance on a scratch `%APPDATA%`, so it does not touch your settings.
+`scripts\smoke.ps1` drives the real `target\release\rexplorer.exe` (about a minute, three the first time while it
+makes its 100,000-file folder; `-Only <regex>` for a subset). It runs every instance on a scratch `%APPDATA%` and
+`%LOCALAPPDATA%`, so it does not touch your settings. CI runs it with `-Hosted` (see the README).
 
 ## Rules for changes
 
-- Never run `--install`, `--uninstall`, `--register` or `--import-explorer` against your real profile while
-  testing; set `REXPLORER_INSTALL_DIR` and `REXPLORER_REG_BASE=Software\rexplorer-test\<tag>` and a scratch
-  `APPDATA` in the environment.
+- Never run `--install`, `--uninstall`, `--register`, `--unregister`, `--import-explorer` or the install scripts
+  (`install.ps1`, `master-install.ps1`, `restore-explorer.ps1`) against your real profile while testing; set
+  `REXPLORER_INSTALL_DIR`, `REXPLORER_REG_BASE=Software\rexplorer-test\<tag>`, `REXPLORER_PROGRAMS_DIR`,
+  `REXPLORER_STARTUP_DIR` and a scratch `APPDATA` / `LOCALAPPDATA` in the environment (the scripts take the same as
+  `-InstallDir`, `-RegBase`, `-ProgramsDir`, `-StartupDir`). Never pass `-RestartShell` while testing.
+- Installing (`--install`, `install.rs` `install`) and taking over Explorer (`--register`, `take_over`) stay
+  separate. A key rexplorer can write is added to `known_keys()` in `install.rs` and to `$KnownKeys` in
+  `scripts\restore-explorer.ps1` together; `install::tests::restore_script_knows_every_key` checks it.
 - Keep `cargo build --release` free of warnings and `cargo test --release` green.
 - Match the surrounding code: small diffs, comments only for a why the code cannot show.
 - The `windows` crate is pinned on purpose (`Cargo.toml`); upgrade it in its own change.
@@ -57,7 +63,8 @@ English and Spanish are built in. Text lives in `crates/core/src/lang/<code>.ini
 
 Before tagging:
 
-1. Run `scripts\smoke.ps1` on Windows 10 22H2 and on Windows 11. CI cannot do this; it is manual.
+1. Run `scripts\smoke.ps1 -NoSkip -UserState` on Windows 10 22H2 and on Windows 11, on a desktop nobody is using
+   (a test account for `-UserState`). CI runs only `-Hosted`, which skips the checks that need such a desktop.
 2. Review the Known gaps in the README against `docs/EXPLORER-PARITY.md` and copy the current list into
    `.github/release-notes.md` under the "Known gaps" heading.
 3. Move the Unreleased lines of `CHANGELOG.md` under the new version and date, then add the release notes

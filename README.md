@@ -110,8 +110,14 @@ keeps the current items on screen. If the place cannot be opened, the previous o
 search shows the same placeholders, with "Searching…", until its first result.
 
 Path bar: click a crumb to go there (the current folder, the last crumb, refreshes), its chevron lists the
-subfolders (drive paths, UNC paths and This PC), a click on the empty area turns it into an address Edit (a path,
-a `shell:` name, a `::{CLSID}` or a path inside a .rar).
+subfolders of any shell folder (drives, shares, This PC, Network, Control Panel; listed in the background, so a slow
+share does not hold the window), the folder icon on the left lists the desktop's places (Home, This PC, Libraries,
+Network, Control Panel, Recycle Bin and the desktop's folders, as Explorer's leftmost chevron), and a click on the
+empty area turns it into an address Edit (a path, a `shell:` name, a `::{CLSID}` or a path inside a .rar).
+
+Taskbar: every window, and the Start menu shortcut an install makes, carry the AppUserModelID
+`CodingDiego.rexplorer`, so they group on one button whose jump list has Frequent (Quick Access's frequent folders),
+Recent (rexplorer's recent folders) and a New window task. A copy that was never installed gets the same list.
 
 Command bar, as in Windows 11 Explorer: **New** v (Folder, which is created and then renamed in place, then the
 shell's own New submenu: shortcut, text document and so on) | **Cut**, **Copy**, **Paste**, **Rename**, **Share**, **Delete**
@@ -146,9 +152,10 @@ Ctrl+A selects the rows, Delete deletes, F5 refreshes, F2 renames in place. The 
 the command bar follow its selection. While Home loads,
 the list's placeholder rows show as for any folder.
 
-More menu: Folder tree, Pin to Home, Open in Explorer, register / unregister as the folder handler, **Install as
-default file manager...** and **Uninstall...** (each asks first, listing what changes; see below), the settings
-folder, About, and **Quick access**: the profile's bookmarks and the cloud-sync roots.
+More menu: Folder tree, Pin to Home, Open in Explorer, **Make rexplorer the default file manager...** (or, once it
+is, **Give folders back to Windows Explorer...**), **Install rexplorer...** and **Uninstall...** (each asks first,
+listing what changes; see below), the settings folder, About, and **Quick access**: the profile's bookmarks and the
+cloud-sync roots.
 
 **Folder options...** (More menu) is a themed tabbed dialog with OK, Cancel and Apply. General: the start folder (Home,
 This PC or the profile's own), single or double click to open with the underline choice (`underline_titles`), Home's
@@ -212,7 +219,8 @@ Every change is written to the active profile in settings.ini and applies at onc
 | Ctrl+F | Search box (Enter searches, Escape stops and returns to the list) |
 | Escape (list) | Stop a running search |
 | F2, Delete, Shift+Delete, Ctrl+C/X/V, Ctrl+A, Alt+Enter | Shell verbs on the selection (F2 on shell items only). F2 and click-again rename were reported broken and could not be reproduced, see [the parity checklist](docs/EXPLORER-PARITY.md) |
-| Right-click | Full shell context menu (Shift adds the extended verbs); the background adds View, Sort by, Refresh, Paste, Pin on top; archives get the extract menu |
+| Right-click | Full shell context menu (Shift adds the extended verbs); the background adds View, Sort by, Refresh, Paste, Paste shortcut, Pin on top; a program (.exe, .bat, .cmd, .com, .msi, .msc) gets Run as administrator first; archives get the extract menu |
+| Ctrl+Shift+Enter | Run the selected program as administrator (the shell's runas verb; Windows asks for consent) |
 | Ctrl+Shift+E | Open the current folder in Windows Explorer (an archive: its folder) |
 | Ctrl+T, Ctrl+W | New tab at the start place, close tab (closing the last tab closes the window) |
 | Ctrl+Tab, Ctrl+Shift+Tab, Ctrl+1..8, Ctrl+9 | Next, previous, nth, last tab |
@@ -283,21 +291,21 @@ rexplorer [options] [folder...]
   --new-window        open a second window (it saves no tabs, placement or recents)
   --desktop-icons     show the desktop's icons in a rexplorer window (opt-in, primary monitor)
   --search <text>     search the (first) folder opened for <text>
-  --register          open folders and Win+E with this exe (per-user HKCU\Software\Classes keys; asks first)
-  --unregister        undo --register
-  --install           copy rexplorer to %LOCALAPPDATA%\Programs and make it the default file manager
-  --uninstall         undo --install
-  --quiet             with --install or --uninstall: no dialog (exit code 0 done, 1 failed)
+  --register          make rexplorer the default file manager (folders, drives, Win+E), recorded so it can be undone
+  --unregister        give folders back to Windows Explorer (undo --register)
+  --install           copy rexplorer to %LOCALAPPDATA%\Programs as a normal program (Start menu, Settings > Apps); Explorer still opens folders
+  --uninstall         give folders back to Explorer, then undo --install
+  --quiet             with --install, --uninstall, --register or --unregister: no dialogs, a failure rolls back (exit code 0 done, 1 failed)
   --import-explorer   copy Windows Explorer's settings into the active profile (backs up settings.ini)
   --overwrite         with --import-explorer: also replace values you changed in rexplorer
   --recover           restore the previous session after a crash
-  --desktop           run the helper that shows rexplorer's context menu on the desktop (install starts it)
+  --desktop           run the helper that shows rexplorer's context menu on the desktop (--register starts it)
   --elevated          when started elevated, stay so (drive-wide indexed search) instead of restarting unelevated
   -h, --help          show this help
 ```
 
 Folders may be paths, `shell:` names, `::{CLSID}` strings, UNC paths or .rar paths. Explorer's own arguments
-work too, since an installed rexplorer is started as `explorer.exe`: `/select,<path>` (also `/select,` followed by
+work too, since rexplorer made the default (`--register`) is started as `explorer.exe`: `/select,<path>` (also `/select,` followed by
 the path as the next argument), `/e,<path>`, `/root,<path>`, `/n`, `/separate`, chained with commas
 (`/n,/e,/select,C:\x`); a file path opens its folder with the file selected (.zip and .rar files open as folders); a
 trailing backslash, or the trailing quote some callers leave (`"C:\"` arrives as `C:"`), is dropped. Anything
@@ -305,7 +313,7 @@ else Explorer-style (`/idlist,...`, an unknown `/` switch, URLs such as `ms-sett
 `shell:AppsFolder\<app>`) is handed verbatim to `C:\Windows\explorer.exe` (with CreateProcess, never through App
 Paths) and the process exits. A second launch hands its folders (and `--search`) to the running window and
 exits (36-78 ms measured from process creation to the new tab's title); a second launch without folders (Win+E once
-installed) opens a tab at the profile's start place. One instance runs per settings folder, so a launch with
+it is the default) opens a tab at the profile's start place. One instance runs per settings folder, so a launch with
 another `%APPDATA%` (the smoke test) runs on its own. A plain first launch opens a tab at the start place, as
 Explorer does (view and panes still come from the session); a launch with folders opens just those. After a crash
 the process relaunches itself with `--recover`; each `--recover` start
@@ -319,9 +327,9 @@ From 1.0 these options keep their meaning until 2.0: `--select` and `/select,`, 
 `--recover`, `--elevated`, `-h` and `--help`, and the Explorer argument forms above. `--new-window`,
 `--desktop-icons`, `--desktop` and `--quiet` are not frozen: they may change in any release.
 
-`--quiet` is for scripted installs (the winget package): with `--install` it skips the warning, rolls back a
-failed install without asking and shows no summary; with `--uninstall` it shows no summary. Exit codes: 0 done,
-1 failed, and 2 when you answer No to the interactive warning.
+`--quiet` is for scripted installs (the winget package and the scripts below): with `--install` or `--register` it
+skips the question, rolls back a failure without asking and shows no summary; with `--uninstall` or `--unregister`
+it shows no summary. Exit codes: 0 done, 1 failed, and 2 when you answer No to the interactive question.
 
 Hand-off to a running window: the second launch sends its arguments as `key=value` lines whose first line is
 `v=1` (`cli::PROTOCOL`). A running window answers 1 when it takes them and 0 when the version differs; the new
@@ -354,18 +362,28 @@ and not yet tested on ARM hardware). `SHA256SUMS.txt` lists both zips and both e
 (`rexplorer-<version>-x64/rexplorer.exe`); check a download with `Get-FileHash <file>` against it. A winget package
 (`CodingDiego.rexplorer`) is drafted under `manifests\` but not published yet.
 
-Option A, the script (no administrator prompt: rexplorer installs per user, under `HKCU` and `%LOCALAPPDATA%`, and
-running it elevated would only hand user-writable files rights they should not have):
+Installing and making rexplorer the default file manager are two separate steps. Three scripts in `scripts\`
+(Windows PowerShell 5.1; no administrator prompt: rexplorer installs per user, under `HKCU` and `%LOCALAPPDATA%`, and
+running them elevated would only hand user-writable files rights they should not have):
+
+| Script | What it does |
+|---|---|
+| `install.ps1` | The standalone install: rexplorer as a normal program. Windows Explorer still opens folders. |
+| `master-install.ps1` | `install.ps1`, then makes rexplorer the default file manager (`--register`), after saving the keys it changes to `%LOCALAPPDATA%\rexplorer\backup\explorer-keys-<date>.reg`. |
+| `restore-explorer.ps1` | Puts Windows Explorer back without needing a working rexplorer.exe (see "Go back to Explorer"). |
 
 ```
 powershell -ExecutionPolicy Bypass -File scripts\install.ps1
+powershell -ExecutionPolicy Bypass -File scripts\master-install.ps1
 ```
 
-It builds `target\release\rexplorer.exe` if missing, runs `rexplorer.exe --install` (which warns first that it
-replaces Explorer and any running rexplorer, and offers Roll back if it fails), then asks whether to import your
-Windows Explorer settings (Y/n, default Y; `-ImportExplorer` answers yes and `-NoImport` no, without asking) and ends
-with where rexplorer is installed, how to start it and how to uninstall. `-Exe <path>` installs another build;
-`-Uninstall` reverts.
+`install.ps1` builds `target\release\rexplorer.exe` if missing, runs `rexplorer.exe --install` (which asks first and
+offers Roll back if it fails), then asks whether to import your Windows Explorer settings (Y/n, default Y;
+`-ImportExplorer` answers yes and `-NoImport` no, without asking) and ends with where rexplorer is installed, how to
+start it, make it the default and uninstall. `-Exe <path>` installs another build; `-Uninstall` reverts. All three
+take `-Quiet` (no question at all, no dialog from the exe; no import unless `-ImportExplorer`), `-WhatIf` (shows what
+would run, changes nothing), and the test overrides `-InstallDir`, `-RegBase`, `-ProgramsDir` and `-StartupDir`.
+Exit codes: 0 done, 1 failed, 2 cancelled.
 
 The import is `rexplorer.exe --import-explorer [--overwrite]`, which you can run any time. It only reads Explorer's
 values and sets these keys of the active profile in `settings.ini` (comments, line endings and spacing kept; a key
@@ -389,56 +407,74 @@ name exists, so an earlier backup is never overwritten or reused), and a message
 was skipped and why, and the backup file it wrote. If the backup or the write fails, it says so and exits with code 1. Uninstalling does not undo an import: your
 settings stay.
 
-Option B, a terminal, no elevation:
+Without the scripts, from a terminal, no elevation:
 
 ```
 cargo build --release
 target\release\rexplorer.exe --install
+%LOCALAPPDATA%\Programs\rexplorer\rexplorer.exe --register
 ```
 
-Uninstall: `powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Uninstall`, or
-`%LOCALAPPDATA%\Programs\rexplorer\rexplorer.exe --uninstall`, or More > **Uninstall...**.
+`rexplorer --install` (or More > **Install rexplorer...**) is the standalone install. It copies the running exe to
+`%LOCALAPPDATA%\Programs\rexplorer\rexplorer.exe`, adds a Start menu shortcut and an entry in Settings > Apps
+(`HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\rexplorer`: DisplayName, DisplayVersion, Publisher,
+InstallLocation, DisplayIcon, UninstallString `"<dir>\rexplorer.exe" --uninstall --quiet`, NoModify and NoRepair).
+It writes no folder, drive, App Paths or other association key and adds no Startup helper: Windows Explorer still
+opens folders, and rexplorer is a program you start yourself. Everything it created is listed in
+`%LOCALAPPDATA%\Programs\rexplorer\install.txt`. Running it again updates the copy (a running copy is renamed to
+`rexplorer.old`, deleted at the next start). It asks first and exits with code 2 if you answer No. If it fails
+partway, a dialog offers **Roll back**, which restores every value (of any registry type), key and file it had
+changed to what was there before, or **Keep changes**, which you can still undo with `--uninstall`.
 
-What it changes is listed in the next section. The taskbar and the Start menu stay Explorer's (Start only gains a
-rexplorer shortcut), and Explorer keeps drawing the desktop: only the desktop's right-click menu becomes rexplorer's. To go back
-to Explorer, uninstall; if rexplorer will not start, run `C:\Windows\explorer.exe` and use Win+R to run the uninstall
-command above.
+Uninstall: Settings > Apps > rexplorer, More > **Uninstall...**, `%LOCALAPPDATA%\Programs\rexplorer\rexplorer.exe
+--uninstall`, or `powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Uninstall`. It always gives folders
+back to Explorer first (as `--unregister` does), then reverts what install.txt lists: the Apps entry, the keys install
+created once they are empty, the shortcut, the copy (if it is running it moves to `%TEMP%`, deleted at the next
+start), a leftover `rexplorer.old`, and the folders install created, if they are empty.
 
 ### Make it the default file manager
 
-`rexplorer --install` (or More > **Install as default file manager...**) copies the running exe to
-`%LOCALAPPDATA%\Programs\rexplorer\rexplorer.exe` and points Windows' entry points for folder windows at that copy.
-It replaces Explorer's folder windows and the desktop's right-click menu: the desktop itself, the taskbar and the
-Start menu stay Explorer.
+`rexplorer --register` (or More > **Make rexplorer the default file manager...**, or `master-install.ps1`) points
+Windows' entry points for folder windows at the exe it runs from (the installed copy, when you start it from the
+Start menu). It replaces Explorer's folder windows and the desktop's right-click menu: the desktop itself, the
+taskbar and the Start menu stay Explorer.
 
-| Entry point | After `--install` | How |
+| Entry point | After `--register` | How |
 |---|---|---|
-| Opening a folder or drive from the desktop, a shortcut, another program's "open folder" (`ShellExecute` of a folder) | rexplorer | `HKCU\Software\Classes\{Folder, Directory, Drive}\shell\open\command` = `"<copy>" "%1"` |
-| Win+E, the taskbar's File Explorer icon, Start's "File Explorer" | rexplorer, at the start place (Home) | `HKCU\Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}\shell\{open, opennewwindow}\command` = `"<copy>"` |
-| Programs that run `explorer.exe` by bare name through `ShellExecute` (`explorer.exe /select,<file>`, `explorer.exe <folder>`) | rexplorer, with the arguments above | `HKCU\Software\Microsoft\Windows\CurrentVersion\App Paths\explorer.exe` = the copy, `Path` = its folder |
-| Start menu | a "rexplorer" shortcut | `<Start Menu>\Programs\rexplorer.lnk` |
-| Right-click, Shift+F10 or the Menu key on the desktop | rexplorer's menu | `<Startup>\rexplorer desktop menu.lnk` runs `rexplorer --desktop` at sign-in; install also starts it |
+| Opening a folder or drive from the desktop, a shortcut, another program's "open folder" (`ShellExecute` of a folder) | rexplorer | `HKCU\Software\Classes\{Folder, Directory, Drive}\shell\open\command` = `"<exe>" "%1"` |
+| Win+E, the taskbar's File Explorer icon, Start's "File Explorer" | rexplorer, at the start place (Home) | `HKCU\Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}\shell\{open, opennewwindow}\command` = `"<exe>"` |
+| Programs that run `explorer.exe` by bare name through `ShellExecute` (`explorer.exe /select,<file>`, `explorer.exe <folder>`) | rexplorer, with the arguments above | `HKCU\Software\Microsoft\Windows\CurrentVersion\App Paths\explorer.exe` = the exe, `Path` = its folder |
+| Right-click, Shift+F10 or the Menu key on the desktop | rexplorer's menu | `<Startup>\rexplorer desktop menu.lnk` runs `rexplorer --desktop` at sign-in; `--register` also starts it |
 | Programs that start `C:\Windows\explorer.exe` with `CreateProcess`, or call `SHOpenFolderAndSelectItems` (Chrome-style "Show in folder") | still Explorer | not reachable per-user |
 | The desktop itself (icons, wallpaper), the taskbar, Start, other programs' Open / Save dialogs, Explorer windows already open | still Explorer | untouched |
 
 Each command key also gets an empty `DelegateExecute` value, which stops Windows from using Explorer's own handler.
-`--install` refuses, changing nothing, when another program already overrides one of these keys. Everything it
-created (keys, values, the copy, the shortcut) is listed in `%LOCALAPPDATA%\Programs\rexplorer\install.txt`.
-Running it again updates the copy (a running copy is renamed to `rexplorer.old`, deleted at the next start).
-Every install first warns that it replaces Explorer and any running rexplorer copy, and exits with code 2 if you
-answer No. If an install fails partway, a dialog offers **Roll back**, which restores every value, key and file it
-had changed to what was there before, or **Keep changes**, which you can still undo with `--uninstall`.
+`--register` refuses, changing nothing, when another program already overrides one of these keys. It asks first
+(listing the keys), journals each change and lists what it created in
+`%LOCALAPPDATA%\Programs\rexplorer\takeover.txt`; a failure offers Roll back like install.
 
-Escape hatch: `rexplorer --uninstall` (or More > **Uninstall...**, or `%LOCALAPPDATA%\Programs\rexplorer\rexplorer.exe
---uninstall` from Win+R) reverts what install.txt lists: the values that still name rexplorer (a value another
-program has written since is left alone), the keys install created once they are empty, the shortcut, then the
-copy (if it is running it moves to `%TEMP%`, deleted at the next start), a leftover `rexplorer.old`, and the
-folders install created, if they are empty. Both print a summary in a message box
-and exit 0, or non-zero on an error. If rexplorer keeps crashing, the crash guard above opens Explorer.
+### Go back to Explorer
+
+- **rexplorer starts:** More > **Give folders back to Windows Explorer...**, or `rexplorer --unregister`. It reverts
+  what takeover.txt lists: the values that still name rexplorer (a value another program has written since is left
+  alone), the keys it created once they are empty, and the desktop helper's Startup shortcut (closing the helper).
+  rexplorer stays installed as a program. Without a takeover.txt (an older build's `--register`) it removes the same
+  keys from its fixed list, only where they name rexplorer.
+- **rexplorer will not start, or the install is broken:** `powershell -ExecutionPolicy Bypass -File
+  scripts\restore-explorer.ps1`. It needs no working exe: it closes the rexplorer processes that run from the install
+  folder (no other process), reverts takeover.txt and install.txt when they exist, then goes through the fixed list of
+  keys rexplorer can write (kept in step with `known_keys()` in `install.rs` by a test) and removes only values that
+  point at rexplorer, and the Startup shortcut. `-RemoveProgram` (automatic when rexplorer.exe is already gone) also
+  removes the exe, the Start menu shortcut and the Apps entry. It is safe to run twice and when nothing is installed.
+- **After a master install:** `reg import %LOCALAPPDATA%\rexplorer\backup\explorer-keys-<date>.reg` puts the saved
+  keys back exactly as they were.
+
+The Explorer shell that is already running may keep the old registration until you sign out and back in.
+`restore-explorer.ps1 -RestartShell` restarts `explorer.exe` instead, but only when no Explorer window and no file
+copy is open (off by default). If rexplorer keeps crashing, the crash guard above opens Explorer, and
+`C:\Windows\explorer.exe` from Win+R always works.
 
 Nothing touches HKLM and nothing needs elevation: all of it is per-user under HKCU and `%LOCALAPPDATA%`.
-`--register` / `--unregister` remain the registry-only subset: they point the five command keys at the exe they run
-from, without copying it, without App Paths and without a shortcut.
 
 ### The desktop menu
 
@@ -453,8 +489,8 @@ Right-dragging icons stays Explorer's: once the pointer leaves the drag box, the
 else, a right-click on any other window included, passes through untouched.
 
 The helper reaches Explorer's desktop view through `IShellWindows` (as Explorer's own tools do) and reads the icon
-under the cursor through the list's accessibility object. Uninstall closes it and removes the Startup shortcut. To
-turn it off without uninstalling, delete `rexplorer desktop menu.lnk` from the Startup folder (`shell:startup`) and
+under the cursor through the list's accessibility object. `--unregister` and uninstall close it and remove the
+Startup shortcut. To turn it off and keep the rest, delete `rexplorer desktop menu.lnk` from the Startup folder (`shell:startup`) and
 end `rexplorer.exe --desktop`.
 
 ### Files under `%APPDATA%\rexplorer`
@@ -555,7 +591,8 @@ the version resource) with the newest Windows SDK `rc.exe` it finds. Without the
 `scripts\smoke.ps1` drives the release exe: startup, the 100k-file folder (`%TEMP%\rexplorer-bench`, populated
 in about 300 ms from process start), columns, keyboard navigation, live update, the not-found fallback (error,
 no Explorer window), the Explorer hotkey, tabs, the single-instance hand-off, first-run settings, `--help`,
-placement, the tree (opened from More > Folder tree), the preview, the views, a RAR5 archive (open, enter a
+placement, the tree (opened from More > Folder tree), the preview, home-preview (the pane on Home with a row
+selected: the window stays alive), the views, a RAR5 archive (open, enter a
 directory, go back up), a search in the 100k folder (typed into the search box), `--search` from the command line,
 the look (the sidebar is there, the list card's corner pixels are the frame color and its inside is not, a click
 on the Downloads row navigates, Ctrl+B hides the sidebar), Home (a first run without folders shows it, and it is the sidebar's first row), the
@@ -569,25 +606,34 @@ RexHome with tiles and rows and the list hidden; a click on the C:\ row brings t
 under `%LOCALAPPDATA%\rexplorer-smoke`, with an extension registered in HKCU for the check only, is found on Home
 and Enter opens it; afterwards it is removed from Home, the Recent shortcut, the keys and the files are deleted),
 remove-bookmark (a scratch profile's bookmark row, removed through its popup, leaves the sidebar and settings.ini),
-share (Share is enabled with a file selected and its click brings the share sheet to the foreground; Escape
+share (Share is enabled with a file selected and its click brings the share sheet to the foreground; WM_CLOSE
 closes it), access-denied (`C:\System Volume Information` shows "Access denied: ..." within 3 s), crash-recovery
 (`REXPLORER_CRASH_AFTER_MS`, read only for this, raises an access violation; within 6 s a `--recover` process
 shows the same folder), dnd (a real `SendInput` drag of a file row onto a folder row moves the file; the file
 is moved back whatever happens), handoff (with one instance running, a second launch with a folder, timed from the
-script's process creation to the new tab's title: under 300 ms, 36-78 ms measured), install-scratch (`--install`
-and `--uninstall` with the undocumented `REXPLORER_INSTALL_DIR` / `REXPLORER_REG_BASE` overrides pointing at a
-scratch folder and `HKCU\Software\rexplorer-test\<pid>`: the install warning is checked and answered Yes, the copy,
-install.txt, the five command keys and App Paths appear, then all of it is gone, the scratch key included; the real keys, App Paths and Start menu are never
-written) and explorer-args (`/select,<file>` selects it, `/e,<dir>` and `<dir>\` open it; `/idlist,x` and `/zzz`
-exit within 2 s, handed to Explorer, which opens a window for `/zzz`). `-Only <regex>` runs the matching checks. The whole run uses a scratch `APPDATA`,
-so the user's settings, window placement and open rexplorer window are never touched; `REXPLORER_INSTALL_DIR` and
-`REXPLORER_REG_BASE` point at scratch places for the whole run. The checks drive the app with `WM_COMMAND` posted to
-its own window instead of keystrokes; the dnd drag is the only real input, and it is let go at its start point if
-the foreground leaves rexplorer. The clipboard is saved and restored around the command bar check. Share and dnd
-need an interactive desktop and SKIP without one. `pin` and `home-open` change this user's Quick Access, Recent
-list and file classes, so they SKIP unless `-UserState` is given. The `accessibility` check walks the UI Automation
-tree on Home and in a folder with the preview pane on, and fails on any unnamed focusable or interactive element
-(scroll bars, the title bar and the embedded Explorer view are excluded, each with its reason). The script exits 1
+script's process creation to the new tab's title: under 300 ms, 36-78 ms measured), install-scratch (`--install`,
+`--register` by the installed copy, then `--uninstall`, with the undocumented `REXPLORER_INSTALL_DIR` /
+`REXPLORER_REG_BASE` overrides pointing at a scratch folder and `HKCU\Software\rexplorer-test\<pid>`: both questions
+are checked and answered Yes; after the install only the copy, install.txt, the Start menu shortcut and the Apps
+entry exist (no association key), after `--register` the five command keys, App Paths and the desktop helper's
+Startup shortcut appear, then all of it is gone, the scratch key included; the real keys, App Paths, Start menu and
+Startup folder are never written), install-scripts (`master-install.ps1 -Quiet` then `restore-explorer.ps1
+-RemoveProgram -Quiet` on the same scratch places: the install, both shortcuts, the folder keys and a `.reg` backup
+appear, then nothing of them is left) and explorer-args (`/select,<file>` selects it, `/e,<dir>` and `<dir>\` open
+it; `/idlist,x` and `/zzz /e,<dir>` exit within 2 s, handed to Explorer, which opens `<dir>` for the second; that
+window is closed). `-Only <regex>` runs the matching checks. The whole run uses a scratch `APPDATA` and
+`LOCALAPPDATA`, so the user's settings, window placement and open rexplorer window are never touched;
+`REXPLORER_INSTALL_DIR`, `REXPLORER_REG_BASE`, `REXPLORER_PROGRAMS_DIR` and `REXPLORER_STARTUP_DIR` point at
+scratch places for the whole run. The checks drive the app with `WM_COMMAND` posted to its own window instead of
+keystrokes; the dnd drag is the only real input, sent only after 5 s without keyboard or mouse input, and it is let
+go over rexplorer if the foreground leaves it. The clipboard is saved and restored around the command bar check.
+`-Hosted` (the CI job) SKIPs the checks that need a desktop someone could be using: perf and handoff (timings for a
+known machine), explorer-hotkey and explorer-args (windows in the user's Explorer shell), share (the foreground)
+and dnd (real input). `pin` and `home-open` change this user's Quick Access, Recent
+list and file classes, so they SKIP unless `-UserState` is given. The `accessibility` check walks the MSAA tree of
+every visible child window on Home and in a folder with the preview pane on, and fails on any unnamed focusable or
+interactive object (scroll bars and the embedded Explorer view are excluded, each with its reason; a build with one
+name blanked on purpose fails it with 12 objects listed). The script exits 1
 on any FAIL, and with `-NoSkip` also on any SKIP (the release run: `-NoSkip -UserState` on an interactive desktop).
 
 `scripts\soak.ps1 [-Minutes 480]` drives one rexplorer for that long (default 10, a harness check) through
@@ -596,8 +642,9 @@ objects, handles, threads and private bytes every 30 s to a CSV in `%TEMP%`. Aft
 median of the last fifth exceeds the median of the first fifth × 1.05 plus a slack (GDI 50, USER 50, handles 200,
 threads 10, private 50 MB). Do not use the clipboard during a run.
 
-`scripts\budgets.ps1` fails when a median is over budget: start to the first visible window ≤ 600 ms, the 100k-file
-folder listed ≤ 600 ms, idle ≤ 1% of a core (`-Focus` for the focused idle budget). It shares
+`scripts\budgets.ps1` fails when a median is over budget: start to the first visible window ≤ 400 ms, the 100k-file
+folder listed ≤ 400 ms, idle ≤ 0.5% of a core (`-Focus` for the focused idle budget); about twice what
+`scripts\bench-results.md` records, so pass looser values on a slower machine. It shares
 `%TEMP%\rexplorer-bench` with the smoke test and creates it when missing.
 `smoke.ps1 -Screenshots` also writes `docs\screenshots\dark.png`, `light.png` and `home.png` (rendered with
 `PrintWindow`, so nothing else on the screen is captured). home.png shows the machine's own Quick Access; the file
@@ -607,14 +654,14 @@ through WM_APP+0x54.
 ### Known gaps
 
 **[docs/EXPLORER-PARITY.md](docs/EXPLORER-PARITY.md) is the full checklist against Windows Explorer**: every
-behaviour marked WORKS, BROKEN, UNVERIFIED, PARTIAL or MISSING. As of 2026-11-09 dragging files to other
-programs is unreliable and F2 and click-again rename were reported broken (not reproduced). Most of the features
-added that day (drag images, right-button drag, drops on the sidebar, crumbs and tabs, tab reordering, the column
-chooser, icon overlays, cut fading) are marked UNVERIFIED: built and unit-tested, not yet tried with a real mouse.
-Added on 2026-11-10 and also UNVERIFIED: the desktop icons view (`--desktop-icons`, never run), high contrast (never
-seen under a contrast theme), screen reader support (MSAA for the custom controls, not tried with Narrator or NVDA),
-toolbar keyboard reach, Text size, indexed search, Back to search results, Home sorting, archive thumbnails and
-preview, and the update check. The list below holds the gaps of rexplorer's own features.
+behaviour marked WORKS, BROKEN, UNVERIFIED, PARTIAL or MISSING. On 2026-11-11 F2 and click-again rename and
+dragging files out to another program were proven with a real keyboard and mouse, in a folder and on Home, along
+with drag images, right-button drag, drops on the sidebar, crumbs and tabs, tab reordering, cut fading, toolbar
+keys, indexed search, Back to search results and the update check. Dragging into browsers, WhatsApp and VS Code
+([#75](https://github.com/CodingDiego/rexplorer/issues/75)) was not tried. Still UNVERIFIED (built and
+unit-tested, not proven on the exe): the desktop icons view (`--desktop-icons`, never run), high contrast (never
+seen under a contrast theme), Narrator and NVDA, Text size, Home sorting, archive thumbnails, the column chooser
+and icon overlays. The list below holds the gaps of rexplorer's own features.
 
 Language: rexplorer's own text is English or Spanish, following Windows; `language=es` (or `en`, `system`) under
 `[general]` in `settings.ini` chooses, and a `lang\<code>.ini` file of `key=text` lines in the settings folder
@@ -631,13 +678,13 @@ Where rexplorer differs from Explorer on purpose: Backspace goes up, Ctrl+D pins
 F4 has no dropdown and F10 opens no menu bar. Left on the first shown crumb opens the "..." menu, the root's
 subfolders, as a click does; the hidden crumbs themselves are not keyboard stops.
 
-- Accessibility: the address and search boxes have no accessible name. While a text or shell-handler preview
-  shows, the preview pane's accessible object lists no child windows, so a pure-MSAA screen reader may not reach
+- Accessibility: while a text or shell-handler preview shows, the preview pane's accessible object lists no child windows, so a pure-MSAA screen reader may not reach
   the text or the handler. A focused toolbar starts again at its first button.
-- Archive members cannot be dragged, sorted by column or renamed. Encrypted .rar gets unrar's error, with no
-  password prompt; multi-volume .rar is untested, and opening a `.partN.rar` other than the first is not redirected.
+- Archive members cannot be sorted by column or renamed (unrar only reads archives; no message says so). An
+  encrypted .rar asks for its password, which unrar takes in the ANSI code page, so characters outside it cannot be
+  used; multi-volume .rar is untested, and opening a `.partN.rar` other than the first is not redirected.
   An archive rewritten during the session with a same-size member can show the old member until the tab closes.
-- Search results have no thumbnails or preview. Index results depend on the index being current and may leave out
+- Sorting, renaming and deleting in search results are untested. Index results depend on the index being current and may leave out
   hidden or system files it does not hold.
 - Only .rar archives get the archive view (zip is the shell's).
 - The embedded Explorer view keeps Windows' own colors, not the theme.
@@ -662,6 +709,12 @@ subfolders, as a click does; the hidden crumbs themselves are not keyboard stops
 - `ftp://` browsing goes through the shell's FTP folder (present on Windows 11 25H2, untested against a live
   server); where it is missing the URL shows the not-found error.
 - Small icons of shell folders resolve on the UI thread.
+- Cloud file marks (a blue cloud for online-only, a green check for always-kept) come from the file attributes and
+  show only in Details and List, and only where the sync app's own overlay is absent; they were never seen on real
+  OneDrive placeholders. An online-only file that is downloaded but not pinned shows no mark.
+- Run as administrator was never invoked in testing (the consent prompt is the user's to answer).
+- The jump list was checked in its file, not on the taskbar. An entry removed from it is left out of the next
+  rebuild only; a later one can bring it back.
 
 Not part of 1.0 (decided, not built):
 

@@ -26,7 +26,8 @@ goes in the fix's commit message and the advisory unless you prefer otherwise.
 In scope:
 
 - Content-driven issues: archives, file and folder names, shortcuts, previews, thumbnails, network locations.
-- The installer and uninstaller (`--install`, `--uninstall`, `scripts/install.ps1`) changing or removing
+- The installer and uninstaller (`--install`, `--uninstall`, `--register`, `--unregister`, `scripts/install.ps1`,
+  `scripts/master-install.ps1`, `scripts/restore-explorer.ps1`) changing or removing
   registry keys or files they did not create.
 - Credentials (for example FTP passwords) shown on screen or written to disk.
 - Anything that makes rexplorer run with more rights than the user who started it.
@@ -48,3 +49,10 @@ Out of scope:
 - Everything rexplorer installs is per-user (HKCU, `%LOCALAPPDATA%`); nothing needs administrator rights.
 - Dependencies are checked with `cargo audit` in CI every week; failures are triaged within 7 days (see
   CONTRIBUTING.md, Dependencies).
+- No telemetry. Crash reports (a minidump per crash, plus a `.txt` with the message and backtrace for a panic) stay
+  in `%LOCALAPPDATA%\rexplorer\crashes`, the newest 10 kept; nothing is sent. To report a crash, attach the newest
+  `.dmp` (and `.txt`) to an issue or a private advisory. A dump holds part of the process memory, which can include
+  file names and paths you had open: look before you share it.
+- The update check is off by default (Folder options > General). When on, it makes at most one HTTPS GET a day to
+  `api.github.com` for the latest release, follows no redirects, reads at most 1 MiB, downloads nothing and sends
+  nothing beyond the request itself.
