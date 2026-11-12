@@ -203,6 +203,10 @@ public static class W {
 $null = [W]::SetProcessDPIAware()
 if (-not (Test-Path $Exe)) { Write-Output "FAIL startup exe missing: $Exe"; exit 1 }
 $Exe = (Resolve-Path $Exe).Path
+# %TEMP% can be a short name (RUNNER~1 on CI); the app shows and stores long ones, and the checks compare with them.
+Add-Type -Namespace RexSmoke -Name Long -MemberDefinition '[DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern int GetLongPathNameW(string path, System.Text.StringBuilder buffer, int size);'
+$longTemp = New-Object System.Text.StringBuilder 1024
+if ([RexSmoke.Long]::GetLongPathNameW($env:TEMP, $longTemp, 1024) -gt 0) { $env:TEMP = $longTemp.ToString() }
 # Every variable this script sets, as found, put back in the finally at the end.
 $SavedEnv = @{}
 foreach ($n in 'APPDATA', 'LOCALAPPDATA', 'REXPLORER_INSTALL_DIR', 'REXPLORER_REG_BASE', 'REXPLORER_PROGRAMS_DIR', 'REXPLORER_STARTUP_DIR', 'REXPLORER_CRASH_AFTER_MS') { $SavedEnv[$n] = [Environment]::GetEnvironmentVariable($n) }
