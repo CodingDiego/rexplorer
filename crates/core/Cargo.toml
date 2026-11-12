@@ -1,9 +1,14 @@
 [package]
 name = "rexplorer-core"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2024"
+rust-version.workspace = true
 license = "MIT"
 repository = "https://github.com/CodingDiego/rexplorer"
+
+[lints.rust]
+# cargo-fuzz builds with --cfg fuzzing: the fuzz/ targets reach the parsers' checks through it.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 
 [dependencies]
 # RAR has no shell namespace handler; this bundles libunrar 7.21 beta 1 (past CVE-2025-6218 and CVE-2025-8088) and builds it with cc.
@@ -11,8 +16,10 @@ unrar-ng = "0.7.7"
 windows-core = { workspace = true }
 windows = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Imaging",
+    "Win32_Networking_WinHttp",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
@@ -26,8 +33,10 @@ windows = { workspace = true, features = [
     "Win32_System_Memory",
     "Win32_System_Ole",
     "Win32_System_Registry",
+    "Win32_System_Search",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
+    "Win32_System_Time",
     "Win32_System_Variant",
     "Win32_UI_Accessibility",
     "Win32_UI_Controls",

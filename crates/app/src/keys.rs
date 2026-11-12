@@ -6,7 +6,7 @@ use windows::Win32::UI::WindowsAndMessaging::{ACCEL, ACCEL_VIRT_FLAGS, FALT, FCO
 use crate::*;
 
 /// The commands a `[keys]` line can name.
-const NAMES: [(&str, u16); 40] = [
+const NAMES: [(&str, u16); 42] = [
     ("cmd.back", CMD_BACK),
     ("cmd.forward", CMD_FORWARD),
     ("cmd.up", CMD_UP),
@@ -47,6 +47,8 @@ const NAMES: [(&str, u16); 40] = [
     ("cmd.redo", CMD_REDO),
     ("cmd.copy_path", CMD_COPY_PATH),
     ("cmd.fit_columns", CMD_FIT_COLUMNS),
+    ("cmd.paste_shortcut", CMD_PASTE_SHORTCUT),
+    ("cmd.run_as_admin", CMD_RUN_AS),
 ];
 
 /// `Ctrl+Shift+X`, `F5`, `Alt+Left`: (modifier flags, virtual key); None when it is not one of those.

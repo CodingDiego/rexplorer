@@ -134,6 +134,19 @@ pub unsafe fn fill_round(dc: HDC, r: &RECT, color: u32, radius: i32) {
     }
 }
 
+/// DrawTextW of `s`, skipped when it is empty: an empty Vec<u16> hands DrawTextW a dangling pointer, which it read
+/// and faulted on (the preview pane crash, 2026-11-11). An empty text measures (DT_CALCRECT) zero wide.
+pub unsafe fn draw_text(dc: HDC, s: &str, r: &mut RECT, flags: DRAW_TEXT_FORMAT) {
+    if s.is_empty() {
+        if flags.0 & DT_CALCRECT.0 != 0 {
+            r.right = r.left;
+        }
+        return;
+    }
+    let mut v: Vec<u16> = s.encode_utf16().collect();
+    unsafe { DrawTextW(dc, &mut v, r, flags) };
+}
+
 /// Share of pixel (x, y) of a corner square `r` px wide that lies inside the quarter circle of radius `r` centered
 /// at (r, r), the square's inner corner: 1 inside the card, 0 in the frame. 4x4 samples per pixel.
 pub fn coverage(x: i32, y: i32, r: i32) -> f32 {
@@ -268,12 +281,53 @@ pub fn round_corners(hwnd: HWND, radius: i32) {
     }
 }
 
+/// Windows' Settings > Accessibility > Text size in percent; 0 until first read.
+static TEXT_SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The text size (100 to 225 percent), read on first use and again by `refresh_text_scale`.
+pub fn text_scale() -> u32 {
+    match TEXT_SCALE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => {
+            refresh_text_scale();
+            TEXT_SCALE.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        s => s,
+    }
+}
+
+/// Re-reads the text size (on WM_SETTINGCHANGE); true when it changed.
+pub fn refresh_text_scale() -> bool {
+    let s = clamp_text_scale(rexplorer_core::import_explorer::dword("Software\\Microsoft\\Accessibility", "TextScaleFactor"));
+    TEXT_SCALE.swap(s, std::sync::atomic::Ordering::Relaxed) != s
+}
+
+/// The registry value, absent meaning 100 %; out-of-range values are clamped to what Settings offers.
+fn clamp_text_scale(raw: Option<u32>) -> u32 {
+    raw.unwrap_or(100).clamp(100, 225)
+}
+
+/// `dpi` grown by `pct` percent of text size.
+fn scaled_dpi(dpi: u32, pct: u32) -> u32 {
+    (dpi * pct + 50) / 100
+}
+
+/// `dpi` grown by the text size: pass it for fonts and for metrics that hold text (rows, bars, tiles, dialogs),
+/// never for glyph or icon sizes.
+pub fn text_dpi(dpi: u32) -> u32 {
+    scaled_dpi(dpi, text_scale())
+}
+
+/// LOGFONT height of a `pt`-point font at `dpi` and `pct` percent text size.
+fn font_height(pt: i32, dpi: u32, pct: u32) -> i32 {
+    -muldiv(pt, scaled_dpi(dpi, pct) as i32, 72)
+}
+
 /// Section headers: the theme's face, semibold.
 pub fn header_font(t: &Theme, dpi: u32, pt: i32) -> HFONT {
     let f = HSTRING::from(t.font.as_str());
     unsafe {
         CreateFontW(
-            -muldiv(pt, dpi as i32, 72), 0, 0, 0, FW_SEMIBOLD.0 as i32, 0, 0, 0, DEFAULT_CHARSET,
+            font_height(pt, dpi, text_scale()), 0, 0, 0, FW_SEMIBOLD.0 as i32, 0, 0, 0, DEFAULT_CHARSET,
             FONT_OUTPUT_PRECISION(0), FONT_CLIP_PRECISION(0), CLEARTYPE_QUALITY, 0, PCWSTR(f.as_ptr()),
         )
     }
@@ -315,7 +369,7 @@ fn first_existing(height: i32, primary: &str, fallback: &str) -> HFONT {
 }
 
 pub fn ui_font(t: &Theme, dpi: u32) -> HFONT {
-    let h = -muldiv(t.font_size, dpi as i32, 72);
+    let h = font_height(t.font_size, dpi, text_scale());
     let f = create_font(h, &t.font);
     if f.is_invalid() { create_font(h, "Segoe UI") } else { f }
 }
@@ -325,7 +379,7 @@ pub fn icon_font(dpi: u32, px: i32) -> HFONT {
 }
 
 pub fn mono_font(dpi: u32, pt: i32) -> HFONT {
-    first_existing(-muldiv(pt, dpi as i32, 72), "Cascadia Mono", "Consolas")
+    first_existing(font_height(pt, dpi, text_scale()), "Cascadia Mono", "Consolas")
 }
 
 pub fn blend(a: u32, b: u32, t: f32) -> u32 {
@@ -588,6 +642,31 @@ mod tests {
             assert_eq!(contrast_button(dc, &rc, &Theme::light(), false, true, false, 4), None);
             assert_eq!((at(20, 20), at(20, 4)), (0xA06020, 0xA06020));
         });
+    }
+
+    #[test]
+    fn text_scale_reads_and_clamps() {
+        assert_eq!(clamp_text_scale(None), 100, "no value: 100 %");
+        assert_eq!([50, 100, 150, 200, 225, 300].map(|v| clamp_text_scale(Some(v))), [100, 100, 150, 200, 225, 225]);
+    }
+
+    #[test]
+    fn text_scale_grows_fonts_and_metrics() {
+        // A 9 pt font at 96 DPI and text size 100 / 150 / 200 / 225 %.
+        assert_eq!([100, 150, 200, 225].map(|p| font_height(9, 96, p)), [-12, -18, -24, -27]);
+        // A 44 px bar, scaled the way ui::layout does with text_dpi.
+        assert_eq!([100, 150, 200, 225].map(|p| 44 * scaled_dpi(96, p) as i32 / 96), [44, 66, 88, 99]);
+        // Text size on top of display scaling multiplies.
+        assert_eq!(scaled_dpi(144, 150), 216);
+        assert_eq!(font_height(9, 240, 225), -68);
+    }
+
+    #[test]
+    fn display_scaling_100_to_250() {
+        let dpis = [96, 120, 144, 168, 192, 240];
+        assert_eq!(dpis.map(|d| scaled_dpi(d, 100)), dpis, "100 % text size leaves the DPI alone");
+        assert_eq!(dpis.map(|d| font_height(9, d, 100)), [-12, -15, -18, -21, -24, -30]);
+        assert_eq!(dpis.map(card_radius), [10, 12, 15, 17, 20, 25]);
     }
 
     #[test]

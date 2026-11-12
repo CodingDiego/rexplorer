@@ -1,1 +1,27 @@
 1 ICON "app.ico"
+
+// REX_VERSION and REX_VERSION_STR come from build.rs (the crate version).
+1 VERSIONINFO
+FILEVERSION REX_VERSION
+PRODUCTVERSION REX_VERSION
+FILEOS 0x40004
+FILETYPE 0x1
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "ProductName", "rexplorer"
+      VALUE "FileDescription", "rexplorer file manager"
+      VALUE "FileVersion", REX_VERSION_STR
+      VALUE "ProductVersion", REX_VERSION_STR
+      VALUE "InternalName", "rexplorer"
+      VALUE "OriginalFilename", "rexplorer.exe"
+      VALUE "LegalCopyright", "Copyright (c) 2026 Diego Palacios. MIT License."
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END

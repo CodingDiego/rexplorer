@@ -130,9 +130,8 @@ pub fn set_text(hwnd: HWND, left: &str, right: &str) {
 unsafe fn text_rects(dc: HDC, st: &State, w: i32, h: i32, dpi: u32) -> (RECT, RECT) {
     let pad = scale(PAD, dpi);
     let flags = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS;
-    let mut right: Vec<u16> = st.right.encode_utf16().collect();
     let mut rr = RECT { left: pad, top: 0, right: w - pad, bottom: h };
-    DrawTextW(dc, &mut right, &mut rr, flags | DT_RIGHT | DT_CALCRECT);
+    crate::theme::draw_text(dc, &st.right, &mut rr, flags | DT_RIGHT | DT_CALCRECT);
     let rw = rr.right - rr.left;
     let rr = RECT { left: (w - pad - rw).max(pad), top: 0, right: w - pad, bottom: h };
     // Centered in the width the right text leaves free on both sides.
@@ -141,17 +140,23 @@ unsafe fn text_rects(dc: HDC, st: &State, w: i32, h: i32, dpi: u32) -> (RECT, RE
     (lr, rr)
 }
 
-unsafe fn acc_tree(hwnd: HWND, st: &State, t: &mut access::Tree) {
-    use windows::Win32::UI::Controls::STATE_SYSTEM_INVISIBLE;
+/// [`text_rects`] in the window's own DC and font.
+unsafe fn window_text_rects(hwnd: HWND, st: &State) -> (RECT, RECT) {
     let mut rc = RECT::default();
     let _ = GetClientRect(hwnd, &mut rc);
     let dpi = GetDpiForWindow(hwnd).max(96);
     let dc = GetDC(Some(hwnd));
     let font = if st.font.is_invalid() { GetStockObject(DEFAULT_GUI_FONT) } else { st.font.into() };
     let old = SelectObject(dc, font);
-    let (l, r) = text_rects(dc, st, rc.right, rc.bottom, dpi);
+    let rects = text_rects(dc, st, rc.right, rc.bottom, dpi);
     SelectObject(dc, old);
     ReleaseDC(Some(hwnd), dc);
+    rects
+}
+
+unsafe fn acc_tree(hwnd: HWND, st: &State, t: &mut access::Tree) {
+    use windows::Win32::UI::Controls::STATE_SYSTEM_INVISIBLE;
+    let (l, r) = window_text_rects(hwnd, st);
     t.name = if st.left.is_empty() { tr("status.window_name").into() } else { st.left.clone() };
     t.role = ROLE_SYSTEM_STATUSBAR;
     for (text, rect) in [(&st.left, l), (&st.right, r)] {
@@ -187,10 +192,8 @@ unsafe fn paint(hwnd: HWND, st: &State) {
     SetTextColor(mem, COLORREF(st.theme.secondary_text));
     let flags = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS;
     let (mut lr, mut rr) = text_rects(mem, st, w, h, dpi);
-    let mut right: Vec<u16> = st.right.encode_utf16().collect();
-    DrawTextW(mem, &mut right, &mut rr, flags | DT_RIGHT);
-    let mut left: Vec<u16> = st.left.encode_utf16().collect();
-    DrawTextW(mem, &mut left, &mut lr, flags | DT_CENTER);
+    crate::theme::draw_text(mem, &st.right, &mut rr, flags | DT_RIGHT);
+    crate::theme::draw_text(mem, &st.left, &mut lr, flags | DT_CENTER);
 
     let _ = BitBlt(hdc, 0, 0, w, h, Some(mem), 0, 0, SRCCOPY);
     SelectObject(mem, old_font);
@@ -200,6 +203,7 @@ unsafe fn paint(hwnd: HWND, st: &State) {
     let _ = EndPaint(hwnd, &ps);
 }
 
+#[allow(clippy::needless_borrow)] // the explicit borrow of a raw-pointer field silences rustc's dangerous_implicit_autorefs
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_NCCREATE => {
@@ -248,6 +252,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if !st.is_null() {
                 paint(hwnd, &*st);
                 return LRESULT(0);
+            }
+        }
+        // A click on the right text goes to the parent as WM_COMMAND from this control (the update notice is there).
+        WM_LBUTTONUP => {
+            let st = state(hwnd);
+            if !st.is_null() && !(&(*st).right).is_empty() {
+                let (_, r) = window_text_rects(hwnd, &*st);
+                let (x, y) = (lparam.0 as i16 as i32, (lparam.0 >> 16) as i16 as i32);
+                if x >= r.left && x < r.right && y >= r.top && y < r.bottom
+                    && let Ok(parent) = GetParent(hwnd) {
+                        SendMessageW(parent, WM_COMMAND, Some(WPARAM(GetDlgCtrlID(hwnd) as usize)), Some(LPARAM(hwnd.0 as isize)));
+                    }
             }
         }
         _ => {}

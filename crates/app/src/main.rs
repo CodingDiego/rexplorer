@@ -35,6 +35,7 @@ mod thumbs;
 mod toolbar;
 mod ui;
 mod views;
+mod watchdog;
 
 use std::ffi::c_void;
 use std::mem::size_of;
@@ -61,16 +62,22 @@ use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetD
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Shell::{
     DefSubclassProc, SHFILEINFOW, SHGFI_PIDL, SHGFI_SMALLICON, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW,
-    SetWindowSubclass,
+    SetWindowSubclass, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Error, HSTRING, PCWSTR, PWSTR, Result, w};
 
-use nav::{Tab, cur, go, listing};
+use nav::{Tab, cur, go};
 use source::Source;
 
 const WM_ENUM_DONE: u32 = WM_APP + 1;
 const WM_SHELL_CHANGE: u32 = WM_APP + 2;
+/// The update check found a newer release: lparam is a Box<String> with its version.
+const WM_UPDATE_FOUND: u32 = WM_APP + 11;
+/// A breadcrumb dropdown's folders are listed: lparam is a Box<ui::CrumbItems>.
+const WM_CRUMB_ITEMS: u32 = WM_APP + 13;
+/// That version, for the status bar and the More menu.
+static UPDATE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 const TIMER_REFRESH: usize = 1;
 const TIMER_STATUS: usize = 2;
 const TIMER_SESSION: usize = 3;
@@ -180,6 +187,12 @@ const CMD_TOGGLE_DETAILS: u16 = 68;
 /// Ctrl+Shift+C: the selected paths as text. Ctrl+Num+: size all columns to fit.
 const CMD_COPY_PATH: u16 = 69;
 const CMD_FIT_COLUMNS: u16 = 70;
+/// Opens the release page the update notice names.
+const CMD_UPDATE: u16 = 71;
+/// Paste shortcut: .lnk files to the clipboard's files, in the current folder.
+const CMD_PASTE_SHORTCUT: u16 = 72;
+/// Ctrl+Shift+Enter: the selected program through the shell's runas verb.
+const CMD_RUN_AS: u16 = 73;
 /// Two crashes this close together (seconds) send the folder to Windows Explorer instead of a third start.
 const CRASH_GUARD_SECS: u64 = 60;
 
@@ -187,7 +200,7 @@ const fn accel(flags: u8, key: VIRTUAL_KEY, cmd: u16) -> ACCEL {
     ACCEL { fVirt: ACCEL_VIRT_FLAGS(FVIRTKEY.0 | flags), key: key.0, cmd }
 }
 
-const ACCELS: [ACCEL; 46] = [
+const ACCELS: [ACCEL; 47] = [
     accel(FALT.0, VK_LEFT, CMD_BACK),
     accel(FALT.0, VK_RIGHT, CMD_FORWARD),
     accel(FALT.0, VK_UP, CMD_UP),
@@ -223,6 +236,7 @@ const ACCELS: [ACCEL; 46] = [
     accel(FCONTROL.0, VK_E, CMD_SEARCH),
     accel(0, VK_F3, CMD_SEARCH),
     accel(FCONTROL.0, VK_RETURN, CMD_OPEN_TAB),
+    accel(FCONTROL.0 | FSHIFT.0, VK_RETURN, CMD_RUN_AS),
     accel(0, VK_F11, CMD_FULLSCREEN),
     accel(FCONTROL.0, VK_I, CMD_INVERT),
     accel(0, VK_F6, CMD_FOCUS_NEXT),
@@ -302,29 +316,38 @@ pub(crate) struct App {
 }
 
 fn main() -> Result<()> {
+    // Before any window, so the taskbar groups them and finds the jump list (no install needed).
+    let _ = rexplorer_core::jumplist::set_process_app_id();
     // Before the usage and argument-error boxes, so they speak the user's language too. Reads settings.ini only (a
     // missing or unreadable file means `system`); nothing may call `tr` before this line: the first call freezes English.
     rexplorer_core::i18n::init(&settings::dir(), &Settings::load().language, &system_language());
     let args = match cli::parse(std::env::args().skip(1)) {
-        Ok(a) if a.help => return Ok(info_box(&cli::usage(), MB_ICONINFORMATION)),
+        Ok(a) if a.help => return {
+            info_box(&cli::usage(), MB_ICONINFORMATION);
+            Ok(())
+        },
         Ok(a) => a,
-        Err(e) => return Ok(info_box(&format!("{e}\n\n{}", cli::usage()), MB_ICONERROR)),
+        Err(e) => return {
+            info_box(&format!("{e}\n\n{}", cli::usage()), MB_ICONERROR);
+            Ok(())
+        },
     };
     if args.forward {
         // Explorer arguments we do not handle (/idlist, URLs, apps): the real Explorer gets them verbatim.
         std::process::exit(if rexplorer_core::fallback::forward_command_line().is_ok() { 0 } else { 1 });
     }
+    // Exit code of the install and register flows: 0 done, 1 failed, 2 cancelled.
+    let code = |o: ui::InstallOutcome| match o {
+        ui::InstallOutcome::Done => 0,
+        ui::InstallOutcome::Cancelled => 2,
+        ui::InstallOutcome::Failed => 1,
+    };
     if args.register || args.unregister {
-        unsafe { ui::register_flow(None, args.unregister) };
-        return Ok(());
+        std::process::exit(code(unsafe { ui::register_flow(None, args.unregister, args.quiet) }));
     }
     if args.install || args.uninstall {
-        // Every install asks first (it replaces Explorer and any running copy); --uninstall stays unconfirmed.
-        std::process::exit(match unsafe { ui::install_flow(None, args.uninstall, !args.uninstall) } {
-            ui::InstallOutcome::Done => 0,
-            ui::InstallOutcome::Cancelled => 2,
-            ui::InstallOutcome::Failed => 1,
-        });
+        // Every install asks first (it replaces any running copy) unless --quiet; --uninstall stays unconfirmed.
+        std::process::exit(code(unsafe { ui::install_flow(None, args.uninstall, !args.uninstall, args.quiet) }));
     }
     if args.import_explorer {
         std::process::exit(if unsafe { ui::import_explorer_flow(args.profile.as_deref(), args.overwrite) } { 0 } else { 1 });
@@ -351,13 +374,11 @@ fn main() -> Result<()> {
     }
     // A recovery launch must not hand off to the instance that is crashing.
     let _instance = if args.new_window { None } else { instance::claim() };
-    if _instance.is_none() && !args.recover && !args.new_window {
-        if let Some(h) = instance::find_main_window() {
-            if instance::send(h, &cli::payload(&args)) {
+    if _instance.is_none() && !args.recover && !args.new_window
+        && let Some(h) = instance::find_main_window()
+            && instance::send(h, &cli::payload(&args)) {
                 return Ok(());
             } // else UIPI dropped it: open our own window
-        }
-    }
     if !args.recover && !args.new_window {
         crash::reset_recoveries();
     }
@@ -418,7 +439,7 @@ fn main() -> Result<()> {
             lpfnWndProc: Some(wndproc),
             hInstance: hinst,
             hCursor: LoadCursorW(None, IDC_ARROW)?,
-            hIcon: LoadIconW(Some(hinst), PCWSTR(1 as *const u16)).unwrap_or_default(),
+            hIcon: LoadIconW(Some(hinst), PCWSTR(std::ptr::without_provenance(1))).unwrap_or_default(),
             hbrBackground: brushes.background,
             lpszClassName: class,
             ..Default::default()
@@ -484,6 +505,7 @@ fn main() -> Result<()> {
             Some(hinst),
             Some(app as *const c_void),
         )?;
+        let _ = rexplorer_core::jumplist::set_window_app_id(hwnd, false);
         // Unmarked, later launches and Win+E still go to the first window; the system cascades this one.
         if !args.new_window {
             instance::mark(hwnd);
@@ -493,6 +515,16 @@ fn main() -> Result<()> {
         }
 
         open_startup_tabs(app, &args);
+        if args.recover && crash::has_dumps() {
+            let q = HSTRING::from(rexplorer_core::i18n::tr("dlg.crash.saved"));
+            if MessageBoxW(Some(hwnd), PCWSTR(q.as_ptr()), w!("rexplorer"), MB_YESNO | MB_ICONINFORMATION) == IDYES {
+                nav::new_tab(app, nav::Target::Name(crash::crash_dir().to_string_lossy().into_owned()), true, None);
+            }
+        }
+        watchdog::spawn(hwnd);
+        if (*app).profile.check_updates {
+            check_updates(hwnd);
+        }
 
         let accel_table = CreateAcceleratorTableW(&accels(&settings.keys))?;
         let mut msg = MSG::default();
@@ -506,10 +538,54 @@ fn main() -> Result<()> {
                 continue;
             }
             let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            watchdog::dispatch(&msg);
         }
     }
     Ok(())
+}
+
+/// The opt-in update check, on a worker: it posts WM_UPDATE_FOUND only when a newer release is out.
+fn check_updates(hwnd: HWND) {
+    let hwnd = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        ui::background_priority();
+        if let Some(v) = rexplorer_core::update::check(&settings::dir(), env!("CARGO_PKG_VERSION")) {
+            let _ = unsafe { PostMessageW(Some(HWND(hwnd as *mut c_void)), WM_UPDATE_FOUND, WPARAM(0), LPARAM(Box::into_raw(Box::new(v)) as isize)) };
+        }
+    });
+}
+
+/// Rebuilds the taskbar jump list on a worker: Quick Access's frequent folders and `recent`. A call made while one
+/// runs leaves its list for that worker, so a burst of navigations rebuilds it once or twice, not once each.
+fn refresh_jump_list(recent: Vec<String>) {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static NEXT: Mutex<Option<Vec<String>>> = Mutex::new(None);
+    static BUSY: AtomicBool = AtomicBool::new(false);
+    let next = || NEXT.lock().unwrap_or_else(|e| e.into_inner()).take();
+    *NEXT.lock().unwrap_or_else(|e| e.into_inner()) = Some(recent);
+    if BUSY.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    std::thread::spawn(move || {
+        ui::background_priority();
+        let _com = ComInit::sta();
+        let exe = std::env::current_exe().unwrap_or_default();
+        let tr = |k: &'static str| rexplorer_core::i18n::tr(k).to_string();
+        let labels = rexplorer_core::jumplist::Labels { frequent: tr("menu.jump.frequent"), recent: tr("menu.jump.recent"), new_window: tr("menu.jump.new_window") };
+        loop {
+            while let Some(recent) = next() {
+                if let Err(e) = rexplorer_core::jumplist::update(&exe, &panes::frequent_folders(), &recent, &labels) {
+                    crash::log(&format!("jump list: {e}"));
+                }
+            }
+            BUSY.store(false, Ordering::Release);
+            // A call between the last take and the store saw BUSY and left its list: take the work back for it.
+            if NEXT.lock().unwrap_or_else(|e| e.into_inner()).is_none() || BUSY.swap(true, Ordering::AcqRel) {
+                break;
+            }
+        }
+    });
 }
 
 /// Pane and view state: the saved session, or the profile on a first run or an explicit --profile.
@@ -538,7 +614,8 @@ unsafe fn pane_accel(app: *mut App, msg: &MSG, focus: HWND) -> bool {
     // The embedded Explorer view keeps Ctrl+Z / Ctrl+Y for its own undo.
     let undo_key = GetKeyState(VK_CONTROL.0 as i32) < 0 && matches!(VIRTUAL_KEY(msg.wParam.0 as u16), VK_Z | VK_Y);
     let panes = (*app).panes.tree.as_ref().is_some_and(|t| inside(t.hwnd())) || (!undo_key && source::browser_hwnd(app).is_some_and(inside));
-    focus == (*app).search || focus == (*app).sidebar || focus == (*app).strip || focus == (*app).crumbs || (panes && !edit_keeps_tab(msg))
+    let bars = [(*app).nav, (*app).tools, (*app).cmdbar].contains(&focus);
+    bars || focus == (*app).search || focus == (*app).sidebar || focus == (*app).strip || focus == (*app).crumbs || (panes && !edit_keeps_tab(msg))
 }
 
 /// Tab in an Edit (a rename in the tree or the embedded view) is the Edit's: it commits and edits the next item.
@@ -633,6 +710,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if code == EN_CHANGE as usize {
                     SetTimer(Some(hwnd), TIMER_SEARCH, (*app).profile.search_delay_ms, None);
                 }
+            } else if id == ID_STATUS {
+                // A click on the status bar's right text, where the update notice is.
+                if UPDATE.get().is_some() {
+                    on_command(app, CMD_UPDATE);
+                }
             } else {
                 on_command(app, id as u16);
             }
@@ -641,8 +723,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             return LRESULT(theme::ctl_color(HDC(wparam.0 as *mut c_void), &(*app).theme, &(*app).brushes).0 as isize);
         }
         WM_COPYDATA => {
-            if let Some(text) = instance::receive(lparam) {
-                let args = cli::parse_payload(&text);
+            // A sender on another protocol version gets 0 and opens its own window.
+            if let Some(args) = instance::receive(lparam).and_then(|text| cli::parse_payload(&text)) {
                 // A launch without folders (Win+E, the taskbar icon once installed) opens a tab at the start place.
                 if !nav::open_args(app, &args) && args.search.is_none() {
                     nav::new_tab(app, nav::Target::Name((*app).profile.start.clone()), true, None);
@@ -670,6 +752,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if theme::is_color_change(msg, wparam.0, setting.as_deref()) {
                 ui::refresh_theme(app);
             }
+            // Text size has no setting name of its own here: re-read it on every broadcast (one registry read).
+            if msg == WM_SETTINGCHANGE && theme::refresh_text_scale() {
+                ui::rescale(app);
+            }
             if msg == WM_SYSCOLORCHANGE {
                 // Common controls cache system colors; they only refresh on this message.
                 unsafe extern "system" fn forward(child: HWND, _: LPARAM) -> windows::core::BOOL {
@@ -682,9 +768,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_CONTEXTMENU if HWND(wparam.0 as *mut c_void) == (*app).nav => nav::on_nav_context(app, lparam),
         WM_ENUM_DONE => nav::on_enum_done(app, Box::from_raw(lparam.0 as *mut nav::EnumDone)),
+        WM_CRUMB_ITEMS => ui::on_crumb_items(app, *Box::from_raw(lparam.0 as *mut ui::CrumbItems)),
+        WM_UPDATE_FOUND => {
+            let _ = UPDATE.set(*Box::from_raw(lparam.0 as *mut String));
+            ui::update_status(app);
+        }
         source::WM_SEARCH_BATCH => source::on_search_batch(app, Box::from_raw(lparam.0 as *mut source::SearchBatch)),
         source::WM_BROWSER_NAV => source::on_browser_nav(app, Box::from_raw(lparam.0 as *mut Pidl)),
         source::WM_WORKER_ERROR => message(hwnd, &Box::from_raw(lparam.0 as *mut String)),
+        source::WM_ARCHIVE_PASSWORD => source::on_archive_password(app, Box::from_raw(lparam.0 as *mut _)),
         panes::WM_SIDEBAR_ROWS => panes::on_sidebar_rows(app, Box::from_raw(lparam.0 as *mut panes::SidebarRows)),
         panes::WM_TREE_SELECT => panes::on_tree_select(app, Box::from_raw(lparam.0 as *mut Pidl)),
         panes::WM_QUICK_ACCESS_DONE => {
@@ -696,6 +788,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         views::WM_THUMB_DONE => views::on_thumb_done(app, wparam, lparam),
         views::WM_ICONS_EXPORTED => views::on_icons_exported(app),
+        watchdog::WM_HEARTBEAT => watchdog::beat(),
         WM_SETCURSOR => {
             if HWND(wparam.0 as *mut c_void) == hwnd && (lparam.0 & 0xFFFF) as u32 == HTCLIENT && panes::on_set_cursor(app) {
                 return LRESULT(1);
@@ -759,25 +852,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
         }
         WM_INITMENUPOPUP | WM_DRAWITEM | WM_MEASUREITEM | WM_MENUCHAR => {
-            if let Some(menu) = &(*app).active_menu {
-                if let Some(result) = menu.handle_message(msg, wparam, lparam) {
+            if let Some(menu) = &(*app).active_menu
+                && let Some(result) = menu.handle_message(msg, wparam, lparam) {
                     return result;
                 }
-            }
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
         WM_DPICHANGED => {
             let r = &*(lparam.0 as *const RECT);
             let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
-            ui::apply_font(app);
-            ui::sync_list_style(app);
-            views::rebuild_tall(app);
-            if let Some(s) = nav::source(app) {
-                nav::set_columns(app, &s.columns());
-                nav::apply_layout(app);
-            }
-            views::apply(app);
-            ui::layout(app);
+            ui::rescale(app);
         }
         WM_DESTROY => {
             if !(*app).secondary {
@@ -796,7 +880,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 rexplorer_core::dragdrop::unregister(w);
             }
             views::destroy(app);
+            let _ = std::fs::remove_dir_all(archive_view::session_dir());
+            rexplorer_core::archive::forget_passwords();
             (*app).panes.tree = None;
+            // The shell asks for a window's properties to be cleared before it goes.
+            let _ = rexplorer_core::jumplist::set_window_app_id(hwnd, true);
             PostQuitMessage(0);
         }
         _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -810,6 +898,7 @@ unsafe fn arm_change(app: *mut App, ms: u32) {
     SetTimer(Some((*app).hwnd), TIMER_CHANGE, ms, None);
 }
 
+#[allow(clippy::needless_borrow)] // the explicit borrow of a raw-pointer field silences rustc's dangerous_implicit_autorefs
 unsafe fn on_notify(app: *mut App, lparam: LPARAM) -> LRESULT {
     let hdr = &*(lparam.0 as *const NMHDR);
     let from = hdr.hwndFrom;
@@ -901,10 +990,11 @@ unsafe fn on_command(app: *mut App, cmd: u16) {
             if GetFocus() == addr {
                 let text = window_text(addr);
                 let current = nav::source(app).map(|s| s.editing_name()).unwrap_or_default();
-                if text.trim().is_empty() || text == current {
+                let searching = matches!(nav::source(app), Some(source::Source::Search(_)));
+                if address_refreshes(&text, &current, searching) {
                     nav::refresh(app);
                 } else {
-                    go(app, nav::Target::Name(text.trim().to_string()), nav::History::Push);
+                    go(app, nav::Target::Name(nav::expand_env(text.trim(), |n| std::env::var(n).ok())), nav::History::Push);
                 }
                 let _ = SetFocus(Some(ui::view_hwnd(app)));
             } else {
@@ -961,6 +1051,8 @@ unsafe fn on_command(app: *mut App, cmd: u16) {
         CMD_COPY_PATH => list::copy_as_path(app),
         CMD_FIT_COLUMNS => list::fit_columns(app),
         CMD_PASTE => list::verb_on_background(app, "paste"),
+        CMD_PASTE_SHORTCUT => list::paste_shortcut(app),
+        CMD_RUN_AS => list::run_as_admin(app),
         CMD_UNDO | CMD_REDO => list::undo_step(app, cmd == CMD_REDO),
         CMD_RENAME => list::begin_rename(app),
         CMD_SHARE => commands::share(app),
@@ -972,7 +1064,7 @@ unsafe fn on_command(app: *mut App, cmd: u16) {
         CMD_TOGGLE_PREVIEW => panes::toggle_right(app, panes::RightPane::Preview),
         CMD_TOGGLE_DETAILS => panes::toggle_right(app, panes::RightPane::Details),
         CMD_CONNECT => {
-            if let Some(url) = connect::dialog((*app).hwnd, &(*app).theme, (*app).font) {
+            if let Some(url) = connect::dialog((*app).hwnd, &(*app).theme) {
                 nav::new_tab(app, nav::Target::Name(url), true, None);
             }
         }
@@ -981,13 +1073,19 @@ unsafe fn on_command(app: *mut App, cmd: u16) {
             SendMessageW((*app).search, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
         }
         CMD_MORE => ui::more_menu(app),
-        CMD_REGISTER | CMD_UNREGISTER => ui::register_flow(Some((*app).hwnd), cmd == CMD_UNREGISTER),
+        CMD_REGISTER | CMD_UNREGISTER => {
+            ui::register_flow(Some((*app).hwnd), cmd == CMD_UNREGISTER, false);
+        }
         CMD_INSTALL | CMD_UNINSTALL => {
-            ui::install_flow(Some((*app).hwnd), cmd == CMD_UNINSTALL, true);
+            ui::install_flow(Some((*app).hwnd), cmd == CMD_UNINSTALL, true, false);
         }
         CMD_FOLDER_OPTIONS => folder_options::run(app),
         CMD_SETTINGS => nav::new_tab(app, nav::Target::Name(settings::dir().display().to_string()), true, None),
         CMD_ABOUT => ui::about(app),
+        CMD_UPDATE => {
+            let page = HSTRING::from(rexplorer_core::update::RELEASE_PAGE);
+            ShellExecuteW(Some((*app).hwnd), w!("open"), &page, PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+        }
         CMD_PIN => list::pin_to_home(app),
         c if (CMD_TAB1..CMD_TAB1 + 9).contains(&c) => {
             // Ctrl+9 is the last tab, as in browsers.
@@ -1072,8 +1170,23 @@ unsafe fn restore_placement(hwnd: HWND) -> bool {
     SetWindowPlacement(hwnd, &wp).is_ok()
 }
 
+/// Enter in the address box refreshes on an empty box or the place's own name; on search results the name is the
+/// searched folder's, and entering it goes to that folder (as in Explorer) instead of searching again.
+fn address_refreshes(text: &str, current: &str, searching: bool) -> bool {
+    text.trim().is_empty() || (text == current && !searching)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn address_enter_refreshes_only_the_place_shown() {
+        use super::address_refreshes;
+        assert!(address_refreshes("C:\\a", "C:\\a", false));
+        assert!(address_refreshes("  ", "C:\\a", true));
+        assert!(!address_refreshes("C:\\a", "C:\\a", true));
+        assert!(!address_refreshes("C:\\b", "C:\\a", false));
+    }
+
     #[test]
     fn system_language_is_a_locale_name() {
         let l = super::system_language();

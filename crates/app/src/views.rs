@@ -9,9 +9,11 @@ use rexplorer_core::images::ImageCache;
 use windows::Win32::UI::HiDpi::GetSystemMetricsForDpi;
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, AlphaBlend, BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CreateCompatibleDC,
-    CreateDIBSection, DIB_RGB_COLORS, DeleteDC, GdiFlush, GetObjectW, HALFTONE, HBITMAP, SRCCOPY, SelectObject,
-    SetStretchBltMode, StretchBlt,
+    CreateDIBSection, DIB_RGB_COLORS, DT_CENTER, DT_NOCLIP, DT_SINGLELINE, DT_VCENTER, DeleteDC, DrawTextW, GdiFlush,
+    GetObjectW, HALFTONE, HBITMAP, SRCCOPY, SelectObject, SetBkMode, SetStretchBltMode, SetTextColor, StretchBlt,
+    TRANSPARENT,
 };
+use windows::Win32::Foundation::COLORREF;
 
 pub(crate) const WM_THUMB_DONE: u32 = WM_APP + 7;
 /// The system-icon export into the default icon theme has finished.
@@ -255,7 +257,8 @@ pub(crate) unsafe fn rebuild_tall(app: *mut App) {
     }
     let (mut w, mut h) = (0, 0);
     let _ = ImageList_GetIconSize(a.views.small, Some(&mut w), Some(&mut h));
-    let tall = ImageList_Create(w, (ROW * GetDpiForWindow(a.hwnd) as i32 / 96 - ROW_PAD).max(h), ILC_COLOR32, 64, 64);
+    // The row holds a line of text, so its height follows the text size.
+    let tall = ImageList_Create(w, (ROW * theme::text_dpi(GetDpiForWindow(a.hwnd)) as i32 / 96 - ROW_PAD).max(h), ILC_COLOR32, 64, 64);
     let old = std::mem::replace(&mut a.views.tall, tall);
     a.views.tall_index.clear();
     SendMessageW(a.list, LVM_SETIMAGELIST, Some(WPARAM(LVSIL_SMALL as usize)), Some(LPARAM(tall.0)));
@@ -284,18 +287,66 @@ pub(crate) unsafe fn tall_icon(app: *mut App, index: i32) -> i32 {
     let (mut w, mut h, mut sw, mut sh) = (0, 0, 0, 0);
     let _ = ImageList_GetIconSize(v.tall, Some(&mut w), Some(&mut h));
     let _ = ImageList_GetIconSize(v.small, Some(&mut sw), Some(&mut sh));
-    let Some((bmp, _)) = dib(w, h) else { return 0 };
+    let Some((bmp, bits)) = dib(w, h) else { return 0 };
     let dc = CreateCompatibleDC(None);
     let old = SelectObject(dc, bmp.into());
     let (base, overlay) = rexplorer_core::item::split_icon(index);
     // INDEXTOOVERLAYMASK: the overlay image's 1-based index goes in bits 8-11 of the draw style.
     let _ = ImageList_Draw(v.small, base, dc, 0, (h - sh) / 2, ILD_TRANSPARENT | ILD_PRESERVEALPHA | IMAGE_LIST_DRAW_STYLE(overlay << 8));
+    let _ = GdiFlush();
     SelectObject(dc, old);
     let _ = DeleteDC(dc);
+    let cloud = rexplorer_core::item::cloud_of(index);
+    if cloud != 0 {
+        let m = (sw * 5 / 8).max(6);
+        cloud_mark(std::slice::from_raw_parts_mut(bits, (w * h * 4) as usize), w, h, ((h - sh) / 2 + sh - m).max(0), m, cloud);
+    }
     let t = ImageList_Add(v.tall, bmp, None).max(0);
     let _ = DeleteObject(bmp.into());
     v.tall_index.insert(index, t);
     t
+}
+
+/// The colors and glyphs of the cloud marks: a blue cloud (online-only) or a green filled check (always kept).
+fn cloud_glyph(state: u32) -> (u16, [u32; 3]) {
+    if state == rexplorer_core::item::CLOUD_PINNED { (0xEC61, [0x10, 0x7C, 0x10]) } else { (0xE753, [0xD4, 0x78, 0x00]) }
+}
+
+/// Paints the cloud mark `state` (`m` px square) over the lower left of the premultiplied BGRA icon `px` (`w` x
+/// `h`, top-down) at row `y`. The glyph is drawn white on black and that gray becomes its alpha, as for menu icons.
+unsafe fn cloud_mark(px: &mut [u8], w: i32, h: i32, y: i32, m: i32, state: u32) {
+    let Some((mb, mbits)) = dib(m, m) else { return };
+    let dc = CreateCompatibleDC(None);
+    let old = SelectObject(dc, mb.into());
+    let font = theme::icon_font(96, m);
+    let old_font = SelectObject(dc, font.into());
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, COLORREF(0x00FF_FFFF));
+    let (glyph, [b, g, r]) = cloud_glyph(state);
+    let mut text = [glyph];
+    let mut rc = RECT { left: 0, top: 0, right: m, bottom: m };
+    DrawTextW(dc, &mut text, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOCLIP);
+    let _ = GdiFlush();
+    SelectObject(dc, old_font);
+    let _ = DeleteObject(font.into());
+    SelectObject(dc, old);
+    let _ = DeleteDC(dc);
+    let src = std::slice::from_raw_parts(mbits, (m * m * 4) as usize);
+    for my in 0..m.min(h - y) {
+        for mx in 0..m.min(w) {
+            let s = ((my * m + mx) * 4) as usize;
+            let a = src[s].max(src[s + 1]).max(src[s + 2]) as u32;
+            let d = (((y + my) * w + mx) * 4) as usize;
+            if a == 0 || d + 3 >= px.len() {
+                continue;
+            }
+            for (k, c) in [b, g, r].into_iter().enumerate() {
+                px[d + k] = (c * a / 255 + px[d + k] as u32 * (255 - a) / 255) as u8;
+            }
+            px[d + 3] = (a + px[d + 3] as u32 * (255 - a) / 255) as u8;
+        }
+    }
+    let _ = DeleteObject(mb.into());
 }
 
 /// After the list exists: starts the worker, loads the icon theme and applies the saved view.
@@ -337,7 +388,7 @@ fn start_icon_export(hwnd: HWND, t: &Theme) {
 pub(crate) unsafe fn on_icons_exported(app: *mut App) {
     let Some(t) = (*app).views.icon_theme.as_mut() else { return };
     t.theme.forget_missing();
-    for t in (&mut (*app).tabs).iter_mut() {
+    for t in (*app).tabs.iter_mut() {
         match &mut t.source {
             Some(Source::Shell(l)) => l.icons.fill(ICON_UNKNOWN),
             Some(Source::Archive(a)) => a.icons.fill(ICON_UNKNOWN),
@@ -441,7 +492,8 @@ pub(crate) unsafe fn apply(app: *mut App) {
             SendMessageW(list, LVM_SETVIEW, Some(WPARAM(LV_VIEW_TILE as usize)), None);
         } else {
             // Distance between tile origins: image plus room for two lines of label.
-            let (cx, cy) = (size + 40 * dpi / 96, size + 44 * dpi / 96);
+            let tdpi = theme::text_dpi(dpi as u32) as i32;
+            let (cx, cy) = (size + 40 * tdpi / 96, size + 44 * tdpi / 96);
             SendMessageW(list, LVM_SETICONSPACING, Some(WPARAM(0)), Some(LPARAM(((cy as isize) << 16) | cx as isize)));
             SendMessageW(list, LVM_SETVIEW, Some(WPARAM(LV_VIEW_ICON as usize)), None);
         }
@@ -471,6 +523,7 @@ pub(crate) unsafe fn reset(app: *mut App, count: usize) {
 }
 
 /// LVN_GETDISPINFO in an icon view: the item's image, requesting it when unknown.
+#[allow(clippy::needless_borrow)] // the explicit borrow of a raw-pointer field silences rustc's dangerous_implicit_autorefs
 pub(crate) unsafe fn image(app: *mut App, i: usize) -> i32 {
     match (&(*app).views.slots).get(i) {
         Some(&UNKNOWN) => request(app, i),
@@ -514,7 +567,7 @@ pub(crate) unsafe fn on_cache_hint(app: *mut App, from: i32, to: i32) {
     // The lookahead preloads pictures only: no off-screen PDF, Office or video rendering.
     for i in thumbs::visible_range(from, to - from + 1, count, LOOKAHEAD) {
         // shortcut: the extension comes from a parsing name asked per lookahead row; keep it per item if the hint gets hot
-        if (&(*app).views.slots)[i] == UNKNOWN && listing(app).and_then(|l| l.items.get(i)).is_some_and(|it| is_picture(&it.parsing_name())) {
+        if (&(*app).views.slots)[i] == UNKNOWN && row_key(app, i).is_some_and(|p| is_picture(&p)) {
             request(app, i);
         }
     }
@@ -561,12 +614,20 @@ fn is_picture(parsing: &str) -> bool {
     rexplorer_core::preview::is_image(std::path::Path::new(parsing).extension().and_then(|e| e.to_str()).unwrap_or(""))
 }
 
+/// Row `i`'s name for the image cache: its parsing name, or an archive member's path inside its archive.
+unsafe fn row_key(app: *mut App, i: usize) -> Option<String> {
+    match nav::source(app)? {
+        Source::Shell(l) => l.items.get(i).map(|it| it.parsing_name()),
+        Source::Archive(a) => a.rows.get(i).map(|e| format!("{}\\{}", a.listing.archive.display(), e.path)),
+        Source::Search(s) => s.rows.get(i).map(|r| r.item.parsing_name()),
+        _ => None,
+    }
+}
+
 /// From the cache when possible (image index), else queued on the worker (placeholder until it lands).
 unsafe fn request(app: *mut App, i: usize) -> i32 {
-    let Some(l) = listing(app) else { return 0 };
-    let Some(item) = l.items.get(i) else { return 0 };
+    let Some(parsing) = row_key(app, i) else { return 0 };
     let v = &mut (*app).views;
-    let parsing = item.parsing_name();
     let key = cache_key(v.view, v.size, &parsing);
     if let Some(bmp) = v.cache.get(&key) {
         let index = ImageList_Add(v.normal, bmp, None).max(0);
@@ -578,9 +639,29 @@ unsafe fn request(app: *mut App, i: usize) -> i32 {
     if !t.in_window(i) {
         return 0;
     }
-    // These views show pictures as thumbnails and everything else as its icon.
-    let icon_only = matches!(v.view, View::Icons | View::Medium | View::Tiles | View::Content) && !is_picture(&parsing);
-    t.request((v.token << 32) | i, l.folder.child_pidl(item), v.size, icon_only);
+    let id = (v.token << 32) | i;
+    match nav::source(app) {
+        Some(Source::Shell(l)) => {
+            // These views show pictures as thumbnails and everything else as its icon.
+            let icon_only = matches!(v.view, View::Icons | View::Medium | View::Tiles | View::Content) && !is_picture(&parsing);
+            t.request(id, l.folder.child_pidl(&l.items[i]), v.size, icon_only);
+        }
+        Some(Source::Search(s)) => {
+            let icon_only = matches!(v.view, View::Icons | View::Medium | View::Tiles | View::Content) && !is_picture(&parsing);
+            t.request(id, source::row_pidl(&s.rows[i]), v.size, icon_only);
+        }
+        // A member is extracted (on the worker) only when it is a picture worth a thumbnail; the rest get their type's icon.
+        Some(Source::Archive(a)) => {
+            let e = &a.rows[i];
+            let Some(abs) = archive_view::member_pidl(e) else { return 0 };
+            if archive_view::showable(e, false) {
+                t.request_member(id, abs, v.size, a.listing.archive.clone(), e.clone());
+            } else {
+                t.request(id, abs, v.size, true);
+            }
+        }
+        _ => return 0,
+    }
     v.slots[i] = REQUESTED;
     0
 }
@@ -601,7 +682,7 @@ pub(crate) unsafe fn on_thumb_done(app: *mut App, wparam: WPARAM, lparam: LPARAM
     if shown {
         v.slots[i] = ImageList_Add(v.normal, bmp, None).max(0);
     }
-    let parsing = listing(app).and_then(|l| l.items.get(i)).map(|it| it.parsing_name());
+    let parsing = row_key(app, i);
     let v = &mut (*app).views;
     match parsing {
         Some(p) => v.cache.insert(cache_key(v.view, v.size, &p), bmp),
@@ -702,7 +783,7 @@ pub(crate) unsafe fn fit(src: HBITMAP, size: i32) -> Option<HBITMAP> {
     let _ = GdiFlush();
     let px = std::slice::from_raw_parts_mut(bits, (size * size * 4) as usize);
     // A source without alpha (all zero) blends to nothing: copy it opaque instead.
-    if !blended || px.chunks_exact(4).all(|p| p[3] == 0) {
+    if !blended || px.as_chunks::<4>().0.iter().all(|p| p[3] == 0) {
         SetStretchBltMode(dc, HALFTONE);
         let _ = StretchBlt(dc, x, y, dw, dh, Some(sdc), 0, 0, w, h, SRCCOPY);
         let _ = GdiFlush();
@@ -853,6 +934,26 @@ fn starter_icon(name: &str, t: &Theme) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloud_marks_paint_their_color_in_the_lower_left_only() {
+        use rexplorer_core::item::{CLOUD_ONLINE, CLOUD_PINNED};
+        for (state, want) in [(CLOUD_ONLINE, 0usize), (CLOUD_PINNED, 1usize)] {
+            // A 16 x 20 transparent icon; a 10 px mark at row 10.
+            let (w, h, m, y) = (16, 20, 10, 10);
+            let mut px = vec![0u8; (w * h * 4) as usize];
+            unsafe { cloud_mark(&mut px, w, h, y, m, state) };
+            let at = |x: i32, y: i32| &px[((y * w + x) * 4) as usize..][..4];
+            let inked: Vec<(i32, i32)> = (0..h).flat_map(|y| (0..w).map(move |x| (x, y))).filter(|&(x, y)| at(x, y)[3] > 0).collect();
+            assert!(!inked.is_empty(), "state {state}: the glyph drew nothing");
+            assert!(inked.iter().all(|&(x, yy)| x < m && yy >= y), "state {state}: ink outside the mark's square");
+            // The strongest pixel is the mark's own hue: blue (B) for online-only, green (G) for always kept.
+            let &(x, yy) = inked.iter().max_by_key(|&&(x, y)| at(x, y)[3]).unwrap();
+            let p = at(x, yy);
+            assert_eq!((0..3).max_by_key(|&k| p[k]).unwrap(), want, "state {state}: {p:?}");
+            assert!(p.iter().take(3).all(|&c| c <= p[3]), "premultiplied: {p:?}");
+        }
+    }
 
     #[test]
     fn view_names_round_trip() {

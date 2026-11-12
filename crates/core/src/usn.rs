@@ -17,6 +17,8 @@ use windows::Win32::System::Ioctl::{
 };
 use windows::core::{HSTRING, Result};
 
+use crate::query::Query;
+
 const FRN_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 const ROOT_INDEX: u64 = 5;
 
@@ -97,7 +99,8 @@ fn enumerate(h: HANDLE, drive: char) -> Result<VolumeIndex> {
         if n < 8 {
             break;
         }
-        med.StartFileReferenceNumber = u64::from_le_bytes(buf[..8].try_into().unwrap());
+        let Ok(cursor) = <[u8; 8]>::try_from(&buf[..8]) else { break };
+        med.StartFileReferenceNumber = u64::from_le_bytes(cursor);
         parse_records(&buf[8..n], &mut entries);
     }
     Ok(VolumeIndex { drive, entries })
@@ -118,7 +121,9 @@ fn parse_records(buf: &[u8], into: &mut HashMap<u64, Entry>) {
         let (name_len, name_off) = (rd16(56) as usize, rd16(58) as usize);
         if rd16(4) == 2 && name_off + name_len <= len {
             let name: Vec<u16> = rec[name_off..name_off + name_len]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
             into.insert(
@@ -148,14 +153,15 @@ impl VolumeIndex {
         None
     }
 
-    /// Case-insensitive substring match on file names; at most `limit` resolvable paths. Setting `cancel` ends the scan.
-    pub fn search(&self, needle: &str, limit: usize, cancel: &AtomicBool) -> Vec<PathBuf> {
-        let needle = needle.to_lowercase();
+    /// Entries whose file name answers `query` (its filters read from disk); at most `limit` resolvable paths.
+    /// Setting `cancel` ends the scan.
+    pub fn search(&self, query: &Query, limit: usize, cancel: &AtomicBool) -> Vec<PathBuf> {
         self.entries
             .iter()
             .take_while(|_| !cancel.load(Ordering::Relaxed))
-            .filter(|(_, e)| e.name.to_lowercase().contains(&needle))
+            .filter(|(_, e)| query.name_matches(&e.name))
             .filter_map(|(&frn, _)| self.path_of(frn))
+            .filter(|p| !query.needs_meta() || query.path_matches(p))
             .take(limit)
             .collect()
     }
@@ -163,6 +169,10 @@ impl VolumeIndex {
     /// Number of indexed entries.
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
@@ -218,14 +228,15 @@ mod tests {
         }
         let idx = build('C').unwrap();
         assert!(idx.len() > 10_000);
-        assert!(!idx.search("notepad.exe", 5, &AtomicBool::new(false)).is_empty());
+        assert!(!idx.search(&Query::parse("notepad.exe"), 5, &AtomicBool::new(false)).is_empty());
     }
 
     #[test]
     fn search_stops_when_cancelled() {
         let entries = HashMap::from([(5, Entry { parent: 5, name: String::new() }), (10, Entry { parent: 5, name: "a".into() })]);
         let idx = VolumeIndex { drive: 'C', entries };
-        assert_eq!(idx.search("a", 5, &AtomicBool::new(false)), vec![PathBuf::from("C:\\a")]);
-        assert!(idx.search("a", 5, &AtomicBool::new(true)).is_empty());
+        let a = Query::parse("A");
+        assert_eq!(idx.search(&a, 5, &AtomicBool::new(false)), vec![PathBuf::from("C:\\a")]);
+        assert!(idx.search(&a, 5, &AtomicBool::new(true)).is_empty());
     }
 }

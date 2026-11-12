@@ -92,8 +92,10 @@ pub fn send(hwnd: HWND, payload: &str) -> bool {
         cbData: (wide.len() * 2) as u32,
         lpData: wide.as_ptr() as *mut _,
     };
+    // The receiver's answer: 1 when it took the hand-off, 0 when it refused it (another protocol version).
+    let mut answer = 0usize;
     unsafe {
-        let call = |flags, ms| SendMessageTimeoutW(hwnd, WM_COPYDATA, WPARAM(0), LPARAM(&cds as *const _ as isize), flags, ms, None);
+        let mut call = |flags, ms| SendMessageTimeoutW(hwnd, WM_COPYDATA, WPARAM(0), LPARAM(&cds as *const _ as isize), flags, ms, Some(&mut answer as *mut usize));
         let mut r = call(SMTO_ABORTIFHUNG, 3000);
         // A busy UI thread is not a dead one: wait longer before this launch becomes a second window. Read before
         // anything else can clobber the error; other failures (access denied) and a hung window fall through unchanged.
@@ -101,7 +103,7 @@ pub fn send(hwnd: HWND, payload: &str) -> bool {
             r = call(SMTO_NORMAL, 10_000);
         }
         let _ = SetForegroundWindow(hwnd);
-        r.0 != 0
+        r.0 != 0 && answer == 1
     }
 }
 

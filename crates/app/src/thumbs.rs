@@ -2,14 +2,16 @@
 #![allow(dead_code)]
 
 use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::thread::{self, JoinHandle};
 
+use rexplorer_core::archive::Entry;
 use rexplorer_core::com::{ComInit, Pidl};
 use rexplorer_core::images;
-use crate::views;
+use crate::{archive_view, views};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Gdi::{DeleteObject, HBITMAP, HGDIOBJ};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
@@ -20,6 +22,8 @@ struct Request {
     abs: Pidl,
     size: i32,
     icon_only: bool,
+    /// An archive member to extract and thumbnail; `abs` (its type's icon) when that fails.
+    member: Option<(PathBuf, Entry)>,
 }
 
 /// `window` before the first scroll: every item.
@@ -55,7 +59,12 @@ pub fn start(hwnd: HWND, msg: u32) -> Thumbs {
             if r.gen_ < latest.load(Ordering::SeqCst) || !in_window(&win, r.id & 0xFFFF_FFFF) {
                 continue;
             }
-            let bmp = if r.icon_only { images::icon(&r.abs, r.size) } else { images::thumbnail(&r.abs, r.size) };
+            let extracted = r.member.as_ref().and_then(|(a, e)| archive_view::extract_into(a, e, &archive_view::show_dir(a)).ok()).and_then(|p| archive_view::path_pidl(&p));
+            let bmp = match &extracted {
+                Some(abs) => images::thumbnail(abs, r.size).or_else(|_| images::icon(&r.abs, r.size)),
+                None if r.icon_only => images::icon(&r.abs, r.size),
+                None => images::thumbnail(&r.abs, r.size),
+            };
             let Ok(bmp) = bmp else { continue };
             // Scaled here: the UI thread only adds the image to its list.
             let fitted = unsafe { views::fit(bmp, r.size) };
@@ -82,17 +91,22 @@ pub fn start(hwnd: HWND, msg: u32) -> Thumbs {
 
 impl Thumbs {
     pub fn request(&self, id: usize, abs: Pidl, size: i32, icon_only: bool) {
-        self.send(self.generation(), id, abs, size, icon_only);
+        self.send(self.generation(), id, abs, size, icon_only, None);
+    }
+
+    /// Archive member `e` of `archive`: extracted under `archive_view::show_dir` and thumbnailed, else `abs`'s icon.
+    pub fn request_member(&self, id: usize, abs: Pidl, size: i32, archive: PathBuf, e: Entry) {
+        self.send(self.generation(), id, abs, size, true, Some((archive, e)));
     }
 
     #[cfg(test)]
     pub fn request_with_generation(&self, gen_: u64, id: usize, abs: Pidl, size: i32, icon_only: bool) {
-        self.send(gen_, id, abs, size, icon_only);
+        self.send(gen_, id, abs, size, icon_only, None);
     }
 
-    fn send(&self, gen_: u64, id: usize, abs: Pidl, size: i32, icon_only: bool) {
+    fn send(&self, gen_: u64, id: usize, abs: Pidl, size: i32, icon_only: bool, member: Option<(PathBuf, Entry)>) {
         if let Some(tx) = &self.tx {
-            let _ = tx.send(Request { gen_, id, abs, size, icon_only });
+            let _ = tx.send(Request { gen_, id, abs, size, icon_only, member });
         }
     }
 

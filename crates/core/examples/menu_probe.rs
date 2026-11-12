@@ -72,7 +72,7 @@ fn packaged_dump(label: &str, regs: &[&packaged::Registration], targets: &[Targe
     let cmds = packaged::query(regs, targets, &[path.to_string()]);
     println!("  {label}: {} commands in {:?}", cmds.len(), t.elapsed());
     for c in cmds {
-        println!("    {:<30} {} took={:?} icon={}", c.title, format!("{:?}", c.clsid), c.took, c.icon.is_some());
+        println!("    {:<30} {:?} took={:?} icon={}", c.title, c.clsid, c.took, c.icon.is_some());
     }
 }
 

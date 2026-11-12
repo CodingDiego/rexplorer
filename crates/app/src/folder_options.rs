@@ -46,6 +46,7 @@ const ID_SEARCH_DELAY: i32 = 127;
 const ID_HOVER_DELAY: i32 = 128;
 const ID_SYSTEM: i32 = 130;
 const ID_ARCHIVES: i32 = 131;
+const ID_UPDATES: i32 = 132;
 
 const PAGES: [&str; 3] = ["fo.page_general", "fo.page_view", "fo.page_search"];
 const TAB: (i32, i32, i32, i32) = (12, 12, 72, 28);
@@ -78,13 +79,14 @@ struct Ctl {
     r: (i32, i32, i32, i32),
 }
 
+#[allow(clippy::too_many_arguments)] // const constructor for the control table
 const fn c(page: usize, kind: Kind, id: i32, text: &'static str, x: i32, y: i32, w: i32, h: i32) -> Ctl {
     Ctl { page, kind, id, text, r: (x, y, w, h) }
 }
 
 const RESTORE: (i32, i32, i32, i32) = (324, 352, 120, 26);
 
-const CTLS: [Ctl; 30] = [
+const CTLS: [Ctl; 31] = [
     c(0, Kind::Label, -1, "fo.open_to", 12, 12, 180, 26),
     c(0, Kind::Combo, ID_START, "", 200, 12, 232, 26),
     c(0, Kind::Header, -1, "fo.click_items", 12, 52, 432, 20),
@@ -99,6 +101,7 @@ const CTLS: [Ctl; 30] = [
     c(0, Kind::Push, ID_CLEAR, "fo.clear", 344, 268, 88, 26),
     c(0, Kind::Header, -1, "fo.startup", 12, 304, 432, 20),
     c(0, Kind::Check, ID_RESTORE_TABS, "fo.restore_tabs", 24, 328, 296, ROW),
+    c(0, Kind::Check, ID_UPDATES, "fo.check_updates", 24, 352, 296, ROW),
     c(0, Kind::Push, ID_RESTORE, "fo.restore_defaults", RESTORE.0, RESTORE.1, RESTORE.2, RESTORE.3),
     c(1, Kind::Header, -1, "fo.advanced", 12, 12, 432, 20),
     c(1, Kind::List, ID_LIST, "", 12, 36, 432, 200),
@@ -119,6 +122,11 @@ const CTLS: [Ctl; 30] = [
 
 fn at(id: i32) -> usize {
     CTLS.iter().position(|c| c.id == id).unwrap_or(0)
+}
+
+/// The DPI the dialog is laid out at: the window's, grown by the Windows text size (every control holds text).
+fn dpi_of(h: HWND) -> i32 {
+    theme::text_dpi(unsafe { GetDpiForWindow(h) }) as i32
 }
 
 fn pos(r: (i32, i32, i32, i32), dpi: i32) -> RECT {
@@ -174,6 +182,7 @@ struct Fonts {
 }
 
 /// A check box or radio and its label inside `r`, on a `bg` backdrop.
+#[allow(clippy::too_many_arguments)] // a Win32 draw helper; a params struct would only be built at its two call sites
 unsafe fn draw_option(dc: HDC, r: &RECT, kind: Kind, on: bool, enabled: bool, focus: bool, label: &str, t: &Theme, f: &Fonts, dpi: i32, bg: u32) {
     let g = 16 * dpi / 96;
     let gy = r.top + (r.bottom - r.top - g) / 2;
@@ -257,7 +266,7 @@ fn row_h(dpi: i32) -> i32 {
 unsafe fn list_scroll(h: HWND, ls: &mut ListState) {
     let mut rc = RECT::default();
     let _ = GetClientRect(h, &mut rc);
-    let dpi = GetDpiForWindow(h) as i32;
+    let dpi = dpi_of(h);
     let total = ls.rows.len() as i32 * row_h(dpi);
     let page = rc.bottom - 2;
     ls.top = ls.top.clamp(0, (total - page).max(0));
@@ -281,7 +290,7 @@ unsafe fn list_paint(h: HWND, ls: &ListState) {
     let dc = CreateCompatibleDC(Some(wdc));
     let bmp = CreateCompatibleBitmap(wdc, rc.right, rc.bottom);
     let old = SelectObject(dc, bmp.into());
-    let (t, dpi) = (&ls.theme, GetDpiForWindow(h) as i32);
+    let (t, dpi) = (&ls.theme, dpi_of(h));
     let (border, fill) = field_colors(t);
     solid(dc, &rc, t.surface);
     field(dc, &rc, border, fill, 4 * dpi / 96);
@@ -336,7 +345,7 @@ unsafe fn list_focus(h: HWND, ls: &mut ListState, i: usize) {
     ls.focus = i;
     let mut rc = RECT::default();
     let _ = GetClientRect(h, &mut rc);
-    let rh = row_h(GetDpiForWindow(h) as i32);
+    let rh = row_h(dpi_of(h));
     ls.top = ls.top.min(i as i32 * rh).max((i as i32 + 1) * rh - (rc.bottom - 2));
     list_scroll(h, ls);
     let _ = InvalidateRect(Some(h), None, false);
@@ -371,7 +380,7 @@ unsafe extern "system" fn list_proc(h: HWND, msg: u32, wparam: WPARAM, lparam: L
         WM_LBUTTONDOWN => {
             let _ = SetFocus(Some(h));
             let y = (lparam.0 >> 16) as i16 as i32;
-            let i = (y - 1 + ls.top).max(0) / row_h(GetDpiForWindow(h) as i32);
+            let i = (y - 1 + ls.top).max(0) / row_h(dpi_of(h));
             if (i as usize) < ls.rows.len() && ls.rows[i as usize].kind != Kind::Header {
                 list_focus(h, ls, i as usize);
                 list_set(h, ls, i as usize);
@@ -380,7 +389,7 @@ unsafe extern "system" fn list_proc(h: HWND, msg: u32, wparam: WPARAM, lparam: L
         }
         WM_MOUSEWHEEL => {
             let lines = (wparam.0 >> 16) as i16 as i32 / 120;
-            ls.top -= lines * 3 * row_h(GetDpiForWindow(h) as i32);
+            ls.top -= lines * 3 * row_h(dpi_of(h));
             list_scroll(h, ls);
             let _ = InvalidateRect(Some(h), None, false);
             LRESULT(0)
@@ -388,7 +397,7 @@ unsafe extern "system" fn list_proc(h: HWND, msg: u32, wparam: WPARAM, lparam: L
         WM_VSCROLL => {
             let mut si = SCROLLINFO { cbSize: size_of::<SCROLLINFO>() as u32, fMask: SIF_ALL, ..Default::default() };
             let _ = GetScrollInfo(h, SB_VERT, &mut si);
-            let rh = row_h(GetDpiForWindow(h) as i32);
+            let rh = row_h(dpi_of(h));
             ls.top = match SCROLLBAR_COMMAND((wparam.0 & 0xFFFF) as i32) {
                 SB_LINEUP => ls.top - rh,
                 SB_LINEDOWN => ls.top + rh,
@@ -443,6 +452,8 @@ struct State {
     app: *mut App,
     theme: Theme,
     fonts: Fonts,
+    /// The dialog's own UI font (the same as `fonts.ui`), deleted when it closes or a DPI change replaces it.
+    own_ui: HFONT,
     bg: HBRUSH,
     field: HBRUSH,
     hw: Vec<HWND>,
@@ -466,7 +477,7 @@ unsafe fn page_origin(dpi: i32) -> (i32, i32) {
 unsafe fn place(hwnd: HWND, st: &State) {
     let mut rc = RECT::default();
     let _ = GetClientRect(hwnd, &mut rc);
-    let dpi = GetDpiForWindow(hwnd) as i32;
+    let dpi = dpi_of(hwnd);
     let s = |v: i32| v * dpi / 96;
     let (ox, oy) = page_origin(dpi);
     let eh = st.theme.font_size * dpi / 72 * 4 / 3 + s(4);
@@ -613,7 +624,7 @@ unsafe fn load(st: &mut State, p: &Profile, page: Option<usize>) {
             entries.len() - 1
         };
         SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(sel)), None);
-        let dpi = GetDpiForWindow(combo) as isize;
+        let dpi = dpi_of(combo) as isize;
         SendMessageW(combo, CB_SETITEMHEIGHT, Some(WPARAM(usize::MAX)), Some(LPARAM(20 * dpi / 96)));
         SendMessageW(combo, CB_SETITEMHEIGHT, Some(WPARAM(0)), Some(LPARAM(COMBO_ROW as isize * dpi / 96)));
         let always = p.underline_titles == "always";
@@ -625,6 +636,7 @@ unsafe fn load(st: &mut State, p: &Profile, page: Option<usize>) {
             (ID_RECENT, p.show_recent),
             (ID_FREQ, p.show_frequent),
             (ID_RESTORE_TABS, p.restore_tabs),
+            (ID_UPDATES, p.check_updates),
         ] {
             set_on(st, id, on);
         }
@@ -674,6 +686,7 @@ unsafe fn profile_of(st: &State, base: &Profile) -> Profile {
         show_recent: get_on(st, ID_RECENT),
         show_frequent: get_on(st, ID_FREQ),
         restore_tabs: get_on(st, ID_RESTORE_TABS),
+        check_updates: get_on(st, ID_UPDATES),
         show_hidden: get_on(st, ID_HIDDEN_SHOW),
         show_extensions: !get_on(st, ID_EXT),
         show_status: get_on(st, ID_STATUS),
@@ -717,7 +730,7 @@ unsafe fn apply(st: &mut State) {
 unsafe fn draw_push(st: &State, di: &DRAWITEMSTRUCT) {
     let t = &st.theme;
     let id = di.CtlID as i32;
-    let dpi = GetDpiForWindow(di.hwndItem) as i32;
+    let dpi = dpi_of(di.hwndItem);
     let primary = id == IDOK.0;
     let disabled = di.itemState.0 & ODS_DISABLED.0 != 0;
     let outside = if CTLS[at(id)].id == id { t.surface } else { t.background };
@@ -749,7 +762,7 @@ unsafe fn draw_push(st: &State, di: &DRAWITEMSTRUCT) {
 /// The start combo's field and its drop-down rows; a long custom path is shortened in the middle.
 unsafe fn draw_combo(st: &State, di: &DRAWITEMSTRUCT) {
     let t = &st.theme;
-    let dpi = GetDpiForWindow(di.hwndItem) as i32;
+    let dpi = dpi_of(di.hwndItem);
     let row = di.itemState.0 & ODS_COMBOBOXEDIT.0 == 0;
     let hot = row && di.itemState.0 & ODS_SELECTED.0 != 0;
     let focused = !row && di.itemState.0 & ODS_FOCUS.0 != 0;
@@ -778,7 +791,7 @@ unsafe fn draw_item(st: &State, di: &DRAWITEMSTRUCT) {
         draw_push(st, di);
         return;
     }
-    let dpi = GetDpiForWindow(di.hwndItem) as i32;
+    let dpi = dpi_of(di.hwndItem);
     solid(di.hDC, &di.rcItem, st.theme.surface);
     let enabled = di.itemState.0 & ODS_DISABLED.0 == 0;
     let mut buf = [0u16; 128];
@@ -795,7 +808,7 @@ fn tab_rect(i: usize, dpi: i32) -> RECT {
 unsafe fn paint_background(hwnd: HWND, dc: HDC, st: &State) {
     let mut rc = RECT::default();
     let _ = GetClientRect(hwnd, &mut rc);
-    let (t, dpi) = (&st.theme, GetDpiForWindow(hwnd) as i32);
+    let (t, dpi) = (&st.theme, dpi_of(hwnd));
     solid(dc, &rc, t.background);
     let line = line_color(t);
     let page = pos(PAGE, dpi);
@@ -861,6 +874,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        // Moved to a monitor of another scale: take the suggested rect (WM_SIZE lays the controls out again).
+        WM_DPICHANGED => {
+            // The fonts were sized for the previous monitor: make both again for this one.
+            let dpi = (wparam.0 & 0xFFFF) as u32;
+            let (ui, glyphs) = (theme::ui_font(&st.theme, dpi), theme::icon_font(theme::text_dpi(dpi), 16));
+            for &h in st.hw.iter().chain([&st.ok, &st.cancel, &st.apply]).filter(|h| !h.0.is_null()) {
+                SendMessageW(h, WM_SETFONT, Some(WPARAM(ui.0 as usize)), Some(LPARAM(1)));
+            }
+            if !st.list.is_null() {
+                (*st.list).fonts = Fonts { ui, glyphs };
+            }
+            for old in [st.own_ui, st.fonts.glyphs].into_iter().filter(|f| !f.is_invalid()) {
+                let _ = DeleteObject(old.into());
+            }
+            (st.own_ui, st.fonts) = (ui, Fonts { ui, glyphs });
+            let r = &*(lparam.0 as *const RECT);
+            let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+            let _ = InvalidateRect(Some(hwnd), None, true);
+            LRESULT(0)
+        }
         WM_ERASEBKGND => {
             let dc = HDC(wparam.0 as *mut c_void);
             let mut rc = RECT::default();
@@ -877,15 +910,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_LBUTTONDOWN => {
             let (x, y) = (lparam.0 as i16 as i32, (lparam.0 >> 16) as i16 as i32);
-            let dpi = GetDpiForWindow(hwnd) as i32;
+            let dpi = dpi_of(hwnd);
             if let Some(i) = (0..PAGES.len()).find(|&i| {
                 let r = tab_rect(i, dpi);
                 x >= r.left && x < r.right && y >= r.top && y < r.bottom
-            }) {
-                if i != st.page {
+            })
+                && i != st.page {
                     show_page(st, i);
                 }
-            }
             LRESULT(0)
         }
         WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC => {
@@ -940,6 +972,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     match CTLS[i].kind {
                         Kind::Check => st.on[i] = !st.on[i],
                         Kind::Radio(g) => {
+                            #[allow(clippy::needless_range_loop)] // j also indexes st.on and st.hw
                             for j in 0..CTLS.len() {
                                 if CTLS[j].kind == Kind::Radio(g) {
                                     st.on[j] = j == i;
@@ -975,7 +1008,7 @@ fn register() {
         let hinst = GetModuleHandleW(None).map(Into::into).unwrap_or_default();
         let cursor = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
         // The app icon (resource 1, as the main window's class) for the caption and Alt+Tab.
-        let icon = LoadIconW(Some(hinst), PCWSTR(1 as *const u16)).unwrap_or_default();
+        let icon = LoadIconW(Some(hinst), PCWSTR(std::ptr::without_provenance(1))).unwrap_or_default();
         let class = |name: PCWSTR, proc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT| {
             RegisterClassW(&WNDCLASSW { hInstance: hinst, hCursor: cursor, hIcon: icon, lpfnWndProc: Some(proc), lpszClassName: name, ..Default::default() });
         };
@@ -1027,14 +1060,16 @@ unsafe fn pre_translate(hwnd: HWND, st: &mut State, msg: &MSG) -> bool {
 unsafe fn dialog(app: *mut App) {
     register();
     let (parent, t, p) = ((*app).hwnd, &(*app).theme, (*app).profile.clone());
-    let dpi = GetDpiForWindow(parent) as i32;
-    let ui = if (*app).font.is_invalid() { HFONT(GetStockObject(DEFAULT_GUI_FONT).0) } else { (*app).font };
+    let dpi = dpi_of(parent);
+    // Its own font: the main window replaces (and deletes) its font on a text size change while this is open.
+    let ui = theme::ui_font(t, GetDpiForWindow(parent));
     let glyphs = theme::icon_font(dpi as u32, 16);
     let start_other = (!p.start.eq_ignore_ascii_case(HOME_START) && !p.start.eq_ignore_ascii_case(THIS_PC)).then(|| p.start.clone());
     let mut st = Box::new(State {
         app,
         theme: t.clone(),
         fonts: Fonts { ui, glyphs },
+        own_ui: ui,
         bg: CreateSolidBrush(COLORREF(t.background)),
         field: CreateSolidBrush(COLORREF(t.background)),
         hw: vec![HWND::default(); CTLS.len()],
@@ -1051,7 +1086,8 @@ unsafe fn dialog(app: *mut App) {
     });
     let mut wr = RECT { left: 0, top: 0, right: CLIENT.0 * dpi / 96, bottom: CLIENT.1 * dpi / 96 };
     let style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
-    let _ = AdjustWindowRectExForDpi(&mut wr, style, false, WINDOW_EX_STYLE(0), dpi as u32);
+    // The frame itself follows the display scale only.
+    let _ = AdjustWindowRectExForDpi(&mut wr, style, false, WINDOW_EX_STYLE(0), GetDpiForWindow(parent));
     let (w, h) = (wr.right - wr.left, wr.bottom - wr.top);
     let mut pr = RECT::default();
     let _ = GetWindowRect(parent, &mut pr);
@@ -1103,7 +1139,9 @@ unsafe fn dialog(app: *mut App) {
     }
     let _ = DeleteObject(st.bg.into());
     let _ = DeleteObject(st.field.into());
-    let _ = DeleteObject(glyphs.into());
+    for f in [st.fonts.glyphs, st.own_ui].into_iter().filter(|f| !f.is_invalid()) {
+        let _ = DeleteObject(f.into());
+    }
 }
 
 /// The statics the rest of the app reads for the profile's keys (startup and after the dialog).
@@ -1127,6 +1165,7 @@ unsafe fn apply_profile(app: *mut App, new: Profile) {
         ("show_recent", b(old.show_recent), b(new.show_recent)),
         ("show_frequent", b(old.show_frequent), b(new.show_frequent)),
         ("restore_tabs", b(old.restore_tabs), b(new.restore_tabs)),
+        ("check_updates", b(old.check_updates), b(new.check_updates)),
         ("show_status", b(old.show_status), b(new.show_status)),
         ("preview_handlers", b(old.preview_handlers), b(new.preview_handlers)),
         ("item_checkboxes", b(old.item_checkboxes), b(new.item_checkboxes)),
@@ -1141,15 +1180,17 @@ unsafe fn apply_profile(app: *mut App, new: Profile) {
         }
     }
     sync(&new);
+    if new.check_updates && !old.check_updates {
+        check_updates((*app).hwnd);
+    }
     for tab in &mut (*app).tabs {
         // Show hidden files changes what a listing holds: the other tabs reload when shown.
         tab.dirty |= old.show_hidden != new.show_hidden;
         // Show file extensions changes the Name column's text; the listings cached it.
-        if old.show_extensions != new.show_extensions {
-            if let Some(Source::Shell(l)) = &mut tab.source {
+        if old.show_extensions != new.show_extensions
+            && let Some(Source::Shell(l)) = &mut tab.source {
                 l.cells.fill(Default::default());
             }
-        }
     }
     ui::sync_list_style(app);
     let _ = InvalidateRect(Some((*app).list), None, true);

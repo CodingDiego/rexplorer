@@ -10,37 +10,93 @@ permissions:
 jobs:
   release:
     runs-on: windows-latest
+    env:
+      TAG: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned so a tag rebuilds to the same bytes; bump on purpose, together with the clippy job in ci.yml.
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          targets: aarch64-pc-windows-msvc
+      - name: Tag matches the crate version
+        shell: pwsh
+        run: |
+          # pkgid ends in #rexplorer@<version> (or #<version> when the folder has the package's name).
+          $id = cargo pkgid --locked -p rexplorer
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $crate = ($id -split '[#@]')[-1]
+          $tag = $env:TAG -replace '^v', ''
+          if ($crate -ne $tag) { throw "tag $env:TAG does not match the rexplorer crate version $crate ($id)" }
+      # .github/release-notes.md starts with "Draft ..." until the notes are final; a draft is never published.
+      # Checked here, before the builds, so a draft tag fails in seconds.
+      - name: Release notes are final
+        shell: pwsh
+        run: |
+          $first = Get-Content .github/release-notes.md -TotalCount 1
+          if ($first -match '\bDraft\b') { throw "the first line of .github/release-notes.md still says Draft: $first" }
       - run: cargo test --release --locked
-      - run: cargo build --release --locked
+      # x64 natively, arm64 cross-compiled (no arm64 runner, so arm64 is built but not tested here).
+      # Built twice from clean: the two builds must match byte for byte. A rebuild on a later runner image can still
+      # differ, because the MSVC linker and the C++ compiler for libunrar come from the image, not from the toolchain.
+      - name: Build twice and compare
+        shell: pwsh
+        run: |
+          # No local paths in the exe: source and cargo paths remapped, the PDB path cut to its file name; /Brepro
+          # replaces the linker's timestamp and PDB id with content hashes.
+          $env:RUSTFLAGS = "--remap-path-prefix=$env:GITHUB_WORKSPACE=/src --remap-path-prefix=$env:USERPROFILE=/home " +
+            "-C link-arg=/PDBALTPATH:%_PDB% -C link-arg=/Brepro"
+          $targets = 'x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc'
+          function Build {
+            foreach ($t in $targets) {
+              cargo build --release --locked --target $t | Out-Host
+              if ($LASTEXITCODE) { exit $LASTEXITCODE }
+              (Get-FileHash "target\$t\release\rexplorer.exe" -Algorithm SHA256).Hash
+            }
+          }
+          $first = Build
+          cargo clean
+          $second = Build
+          if (Compare-Object $first $second) { throw "two builds of $env:TAG differ: $first / $second" }
+          foreach ($t in $targets) {
+            $b = [IO.File]::ReadAllBytes("target\$t\release\rexplorer.exe")
+            $s = [Text.Encoding]::Latin1.GetString($b) + [Text.Encoding]::Unicode.GetString($b)
+            foreach ($p in $env:GITHUB_WORKSPACE, $env:USERPROFILE) {
+              foreach ($q in $p, $p.Replace('\', '/')) {
+                if ($s.IndexOf($q, [StringComparison]::OrdinalIgnoreCase) -ge 0) { throw "$t exe contains the local path $q" }
+              }
+            }
+          }
       - name: Package
         shell: pwsh
         run: |
-          $v = "${{ github.ref_name }}".TrimStart('v')
-          $d = "rexplorer-$v-x64"
-          New-Item -ItemType Directory $d | Out-Null
-          Copy-Item target\release\rexplorer.exe, LICENSE, THIRD-PARTY-NOTICES.md $d
-          @"
-          rexplorer $v (Windows x64)
+          $v = $env:TAG.TrimStart('v')
+          $readme = @"
+          rexplorer $v (Windows ARCH)
 
           Run rexplorer.exe to try it; nothing is installed.
 
-          Make it the default file manager (no administrator rights needed, everything is per-user):
-            rexplorer.exe --install
-            rexplorer.exe --import-explorer      (optional: copy your Windows Explorer settings)
-          Undo:
-            %LOCALAPPDATA%\Programs\rexplorer\rexplorer.exe --uninstall
+          No administrator rights needed, everything is per-user:
+            powershell -ExecutionPolicy Bypass -File install.ps1          install it as a program (Explorer still opens folders)
+            powershell -ExecutionPolicy Bypass -File master-install.ps1   install it and make it the default file manager
+            powershell -ExecutionPolicy Bypass -File restore-explorer.ps1 put Windows Explorer back, even if rexplorer will not start
+          Or by hand: rexplorer.exe --install, then %LOCALAPPDATA%\Programs\rexplorer\rexplorer.exe --register.
+          Go back: rexplorer.exe --unregister (keeps the program) or --uninstall (also from Settings > Apps).
 
           Docs, source and security policy: https://github.com/${{ github.repository }}
-          "@ -replace '(?m)^ {10}', '' | Set-Content -Encoding utf8 "$d\README.txt"
-          Compress-Archive -Path $d -DestinationPath "$d.zip"
-          Get-FileHash "$d.zip", "$d\rexplorer.exe" -Algorithm SHA256 |
-            ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) } |
-            Set-Content -Encoding ascii SHA256SUMS.txt
-          "ZIP=$d.zip" >> $env:GITHUB_ENV
+          "@
+          $sums = foreach ($a in ([ordered]@{ x64 = 'x86_64-pc-windows-msvc'; arm64 = 'aarch64-pc-windows-msvc' }).GetEnumerator()) {
+            $d = "rexplorer-$v-$($a.Key)"
+            New-Item -ItemType Directory $d | Out-Null
+            Copy-Item "target\$($a.Value)\release\rexplorer.exe", LICENSE, THIRD-PARTY-NOTICES.md, scripts\install.ps1, scripts\master-install.ps1, scripts\restore-explorer.ps1 $d
+            $readme.Replace('ARCH', $a.Key) | Set-Content -Encoding utf8 "$d\README.txt"
+            Compress-Archive -Path $d -DestinationPath "$d.zip"
+            foreach ($f in "$d.zip", "$d/rexplorer.exe") { "{0}  {1}" -f (Get-FileHash $f -Algorithm SHA256).Hash.ToLower(), $f }
+          }
+          $sums | Set-Content -Encoding ascii SHA256SUMS.txt
       - name: Publish
+        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" "${{ env.ZIP }}" SHA256SUMS.txt --title "rexplorer ${{ github.ref_name }}" --notes-file .github/release-notes.md --verify-tag
+        run: |
+          $v = $env:TAG.TrimStart('v')
+          gh release create $env:TAG "rexplorer-$v-x64.zip" "rexplorer-$v-arm64.zip" SHA256SUMS.txt --title "rexplorer $env:TAG" --notes-file .github/release-notes.md --verify-tag

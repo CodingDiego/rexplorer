@@ -1,7 +1,7 @@
 //! Command-line parsing for the app, and the payload sent to an already running instance
 //! (WM_COPYDATA). Pure Rust, no shell or Win32 calls (it only asks the filesystem whether a path is a file).
 //!
-//! Once installed, rexplorer is launched as `explorer.exe` too, so it takes Explorer's arguments: `/select,<path>`
+//! Once it is the default file manager (`--register`), rexplorer is launched as `explorer.exe` too, so it takes Explorer's arguments: `/select,<path>`
 //! (or `/select,` then the path), `/e,<path>`, `/root,<path>`, `/n`, `/separate` (switches may be chained with
 //! commas), a file path (its folder opens with it selected), and paths with a trailing backslash or with the
 //! trailing quote some callers leave (`"C:\"` arrives as `C:"`). Anything else Explorer-style (`/idlist,...`,
@@ -21,8 +21,12 @@ pub struct Args {
     pub recover: bool,
     pub search: Option<String>,
     pub help: bool,
+    /// A standalone install: the program only, Explorer still opens folders.
     pub install: bool,
     pub uninstall: bool,
+    /// With `--install` / `--uninstall` / `--register` / `--unregister`: no dialogs (package managers, the install
+    /// scripts); the exit code is the result.
+    pub quiet: bool,
     pub import_explorer: bool,
     /// With `--import-explorer`: also replace values the profile already changed.
     pub overwrite: bool,
@@ -161,6 +165,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> std::result::Result<Arg
             "--recover" => out.recover = true,
             "--install" => out.install = true,
             "--uninstall" => out.uninstall = true,
+            "--quiet" => out.quiet = true,
             "--import-explorer" => out.import_explorer = true,
             "--overwrite" => out.overwrite = true,
             "--elevated" => out.elevated = true,
@@ -177,16 +182,16 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> std::result::Result<Arg
             _ => out.paths.push(clean(&a)),
         }
     }
-    if out.select.is_none() {
-        if let Some(i) = out.paths.iter().position(|p| is_plain_file(p)) {
-            out.select = Some(out.paths.remove(i));
-        }
+    if out.select.is_none()
+        && let Some(i) = out.paths.iter().position(|p| is_plain_file(p))
+    {
+        out.select = Some(out.paths.remove(i));
     }
     Ok(out)
 }
 
 /// Option column and the key of its description, in usage order. Only the description is translated.
-const OPTS: [(&str, &str); 16] = [
+const OPTS: [(&str, &str); 17] = [
     ("--select <path>", "cli.opt.select"),
     ("--profile <name>", "cli.opt.profile"),
     ("--new-tab, -t", "cli.opt.new_tab"),
@@ -195,6 +200,7 @@ const OPTS: [(&str, &str); 16] = [
     ("--unregister", "cli.opt.unregister"),
     ("--install", "cli.opt.install"),
     ("--uninstall", "cli.opt.uninstall"),
+    ("--quiet", "cli.opt.quiet"),
     ("--import-explorer", "cli.opt.import_explorer"),
     ("--overwrite", "cli.opt.overwrite"),
     ("--recover", "cli.opt.recover"),
@@ -206,12 +212,15 @@ const OPTS: [(&str, &str); 16] = [
 ];
 
 /// Names a description may mention; they are never translated.
-const NAMES: [(&str, &dyn std::fmt::Display); 7] = [
+const NAMES: [(&str, &dyn std::fmt::Display); 10] = [
     ("path", &"<path>"),
     ("select", &"/select,<path>"),
     ("text", &"<text>"),
     ("programs", &r"%LOCALAPPDATA%\Programs"),
     ("install", &"--install"),
+    ("uninstall", &"--uninstall"),
+    ("register", &"--register"),
+    ("unregister", &"--unregister"),
     ("import", &"--import-explorer"),
     ("ini", &"settings.ini"),
 ];
@@ -234,9 +243,12 @@ fn usage_in(t: &crate::i18n::Table) -> String {
     usage_with(|k| t.fmt(k, &NAMES))
 }
 
+/// Hand-off protocol version, the first line of the payload (`v=1`). Bump it when a line changes meaning.
+pub const PROTOCOL: u32 = 1;
+
 /// Serialise for WM_COPYDATA: one `key=value` per line.
 pub fn payload(args: &Args) -> String {
-    let mut s = String::new();
+    let mut s = format!("v={PROTOCOL}\n");
     for p in &args.paths {
         s.push_str(&format!("path={p}\n"));
     }
@@ -252,10 +264,25 @@ pub fn payload(args: &Args) -> String {
     s
 }
 
-pub fn parse_payload(text: &str) -> Args {
+/// The seeded test's and fuzz/'s checks: `tail`, `parse` and `parse_payload` never panic on junk, and a payload
+/// made from `values` (line breaks dropped: the payload is line-based) reads back as the same arguments.
+#[cfg(any(test, fuzzing))]
+pub fn fuzz_check(line: &str, args: &[String], values: &[String], new_tab: bool) {
+    assert!(line.ends_with(tail(line)), "{line:?}");
+    let _ = parse(args.to_vec());
+    let _ = parse_payload(line);
+    let v = |i: usize| values.get(i).map_or_else(String::new, |s| s.replace(['\n', '\r'], ""));
+    let a = Args { paths: vec![v(0), v(1)], select: Some(v(2)), search: Some(v(3)), new_tab, ..Args::default() };
+    assert_eq!(parse_payload(&payload(&a)), Some(a), "{values:?}");
+}
+
+/// None when the sender speaks another protocol version; a payload without a version line (an older build) is
+/// accepted, its lines are a subset of today's.
+pub fn parse_payload(text: &str) -> Option<Args> {
     let mut a = Args::default();
     for line in text.lines() {
         match line.split_once('=') {
+            Some(("v", v)) if v != PROTOCOL.to_string() => return None,
             Some(("path", v)) => a.paths.push(v.to_string()),
             Some(("select", v)) => a.select = Some(v.to_string()),
             Some(("search", v)) => a.search = Some(v.to_string()),
@@ -263,7 +290,7 @@ pub fn parse_payload(text: &str) -> Args {
             _ => {}
         }
     }
-    a
+    Some(a)
 }
 
 #[cfg(test)]
@@ -337,8 +364,22 @@ mod tests {
         let a = p(&[fs.as_str()]).unwrap();
         assert_eq!((a.paths.len(), a.select.as_deref()), (0, Some(fs.as_str())));
         let ds = dir.display().to_string();
-        assert_eq!(p(&[ds.as_str()]).unwrap().paths, [ds.clone()]);
+        assert_eq!(p(&[ds.as_str()]).unwrap().paths, std::slice::from_ref(&ds));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_over_260_characters_opens_its_folder_selected() {
+        let root = std::env::temp_dir().join(format!("rexplorer-cli-long-{}", std::process::id()));
+        let dir = (0..6).fold(root.clone(), |d, i| d.join(format!("{i}-{}", "x".repeat(50))));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("a.txt");
+        std::fs::write(&f, "x").unwrap();
+        let fs = f.display().to_string();
+        assert!(fs.len() > 260, "{}", fs.len());
+        let a = p(&[fs.as_str()]).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!((a.paths.len(), a.select.as_deref()), (0, Some(fs.as_str())));
     }
 
     #[test]
@@ -391,8 +432,61 @@ mod tests {
             new_tab: true,
             ..Default::default()
         };
-        assert_eq!(parse_payload(&payload(&a)), a);
-        assert_eq!(parse_payload("junk\nfoo=bar\n"), Args::default());
+        assert!(payload(&a).starts_with("v=1\n"));
+        assert_eq!(parse_payload(&payload(&a)), Some(a));
+        assert_eq!(parse_payload("junk\nfoo=bar\n"), Some(Args::default()));
+    }
+
+    #[test]
+    fn payload_without_version_is_accepted_and_other_versions_rejected() {
+        let old = parse_payload("path=C:\\x\nnewtab=1\n").unwrap();
+        assert!(old.new_tab && old.paths == ["C:\\x"]);
+        assert_eq!(parse_payload("v=0\npath=C:\\x\n"), None);
+        assert_eq!(parse_payload(&format!("v={}\n", PROTOCOL + 1)), None);
+        assert_eq!(parse_payload("v=\n"), None);
+    }
+
+    /// Every documented flag and Explorer-style form sets exactly its own field and nothing else.
+    #[test]
+    fn each_flag_sets_exactly_its_field() {
+        let d = Args::default;
+        let cases: Vec<(Vec<&str>, Args)> = vec![
+            (vec!["--select", "C:\\x"], Args { select: Some("C:\\x".into()), ..d() }),
+            (vec!["--select=C:\\x"], Args { select: Some("C:\\x".into()), ..d() }),
+            (vec!["/select,C:\\x"], Args { select: Some("C:\\x".into()), ..d() }),
+            (vec!["/select,", "C:\\x"], Args { select: Some("C:\\x".into()), ..d() }),
+            (vec!["--profile", "w"], Args { profile: Some("w".into()), ..d() }),
+            (vec!["--profile=w"], Args { profile: Some("w".into()), ..d() }),
+            (vec!["--new-tab"], Args { new_tab: true, ..d() }),
+            (vec!["-t"], Args { new_tab: true, ..d() }),
+            (vec!["--search", "q"], Args { search: Some("q".into()), ..d() }),
+            (vec!["--search=q"], Args { search: Some("q".into()), ..d() }),
+            (vec!["--register"], Args { register: true, ..d() }),
+            (vec!["--unregister"], Args { unregister: true, ..d() }),
+            (vec!["--install"], Args { install: true, ..d() }),
+            (vec!["--uninstall"], Args { uninstall: true, ..d() }),
+            (vec!["--quiet"], Args { quiet: true, ..d() }),
+            (vec!["--install", "--quiet"], Args { install: true, quiet: true, ..d() }),
+            (vec!["--import-explorer"], Args { import_explorer: true, ..d() }),
+            (vec!["--overwrite"], Args { overwrite: true, ..d() }),
+            (vec!["--recover"], Args { recover: true, ..d() }),
+            (vec!["--elevated"], Args { elevated: true, ..d() }),
+            (vec!["--desktop"], Args { desktop: true, ..d() }),
+            (vec!["--desktop-icons"], Args { desktop_icons: true, ..d() }),
+            (vec!["--new-window"], Args { new_window: true, ..d() }),
+            (vec!["-h"], Args { help: true, ..d() }),
+            (vec!["--help"], Args { help: true, ..d() }),
+            (vec!["/e,C:\\x"], Args { paths: vec!["C:\\x".into()], ..d() }),
+            (vec!["/root,C:\\x"], Args { paths: vec!["C:\\x".into()], ..d() }),
+            (vec!["/n"], d()),
+            (vec!["/separate"], d()),
+            (vec!["C:\\x\\"], Args { paths: vec!["C:\\x".into()], ..d() }),
+            (vec!["/idlist,1"], Args { forward: true, ..d() }),
+            (vec!["ms-settings:"], Args { forward: true, ..d() }),
+        ];
+        for (argv, want) in cases {
+            assert_eq!(p(&argv).unwrap(), want, "{argv:?}");
+        }
     }
 
     #[test]
@@ -409,14 +503,14 @@ mod tests {
     fn new_window_flag() {
         let a = p(&["--new-window", "C:\\x"]).unwrap();
         assert!(a.new_window && a.paths == ["C:\\x"]);
-        assert!(!parse_payload(&payload(&Args { new_window: true, ..Default::default() })).new_window);
+        assert!(!parse_payload(&payload(&Args { new_window: true, ..Default::default() })).unwrap().new_window);
     }
 
     #[test]
     fn usage_mentions_every_option() {
         let u = usage();
         assert!(u.starts_with("rexplorer [options] [folder...]\n"));
-        for o in ["--select", "/select,", "--profile", "--new-tab", "-t", "--register", "--unregister", "--install", "--uninstall", "--import-explorer", "--overwrite", "--recover", "--elevated", "--desktop", "--desktop-icons", "--new-window", "--search", "-h", "--help"] {
+        for o in ["--select", "/select,", "--profile", "--new-tab", "-t", "--register", "--unregister", "--install", "--uninstall", "--quiet", "--import-explorer", "--overwrite", "--recover", "--elevated", "--desktop", "--desktop-icons", "--new-window", "--search", "-h", "--help"] {
             assert!(u.contains(o), "{o}");
         }
     }
@@ -462,9 +556,35 @@ mod tests {
         }
     }
 
+    /// The help says which flag only installs the program and which one takes Explorer's place.
+    #[test]
+    fn help_separates_install_from_taking_over() {
+        let u = usage();
+        let line = |opt: &str| u.lines().find(|l| l.trim_start().starts_with(opt)).unwrap().to_string();
+        assert!(line("--install").contains("Explorer still opens folders"), "{u}");
+        assert!(line("--register").contains("default file manager"), "{u}");
+        assert!(line("--unregister").contains("back to Windows Explorer") && line("--unregister").contains("--register"), "{u}");
+        assert!(line("--uninstall ").contains("back to Explorer"), "{u}");
+        let quiet = line("--quiet");
+        assert!(["--install", "--uninstall", "--register", "--unregister"].iter().all(|f| quiet.contains(f)), "{quiet}");
+        let a = p(&["--register", "--quiet"]).unwrap();
+        assert!(a.register && a.quiet && !a.install);
+    }
+
     #[test]
     fn argument_errors_carry_the_option() {
         assert_eq!(p(&["--select"]).unwrap_err(), "--select needs a value");
         assert_eq!(p(&["--nope=1"]).unwrap_err(), "unknown option: --nope=1");
+    }
+
+    #[test]
+    fn fuzz_command_line_and_payload() {
+        for seed in 0..500 {
+            let mut r = crate::fuzz::Rng::new(seed);
+            let line = r.text(crate::fuzz::TOKENS, 20);
+            let args: Vec<String> = (0..r.below(6)).map(|_| r.text(crate::fuzz::TOKENS, 6)).collect();
+            let values: Vec<String> = (0..4).map(|_| r.text(crate::fuzz::TOKENS, 6)).collect();
+            fuzz_check(&line, &args, &values, seed % 2 == 0);
+        }
     }
 }

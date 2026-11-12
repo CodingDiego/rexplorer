@@ -136,6 +136,10 @@ fn recycle_flags(confirm: bool) -> FILEOPERATION_FLAGS {
     if confirm { f } else { f | FOF_NOCONFIRMATION }
 }
 
+fn too_long_to_recycle(path: &str) -> bool {
+    path.encode_utf16().count() >= 260
+}
+
 fn confirms_recycle() -> bool {
     let mut ss = SHELLSTATEA::default();
     unsafe { SHGetSetSettings(Some(&mut ss), SSF_NOCONFIRMRECYCLE, false) };
@@ -227,7 +231,10 @@ pub fn recycle(hwnd: HWND, paths: &[String], quiet: bool) -> Vec<(String, String
     let go = || -> Result<()> {
         unsafe {
             let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER)?;
-            op.SetOperationFlags(if quiet { FOF_NO_UI | FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE } else { recycle_flags(confirms_recycle()) })?;
+            // The bin takes no path over MAX_PATH: the shell then deletes for good, and with the confirmation off it
+            // does so without its nuke warning. Such a delete always asks (#34).
+            let ask = confirms_recycle() || paths.iter().any(|p| too_long_to_recycle(p));
+            op.SetOperationFlags(if quiet { FOF_NO_UI | FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE } else { recycle_flags(ask) })?;
             if !hwnd.is_invalid() {
                 op.SetOwnerWindow(hwnd)?;
             }
@@ -242,8 +249,7 @@ pub fn recycle(hwnd: HWND, paths: &[String], quiet: bool) -> Vec<(String, String
         Ok(())
     };
     let _ = go();
-    let done = got.borrow().iter().filter(|(o, _)| paths.iter().any(|p| p.eq_ignore_ascii_case(o))).cloned().collect();
-    done
+    got.borrow().iter().filter(|(o, _)| paths.iter().any(|p| p.eq_ignore_ascii_case(o))).cloned().collect()
 }
 
 /// Puts Recycle Bin items back with the bin's "undelete" verb; returns the originals invoked. Never onto a name that is taken.
@@ -449,6 +455,13 @@ mod tests {
     }
 
     #[test]
+    fn long_paths_are_too_long_to_recycle() {
+        assert!(!too_long_to_recycle(r"C:\a\b.txt"));
+        assert!(!too_long_to_recycle(&format!(r"C:\{}", "a".repeat(256))), "259 units");
+        assert!(too_long_to_recycle(&format!(r"C:\{}", "a".repeat(257))));
+    }
+
+    #[test]
     fn recycle_flags_follow_the_confirmation_setting() {
         let has = |f: FILEOPERATION_FLAGS, x: FILEOPERATION_FLAGS| f.0 & x.0 == x.0;
         let (on, off) = (recycle_flags(true), recycle_flags(false));
@@ -485,6 +498,21 @@ mod tests {
         assert!(r.is_empty());
         assert_eq!(std::fs::read_to_string(&sx).unwrap(), "new");
         assert_eq!(std::fs::read_to_string(&dx).unwrap(), "other");
+    }
+
+    #[test]
+    fn transfer_whose_source_is_gone_moves_back() {
+        // A cut and paste: undo moves the file back instead of sending it to the bin.
+        let _c = ComInit::sta();
+        let fx = fixture("cutpaste");
+        std::fs::create_dir_all(fx.0.join("src")).unwrap();
+        std::fs::create_dir_all(fx.0.join("dst")).unwrap();
+        let (sx, dx) = (p(&fx.0, "src\\x.txt"), p(&fx.0, "dst\\x.txt"));
+        std::fs::write(&dx, "moved").unwrap();
+        let r = reverse_with(HWND::default(), vec![Op::Transfer(vec![(sx.clone(), dx.clone())])], true);
+        assert_eq!(r, vec![Op::Moved(vec![(dx.clone(), sx.clone())])]);
+        assert_eq!(std::fs::read_to_string(&sx).unwrap(), "moved");
+        assert!(!Path::new(&dx).exists());
     }
 
     #[test]

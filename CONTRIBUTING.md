@@ -14,16 +14,62 @@ cargo test --release
 The core crate's tests run against the real shell. Tests that touch the registry use a throwaway key under
 `HKCU\Software\rexplorer-test-<pid>-...` and remove it; keep new tests that way.
 
-`scripts\smoke.ps1` drives the real `target\release\rexplorer.exe` (about five minutes, `-Only <regex>` for a
-subset). It runs every instance on a scratch `%APPDATA%`, so it does not touch your settings.
+`scripts\smoke.ps1` drives the real `target\release\rexplorer.exe` (about a minute, three the first time while it
+makes its 100,000-file folder; `-Only <regex>` for a subset). It runs every instance on a scratch `%APPDATA%` and
+`%LOCALAPPDATA%`, so it does not touch your settings. CI runs it with `-Hosted` (see the README).
 
 ## Rules for changes
 
-- Never run `--install`, `--uninstall`, `--register` or `--import-explorer` against your real profile while
-  testing; set `REXPLORER_INSTALL_DIR` and `REXPLORER_REG_BASE=Software\rexplorer-test\<tag>` and a scratch
-  `APPDATA` in the environment.
+- Never run `--install`, `--uninstall`, `--register`, `--unregister`, `--import-explorer` or the install scripts
+  (`install.ps1`, `master-install.ps1`, `restore-explorer.ps1`) against your real profile while testing; set
+  `REXPLORER_INSTALL_DIR`, `REXPLORER_REG_BASE=Software\rexplorer-test\<tag>`, `REXPLORER_PROGRAMS_DIR`,
+  `REXPLORER_STARTUP_DIR` and a scratch `APPDATA` / `LOCALAPPDATA` in the environment (the scripts take the same as
+  `-InstallDir`, `-RegBase`, `-ProgramsDir`, `-StartupDir`). Never pass `-RestartShell` while testing.
+- Installing (`--install`, `install.rs` `install`) and taking over Explorer (`--register`, `take_over`) stay
+  separate. A key rexplorer can write is added to `known_keys()` in `install.rs` and to `$KnownKeys` in
+  `scripts\restore-explorer.ps1` together; `install::tests::restore_script_knows_every_key` checks it.
 - Keep `cargo build --release` free of warnings and `cargo test --release` green.
 - Match the surrounding code: small diffs, comments only for a why the code cannot show.
 - The `windows` crate is pinned on purpose (`Cargo.toml`); upgrade it in its own change.
+- Every user-visible change adds a line under Unreleased in [CHANGELOG.md](CHANGELOG.md).
+
+## Translations
+
+English and Spanish are built in. Text lives in `crates/core/src/lang/<code>.ini`, one `key=text` per line.
+
+1. Copy `crates/core/src/lang/en.ini` to `<code>.ini` (`fr.ini`, `de.ini`...). Translate the text after `=`; never
+   change a key. A key you leave out falls back to English.
+2. Keep every `{placeholder}` (`{n}`, `{a}`...) exactly as written; you may move it within the sentence. Keep the
+   `\n` escapes and the `&` menu accelerators (two `&` in the same menu must not share a letter).
+3. Counts use two keys, `<name>.one` (exactly 1) and `<name>.many` (every other number, including 0). Translate
+   both; if your language needs only one form, write the same text in both.
+4. Try it without building: put the file in `%APPDATA%\rexplorer\lang\<code>.ini`, set `language=<code>` under
+   `[general]` in `settings.ini`, and restart. Run it on a scratch `APPDATA` (see Rules for changes).
+5. To ship it built in, add `pub const FR: &str = include_str!("lang/fr.ini");` and an entry in `BUILTIN` in
+   `crates/core/src/i18n.rs`, then run `cargo test -p rexplorer-core --lib i18n`. The tests check that every key
+   in the code exists in English and that menu accelerators are unique.
+
+## Dependencies
+
+- `cargo audit` runs weekly in CI and on every pull request. Triage a failure within 7 days: update, or record
+  in the issue why it does not apply.
+- Dependabot opens pull requests weekly for Cargo and GitHub Actions. Review each within 7 days.
+- The `windows` family (`windows`, `windows-core`, `windows-collections`) is pinned and ignored by Dependabot.
+  Review a new minor every quarter, and at once on a security advisory. Upgrade in its own pull request.
+- `unrar-ng` (it bundles libunrar; `crates/core/Cargo.toml`) is checked against RARLAB's releases every month. Bump
+  it within 14 days of a release that fixes a security issue, and sooner for a published CVE.
+
+## Releasing
+
+Before tagging:
+
+1. Run `scripts\smoke.ps1 -NoSkip -UserState` on Windows 10 22H2 and on Windows 11, on a desktop nobody is using
+   (a test account for `-UserState`). CI runs only `-Hosted`, which skips the checks that need such a desktop.
+2. Review the Known gaps in the README against `docs/EXPLORER-PARITY.md` and copy the current list into
+   `.github/release-notes.md` under the "Known gaps" heading.
+3. Move the Unreleased lines of `CHANGELOG.md` under the new version and date, then add the release notes
+   (with their Known gaps) to it.
+4. Bump the version, tag it, and check that the release workflow's zip and `SHA256SUMS.txt` match.
+5. Check that nothing deprecated was removed earlier than the README's Stability and deprecation section allows.
 
 By contributing you agree that your contribution is licensed under the MIT license (`LICENSE`).

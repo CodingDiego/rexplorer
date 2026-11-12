@@ -143,10 +143,11 @@ pub fn open(parent: HWND, id: usize, candidates: Vec<Candidate>, t: &Theme, font
             };
             RegisterClassW(&wc);
         });
-        let dpi = match GetDpiForWindow(parent) {
+        // The popup is all text: its whole geometry follows the Windows text size.
+        let dpi = theme::text_dpi(match GetDpiForWindow(parent) {
             0 => 96,
             d => d,
-        };
+        });
         let model = Model::new(candidates);
         let (wd, ht) = (sc(WIDTH, dpi), height_for(model.results().len(), dpi));
         let mut pr = RECT::default();
@@ -434,11 +435,6 @@ unsafe extern "system" fn edit_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
     DefSubclassProc(hwnd, msg, wparam, lparam)
 }
 
-unsafe fn draw_text(hdc: HDC, s: &str, rc: &mut RECT, flags: DRAW_TEXT_FORMAT) {
-    let mut v: Vec<u16> = s.encode_utf16().collect();
-    DrawTextW(hdc, &mut v, rc, flags);
-}
-
 unsafe fn fill(hdc: HDC, rc: &RECT, color: u32) {
     let b = CreateSolidBrush(COLORREF(color));
     FillRect(hdc, rc, b);
@@ -474,13 +470,13 @@ unsafe fn paint(hwnd: HWND, st: *mut State) {
         let selected = i == s.model.selected();
         SetTextColor(mem, COLORREF(if selected { on_sel } else { text }));
         let mut measure = name;
-        draw_text(mem, &c.text, &mut measure, flags | DT_CALCRECT);
-        draw_text(mem, &c.text, &mut name, flags | DT_END_ELLIPSIS);
+        theme::draw_text(mem, &c.text, &mut measure, flags | DT_CALCRECT);
+        theme::draw_text(mem, &c.text, &mut name, flags | DT_END_ELLIPSIS);
         let left = pad + (measure.right - measure.left) + pad;
         if c.target != c.text && left < cw - pad {
             let mut tr = RECT { left, right: cw - pad, ..row };
             SetTextColor(mem, COLORREF(if selected && s.contrast { on_sel } else { secondary }));
-            draw_text(mem, &c.target, &mut tr, flags | DT_RIGHT | DT_PATH_ELLIPSIS);
+            theme::draw_text(mem, &c.target, &mut tr, flags | DT_RIGHT | DT_PATH_ELLIPSIS);
         }
     }
     if s.contrast {
@@ -597,7 +593,7 @@ mod tests {
             assert_eq!(k[1].state & STATE_SYSTEM_SELECTED, 0);
             let mut rc = RECT::default();
             let _ = GetClientRect(p, &mut rc);
-            let r = screen(p, row_rect(1, rc.right, GetDpiForWindow(parent).max(96)));
+            let r = screen(p, row_rect(1, rc.right, theme::text_dpi(GetDpiForWindow(parent).max(96))));
             assert_eq!((k[1].rect.left, k[1].rect.top, k[1].rect.right, k[1].rect.bottom), (r.left, r.top, r.right, r.bottom));
             let r0 = root(&acc);
             assert_eq!((r0.name.as_str(), r0.role), ("Command palette", ROLE_SYSTEM_LIST));

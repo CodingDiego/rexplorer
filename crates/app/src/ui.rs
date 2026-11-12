@@ -107,6 +107,9 @@ pub(crate) unsafe fn create_children(app: *mut App) -> Result<()> {
     // wparam 1: the cue stays visible while the box has the focus and is empty.
     let cue = HSTRING::from(tr("tb.search_cue"));
     SendMessageW((*app).search, EM_SETCUEBANNER, Some(WPARAM(1)), Some(LPARAM(cue.as_ptr() as isize)));
+    // Neither box has a label next to it, so screen readers would announce a nameless edit (#25).
+    let _ = rexplorer_core::access::set_name((*app).search, tr("tb.search_cue"));
+    let _ = rexplorer_core::access::set_name((*app).addr, tr("tb.address_name"));
     let _ = SetWindowSubclass((*app).search, Some(source::search_subclass), 2, app as usize);
     edit::attach((*app).search);
     let _ = edit::autocomplete((*app).addr); // before attach: the word-delete subclass must stay outermost
@@ -139,6 +142,7 @@ pub(crate) unsafe fn create_children(app: *mut App) -> Result<()> {
     let ex = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_HEADERDRAGDROP;
     SendMessageW((*app).list, LVM_SETEXTENDEDLISTVIEWSTYLE, Some(WPARAM(0)), Some(LPARAM(ex as isize)));
     let _ = SetWindowSubclass((*app).list, Some(list::subclass), 1, app as usize);
+    let _ = rexplorer_core::access::set_name((*app).list, tr("tb.items_name"));
     let header = HWND(SendMessageW((*app).list, LVM_GETHEADER, None, None).0 as *mut c_void);
     // The header only reports a hot column (draw_header's hover fill) with HDS_HOTTRACK, which the ListView leaves off.
     SetWindowLongPtrW(header, GWL_STYLE, GetWindowLongPtrW(header, GWL_STYLE) | HDS_HOTTRACK as isize);
@@ -291,16 +295,34 @@ pub(crate) unsafe fn apply_font(app: *mut App) {
     panes::set_preview_fonts(app);
 }
 
+/// After a DPI change (WM_DPICHANGED) or a Windows text size change: fonts, image lists, columns, view spacing
+/// and layout again, then a full repaint for the children whose size did not change.
+pub(crate) unsafe fn rescale(app: *mut App) {
+    use windows::Win32::Graphics::Gdi::{RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RedrawWindow};
+    apply_font(app);
+    sync_list_style(app);
+    views::rebuild_tall(app);
+    if let Some(s) = nav::source(app) {
+        nav::set_columns(app, &s.columns());
+        nav::apply_layout(app);
+    }
+    views::apply(app);
+    layout(app);
+    let _ = RedrawWindow(Some((*app).hwnd), None, None, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+}
+
 pub(crate) unsafe fn layout(app: *mut App) {
     let mut rc = RECT::default();
     let _ = GetClientRect((*app).hwnd, &mut rc);
     let dpi = GetDpiForWindow((*app).hwnd);
+    // Bar heights hold text, so they follow the Windows text size too; widths and glyphs stay at `dpi`.
+    let tdpi = theme::text_dpi(dpi);
     let (w, pad) = (rc.right, scale(PAD, dpi));
-    let th = tabs::height(dpi);
+    let th = tabs::height(tdpi);
     let _ = MoveWindow((*app).strip, 0, 0, w, th, true);
 
     // The header bar: 32 px controls centered in 44 px.
-    let (hh, nh) = (scale(HEADER_H, dpi), scale(CONTROL_H, dpi));
+    let (hh, nh) = (scale(HEADER_H, tdpi), scale(CONTROL_H, tdpi));
     let y = th + (hh - nh) / 2;
     let nw = toolbar::width((*app).nav);
     let tw = toolbar::width((*app).tools);
@@ -313,7 +335,7 @@ pub(crate) unsafe fn layout(app: *mut App) {
     let _ = MoveWindow((*app).crumbs, cx, y, cw, nh, true);
     // A single-line Edit draws its text at the top, so size it to one line and center it in the field,
     // right of the breadcrumb's icon (8 + 16 + 4 px).
-    let eh = (*app).theme.font_size * dpi as i32 / 72 * 4 / 3 + scale(4, dpi);
+    let eh = (*app).theme.font_size * tdpi as i32 / 72 * 4 / 3 + scale(4, dpi);
     let ex = scale(28, dpi);
     let _ = MoveWindow((*app).addr, cx + ex, y + (nh - eh) / 2, (cw - ex - 2 * pad).max(0), eh, true);
     // The search Edit sits in a rounded field the window paints, right of a magnifier glyph.
@@ -330,7 +352,7 @@ pub(crate) unsafe fn layout(app: *mut App) {
     let _ = MoveWindow((*app).cmdbar, pad, th + hh + (hh - nh) / 2, (w - 2 * pad).max(0), nh, true);
 
     let show_status = (*app).profile.show_status;
-    let sh = if show_status { statusbar::height(dpi) } else { 0 };
+    let sh = if show_status { statusbar::height(tdpi) } else { 0 };
     let _ = ShowWindow((*app).status, if show_status { SW_SHOW } else { SW_HIDE });
     let _ = MoveWindow((*app).status, 0, rc.bottom - sh, w, sh, true);
     panes::layout(app, th + 2 * hh, rc.bottom - sh, w);
@@ -350,13 +372,15 @@ fn next_pane(at: Option<usize>, n: usize, back: bool) -> usize {
     }
 }
 
-/// The panes in F6 order; the crumbs, the left pane and the strip are left out when hidden.
-fn panes_in_order<T>(view: T, crumbs: Option<T>, addr: T, search: T, left: Option<T>, strip: Option<T>) -> Vec<T> {
-    [Some(view), crumbs, Some(addr), Some(search), left, strip].into_iter().flatten().collect()
+/// The panes in F6 order; the crumbs, the left pane, the strip and the toolbars (navigation, tools, command bar)
+/// are left out when hidden.
+fn panes_in_order<T>(view: T, crumbs: Option<T>, addr: T, search: T, left: Option<T>, strip: Option<T>, bars: [Option<T>; 3]) -> Vec<T> {
+    let [nav, tools, cmds] = bars;
+    [Some(view), crumbs, Some(addr), Some(search), left, strip, nav, tools, cmds].into_iter().flatten().collect()
 }
 
 /// Moves the keyboard focus (F6, Tab) around the view, the breadcrumb, the address bar, the search box, the left
-/// pane (the folder tree, else the sidebar, when shown) and the tab strip.
+/// pane (the folder tree, else the sidebar, when shown), the tab strip and the toolbars.
 pub(crate) unsafe fn cycle_focus(app: *mut App, back: bool) {
     let view = source::browser_hwnd(app).unwrap_or_else(|| view_hwnd(app));
     let tree = (*app).panes.tree.as_ref().filter(|_| (*app).session.show_tree).map(|t| t.hwnd());
@@ -364,7 +388,8 @@ pub(crate) unsafe fn cycle_focus(app: *mut App, back: bool) {
     let left = tree.or_else(|| shown((*app).sidebar));
     // The address Edit covers the breadcrumb while it is shown.
     let crumbs = shown((*app).crumbs).filter(|_| !IsWindowVisible((*app).addr).as_bool());
-    let panes = panes_in_order(view, crumbs, (*app).addr, (*app).search, left, shown((*app).strip));
+    let bars = [(*app).nav, (*app).tools, (*app).cmdbar].map(shown);
+    let panes = panes_in_order(view, crumbs, (*app).addr, (*app).search, left, shown((*app).strip), bars);
     let focus = GetFocus();
     let at = panes.iter().position(|&h| h == focus || IsChild(h, focus).as_bool());
     let h = panes[next_pane(at, panes.len(), back)];
@@ -533,13 +558,12 @@ pub(crate) unsafe fn build_menu(owner: HWND, entries: &[Entry], bitmaps: &mut Ve
             build_menu(owner, &e.sub, bitmaps).0 as usize
         };
         let _ = AppendMenuW(menu, flags, id, PCWSTR(text.as_ptr()));
-        if e.glyph != 0 {
-            if let Some(b) = glyph_bitmap(owner, e.glyph) {
+        if e.glyph != 0
+            && let Some(b) = glyph_bitmap(owner, e.glyph) {
                 bitmaps.push(b);
                 let mii = MENUITEMINFOW { cbSize: size_of::<MENUITEMINFOW>() as u32, fMask: MIIM_BITMAP, hbmpItem: b, ..Default::default() };
                 let _ = SetMenuItemInfoW(menu, pos as u32, true, &mii);
             }
-        }
     }
     menu
 }
@@ -581,7 +605,7 @@ unsafe fn glyph_bitmap(owner: HWND, glyph: u16) -> Option<HBITMAP> {
     let color = if theme::menus_dark() { 0x00FF_FFFF } else { GetSysColor(COLOR_MENUTEXT) };
     let (cr, cg, cb) = (color & 0xFF, (color >> 8) & 0xFF, (color >> 16) & 0xFF);
     let px = std::slice::from_raw_parts_mut(bits, (size * size * 4) as usize);
-    for p in px.chunks_exact_mut(4) {
+    for p in px.as_chunks_mut::<4>().0 {
         let a = p[0].max(p[1]).max(p[2]) as u32;
         p[0] = (cb * a / 255) as u8;
         p[1] = (cg * a / 255) as u8;
@@ -591,43 +615,82 @@ unsafe fn glyph_bitmap(owner: HWND, glyph: u16) -> Option<HBITMAP> {
     Some(bmp)
 }
 
-/// Breadcrumb chevron: the subfolders of crumb `index`, listed on the UI thread only where that is cheap.
+/// A crumb's subfolders, listed by a worker: (display name, absolute PIDL), or None when the folder failed.
+pub(crate) struct CrumbItems {
+    token: u64,
+    generation: u64,
+    at: POINT,
+    keyboard: bool,
+    items: Option<Vec<(String, Pidl)>>,
+}
+
+/// The newest dropdown request: an older listing that arrives late is dropped.
+static CRUMB_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Breadcrumb chevron: the subfolders of crumb `index` (`breadcrumb::ROOT`: the desktop's places, as Explorer's
+/// leftmost chevron), listed off the UI thread: This PC, a network or a dead share can take seconds.
 /// `at`: the screen point of a keyboard-opened menu (which beeps when the crumb has no dropdown); else the cursor.
 pub(crate) unsafe fn crumb_dropdown(app: *mut App, index: usize, at: Option<POINT>) {
-    let beep = || {
+    let pidl = if index == breadcrumb::ROOT {
+        ShellFolder::desktop().ok().map(|d| d.pidl)
+    } else {
+        cur(app).crumbs.get(index).and_then(|c| c.pidl.clone())
+    };
+    // Archive and search crumbs have no shell folder behind them.
+    let Some(pidl) = pidl else {
         if at.is_some() {
             let _ = MessageBeep(MB_OK);
         }
+        return;
     };
-    let Some(c) = cur(app).crumbs.get(index) else { return beep() };
-    let Some(pidl) = &c.pidl else { return beep() };
-    if !(is_fs_path(&c.parsing) || c.parsing.eq_ignore_ascii_case(THIS_PC)) {
-        return beep();
-    }
-    // A dead share would block here until the SMB timeout; the crumb itself still navigates.
-    if is_remote(&c.parsing) {
-        return beep();
-    }
-    let Ok(folder) = ShellFolder::from_pidl(pidl) else { return beep() };
-    // Bounded: this runs on the UI thread, and the menu shows 500 at most anyway.
-    let Ok(mut items) = folder.subfolders_up_to(2000) else { return };
-    items.retain(|i| i.is_folder() && !i.is_hidden());
-    items.sort_by(|a, b| folder.compare(0, a, b));
-    // shortcut: a menu past a few hundred entries is unusable anyway; a scrolling flyout would replace it
-    items.truncate(500);
-    let entries: Vec<(usize, String)> = items.iter().enumerate().map(|(i, it)| (i + 1, it.display_name())).collect();
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
-    let pt = at.unwrap_or(pt);
-    let picked = popup(app, &entries, &[], pt.x, pt.y);
-    if let Some(item) = picked.checked_sub(1).and_then(|i| items.get(i)) {
-        go(app, Target::Pidl(folder.child_pidl(item)), nav::History::Push);
+    let at_pt = at.unwrap_or(pt);
+    let token = CRUMB_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let (hwnd, generation, keyboard) = ((*app).hwnd.0 as isize, (*app).generation, at.is_some());
+    std::thread::spawn(move || {
+        background_priority();
+        let _com = ComInit::mta();
+        let items = (|| {
+            let folder = ShellFolder::from_pidl(&pidl).ok()?;
+            let mut items = folder.subfolders_up_to(2000).ok()?;
+            items.retain(|i| i.is_folder() && !i.is_hidden());
+            items.sort_by(|a, b| folder.compare(0, a, b));
+            // shortcut: a menu past a few hundred entries is unusable anyway; a scrolling flyout would replace it
+            items.truncate(500);
+            Some(items.iter().map(|it| (it.display_name(), folder.child_pidl(it))).collect())
+        })();
+        let done = Box::into_raw(Box::new(CrumbItems { token, generation, at: at_pt, keyboard, items }));
+        if unsafe { PostMessageW(Some(HWND(hwnd as *mut c_void)), WM_CRUMB_ITEMS, WPARAM(0), LPARAM(done as isize)) }.is_err() {
+            drop(unsafe { Box::from_raw(done) });
+        }
+    });
+}
+
+/// A dropdown's listing is in: shown unless a newer one was asked for, the tab navigated, or the window lost the
+/// foreground meanwhile.
+pub(crate) unsafe fn on_crumb_items(app: *mut App, done: CrumbItems) {
+    let current = done.token == CRUMB_TOKEN.load(std::sync::atomic::Ordering::Relaxed) && done.generation == (*app).generation;
+    if !current || GetForegroundWindow() != (*app).hwnd {
+        return;
+    }
+    let items = done.items.unwrap_or_default();
+    if items.is_empty() {
+        if done.keyboard {
+            let _ = MessageBeep(MB_OK);
+        }
+        return;
+    }
+    let entries: Vec<(usize, String)> = items.iter().enumerate().map(|(i, (name, _))| (i + 1, name.clone())).collect();
+    let picked = popup(app, &entries, &[], done.at.x, done.at.y);
+    if let Some((_, pidl)) = picked.checked_sub(1).and_then(|i| items.get(i)) {
+        go(app, Target::Pidl(pidl.clone()), nav::History::Push);
     }
 }
 
 pub(crate) unsafe fn more_menu(app: *mut App) {
     let exe = std::env::current_exe().unwrap_or_default();
-    let reg = if register::is_registered(register::REAL_BASE, &exe) {
+    let reg = if register::is_registered(&rexplorer_core::install::classes(&rexplorer_core::install::reg_base()), &exe) {
         (CMD_UNREGISTER as usize, tr("menu.more.unregister").to_string())
     } else {
         (CMD_REGISTER as usize, tr("menu.more.register").to_string())
@@ -646,6 +709,10 @@ pub(crate) unsafe fn more_menu(app: *mut App) {
         (0, String::new()),
         (CMD_ABOUT as usize, tr("menu.more.about").to_string()),
     ];
+    // The keyboard's way to the update notice's page.
+    if let Some(v) = UPDATE.get() {
+        entries.push((CMD_UPDATE as usize, trf("menu.more.update", &[("version", v)])));
+    }
     // Quick access: profile bookmarks, then cloud-sync roots.
     let quick: Vec<(String, String)> = (*app).profile.bookmarks.iter().chain(CLOUD.get().into_iter().flatten()).cloned().collect();
     if !quick.is_empty() {
@@ -662,27 +729,56 @@ pub(crate) unsafe fn more_menu(app: *mut App) {
     }
 }
 
-/// --register / --unregister and the More menu: confirm, change HKCU, report.
-pub(crate) unsafe fn register_flow(owner: Option<HWND>, unregister: bool) {
+/// --register / --unregister and the More menu: make rexplorer the default file manager (journaled in the install
+/// folder's takeover.txt) or give folders back to Windows Explorer. Confirms unless `quiet`, reports, and like
+/// install_flow offers (or with `quiet` runs) the rollback of a failed take-over.
+pub(crate) unsafe fn register_flow(owner: Option<HWND>, unregister: bool, quiet: bool) -> InstallOutcome {
+    use rexplorer_core::install;
     let exe = std::env::current_exe().unwrap_or_default();
-    let keys = trf("dlg.register.keys", &[("clsid", &register::EXPLORER_CLSID)]);
-    let question = if unregister {
-        trf("dlg.register.stop", &[("keys", &keys)])
-    } else {
-        trf("dlg.register.start", &[("keys", &keys), ("exe", &exe.display())])
-    };
-    let q = HSTRING::from(question);
-    if MessageBoxW(owner, PCWSTR(q.as_ptr()), w!("rexplorer"), MB_YESNO | MB_ICONQUESTION) != IDYES {
-        return;
+    let (dir, base) = (install::default_dir(), install::reg_base());
+    if !quiet {
+        let question = if unregister {
+            tr("dlg.register.stop").to_string()
+        } else {
+            trf("dlg.register.start", &[("plan", &install::takeover_plan(&base, &exe))])
+        };
+        let q = HSTRING::from(question);
+        if MessageBoxW(owner, PCWSTR(q.as_ptr()), w!("rexplorer"), MB_YESNO | MB_ICONQUESTION) != IDYES {
+            return InstallOutcome::Cancelled;
+        }
     }
-    let r = if unregister { register::unregister(register::REAL_BASE) } else { register::register(register::REAL_BASE, &exe) };
-    let (text, icon) = match r {
-        Ok(()) if unregister => (tr("dlg.register.stopped").to_string(), MB_ICONINFORMATION),
-        Ok(()) => (tr("dlg.register.started").to_string(), MB_ICONINFORMATION),
-        Err(e) => (trf("err.registry", &[("error", &e)]), MB_ICONERROR),
+    // The desktop helper is part of taking over; a test base (REXPLORER_REG_BASE) leaves the real one alone.
+    let real = base == install::REAL_REG_BASE;
+    let (report, outcome) = if unregister {
+        let _ = real && crate::desktop::stop();
+        match install::give_back(&dir, &base) {
+            Ok(s) => (Some((format!("{}\n\n{s}", tr("dlg.register.stopped")), MB_ICONINFORMATION)), InstallOutcome::Done),
+            Err(e) => (Some((trf("err.registry", &[("error", &e.message())]), MB_ICONERROR)), InstallOutcome::Failed),
+        }
+    } else {
+        match install::take_over(&dir, &base, &exe) {
+            Ok(s) => {
+                if real {
+                    let _ = std::process::Command::new(&exe).arg("--desktop").spawn();
+                }
+                (Some((format!("{}\n\n{s}", tr("dlg.register.started")), MB_ICONINFORMATION)), InstallOutcome::Done)
+            }
+            Err(f) if !f.rollback.is_empty() => {
+                if quiet {
+                    let _ = f.rollback.run();
+                } else {
+                    offer_rollback(owner, &f.error, f.rollback, &dir);
+                }
+                (None, InstallOutcome::Failed)
+            }
+            Err(f) => (Some((trf("err.registry", &[("error", &f.error.message())]), MB_ICONERROR)), InstallOutcome::Failed),
+        }
     };
-    let t = HSTRING::from(text);
-    MessageBoxW(owner, PCWSTR(t.as_ptr()), w!("rexplorer"), MB_OK | icon);
+    if let Some((text, icon)) = report.filter(|_| !quiet) {
+        let t = HSTRING::from(text);
+        MessageBoxW(owner, PCWSTR(t.as_ptr()), w!("rexplorer"), MB_OK | icon);
+    }
+    outcome
 }
 
 pub(crate) enum InstallOutcome {
@@ -692,26 +788,23 @@ pub(crate) enum InstallOutcome {
 }
 
 /// --install / --uninstall and the More menu: optionally confirm (listing what changes), run, report. A failed
-/// install offers to roll back what it changed.
-pub(crate) unsafe fn install_flow(owner: Option<HWND>, uninstall: bool, confirm: bool) -> InstallOutcome {
+/// install offers to roll back what it changed. `quiet` (a package manager's `--quiet`): no dialog at all, a failed
+/// install rolls back, the outcome is the only report.
+pub(crate) unsafe fn install_flow(owner: Option<HWND>, uninstall: bool, confirm: bool, quiet: bool) -> InstallOutcome {
     use rexplorer_core::install;
     let dir = install::default_dir();
     let base = install::reg_base();
-    if confirm {
+    if confirm && !quiet {
         let question = if uninstall {
-            let record = std::fs::read_to_string(dir.join("install.txt")).unwrap_or_default();
-            let listed: Vec<String> = record
-                .lines()
-                .filter_map(|l| l.strip_prefix("value ").map(|k| format!("HKCU\\{k}")).or_else(|| l.strip_prefix("file ").map(str::to_string)))
-                .collect();
+            let listed = install::recorded(&dir);
             let listed = if listed.is_empty() { tr("dlg.uninstall.nothing").to_string() } else { listed.join("\n") };
             trf("dlg.uninstall.confirm", &[("record", &dir.join("install.txt").display()), ("listed", &listed)])
         } else {
             trf("dlg.install.confirm", &[("plan", &install::plan(&dir, &base))])
         };
         let q = HSTRING::from(question);
-        let icon = if uninstall { MB_ICONQUESTION } else { MB_ICONWARNING | MB_DEFBUTTON2 };
-        if MessageBoxW(owner, PCWSTR(q.as_ptr()), w!("rexplorer"), MB_YESNO | icon) != IDYES {
+        // A standalone install changes no association any more: an ordinary question, Yes by default.
+        if MessageBoxW(owner, PCWSTR(q.as_ptr()), w!("rexplorer"), MB_YESNO | MB_ICONQUESTION) != IDYES {
             return InstallOutcome::Cancelled;
         }
     }
@@ -722,14 +815,18 @@ pub(crate) unsafe fn install_flow(owner: Option<HWND>, uninstall: bool, confirm:
     // The icons view may hold the installed exe too; it is opt-in, so it is not started again afterwards.
     let _ = real && crate::desktop_icons::stop();
     let r = if uninstall {
-        install::uninstall(&dir).map_err(|e| (e, None))
+        install::uninstall(&dir, &base).map_err(|e| (e, None))
     } else {
         install::install(&dir, &base).map_err(|f| (f.error, Some(f.rollback)))
     };
     let (report, outcome) = match r {
         Ok(s) => (Some((s, MB_ICONINFORMATION)), InstallOutcome::Done),
         Err((e, Some(rollback))) if !rollback.is_empty() => {
-            offer_rollback(owner, &e, rollback, &dir);
+            if quiet {
+                let _ = rollback.run();
+            } else {
+                offer_rollback(owner, &e, rollback, &dir);
+            }
             (None, InstallOutcome::Failed)
         }
         Err((e, _)) => {
@@ -737,16 +834,14 @@ pub(crate) unsafe fn install_flow(owner: Option<HWND>, uninstall: bool, confirm:
             (Some((trf(key, &[("error", &e.message())]), MB_ICONERROR)), InstallOutcome::Failed)
         }
     };
-    // After a failure (rolled back or kept), the helper that was running comes back on whichever copy is in place.
-    let restart = match outcome {
-        InstallOutcome::Done => real && !uninstall,
-        _ => helper_was_running,
-    };
+    // A standalone install starts no helper (that is --register's); one that was running comes back after an update or
+    // a failure, on whichever copy is in place, but not after an uninstall.
+    let restart = helper_was_running && !(uninstall && matches!(outcome, InstallOutcome::Done));
     let exe = dir.join("rexplorer.exe");
     if restart && exe.is_file() {
         let _ = std::process::Command::new(exe).arg("--desktop").spawn();
     }
-    if let Some((text, icon)) = report {
+    if let Some((text, icon)) = report.filter(|_| !quiet) {
         let t = HSTRING::from(text);
         MessageBoxW(owner, PCWSTR(t.as_ptr()), w!("rexplorer"), MB_OK | icon);
     }
@@ -864,11 +959,10 @@ pub(crate) unsafe fn open_palette(app: *mut App) {
 }
 
 pub(crate) unsafe fn on_palette(app: *mut App, hdr: &NMHDR) {
-    if hdr.code == palette::PN_PICK {
-        if let Some(target) = palette::picked(hdr.hwndFrom) {
+    if hdr.code == palette::PN_PICK
+        && let Some(target) = palette::picked(hdr.hwndFrom) {
             go(app, Target::Name(target), nav::History::Push);
         }
-    }
     let _ = SetFocus(Some(ui::view_hwnd(app)));
 }
 
@@ -915,6 +1009,11 @@ pub(crate) unsafe fn selected_bytes(app: *mut App, selected: usize) -> Option<u6
             let sizes: Vec<u64> = list::selected_indices((*app).list).iter().filter_map(|&i| l.items.get(i)).filter(|it| !it.is_folder()).filter_map(|it| it.size()).collect();
             (!sizes.is_empty()).then(|| sizes.iter().sum())
         }
+        // The walk sized every result already.
+        Some(Source::Search(s)) => {
+            let sizes: Vec<u64> = list::selected_indices((*app).list).iter().filter_map(|&i| s.rows.get(i)).filter(|r| !r.is_folder).filter_map(|r| r.bytes).collect();
+            (!sizes.is_empty()).then(|| sizes.iter().sum())
+        }
         _ => None,
     }
 }
@@ -922,17 +1021,20 @@ pub(crate) unsafe fn selected_bytes(app: *mut App, selected: usize) -> Option<u6
 /// The status bar and the command bar's enabled states.
 pub(crate) unsafe fn update_status(app: *mut App) {
     commands::update(app);
+    let right = match UPDATE.get() {
+        Some(v) => format!("{}  \u{b7}  {}", trf("status.update", &[("version", v)]), (*app).profile.name),
+        None => (*app).profile.name.clone(),
+    };
     if cur(app).loading.is_some() {
-        return statusbar::set_text((*app).status, tr("status.loading"), &(*app).profile.name);
+        return statusbar::set_text((*app).status, tr("status.loading"), &right);
     }
     let count = source(app).map_or(0, |s| s.len());
     let selected = SendMessageW((*app).list, LVM_GETSELECTEDCOUNT, None, None).0 as usize;
     let mut left = statusbar::summary(count, selected, selected_bytes(app, selected));
-    if let Some(Source::Shell(l)) = source(app) {
-        if let Some(e) = &l.denied {
+    if let Some(Source::Shell(l)) = source(app)
+        && let Some(e) = &l.denied {
             left = trf("status.access_denied", &[("error", e)]);
         }
-    }
     if let Some(Source::Search(s)) = source(app) {
         if s.running && s.rows.is_empty() {
             left = tr("status.searching").to_string();
@@ -941,7 +1043,7 @@ pub(crate) unsafe fn update_status(app: *mut App) {
             left.push_str(tr(if s.running { "status.search_running" } else { "status.search_done" }));
         }
     }
-    statusbar::set_text((*app).status, &left, &(*app).profile.name);
+    statusbar::set_text((*app).status, &left, &right);
 }
 
 #[cfg(test)]
@@ -965,10 +1067,11 @@ mod tests {
         assert_eq!(next_pane(Some(0), 4, true), 3);
         assert_eq!(next_pane(Some(2), 3, true), 1);
         assert_eq!((next_pane(None, 3, false), next_pane(None, 3, true)), (0, 0));
-        let order = panes_in_order("view", Some("crumbs"), "addr", "search", Some("left"), Some("strip"));
-        assert_eq!(order, ["view", "crumbs", "addr", "search", "left", "strip"]);
-        let walked: Vec<_> = std::iter::successors(Some(0), |&i| Some(next_pane(Some(i), order.len(), false))).take(7).map(|i| order[i]).collect();
-        assert_eq!(walked, ["view", "crumbs", "addr", "search", "left", "strip", "view"]);
-        assert_eq!(panes_in_order("view", None, "addr", "search", None, None), ["view", "addr", "search"], "hidden panes are skipped");
+        let bars = [Some("nav"), Some("tools"), Some("cmds")];
+        let order = panes_in_order("view", Some("crumbs"), "addr", "search", Some("left"), Some("strip"), bars);
+        assert_eq!(order, ["view", "crumbs", "addr", "search", "left", "strip", "nav", "tools", "cmds"]);
+        let walked: Vec<_> = std::iter::successors(Some(0), |&i| Some(next_pane(Some(i), order.len(), false))).take(10).map(|i| order[i]).collect();
+        assert_eq!(walked, ["view", "crumbs", "addr", "search", "left", "strip", "nav", "tools", "cmds", "view"]);
+        assert_eq!(panes_in_order("view", None, "addr", "search", None, None, [None, Some("tools"), None]), ["view", "addr", "search", "tools"], "hidden panes are skipped");
     }
 }

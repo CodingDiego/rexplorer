@@ -38,6 +38,17 @@ fn unescape(v: &str) -> String {
     out
 }
 
+/// The seeded test's and fuzz/'s check: a language file of any text keeps every English key, and placeholder
+/// substitution on it as a template does not panic.
+#[cfg(any(test, fuzzing))]
+pub fn fuzz_check(text: &str) {
+    let t = Table::new(Some(text));
+    assert!(Table::parse(EN).keys().all(|k| t.map.contains_key(k)), "{text:?}");
+    let mut junk = Table::new(None);
+    junk.map.insert("k".into(), text.to_string());
+    let _ = junk.fmt("k", &[("a", &1), ("b", &"x")]);
+}
+
 impl Table {
     /// All sections flattened, last duplicate wins.
     pub fn parse(text: &str) -> HashMap<String, String> {
@@ -163,12 +174,16 @@ mod tests {
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("rexplorer-i18n-{}", std::process::id())).join(tag);
         let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
+        // Another test's cleanup can remove the shared parent between the two steps of create_dir_all: try again.
+        assert!((0..5).any(|_| std::fs::create_dir_all(&d).is_ok()), "{}", d.display());
         d
     }
 
     fn cleanup(tag: &str) {
-        let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("rexplorer-i18n-{}", std::process::id())).join(tag));
+        let base = std::env::temp_dir().join(format!("rexplorer-i18n-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(base.join(tag));
+        // Only succeeds once the last test's folder is gone, so the per-process folder does not pile up in %TEMP%.
+        let _ = std::fs::remove_dir(base);
     }
 
     fn key_shape(k: &str) -> bool {
@@ -255,10 +270,10 @@ mod tests {
                 let group = k.rsplit_once('.').map_or("", |(g, _)| g).to_string();
                 let b: Vec<char> = v.chars().collect();
                 let at = (0..b.len()).find(|&i| b[i] == '&' && b.get(i + 1).is_some_and(|c| *c != '&') && (i == 0 || b[i - 1] != '&'));
-                if let Some(i) = at.filter(|_| k.starts_with("menu.") || k.starts_with("tabs.") || k.starts_with("desk.")) {
-                    if let Some(other) = seen.insert((group, b[i + 1].to_lowercase().next().unwrap()), k.clone()) {
-                        dup.push(format!("{lang}: {k} / {other}"));
-                    }
+                if let Some(i) = at.filter(|_| k.starts_with("menu.") || k.starts_with("tabs.") || k.starts_with("desk."))
+                    && let Some(other) = seen.insert((group, b[i + 1].to_lowercase().next().unwrap()), k.clone())
+                {
+                    dup.push(format!("{lang}: {k} / {other}"));
                 }
             }
             assert!(dup.is_empty(), "{dup:?}");
@@ -398,5 +413,12 @@ mod tests {
             .cloned()
             .collect();
         assert!(unused.is_empty(), "{unused:#?}");
+    }
+
+    #[test]
+    fn fuzz_language_files_never_drop_the_english_keys() {
+        for seed in 0..300 {
+            fuzz_check(&crate::fuzz::Rng::new(seed).text(crate::fuzz::TOKENS, 80));
+        }
     }
 }
