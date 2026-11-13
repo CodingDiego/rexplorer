@@ -2,4 +2,4 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 
-fuzz_target!(|data: &[u8]| rexplorer_core::fuzz::update_response(data));
+fuzz_target!(init: rexplorer_fuzz::init!(), |data: &[u8]| rexplorer_core::fuzz::update_response(data));

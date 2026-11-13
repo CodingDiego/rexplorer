@@ -7,7 +7,7 @@ use windows::Win32::System::Registry::{
 };
 use windows::Win32::UI::Shell::Common::{ITEMIDLIST, SHCOLSTATE, SHCOLSTATE_HIDDEN, SHCOLSTATE_ONBYDEFAULT, SHCOLSTATE_SECONDARYUI, SHCOLSTATE_TYPEMASK, SHCOLSTATE_TYPE_DATE, SHCOLSTATE_TYPE_INT, SHELLDETAILS, STRRET};
 use windows::Win32::UI::Shell::{
-    BHID_SFObject, CSIDL_DESKTOP, IEnumIDList, SHGetFolderLocation, ILClone, ILCombine, ILFindLastID, ILRemoveLastID, IShellFolder,
+    BHID_SFObject, CSIDL_DESKTOP, IEnumIDList, SHGetDesktopFolder, SHGetFolderLocation, ILClone, ILCombine, ILFindLastID, ILRemoveLastID, IShellFolder,
     IShellFolder2, IShellItem, SHCONTF_FOLDERS, SHCONTF_INCLUDEHIDDEN, SHCONTF_NONFOLDERS,
     SHCreateItemFromIDList, SHCreateItemFromParsingName, SHGDN_INFOLDER, SHGDN_NORMAL, SHGDNF, SHGetIDListFromObject,
     SHParseDisplayName, SIGDN_DESKTOPABSOLUTEEDITING, SIGDN_DESKTOPABSOLUTEPARSING,
@@ -134,11 +134,30 @@ impl ShellFolder {
         if !refused(name(SHGDN_NORMAL)) && !refused(name(SHGDN_INFOLDER)) && !refused(listing()) {
             return Ok(());
         }
+        self.rebind(items)
+    }
+
+    /// Binds this folder again on the calling thread and points its `items` at the new binding.
+    pub fn rebind(&mut self, items: &mut [ShellItem]) -> Result<()> {
         let fresh = Self::from_pidl(&self.pidl)?;
         for i in items.iter_mut().filter(|i| i.parent.as_raw() == self.folder.as_raw()) {
             i.parent = fresh.folder.clone();
         }
         *self = fresh;
+        Ok(())
+    }
+
+    /// Releases this folder's COM object, and its `items`' references to it, on the calling thread, leaving the
+    /// desktop folder (one object for the process, callable and releasable from any thread) in their place. For a
+    /// listing made on a single-threaded apartment that ends with its thread: nothing of that apartment may be
+    /// called or released after it. The IDs and names stay, and `rebind` on the receiving thread makes the listing
+    /// usable; until then no item may be asked anything.
+    pub fn park(&mut self, items: &mut [ShellItem]) -> Result<()> {
+        let desktop = unsafe { SHGetDesktopFolder()? };
+        for i in items.iter_mut().filter(|i| i.parent.as_raw() == self.folder.as_raw()) {
+            i.parent = desktop.clone();
+        }
+        self.folder = desktop;
         Ok(())
     }
 
@@ -348,6 +367,34 @@ mod tests {
         assert!(z.enumerate().is_err(), "zipfldr refuses another thread");
         z.adopt(&mut none).unwrap();
         assert!(z.enumerate().is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_parked_listing_keeps_nothing_of_its_thread_and_answers_after_rebind() {
+        let _c = ComInit::sta();
+        let dir = std::env::temp_dir().join(format!("rexplorer-test-park-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"x").unwrap();
+        let path = dir.to_str().unwrap().to_string();
+        // As the app's FTP loader does: bound and listed on a single-threaded apartment that ends with its thread.
+        let addr = std::thread::spawn(move || {
+            let _c = ComInit::sta();
+            let mut f = ShellFolder::parse(&path).unwrap();
+            let mut items = f.enumerate().unwrap();
+            let bound = f.folder.as_raw();
+            f.park(&mut items).unwrap();
+            assert!(f.folder.as_raw() != bound && items.iter().all(|i| i.parent.as_raw() == f.folder.as_raw()), "no reference to the worker's object is left");
+            Box::into_raw(Box::new((f, items))) as usize
+        })
+        .join()
+        .unwrap();
+        let (mut f, mut items) = *unsafe { Box::from_raw(addr as *mut (ShellFolder, Vec<ShellItem>)) };
+        let parked = f.folder.as_raw();
+        f.rebind(&mut items).unwrap();
+        assert!(f.folder.as_raw() != parked && items.iter().all(|i| i.parent.as_raw() == f.folder.as_raw()), "bound again here");
+        assert!(items.iter().any(|i| i.file_name() == "a.txt"));
+        assert!(f.enumerate().is_ok_and(|v| v.len() == items.len()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

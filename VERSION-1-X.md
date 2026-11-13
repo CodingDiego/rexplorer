@@ -31,7 +31,7 @@ kept out of git) lists what is left; the parity checklist's notes say what each 
 
 | Done (code, CI or the release meets every clause) | Only a person can finish (hardware, account, Windows setting, judgment, certificate, store submission, a live run) | Still needs code or agent work |
 |---|---|---|
-| #19 notices, #28 panic audit, #40 desktop menu, #41 indexed search and results (proven live 2026-11-11 and 2026-11-13), #50 command line, #51 settings format, #52 hand-off, #55 data-operation tests in CI, #26 automated checks for every data operation (2026-11-13), #43 multi-volume .rar fixtures and tests (2026-11-13), no BROKEN parity rows | #18 icon art approval, #21 Narrator and NVDA, #22 the focus rectangle under a contrast theme, #23 contrast theme, #27 undo of Home tile drops and in `--desktop` / `--desktop-icons` (test account), #29 the 8-hour soak, #32 Windows 10 and two Windows 11 releases, #33 DPI and monitors, #34 places (OneDrive, MTP, WSL, drives), #37 proofreader and large Text size, #54 `-NoSkip -UserState` run on a test account, #59 signing certificate, #63 winget submission, #64 a real upgrade on a VM, #65 uninstall on a clean VM, #68 cold read and the revert steps on a VM | #27 drops onto the folder tree are not undoable, #48 churn-reload and 100 ms UI-call budgets, #60 the security review of this round's diff and of the desktop helper's hooks, daily-use parity rows (the drag image from Home) |
+| #19 notices, #28 panic audit, #40 desktop menu, #41 indexed search and results (proven live 2026-11-11 and 2026-11-13), #50 command line, #51 settings format, #52 hand-off, #55 data-operation tests in CI, #26 automated checks for every data operation (2026-11-13), #43 multi-volume .rar fixtures and tests (2026-11-13), no BROKEN parity rows | #18 icon art approval, #21 Narrator and NVDA, #22 the focus rectangle under a contrast theme, #23 contrast theme, #27 undo of Home tile drops and in `--desktop` / `--desktop-icons` (test account), #29 the one-hour soak (the hosted "Fuzz and soak" run), #32 Windows 10 and two Windows 11 releases, #33 DPI and monitors, #34 places (OneDrive, MTP, WSL, drives), #37 proofreader and large Text size, #54 `-NoSkip -UserState` run on a test account, #59 signing certificate, #63 winget submission, #64 a real upgrade on a VM, #65 uninstall on a clean VM, #68 cold read and the revert steps on a VM | #27 drops onto the folder tree are not undoable, #48 the 100 ms UI-call budget is measured and holds only on a quiet machine (43-46 ms; 69-11,542 ms under load, a 100,000-file load's WM_ENUM_DONE, 2026-11-13), #60 the security review of this round's diff and of the desktop helper's hooks, daily-use parity rows (the drag image from Home) |
 
 ## 1. Legal and branding
 
@@ -183,9 +183,10 @@ Automation clients read through Windows' bridge. None of it has been tried with 
   `crates/core/src/lib.rs:3` and `crates/app/src/main.rs:7` (the whole workspace), enforced by both clippy steps in CI;
   the remaining sites now degrade (a missing menu takes the error path, a failed settings backup reports the import
   as failed). Not covered by the lint: indexing and arithmetic panics, and `build.rs`.
-- [ ] **[blocker] Soak test.** ([#29](https://github.com/CodingDiego/rexplorer/issues/29)) *Done when:* an 8-hour scripted session (navigate, switch tabs, search, preview,
-  thumbnails, file operations) ends with GDI objects, USER objects, handles, threads and private bytes flat within
-  a stated margin. The test runs before every release.
+- [ ] **[blocker] Soak test.** ([#29](https://github.com/CodingDiego/rexplorer/issues/29)) *Done when (changed 2026-11-13 by the owner: a leak shows with the number of
+  operations, not the clock):* a one-hour scripted session (navigate, switch tabs, search, preview, thumbnails, file
+  operations) of a stated operation count ends with GDI objects, USER objects, handles, threads and private bytes
+  flat within a stated margin. The test runs before every release. (Was: an 8-hour session.)
   *Status 2026-11-10:* `scripts/soak.ps1` (margin: end median ≤ baseline median × 1.05 + slack). Never run; the
   8-hour run needs an idle machine. It leaves out the app's Delete and Undo (both recycle).
   *Status 2026-11-11:* three 15-minute runs (`scripts/bench-results.md`) found a thread leak per Copy, Cut and Paste and two app
@@ -196,6 +197,13 @@ Automation clients read through Windows' bridge. None of it has been tried with 
   30-minute soak job (`.github/workflows/fuzz-soak.yml`, never run yet) gives a signal between releases. Left: the
   user's 8-hour run (`scripts\soak.ps1 -Minutes 480`) on an idle machine before each release.
   *2026-11-13:* the 15-minute soak was not run for 1.0.0-rc.1.
+  *Status 2026-11-13, later:* the release run is `scripts\soak.ps1 -Minutes 60` (CONTRIBUTING.md); the stated count
+  is at least 300 rounds (`-MinIterations`, default 5 a minute; about 400 an hour here, 6.8 a minute on 2026-11-11),
+  each round 3 navigations, 2 tab switches plus a new and a closed tab, a search, 6 previewed rows, a thumbnails view,
+  a copy and a paste and about 60 file changes; the margin is unchanged (end median ≤ baseline median × 1.05 + slack,
+  GDI plus one per paste). The script prints the operation counts and each resource's baseline, end and limit, and
+  the first and last samples. The hosted "Fuzz and soak" job runs it for 60 minutes (`fuzz-soak.yml`, timeout 100).
+  Parse-checked only, not run (it uses the clipboard). Left: the first hosted run, after the merge.
 - [x] **[should] Crash reports users can send.** ([#30](https://github.com/CodingDiego/rexplorer/issues/30)) Crash recovery exists (`--recover`, a second crash opens Explorer).
   *Done when:* a crash also writes a minidump and a short text report under `%LOCALAPPDATA%\rexplorer\crashes`, and
   `SECURITY.md`/README say how to send them (no telemetry).
@@ -265,6 +273,20 @@ Automation clients read through Windows' bridge. None of it has been tried with 
   *Status 2026-11-10:* deferred: README "Not part of 1.0" says FTP is present but unverified, with the reason.
   *Left 2026-11-13:* deferred with a written reason; a test against a live FTP server (the user's choice of server)
   would close it, or removing it from the docs.
+  *Status 2026-11-13, later:* tested against a local server (a small read-only one on 127.0.0.1 written with Python's
+  standard library; passive mode) by window messages on a copy of the release exe with a scratch profile. Found and
+  fixed: the shell's FTP folder lists nothing from the MTA loader (EnumObjects E_UNEXPECTED), so the tab fell back
+  to the embedded Explorer view; `ftp://` loads now run on an STA worker (`nav.rs` `navigate`) and are bound again
+  on the UI thread (`sorts_on_ui_thread`, `folder.rs` `adopt`). After it: the root listed, Enter opened a subfolder,
+  Up came back, and the title, address bar, `recent.txt`, `session.txt` and `rexplorer.log` never held the password.
+  Limits: the preview pane did not fetch an FTP file; Copy / Paste out was not tried (no clipboard on the test PC
+  that day) and the shell's own copy from that server wrote 0 bytes; no real FTP server or TLS. README and the
+  parity row say so (PARTIAL). Redaction (`connect.rs` `redact`), from a review: a raw `/` in a typed password,
+  blanks before the scheme, and `ftps://` / `sftp://` (now any `scheme://`) slipped through; fixed, the password
+  now runs to the last `@` (`redact_finds_raw_passwords_other_schemes_and_leading_blanks`). The Connect dialog's
+  `ftp_url` percent-encodes `/ @ : %`, so only typed addresses carry them raw. Live, with the password `pa/ss@w0rd`:
+  the encoded address logged in and listed; the raw typed one failed to open, and neither the title, the address
+  bar, the error box, `recent.txt`, `session.txt` nor the log held any part of it.
 
 ## 5. Localization
 
@@ -444,12 +466,32 @@ Measured on 2026-10-11 with the 0.1.4 work, on a 12-core laptop:
   tripwire at about ten times the laptop medians; not run yet. Left (code, an agent): the churn-reload (≤ 1/s) and
   100 ms UI-call budgets are not measured; after the first CI run, tighten the hosted values to about 3x the runner's
   medians. The local budget and smoke scripts were not run for 1.0.0-rc.1; CI runs both.
+  *Status 2026-11-13, later:* all five budgets are measured. Churn: a file written and deleted nonstop for 10 s in a
+  scratch folder on screen, reloads counted by `rexplorer.loads`; fails over `-ChurnPerSec` (default 1) and on zero
+  reloads. UI thread: `watchdog::timed` times every message the main pump handles (dispatched or turned into a
+  command by the accelerator table) in every build (per message two `Instant::now` reads, an uncontended lock and a
+  compare), and writes the slowest so
+  far to `rexplorer.slowest` / `rexplorer.slowestmsg` (`instance.rs` `signal_slowest`) only when one beats it; the
+  script fails over `-UiMs` (default 100) for its whole session. CI passes `-ChurnPerSec 1 -UiMs 1000` (`ci.yml`).
+  Five local runs (a busy laptop, three builds sharing it): churn 0.5-0.6 reloads/s (5-6 in 10 s), slowest
+  UI message 152, 69, 573, 290 and 11,542 ms, every time WM_ENUM_DONE of the 100,000-file folder
+  (`nav::on_enum_done`); lowering the limits (`-ChurnPerSec 0.3 -UiMs 20`) made both FAIL. Two later runs on a
+  quieter machine: slowest 46 ms (WM_ENUM_DONE) and 43 ms (WM_PAINT), churn 0.5/s, both PASS. Left (code): the
+  100,000-file load's UI-thread step goes over 100 ms under load (once 11.5 s, cause not found); the first CI
+  run's numbers decide the hosted `-UiMs`.
 - [x] **[should] UI-thread budget tooling.** ([#49](https://github.com/CodingDiego/rexplorer/issues/49)) *Done when:* a debug build logs every UI-thread message that takes over 50 ms,
   with its source.
   *Status 2026-11-10:* `watchdog::dispatch` (`main.rs:531`) logs `slow:` lines in debug builds. Nested modal loops
   count as one message.
   *Status 2026-11-13:* checked: every piece is `cfg(debug_assertions)` (`watchdog.rs:19`, `:48`, `:51`), the pump
   calls it (`main.rs:550`). A debug-build run on a big folder is in HANDOFF.md.
+  *Status 2026-11-13, later:* run, not just read. A debug copy on a scratch profile, driven by messages through the
+  100,000-file folder, a refresh, F5 posted to the list and a close, logged
+  `slow: WM_APP+1 0x0 = WM_ENUM_DONE to RexplorerMain took 98 ms in show a loaded folder (nav::on_enum_done)` and
+  `slow: WM_CLOSE 0x0 to RexplorerMain took 88 ms in close the window (save placement and session)`. The line now
+  names the main window's own WM_APP messages, a command's id in decimal (as `CMD_*` is written), the window class
+  read before the handler runs, and the operation the handler entered (`watchdog::op`); a key the accelerator table
+  turns into a command is timed too (it never went through `DispatchMessageW`). Tests: `watchdog::tests`.
 - [ ] **[should] Backlog from issue #17** ([#17](https://github.com/CodingDiego/rexplorer/issues/17)) is closed or explicitly accepted.
   *Left 2026-11-13:* the user decides which #17 items are accepted for 1.0.
 
@@ -518,6 +560,18 @@ From 1.0, breaking any of these needs 2.0:
   that fuzzes every target three minutes (`.github/workflows/fuzz-soak.yml`). No parser panicked. Not run with
   cargo-fuzz yet: the first scheduled or manual run of "Fuzz and soak" does that. For 1.0.0-rc.1 the job pins the
   version of the fuzz tool it installs (being finished, not run); the targets were not run for this release.
+  *Status 2026-11-13, later:* the first hosted run (43431291987) failed to link every target on MSVC
+  (`__start___sancov_cntrs` and three more unresolved): with `--sanitizer none` nothing defines the coverage section
+  bounds LLVM refers to on COFF (compiler-rt's `sanitizer_coverage_win_sections.cpp` comes only with ASan).
+  `fuzz/src/lib.rs` now defines them the same way, and its `init!` makes a panic abort through the C runtime
+  (SIGABRT, which libFuzzer catches) instead of `__fastfail`, which wrote no `crash-*` file (checked with a
+  throwaway target that panics: before, exit 0xC0000409 and no file; after, "deadly signal" and the input saved).
+  The workflow fails a target that ends without libFuzzer's "Done N runs" line and uploads a summary. Every target
+  ran 3 minutes here (nightly 1.102, cargo-fuzz 0.13.2, one job each), no crash or panic: archive_member 7.25 M
+  runs (40,079/s, coverage 97 -> 160, 246 new inputs), command_line 625 k (3,450/s, 197 -> 552, 613), ini_file
+  1.15 M (6,367/s, 456 -> 722, 1,114), language_file 62 k (345/s, 241 -> 390, 446), search_query 1.44 M
+  (7,933/s, 253 -> 573, 975), session_files 2.85 M (15,749/s, 279 -> 632, 1,792), update_response 20.9 M
+  (115,606/s, 106 -> 181, 242). Left: the next hosted "Fuzz and soak" run.
 - [x] **[should] Reproducible releases.** ([#58](https://github.com/CodingDiego/rexplorer/issues/58)) Release binaries are built only by CI from the tag, as today, and the build
   embeds no local paths.
   *Status 2026-11-10:* the release job pins Rust, remaps paths, links with `/Brepro`, builds twice and fails on a

@@ -62,6 +62,8 @@ pub(crate) struct Loaded {
     pub icon: (usize, i32),
     /// The worker left the listing unsorted, ungrouped and without icons: the UI thread sorts it once it holds it.
     pub unsorted: bool,
+    /// The listing's COM objects stayed on the worker (`ShellFolder::park`): the UI thread binds it again.
+    pub parked: bool,
 }
 
 pub(crate) struct EnumDone {
@@ -311,10 +313,21 @@ pub(crate) unsafe fn navigate(app: *mut App, t: usize, target: Target, history: 
     } else {
         SendMessageW((*app).list, LVM_GETCOUNTPERPAGE, None, None).0.max(0) as usize + 1
     };
+    // The shell's FTP folder lists nothing from the multi-threaded apartment (EnumObjects fails with E_UNEXPECTED;
+    // seen 2026-11-13), and the embedded Explorer view shows a web page for it that never reaches the server: an
+    // `ftp://` load gets a single-threaded apartment of its own.
+    let sta = crate::connect::is_ftp(&destination(&target).1);
     std::thread::spawn(move || {
-        let _com = ComInit::mta();
+        let _com = if sta { ComInit::sta() } else { ComInit::mta() };
         let superseded = || latest.load(Ordering::Relaxed) != generation;
-        let result = load(target, show_hidden, sort, &saved, prefill, &superseded);
+        let mut result = load(target, show_hidden, sort, &saved, prefill, &superseded);
+        // That apartment ends with this thread, so its objects are released here and only IDs travel (`parked`).
+        if sta && let Ok(Loaded { source: Source::Shell(l), parked, .. }) = &mut result {
+            match l.folder.park(&mut l.items) {
+                Ok(()) => *parked = true,
+                Err(err) => result = Err(LoadError { name: l.folder.parsing_name.clone(), err }),
+            }
+        }
         // A newer load of this tab would make on_enum_done drop this one anyway.
         if superseded() {
             return;
@@ -375,11 +388,13 @@ fn load(target: Target, show_hidden: bool, sort: Option<(u32, bool, Option<u32>)
     let why = || ui::is_fs_path(&folder.parsing_name).then(|| std::fs::read_dir(&folder.parsing_name).err()).flatten().filter(|e| e.kind() == std::io::ErrorKind::PermissionDenied).map(|e| e.to_string());
     let (mut items, mut denied) = match folder.enumerate() {
         Ok(items) => (items, None),
-        Err(_) => match why() {
+        Err(e) => match why() {
             // An empty listing that says why: the embedded Explorer view could not read it either.
             Some(e) => (Vec::new(), Some(e)),
+            // An FTP server that refused the login or did not answer: say so (the embedded view would show a blank page).
+            None if crate::connect::is_ftp(&folder.parsing_name) => return Err(LoadError { name: folder.parsing_name.clone(), err: e }),
             // The folder exists but we cannot list it (a phone, an odd namespace extension): the embedded Explorer view.
-            None => return Ok(Loaded { source: Source::Browser(source::BrowserPlace::of(&folder)), crumbs, icon, unsorted: false }),
+            None => return Ok(Loaded { source: Source::Browser(source::BrowserPlace::of(&folder)), crumbs, icon, unsorted: false, parked: false }),
         },
     };
     if superseded() {
@@ -413,7 +428,7 @@ fn load(target: Target, show_hidden: bool, sort: Option<(u32, bool, Option<u32>)
     // shortcut: a big library sorts on the UI thread; give those an STA worker of their own if one stalls.
     let unsorted = l.home.is_none() && sorts_on_ui_thread(&l.folder.parsing_name);
     if unsorted {
-        return Ok(Loaded { source: Source::Shell(l), crumbs, icon, unsorted });
+        return Ok(Loaded { source: Source::Shell(l), crumbs, icon, unsorted, parked: false });
     }
     // After the Home build: its tiles keep the enumeration order.
     unsafe { sort_listing(&mut l) };
@@ -423,7 +438,7 @@ fn load(target: Target, show_hidden: bool, sort: Option<(u32, bool, Option<u32>)
             *icon = item.icon_index(&l.folder.pidl).1;
         }
     }
-    Ok(Loaded { source: Source::Shell(l), crumbs, icon, unsorted })
+    Ok(Loaded { source: Source::Shell(l), crumbs, icon, unsorted, parked: false })
 }
 
 /// The Libraries root, a library, or a folder inside an archive file (.zip, .cab): apartment-threaded folders whose
@@ -476,6 +491,7 @@ fn find_tab<'a>(mut latests: impl Iterator<Item = &'a Arc<AtomicU64>>, id: &Arc<
 }
 
 pub(crate) unsafe fn on_enum_done(app: *mut App, done: Box<EnumDone>) {
+    let _op = crate::watchdog::op("show a loaded folder (nav::on_enum_done)");
     let Some(mut t) = (*app).tabs.iter().position(|x| x.pending == done.generation) else { return };
     (&mut (*app).tabs)[t].pending = 0;
     let was_loading = (&mut (*app).tabs)[t].loading.take().is_some();
@@ -487,6 +503,7 @@ pub(crate) unsafe fn on_enum_done(app: *mut App, done: Box<EnumDone>) {
     // directory answers on any thread). Unbound, every name would show empty: a failed load instead.
     let unbound = match &mut result {
         Ok(Loaded { source: Source::Shell(l), unsorted: true, .. }) => l.folder.adopt(&mut l.items).err().map(|err| LoadError { name: l.folder.parsing_name.clone(), err }),
+        Ok(Loaded { source: Source::Shell(l), parked: true, .. }) => l.folder.rebind(&mut l.items).err().map(|err| LoadError { name: l.folder.parsing_name.clone(), err }),
         _ => None,
     };
     if let Some(e) = unbound {
@@ -532,7 +549,7 @@ pub(crate) unsafe fn on_enum_done(app: *mut App, done: Box<EnumDone>) {
                 set_address(app, &crate::connect::redact(&s.editing_name()));
             }
             if !cancelled {
-                message(hwnd, &trf("err.open", &[("name", &crate::connect::redact(&name)), ("error", &err)]));
+                message(hwnd, &trf("err.open", &[("name", &crate::connect::redact(&name)), ("error", &crate::connect::redact(&err.to_string()))]));
             }
             return;
         }

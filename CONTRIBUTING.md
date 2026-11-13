@@ -75,7 +75,8 @@ Before tagging:
 
 1. Run `scripts\smoke.ps1 -NoSkip -UserState` on Windows 10 22H2 and on Windows 11, on a desktop nobody is using
    (a test account for `-UserState`). CI runs only `-Hosted`, which skips the checks that need such a desktop.
-2. Run `scripts\soak.ps1 -Minutes 480` on the release build on an idle machine; it must PASS every resource.
+2. Run `scripts\soak.ps1 -Minutes 60` on the release build on an idle machine (or the "Fuzz and soak" workflow by
+   hand); it must PASS every resource and reach its stated 300 rounds.
 3. Review the Known gaps in the README against `docs/EXPLORER-PARITY.md` and copy the current list into
    `.github/release-notes.md` under the "Known gaps" heading. Remove the word "Draft" from its first line: the
    release job refuses to publish while it is there.

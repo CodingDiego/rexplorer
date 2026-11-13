@@ -1,5 +1,7 @@
 # cargo-fuzz targets for the parsers (#57). Outside the workspace (its own [workspace] below), so the workspace's
-# Cargo.lock and builds never see libfuzzer-sys. Needs nightly: `cargo +nightly fuzz run ini_file -- -max_total_time=120`.
+# Cargo.lock and builds never see libfuzzer-sys. Needs nightly:
+# `cargo +nightly fuzz run ini_file --sanitizer none -- -max_total_time=120` (README.md: why `--sanitizer none` and
+# src/lib.rs on Windows MSVC).
 [package]
 name = "rexplorer-fuzz"
 version = "0.0.0"
@@ -10,7 +12,7 @@ edition = "2024"
 cargo-fuzz = true
 
 [dependencies]
-libfuzzer-sys = "0.4"
+libfuzzer-sys = "=0.4.13" # src/lib.rs `init!` relies on this version's hook order
 rexplorer-core = { path = "../crates/core" }
 
 [workspace]

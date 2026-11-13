@@ -443,6 +443,7 @@ unsafe fn group_runs<'a>(app: *mut App) -> &'a [(String, usize)] {
 
 /// Drags the selection with the shell's data object; the shell performs the operation and the change watch refreshes.
 pub(crate) unsafe fn begin_drag(app: *mut App) {
+    crate::watchdog::modal(); // the drag runs its own loop until the drop
     let sel = selected_indices((*app).list);
     let data = match source(app) {
         Some(Source::Shell(l)) => {

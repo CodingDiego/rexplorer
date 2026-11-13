@@ -62,6 +62,25 @@ a line under Unreleased. Sections up to 0.1.4 were rebuilt from git history and 
   commands are left out for Recycle Bin items, told by the item's folder or by a `$Recycle.Bin` folder on the way to
   it, so an item inside a recycled folder opened from the bin gets none either
   ([#84](https://github.com/CodingDiego/rexplorer/issues/84)).
+- `ftp://` folders list in rexplorer's own view, with their subfolders and Up. Before, the shell's FTP folder listed
+  nothing from the loader thread and the tab fell back to an embedded view that showed a blank page and never
+  reached the server. A refused login, or a server that does not answer, now shows an error that names the place.
+  `scripts\ftp-check.ps1` proves it against a local server (`scripts\ftp-server.py`)
+  ([#36](https://github.com/CodingDiego/rexplorer/issues/36)).
+- A password in an address is hidden wherever the address starts (after blanks, a quote or an invisible character,
+  inside an error text), with one slash or two of either kind, in any `scheme://`, and when typed raw with a `/` or
+  `@` in it. An `@` in a folder name never changes the host of the address that is shown and saved
+  ([#36](https://github.com/CodingDiego/rexplorer/issues/36)).
+- The fuzz targets build and run on Windows (`--sanitizer none`; `fuzz/src/lib.rs` supplies the coverage section
+  bounds the MSVC linker lacked, and a panic now leaves its input in `fuzz/artifacts`)
+  ([#57](https://github.com/CodingDiego/rexplorer/issues/57)).
+- The debug build's `slow:` lines name the message, the window class and the operation, and cover keyboard
+  shortcuts; every build keeps its slowest UI-thread message in the `rexplorer.slowest` window property
+  ([#49](https://github.com/CodingDiego/rexplorer/issues/49)).
+- `scripts\budgets.ps1` also checks churn reloads (at most 1 a second) and the slowest UI-thread message (100 ms; CI
+  1000 ms) ([#48](https://github.com/CodingDiego/rexplorer/issues/48)).
+- The soak before a release is one hour with a stated operation count; the script prints its operation counts, and
+  the weekly workflow runs that hour ([#29](https://github.com/CodingDiego/rexplorer/issues/29)).
 
 ## 1.0.0-rc.2 - 2026-11-13
 

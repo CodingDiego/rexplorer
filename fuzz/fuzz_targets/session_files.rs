@@ -12,7 +12,7 @@ mod connect {
 #[path = "../../crates/app/src/session.rs"]
 mod session;
 
-fuzz_target!(|data: &[u8]| {
+fuzz_target!(init: rexplorer_fuzz::init!(), |data: &[u8]| {
     let text = String::from_utf8_lossy(data);
     let s = session::parse(&text);
     assert!(s.active < s.tabs.len().max(1) && (120..=1200).contains(&s.tree_width) && (120..=1200).contains(&s.preview_width));

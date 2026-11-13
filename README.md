@@ -650,22 +650,29 @@ interactive object (scroll bars and the embedded Explorer view are excluded, eac
 name blanked on purpose fails it with 12 objects listed). The script exits 1
 on any FAIL, and with `-NoSkip` also on any SKIP (the release run: `-NoSkip -UserState` on an interactive desktop).
 
-`scripts\soak.ps1 [-Minutes 480]` drives one rexplorer for that long (default 10, a harness check) through
+`scripts\soak.ps1 [-Minutes 60]` drives one rexplorer for that long (default 10, a harness check) through
 navigation, preview, thumbnails, tabs, search, copy and paste while it churns files itself, and samples GDI and USER
 objects, handles, threads and private bytes every 30 s to a CSV in `%TEMP%`. After a warm-up it fails when the
 median of the last fifth exceeds the median of the first fifth × 1.05 plus a slack (GDI 50, USER 50, handles 200,
 threads 10, private 50 MB). GDI is also allowed one object per paste made between those two windows (the CSV's
 `copies` column), because the Windows copy engine leaks about one per copy in any process. Do not use the clipboard
-during a run. A weekly and manual GitHub workflow, "Fuzz and soak", runs it for 30 minutes; the 8-hour run before a
-release stays manual.
+during a run. It prints how many navigations, tab switches, searches, previews, thumbnail views and file operations
+it made, and fails under 5 rounds a minute (`-MinIterations`). The release run is one hour (a leak grows with the
+operations, not the clock: about 400 rounds); the weekly and manual GitHub workflow "Fuzz and soak" runs that hour.
 
 `scripts\budgets.ps1` fails when a median is over budget: start to the window's first paint ≤ 400 ms, the 100k-file
 folder listed (the load finished and the list holds every file) ≤ 400 ms, idle ≤ 0.5% of a core (`-Focus` for the
 focused idle budget); about twice what `scripts\bench-results.md` records, so pass looser values on a slower machine.
 It reads window properties the app sets on its main window: `rexplorer.painted` (tick count of the first paint),
-`rexplorer.loads` (finished folder loads) and `rexplorer.loadtick` (tick count of the last one). CI runs it on every
-pull request with `-StartMs 2000 -ListMs 2000 -IdlePct 3`, a tripwire, not a performance claim. It shares
+`rexplorer.loads` (finished folder loads) and `rexplorer.loadtick` (tick count of the last one). It also fails on
+more than 1 reload a second while files churn in the shown folder (`-ChurnPerSec`) and on a UI-thread message over
+100 ms in its session (`-UiMs`, from `rexplorer.slowest`). CI runs it on every pull request with `-StartMs 2000
+-ListMs 2000 -IdlePct 3 -ChurnPerSec 1 -UiMs 1000`, a tripwire, not a performance claim. It shares
 `%TEMP%\rexplorer-bench` with the smoke test and creates it when missing.
+
+`scriptstp-check.ps1` starts `scriptstp-server.py` (a read-only FTP server on 127.0.0.1; Python 3 on PATH) and
+checks FTP browsing on a copy of the exe with a scratch profile, by window messages: listing, a subfolder, Up, a
+refused login, a file copied out by the shell, and that the password is never shown or saved. It exits 1 on any FAIL.
 
 Fuzzing: `fuzz\` holds one cargo-fuzz target per parser (settings and themes, language files, session and folders
 files, archive names, the command line, the search box, the update check's answer); `fuzz\README.md` has the
@@ -685,7 +692,7 @@ says how), 3 more on a scratch install base, 12 UNVERIFIED and 3 PARTIAL. Draggi
 ([#75](https://github.com/CodingDiego/rexplorer/issues/75)); WhatsApp was not tried. Still UNVERIFIED (built, not
 proven on the exe): the desktop icons view (`--desktop-icons`, never run), high contrast (never seen under a
 contrast theme), Text size, per-monitor DPI, the light / dark live switch, icon overlays on OneDrive files, Run as
-administrator, Empty Recycle Bin, the drag image from Home, FTP and the default folder handler
+administrator, Empty Recycle Bin, the drag image from Home and the default folder handler
 on a real install. Narrator and NVDA were never tried.
 
 Open in 1.0.0-rc.2:
@@ -696,7 +703,7 @@ Open in 1.0.0-rc.2:
 - Not run for this release candidate: the 15-minute soak script, the local smoke and budget scripts (CI runs smoke
   and budgets) and the fuzz targets.
 - Only a person can check: MTP devices and OneDrive, Windows settings such as Text size, contrast themes and display
-  scale (including how the address bar trims long names), Narrator or NVDA, the 8-hour soak, ARM hardware,
+  scale (including how the address bar trims long names), Narrator or NVDA, the one-hour soak, ARM hardware,
   Windows 10, an install on a clean machine, WhatsApp as a drop target, and Libraries in an icon view before their
   thumbnails are cached.
 
@@ -763,8 +770,11 @@ and Ctrl+W do the same).
   square corner until the next paint.
 - Share skips selected rows without a local file (on Home, files shared with you live only in the cloud); with
   none left it beeps.
-- `ftp://` browsing goes through the shell's FTP folder (present on Windows 11 25H2, untested against a live
-  server); where it is missing the URL shows the not-found error.
+- `ftp://` browsing goes through the shell's FTP folder (present on Windows 11 25H2). `scripts\ftp-check.ps1`
+  tests it against a local server: listing, opening a subfolder, Up, a refused login and the password never shown
+  or saved. A login that fails shows an error instead of the shell's log-on dialog: put the user and password in
+  the Connect dialog. The preview pane shows nothing for an FTP file. Where the shell's FTP folder is missing the
+  URL shows the not-found error.
 - Small icons of shell folders resolve on the UI thread.
 - Cloud file marks (a blue cloud for online-only, a green check for always-kept) come from the file attributes and
   show only in Details and List, and only where the sync app's own overlay is absent; they were never seen on real
@@ -780,9 +790,9 @@ and Ctrl+W do the same).
 
 Not part of 1.0 (decided, not built):
 
-- FTP. The Connect dialog and `ftp://` browsing are present but have never been tested against a live server, so
-  1.0 makes no promise that they work. Reason: no test server or hosted runner to verify it; it may be
-  removed in a later release.
+- FTP beyond browsing. `ftp://` browsing is tested against a local server (`scripts\ftp-check.ps1`), and the
+  shell's copy engine copied a file out of it. Copy and Paste from rexplorer's own window, uploads, the preview
+  pane, TLS and real FTP servers were not tested, so 1.0 makes no promise for them.
 
 ## Benchmark
 
