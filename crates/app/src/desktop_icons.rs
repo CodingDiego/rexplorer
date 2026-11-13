@@ -625,8 +625,8 @@ unsafe fn undo_step(hwnd: HWND, redo: bool) {
         return;
     };
     // No borrow of the log across the shell's UI, which pumps messages.
-    let done = undo::reverse(hwnd, entry);
-    UNDO.with(|u| u.borrow_mut().put(redo, done));
+    let r = undo::reverse_all(hwnd, entry);
+    UNDO.with(|u| u.borrow_mut().finish(redo, r));
     SetTimer(Some(hwnd), TIMER_RELOAD, 150, None);
 }
 

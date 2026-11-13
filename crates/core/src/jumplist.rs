@@ -96,7 +96,9 @@ pub fn link_app_id(lnk: &Path) -> Option<String> {
 /// system path or would break out of the quotes.
 pub fn folder_arg(path: &str) -> Option<String> {
     let ok = Path::new(path).is_absolute() && !path.chars().any(|c| c == '"' || c.is_control());
-    ok.then(|| format!("\"{path}\""))
+    // Backslashes before the closing quote are doubled, or `"C:\"` would read as `C:"` (the argv rule for `\"`).
+    let trailing = &path[path.trim_end_matches('\\').len()..];
+    ok.then(|| format!("\"{path}{trailing}\""))
 }
 
 /// (frequent, recent) items for `slots` places: frequent first, recent without them; nothing the user removed from
@@ -211,10 +213,29 @@ mod tests {
         s.iter().map(|s| s.to_string()).collect()
     }
 
+    /// How Windows splits a command line (the rules Rust's own args follow).
+    fn argv(line: &str) -> Vec<String> {
+        use windows::Win32::Foundation::{HLOCAL, LocalFree};
+        use windows::Win32::UI::Shell::CommandLineToArgvW;
+        unsafe {
+            let mut n = 0;
+            let p = CommandLineToArgvW(&HSTRING::from(line), &mut n);
+            let out = (0..n as usize).map(|i| (*p.add(i)).to_string().unwrap()).collect();
+            LocalFree(Some(HLOCAL(p as _)));
+            out
+        }
+    }
+
     #[test]
     fn folder_arg_quotes_paths_and_refuses_the_rest() {
         assert_eq!(folder_arg(r"C:\Users\a b").as_deref(), Some("\"C:\\Users\\a b\""));
         assert_eq!(folder_arg(r"\\server\share").as_deref(), Some("\"\\\\server\\share\""));
+        // A root keeps its backslash through the command line's quoting rules.
+        for root in [r"C:\", r"\\server\share\", r"C:\a\\"] {
+            let arg = folder_arg(root).unwrap();
+            assert_eq!(argv(&format!("rexplorer.exe {arg}")), [String::from("rexplorer.exe"), root.to_string()], "{arg}");
+        }
+        assert_eq!(argv(&format!("x {}", folder_arg(r"C:\Users\a b").unwrap())), ["x", r"C:\Users\a b"]);
         for bad in ["::{20D04FE0-3AEA-1069-A2D8-08002B30309D}", "shell:Downloads", "relative", "C:\\a\"b", "C:\\a\nb", ""] {
             assert_eq!(folder_arg(bad), None, "{bad:?}");
         }

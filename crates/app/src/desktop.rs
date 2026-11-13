@@ -2,7 +2,7 @@
 //! shell); a low-level mouse hook takes right-clicks that land on its icon list and shows our menu instead, built
 //! like the file list's: the shell's verbs for the selected icons, or View, Sort by, Refresh and Paste plus the
 //! shell's background verbs. A low-level keyboard hook does the same for Shift+F10 and the Menu key on the focused
-//! list, at the first selected icon. One helper runs per session; install starts it at sign-in.
+//! list, at the first selected icon. One helper runs per session; `--register` starts it at sign-in.
 //!
 //! The press is taken so a plain click can show our menu, which would keep Explorer from starting a right-drag. So
 //! once the pointer leaves the drag box the press is replayed to Explorer (tagged, so the hook lets it through), and
@@ -13,7 +13,7 @@
 //! else runs on the main thread.
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicIsize, AtomicU32, Ordering};
 
 use rexplorer_core::com::ComInit;
 use rexplorer_core::desktop::{self, ARRANGE, DesktopView, ICON_SIZES, SORT_KEYS};
@@ -50,7 +50,6 @@ const REPLAY_TAG: usize = 0x5245_5850;
 /// The window the hook posts to, and the desktop list a right press started on.
 static TARGET: AtomicIsize = AtomicIsize::new(0);
 static LIST: AtomicIsize = AtomicIsize::new(0);
-static PRESSED: AtomicBool = AtomicBool::new(false);
 /// Where the taken press landed (packed), the drag box around it, and the hook thread that replays it.
 static PRESS: AtomicIsize = AtomicIsize::new(0);
 static DRAG_X: AtomicI32 = AtomicI32::new(0);
@@ -66,7 +65,67 @@ enum At {
     Keyboard,
 }
 
+/// Where a right press the mouse hook took stands.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Drag {
+    Idle,
+    /// A press on the desktop list was taken: its release gets our menu, a drag replays it.
+    Pressed,
+    /// The replay is sent and its tagged press has not reached the hook yet.
+    Replaying,
+    /// The user's release reached the hook before the replay's tagged press (it was already queued when the replay
+    /// was sent): the replay's input is taken up to its last move, so no press stays down. `pressed`: its press
+    /// has gone by.
+    Overtaken { pressed: bool },
+}
+
+/// What the mouse hook sees, as far as a taken press is concerned; `Replay` is the hook thread about to send it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Event {
+    PressOnList,
+    PressElsewhere,
+    MoveBeyond,
+    Release,
+    Replay,
+    TaggedPress,
+    TaggedMove,
+    Forget,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Act {
+    /// Let the input through (for `Replay`: send nothing).
+    Pass,
+    Swallow,
+    PostReplay,
+    /// Swallow the release and show our menu.
+    Menu,
+    SendReplay,
+}
+
+/// The press state machine. A real press can only follow a release, and SendInput queues the replay's three events
+/// together, behind any real input already queued; so a release seen while the replay is in flight came first.
+fn step(s: Drag, e: Event) -> (Drag, Act) {
+    use {Act::*, Drag::*, Event::*};
+    match (s, e) {
+        (_, Forget) => (Idle, Pass),
+        (_, PressOnList) => (Pressed, Swallow),
+        (Pressed, PressElsewhere) => (Idle, Pass),
+        (Pressed, MoveBeyond) => (Pressed, PostReplay),
+        (Pressed, Release) => (Idle, Menu),
+        (Pressed, Replay) => (Replaying, SendReplay),
+        (Replaying, TaggedPress) => (Idle, Pass),
+        (Replaying, Release) => (Overtaken { pressed: false }, Pass),
+        (Overtaken { pressed: false }, TaggedMove) => (s, Swallow),
+        (Overtaken { pressed: false }, TaggedPress) => (Overtaken { pressed: true }, Swallow),
+        (Overtaken { pressed: true }, TaggedMove) => (Idle, Swallow),
+        _ => (s, Pass),
+    }
+}
+
 thread_local! {
+    /// The hook thread's press state: the hooks, the desktop-switch event and the replay all run on that thread.
+    static DRAG: std::cell::Cell<Drag> = const { std::cell::Cell::new(Drag::Idle) };
     /// The shell menu being shown: its owner-drawn and submenu messages are forwarded to it.
     static ACTIVE: RefCell<Option<ContextMenu>> = const { RefCell::new(None) };
     /// A menu is being built or shown.
@@ -130,8 +189,16 @@ fn hook_thread() {
 /// A desktop switch (Win+L, Ctrl+Alt+Del, a UAC prompt) hides from the hooks the release of a press or key they took:
 /// forget both, so the next move does not replay a press nobody holds and the next such key is not taken.
 unsafe extern "system" fn desktop_switched(_: HWINEVENTHOOK, _: u32, _: HWND, _: i32, _: i32, _: u32, _: u32) {
-    PRESSED.store(false, Ordering::SeqCst);
+    advance(Event::Forget);
     SWALLOWED_KEY.store(0, Ordering::SeqCst);
+}
+
+fn advance(e: Event) -> Act {
+    DRAG.with(|d| {
+        let (s, act) = step(d.get(), e);
+        d.set(s);
+        act
+    })
 }
 
 /// Takes a right press and release on the desktop's icon list; a press that turns into a drag is replayed to Explorer
@@ -139,31 +206,41 @@ unsafe extern "system" fn desktop_switched(_: HWINEVENTHOOK, _: u32, _: HWND, _:
 unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code == HC_ACTION as i32 {
         let m = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-        if m.dwExtraInfo == REPLAY_TAG {
-            return CallNextHookEx(None, code, wparam, lparam);
-        }
-        match wparam.0 as u32 {
+        let tagged = m.dwExtraInfo == REPLAY_TAG;
+        let event = match wparam.0 as u32 {
+            // The replay presses the physical button, which is the left one with the buttons swapped.
+            WM_RBUTTONDOWN | WM_LBUTTONDOWN if tagged => Some(Event::TaggedPress),
+            WM_MOUSEMOVE if tagged => Some(Event::TaggedMove),
+            _ if tagged => None,
             WM_RBUTTONDOWN => {
                 let h = WindowFromPoint(m.pt);
                 if desktop::is_desktop_list(h) {
                     LIST.store(h.0 as isize, Ordering::SeqCst);
                     PRESS.store(pack(m.pt), Ordering::SeqCst);
-                    PRESSED.store(true, Ordering::SeqCst);
-                    return LRESULT(1);
+                    Some(Event::PressOnList)
+                } else {
+                    // A press elsewhere ends one whose release never reached the hook.
+                    Some(Event::PressElsewhere)
                 }
-                // A press elsewhere ends one whose release never reached the hook.
-                PRESSED.store(false, Ordering::SeqCst);
             }
-            // Moves are never taken. The replay, not the move, clears PRESSED: a release the hook sees before the
-            // replay runs then gets our menu instead of leaving a replayed press down. Extra posts do nothing.
             WM_MOUSEMOVE
-                if PRESSED.load(Ordering::SeqCst)
+                if DRAG.with(|d| d.get()) == Drag::Pressed
                     && beyond_drag(m.pt, unpack(PRESS.load(Ordering::SeqCst)), (DRAG_X.load(Ordering::SeqCst), DRAG_Y.load(Ordering::SeqCst))) =>
             {
+                Some(Event::MoveBeyond)
+            }
+            WM_RBUTTONUP => Some(Event::Release),
+            _ => None,
+        };
+        match event.map(advance) {
+            Some(Act::Swallow) => return LRESULT(1),
+            // Moves are never taken. The replay, not the move, ends the press: a release the hook sees before the
+            // replay runs then gets our menu. Extra posts do nothing.
+            Some(Act::PostReplay) => {
                 // SendInput inside the callback would re-enter the hook: the hook thread sends it.
                 let _ = PostThreadMessageW(HOOK_THREAD.load(Ordering::SeqCst), WM_REPLAY, WPARAM(0), LPARAM(PRESS.load(Ordering::SeqCst)));
             }
-            WM_RBUTTONUP if PRESSED.swap(false, Ordering::SeqCst) => {
+            Some(Act::Menu) => {
                 let target = HWND(TARGET.load(Ordering::SeqCst) as *mut _);
                 let _ = PostMessageW(Some(target), WM_DESKTOP_MENU, WPARAM(LIST.load(Ordering::SeqCst) as usize), LPARAM(pack(m.pt)));
                 return LRESULT(1);
@@ -183,12 +260,12 @@ fn beyond_drag(pt: POINT, press: POINT, drag: (i32, i32)) -> bool {
 /// One call, so no other input interleaves.
 unsafe fn replay_right_press(press: POINT) {
     // Released (or forgotten) meanwhile: its release got our menu, and a press now would stay down. GetAsyncKeyState
-    // cannot tell: a press the hook took never reaches the async key state. Hook callbacks run on this thread only
-    // between messages, so no release slips in between this check and SendInput.
-    if !PRESSED.swap(false, Ordering::SeqCst) {
+    // cannot tell: a press the hook took never reaches the async key state. A release the user makes while this runs
+    // was queued before the replay and reaches the hook first; `step` then takes the replay back.
+    let Some(now) = cursor_pos() else { return };
+    if advance(Event::Replay) != Act::SendReplay {
         return;
     }
-    let Some(now) = cursor_pos() else { return };
     // SendInput presses physical buttons; with the buttons swapped the logical right one is the physical left.
     let down = if GetSystemMetrics(SM_SWAPBUTTON) != 0 { MOUSEEVENTF_LEFTDOWN } else { MOUSEEVENTF_RIGHTDOWN };
     let origin = POINT { x: GetSystemMetrics(SM_XVIRTUALSCREEN), y: GetSystemMetrics(SM_YVIRTUALSCREEN) };
@@ -201,7 +278,10 @@ unsafe fn replay_right_press(press: POINT) {
         let (x, y) = to_absolute(pt, origin, size);
         mouse(x, y, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK)
     };
-    SendInput(&[goto(press), mouse(0, 0, down), goto(now)], size_of::<INPUT>() as i32);
+    if SendInput(&[goto(press), mouse(0, 0, down), goto(now)], size_of::<INPUT>() as i32) != 3 {
+        // Blocked (by another desktop or a higher integrity window): no tagged press will come to end the replay.
+        advance(Event::Forget);
+    }
 }
 
 /// A virtual-screen pixel as SendInput's absolute coordinate (0..=65535 across the virtual desktop). Windows maps it
@@ -260,6 +340,12 @@ unsafe fn desktop_focus() -> Option<HWND> {
     desktop::is_desktop_list(info.hwndFocus).then_some(info.hwndFocus)
 }
 
+/// Whether a menu request posted at tick `posted` is too old to answer at tick `now` (more than 2 s; the tick
+/// count wraps every 49.7 days, and a time just ahead of `now` is not old).
+fn stale(posted: u32, now: u32) -> bool {
+    now.wrapping_sub(posted) as i32 > 2000
+}
+
 /// A screen point in one LPARAM (64-bit), negative coordinates of left or upper monitors included.
 fn pack(pt: POINT) -> isize {
     (((pt.y as u32 as u64) << 32) | pt.x as u32 as u64) as isize
@@ -271,6 +357,8 @@ fn unpack(v: isize) -> POINT {
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
+        // Clicks taken while Explorer hung must not come out later as a run of menus.
+        WM_DESKTOP_MENU | WM_DESKTOP_KEYMENU if stale(GetMessageTime() as u32, windows::Win32::System::SystemInformation::GetTickCount()) => LRESULT(0),
         WM_DESKTOP_MENU => {
             show(hwnd, HWND(wparam.0 as *mut _), At::Point(unpack(lparam.0)));
             LRESULT(0)
@@ -323,6 +411,9 @@ unsafe fn show(hwnd: HWND, list: HWND, at: At) {
         return;
     }
     menu_for(hwnd, list, at);
+    // The key that opened the menu has been released by now; if the hook missed that release (another hook took it),
+    // the next such key in any window must not be taken.
+    SWALLOWED_KEY.store(0, Ordering::SeqCst);
     BUSY.with(|b| b.set(false));
 }
 
@@ -341,17 +432,23 @@ unsafe fn take_foreground(hwnd: HWND) {
 
 unsafe fn menu_for(hwnd: HWND, list: HWND, at: At) {
     // Explorer restarts replace the view: look it up for every menu.
+    // The hook checked `list` is the shell's own; it is checked again here, as the window may have changed since. A
+    // list that does not answer gives no selection and no menu.
+    if !desktop::is_desktop_list(list) {
+        return;
+    }
+    // The timed read first: it is the liveness probe (a hung list fails at once), before `find`'s untimed COM calls.
+    let Some(sel) = DesktopView::selection(list) else { return };
     let Ok(view) = DesktopView::find() else { return };
     let (index, pt) = match at {
         At::Point(pt) => {
             let index = DesktopView::index_at(list, pt);
-            let _ = view.select_for_menu(list, index);
+            let _ = view.select_for_menu(index, &sel);
             (index, pt)
         }
         // A key acts on the selection as it is, with nothing under a pointer to select; the menu opens at the focused
         // icon, as in Explorer (the first selected one when the focus is elsewhere).
         At::Keyboard => {
-            let sel = DesktopView::selection(list);
             let index = DesktopView::focused(list).filter(|f| sel.contains(f)).or(sel.first().copied());
             let at_icon = index.and_then(|i| view.item_point(list, i).ok()).map(|p| POINT { x: p.x + 8, y: p.y + 8 });
             (index, at_icon.or_else(|| cursor_pos()).unwrap_or_default())
@@ -359,7 +456,10 @@ unsafe fn menu_for(hwnd: HWND, list: HWND, at: At) {
     };
     let Ok(root) = ShellFolder::desktop() else { return };
     let items: Vec<ShellItem> = match index {
-        Some(_) => DesktopView::selection(list).into_iter().filter_map(|i| view.item(i).ok()).map(|pidl| ShellItem { parent: root.folder.clone(), pidl }).collect(),
+        Some(_) => {
+            let Some(sel) = DesktopView::selection(list) else { return };
+            sel.into_iter().filter_map(|i| view.item(i).ok()).map(|pidl| ShellItem { parent: root.folder.clone(), pidl }).collect()
+        }
         None => Vec::new(),
     };
     let refs: Vec<&ShellItem> = items.iter().collect();
@@ -397,7 +497,10 @@ unsafe fn menu_for(hwnd: HWND, list: HWND, at: At) {
         Some(Ok(Picked::Own(REFRESH))) => view.refresh(),
         Some(Ok(Picked::Own(PASTE))) => menu.map_or(Ok(()), |m| m.invoke_verb(hwnd, "paste", false)),
         // In Explorer, so its Ctrl+Z on the desktop brings the icons back; here only when it cannot.
-        Some(Ok(Picked::Delete)) => view.delete_selection(items.len()).or_else(|_| menu.map_or(Ok(()), |m| m.invoke_verb(hwnd, "delete", false))),
+        Some(Ok(Picked::Delete)) => {
+            let paths: Vec<String> = items.iter().map(ShellItem::parsing_name).collect();
+            view.delete_selection(&paths).or_else(|_| menu.map_or(Ok(()), |m| m.invoke_verb(hwnd, "delete", false)))
+        }
         Some(Ok(Picked::Own(id))) if id >= SORT => SORT_KEYS.get(id - SORT).map_or(Ok(()), |(_, k)| view.sort_by(*k)),
         Some(Ok(Picked::Own(id))) if id >= ARRANGE_ID => ARRANGE.get(id - ARRANGE_ID).map_or(Ok(()), |(_, f)| view.toggle_flag(*f)),
         Some(Ok(Picked::Own(id))) if id >= ICON => ICON_SIZES.get(id - ICON).map_or(Ok(()), |(_, s)| view.set_icon_size(*s)),
@@ -433,6 +536,18 @@ mod tests {
     }
 
     #[test]
+    fn a_request_older_than_two_seconds_is_dropped() {
+        assert!(!stale(1000, 1000));
+        assert!(!stale(1000, 3000));
+        assert!(stale(1000, 3001));
+        // Across the tick count's wrap.
+        assert!(!stale(u32::MAX - 500, 1000));
+        assert!(stale(u32::MAX - 500, 1600));
+        // A message time a tick ahead of the clock read after it.
+        assert!(!stale(1016, 1000));
+    }
+
+    #[test]
     fn menu_keys() {
         assert!(is_menu_key(VK_APPS.0, false, false, false));
         assert!(is_menu_key(VK_F10.0, true, false, false));
@@ -463,6 +578,45 @@ mod tests {
         for v in ["delete", "open", "properties", "paste", ""] {
             assert!(!keeps_desktop_keyboard(v), "{v}");
         }
+    }
+
+    fn run(events: &[Event]) -> (Drag, Vec<Act>) {
+        let mut s = Drag::Idle;
+        let acts = events
+            .iter()
+            .map(|&e| {
+                let (next, act) = step(s, e);
+                s = next;
+                act
+            })
+            .collect();
+        (s, acts)
+    }
+
+    #[test]
+    fn a_click_gets_our_menu_and_a_drag_is_replayed() {
+        use {Act::*, Event::*};
+        assert_eq!(run(&[PressOnList, Release]), (Drag::Idle, vec![Swallow, Menu]));
+        // Replayed once however many moves posted it; the replay's press and moves pass, and so does the release.
+        let drag = [PressOnList, MoveBeyond, MoveBeyond, Replay, Replay, TaggedMove, TaggedPress, TaggedMove, Release];
+        assert_eq!(run(&drag), (Drag::Idle, vec![Swallow, PostReplay, PostReplay, SendReplay, Pass, Pass, Pass, Pass, Pass]));
+        // Released before the posted replay ran: the release got the menu, the replay sends nothing.
+        assert_eq!(run(&[PressOnList, MoveBeyond, Release, Replay]), (Drag::Idle, vec![Swallow, PostReplay, Menu, Pass]));
+        assert_eq!(run(&[PressOnList, PressElsewhere, Release]).0, Drag::Idle);
+        assert_eq!(run(&[PressOnList, Forget, Replay]), (Drag::Idle, vec![Swallow, Pass, Pass]));
+    }
+
+    #[test]
+    fn a_release_that_overtakes_the_replay_takes_the_replay_back() {
+        use {Act::*, Event::*};
+        // The user's release was queued while the hook thread was sending: it reaches the hook first, so the tagged
+        // press and the moves around it are taken and no button is left down.
+        let events = [PressOnList, MoveBeyond, Replay, Release, TaggedMove, TaggedPress, TaggedMove];
+        assert_eq!(run(&events), (Drag::Idle, vec![Swallow, PostReplay, SendReplay, Pass, Swallow, Swallow, Swallow]));
+        // After that, other tagged input and the next click are back to normal.
+        let (s, _) = run(&events);
+        assert_eq!(step(s, TaggedMove), (Drag::Idle, Pass));
+        assert_eq!(step(s, PressOnList), (Drag::Pressed, Swallow));
     }
 
     #[test]

@@ -557,6 +557,9 @@ fn main() -> Result<()> {
             watchdog::dispatch(&msg);
         }
     }
+    // Last, after every teardown main does (COM above, the instance claim here): until then a crash keeps its record.
+    drop(_instance);
+    crash::finish();
     Ok(())
 }
 
@@ -847,7 +850,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let _ = MessageBeep(MB_OK);
             }
         }
-        views::WM_THUMB_DONE => views::on_thumb_done(app, wparam, lparam),
+        views::WM_THUMB_DONE => views::on_thumb_done(app),
         views::WM_ICONS_EXPORTED => views::on_icons_exported(app),
         watchdog::WM_HEARTBEAT => watchdog::beat(),
         WM_SETCURSOR => {
@@ -972,11 +975,14 @@ unsafe fn arm_change(app: *mut App, ms: u32) {
 
 #[allow(clippy::needless_borrow)] // the explicit borrow of a raw-pointer field silences rustc's dangerous_implicit_autorefs
 unsafe fn on_notify(app: *mut App, lparam: LPARAM) -> LRESULT {
+    // rexplorer's own controls notify through `access::send_own`, so their structures are read only from such a send;
+    // anything else here is the list's (comctl32's own notifications).
+    if !rexplorer_core::access::own_pointer(lparam) {
+        let hdr = &*(lparam.0 as *const NMHDR);
+        return if hdr.hwndFrom == (*app).list { list::on_notify(app, lparam) } else { LRESULT(0) };
+    }
     let hdr = &*(lparam.0 as *const NMHDR);
     let from = hdr.hwndFrom;
-    if from == (*app).list {
-        return list::on_notify(app, lparam);
-    }
     if from == (*app).home {
         nav::on_home_notify(app, &*(lparam.0 as *const home::NmHome));
         return LRESULT(0);

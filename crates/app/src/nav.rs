@@ -180,7 +180,7 @@ impl Deleted {
 
 /// The row that takes the selection after the `selected` rows (ascending) go: the first survivor after the focused
 /// one (the first selected when the focus is elsewhere), else the last survivor before it; None when none survives.
-fn row_taking_place(len: usize, selected: &[usize], focused: Option<usize>) -> Option<usize> {
+pub(crate) fn row_taking_place(len: usize, selected: &[usize], focused: Option<usize>) -> Option<usize> {
     let at = focused.filter(|f| selected.binary_search(f).is_ok()).or_else(|| selected.first().copied())?;
     let survives = |i: &usize| selected.binary_search(i).is_err();
     (at + 1..len).find(survives).or_else(|| (0..at.min(len)).rev().find(survives))

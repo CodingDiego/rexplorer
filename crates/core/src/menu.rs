@@ -2,7 +2,7 @@ use std::path::Path;
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::DeleteObject;
-use windows::Win32::System::Com::IDataObject;
+use windows::Win32::System::Com::{IDataObject, IPersist};
 use windows::Win32::UI::Shell::{
     CMF_CANRENAME, CMF_DEFAULTONLY, CMF_EXPLORE, CMF_EXTENDEDVERBS, CMF_NORMAL,
     CMF_OPTIMIZEFORINVOKE,
@@ -219,7 +219,7 @@ impl ContextMenu {
                 let paths: Vec<String> = items.iter().map(|i| i.parsing_name()).collect();
                 let mut targets = Vec::new();
                 for (item, p) in items.iter().zip(&paths) {
-                    if p.starts_with("::") || in_recycle_bin(p) {
+                    if p.starts_with("::") || item_in_recycle_bin(item, p) {
                         return None;
                     }
                     targets.push(if item.is_folder() {
@@ -436,6 +436,22 @@ fn in_recycle_bin(path: &str) -> bool {
     path.split(['\\', '/']).any(|dir| dir.eq_ignore_ascii_case("$Recycle.Bin"))
 }
 
+/// The Recycle Bin folder's class (CLSID_RecycleBin).
+const RECYCLE_BIN: windows::core::GUID = windows::core::GUID::from_u128(0x645FF040_5081_101B_9F08_00AA002F954E);
+
+/// Whether `item` (parsing name `path`) is a Recycle Bin item.
+fn item_in_recycle_bin(item: &ShellItem, path: &str) -> bool {
+    let parent_is_bin = unsafe { item.parent.cast::<IPersist>().and_then(|p| p.GetClassID()) }.is_ok_and(|c| c == RECYCLE_BIN);
+    in_bin(parent_is_bin, path)
+}
+
+/// The bin's own items answer with the bin's class; an item inside a recycled folder opened from the bin has an
+/// ordinary file system folder as its parent, so its path tells. A folder of the user's named `$Recycle.Bin` then
+/// counts too, which only costs its items the packaged apps' commands.
+fn in_bin(parent_is_bin: bool, path: &str) -> bool {
+    parent_is_bin || in_recycle_bin(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,6 +469,30 @@ mod tests {
         assert!(!in_recycle_bin(r"C:\Users\u\$Recycle.Bin.txt"));
         assert!(!in_recycle_bin(r"C:\Users\u\a.txt"));
         assert!(!in_recycle_bin(r"\\server\share\a.txt"));
+    }
+
+    #[test]
+    fn the_bin_is_told_by_its_folder_not_a_folder_name() {
+        // The decision: the bin's own items by their folder's class, an item inside a recycled folder (its parent an
+        // ordinary folder under $Recycle.Bin) by its path.
+        assert!(in_bin(true, r"::{645FF040-5081-101B-9F08-00AA002F954E}\x"));
+        assert!(in_bin(false, r"C:\$Recycle.Bin\S-1-5-21-1-2-3-1001\$RAB12CD\inner.txt"), "inside a recycled folder");
+        assert!(!in_bin(false, r"C:\Users\u\a.txt"));
+        let _c = ComInit::sta();
+        // Live: a folder of the user's named like the bin counts by its path (the safe side), and its parent does not
+        // answer with the bin's class.
+        let dir = std::env::temp_dir().join(format!("rexplorer-menu-bin-{}", std::process::id())).join("$Recycle.Bin");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        let (_, items) = list(&dir.to_string_lossy()).unwrap();
+        let p = items[0].parsing_name();
+        assert!(item_in_recycle_bin(&items[0], &p), "{p}");
+        assert!(!unsafe { items[0].parent.cast::<IPersist>().and_then(|p| p.GetClassID()) }.is_ok_and(|c| c == RECYCLE_BIN));
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+        // The Recycle Bin folder itself answers with its class.
+        let pidl = unsafe { Pidl::from_raw(windows::Win32::UI::Shell::SHGetKnownFolderIDList(&windows::Win32::UI::Shell::FOLDERID_RecycleBinFolder, 0, None).unwrap()) };
+        let bin = ShellFolder::from_pidl(&pidl).unwrap();
+        assert_eq!(unsafe { bin.folder.cast::<IPersist>().unwrap().GetClassID().unwrap() }, RECYCLE_BIN);
     }
 
     #[test]

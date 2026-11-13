@@ -34,7 +34,8 @@ fn main() {
         println!("refresh: {:?}", view.refresh());
     }
     if let Some(n) = std::env::args().skip_while(|a| a != "--select").nth(1).and_then(|s| s.parse::<usize>().ok()) {
-        println!("select_for_menu({n}): {:?}", view.select_for_menu(list, Some(n)));
+        let sel = DesktopView::selection(list).unwrap_or_default();
+        println!("select_for_menu({n}): {:?}", view.select_for_menu(Some(n), &sel));
         println!("selection after: {:?}", DesktopView::selection(list));
     }
     for i in [0usize, 5] {

@@ -711,13 +711,18 @@ reading order, Left and Right swapped in the strips, menus opening leftwards). N
 yet; `crates/core/tests/lang/xr.ini` is a test language for it, and the layout was checked on screenshots with it on
 2026-11-13.
 
-Known and not fixed: two kinds of internal window message still carry a pointer, the accessibility request of
-rexplorer's own controls (`WM_ACC_ITEMS`) and their notifications to the parent (`WM_NOTIFY`); worker results now
-wait in a per-window queue and their message carries nothing. The thumbnail and Home icon messages carry a bitmap
-handle, which a forged message can only use to spoil drawing. Another program running as the same user at the same
-integrity level can crash rexplorer by sending one of the two with a bad value. Windows blocks lower-integrity
-senders, and a program at the same level could already inject code, so this is a robustness gap, not a privilege
-boundary.
+Known and not fixed: the notifications the system's list view sends the main window (`WM_NOTIFY` from comctl32) are
+read through their pointer, as in every Win32 program, so another program running as the same user at the same
+integrity level can crash rexplorer with a forged one. rexplorer's own messages no longer trust a pointer or handle
+from the sender: worker results (thumbnails and Home icons too) wait in a per-window queue, and the accessibility
+request and the custom controls' notifications are read only when rexplorer sent them. The shell's drag image
+request is answered through its pointer only once, from Home's own thread, while a drag from Home is starting.
+Windows blocks
+lower-integrity senders, and a program at the same level could already inject code, so this is a robustness gap,
+not a privilege boundary. Undo checks each item again when the shell acts on it; whether the Recycle Bin
+confirmation (shown only with "Display delete confirmation" on) comes before or after that check was not tested.
+`--register` registers only the installed copy: install first (`--install`), then register from the installed
+copy.
 
 Where rexplorer differs from Explorer on purpose: Ctrl+D pins, Ctrl+Shift+E opens Explorer,
 F4's list holds rexplorer's recent places rather than Explorer's typed paths, and Alt or F10 focuses the command bar

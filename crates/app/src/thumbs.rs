@@ -4,17 +4,19 @@
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Sender, channel};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::{Sender, TryRecvError, channel};
 use std::thread::{self, JoinHandle};
 
 use rexplorer_core::archive::Entry;
 use rexplorer_core::com::{ComInit, Pidl};
 use rexplorer_core::images;
+use crate::mailbox::Mailbox;
 use crate::{archive_view, views};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Gdi::{DeleteObject, HBITMAP, HGDIOBJ};
-use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, GetMessageW, MSG, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, WM_NULL};
 
 struct Request {
     gen_: u64,
@@ -34,29 +36,59 @@ pub struct Thumbs {
     gen_: Arc<AtomicU64>,
     /// Items worth rendering, `start << 32 | end`: the worker skips requests outside it.
     window: Arc<AtomicU64>,
+    /// The worker's thread id once its message queue exists (0 before), for the wake-up posts.
+    thread: Arc<AtomicU32>,
     worker: Option<JoinHandle<()>>,
 }
 
-/// Decoded completion message; the receiver owns `bitmap` (already fitted to the request's size) and must DeleteObject it.
+/// A finished bitmap; the receiver owns `bitmap` (already fitted to the request's size) and must DeleteObject it.
 pub struct Done {
     pub id: usize,
     pub bitmap: HBITMAP,
 }
 
-/// Spawns the worker; each finished bitmap is posted to `hwnd` as `msg` (wparam = id, lparam = HBITMAP).
+/// The finished bitmaps, one per `msg` the worker posts (the message carries no handle).
+pub(crate) static DONE: Mailbox<Done> = Mailbox::new();
+
+/// Deletes the bitmaps still queued for `hwnd`, which is being destroyed.
+pub(crate) fn forget(hwnd: HWND) {
+    while let Some(d) = DONE.take(hwnd) {
+        let _ = unsafe { DeleteObject(HGDIOBJ(d.bitmap.0)) };
+    }
+}
+
+/// Spawns the worker; each finished bitmap is queued in `DONE` for `hwnd`, which gets `msg`.
 pub fn start(hwnd: HWND, msg: u32) -> Thumbs {
     let (tx, rx) = channel::<Request>();
     let gen_ = Arc::new(AtomicU64::new(0));
     let latest = gen_.clone();
     let window = Arc::new(AtomicU64::new(ALL));
     let win = window.clone();
+    let thread_id = Arc::new(AtomicU32::new(0));
+    let tid = thread_id.clone();
     let hwnd = hwnd.0 as isize;
     let worker = thread::spawn(move || {
         // An STA: thumbnails of a library's files asked from an MTA crash the process inside thumbcache's own worker
         // (an access violation in Windows.Storage.Search); from an STA they work.
         let _com = ComInit::sta();
-        // recv fails once the sender is dropped.
-        while let Ok(r) = rx.recv() {
+        // The queue exists before the id is published, so the first wake-up post cannot fail.
+        let mut m = MSG::default();
+        let _ = unsafe { PeekMessageW(&mut m, None, 0, 0, PM_NOREMOVE) };
+        tid.store(unsafe { GetCurrentThreadId() }, Ordering::SeqCst);
+        // An STA must pump between requests: COM calls into it and broadcasts sent to it wait on its messages. The
+        // sender posts a wake-up after each request and at shutdown; the requests themselves stay in the channel.
+        loop {
+            let r = match rx.try_recv() {
+                Ok(r) => r,
+                Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) => {
+                    if unsafe { GetMessageW(&mut m, None, 0, 0) }.0 <= 0 {
+                        break;
+                    }
+                    unsafe { DispatchMessageW(&m) };
+                    continue;
+                }
+            };
             // Stale, or scrolled out of the window while queued.
             if r.gen_ < latest.load(Ordering::SeqCst) || !in_window(&win, r.id & 0xFFFF_FFFF) {
                 continue;
@@ -79,16 +111,14 @@ pub fn start(hwnd: HWND, msg: u32) -> Thumbs {
                     let _ = DeleteObject(HGDIOBJ(o.0));
                 }
             }
-            let posted = unsafe {
-                PostMessageW(Some(HWND(hwnd as *mut _)), msg, WPARAM(r.id), LPARAM(bmp.0 as isize))
-            };
-            if posted.is_err() {
-                // Window is gone: nobody will own the bitmap.
-                let _ = unsafe { DeleteObject(HGDIOBJ(bmp.0)) };
+            // Dropping `Thumbs` moves the generation on before the window's `forget`: a bitmap queued after it comes back.
+            if let Err(d) = DONE.post_while(hwnd, msg, Done { id: r.id, bitmap: bmp }, || latest.load(Ordering::SeqCst) == r.gen_) {
+                // Window is gone or the listing changed: nobody will own the bitmap.
+                let _ = unsafe { DeleteObject(HGDIOBJ(d.bitmap.0)) };
             }
         }
     });
-    Thumbs { tx: Some(tx), gen_, window, worker: Some(worker) }
+    Thumbs { tx: Some(tx), gen_, window, thread: thread_id, worker: Some(worker) }
 }
 
 impl Thumbs {
@@ -109,6 +139,15 @@ impl Thumbs {
     fn send(&self, gen_: u64, id: usize, abs: Pidl, size: i32, icon_only: bool, member: Option<(PathBuf, Entry)>) {
         if let Some(tx) = &self.tx {
             let _ = tx.send(Request { gen_, id, abs, size, icon_only, member });
+            self.wake();
+        }
+    }
+
+    /// A request before the worker published its id needs no wake-up: it reads the channel before it first waits.
+    fn wake(&self) {
+        let tid = self.thread.load(Ordering::SeqCst);
+        if tid != 0 {
+            let _ = unsafe { PostThreadMessageW(tid, WM_NULL, WPARAM(0), LPARAM(0)) };
         }
     }
 
@@ -140,14 +179,13 @@ fn in_window(window: &AtomicU64, i: usize) -> bool {
 
 impl Drop for Thumbs {
     fn drop(&mut self) {
+        self.gen_.fetch_add(1, Ordering::SeqCst);
         self.tx = None;
+        // The worker sees the channel closed once it wakes.
+        self.wake();
         // Not joined: the worker may be inside a slow shell call and must not stall the UI thread.
         self.worker = None;
     }
-}
-
-pub fn done(wparam: WPARAM, lparam: LPARAM) -> Done {
-    Done { id: wparam.0, bitmap: HBITMAP(lparam.0 as *mut _) }
 }
 
 /// Items the parent should request: `top - lookahead .. top + per_page + lookahead`, clamped to `0..count`.
@@ -185,6 +223,53 @@ mod tests {
         unsafe { Pidl::from_raw(p) }
     }
 
+    /// The payload a MSG_ID message announced, which carries no handle itself.
+    fn taken(m: &MSG) -> Done {
+        assert_eq!((m.wParam.0, m.lParam.0), (0, 0), "no handle in the message");
+        DONE.take(m.hwnd).expect("a payload per message")
+    }
+
+    #[test]
+    fn the_worker_pumps_while_it_waits() {
+        // A message sent to the worker's apartment window is answered while no request is queued: blocked in a
+        // plain channel read, the send would time out.
+        let _com = ComInit::sta();
+        let hwnd = unsafe {
+            CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR::null(), WS_OVERLAPPEDWINDOW, 0, 0, 80, 60, None, None, None, None)
+        }
+        .unwrap();
+        let t = start(hwnd, MSG_ID);
+        let end = Instant::now() + Duration::from_secs(5);
+        while t.thread.load(Ordering::SeqCst) == 0 && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let tid = t.thread.load(Ordering::SeqCst);
+        // COM makes the apartment's window on its first cross-apartment work: a thumbnail does that.
+        t.request(1, temp_pidl(), 32, false);
+        let m = wait_msg(5000).expect("a first thumbnail");
+        let _ = unsafe { DeleteObject(HGDIOBJ(taken(&m).bitmap.0)) };
+        let mut ole = None;
+        let mut after = None;
+        while let Ok(h) = unsafe { FindWindowExW(Some(HWND_MESSAGE), after, w!("OleMainThreadWndClass"), PCWSTR::null()) } {
+            if unsafe { GetWindowThreadProcessId(h, None) } == tid {
+                ole = Some(h);
+                break;
+            }
+            after = Some(h);
+        }
+        let ole = ole.expect("the worker's apartment window");
+        std::thread::sleep(Duration::from_millis(200));
+        let mut out = 0usize;
+        let answered = unsafe { SendMessageTimeoutW(ole, WM_NULL, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG, 2000, Some(&mut out)) };
+        assert_ne!(answered.0, 0, "the idle worker answers a sent message");
+        // It still serves requests afterwards, and stops when dropped.
+        t.request(1, temp_pidl(), 32, true);
+        let m = wait_msg(5000).expect("a request after the pump");
+        let _ = unsafe { DeleteObject(HGDIOBJ(taken(&m).bitmap.0)) };
+        drop(t);
+        let _ = unsafe { DestroyWindow(hwnd) };
+    }
+
     /// Waits up to `ms` for MSG_ID; None on timeout.
     fn wait_msg(ms: u64) -> Option<MSG> {
         let end = Instant::now() + Duration::from_millis(ms);
@@ -208,7 +293,7 @@ mod tests {
         let t = start(hwnd, MSG_ID);
         t.request(7, temp_pidl(), 64, false);
         let m = wait_msg(5000).expect("no thumbnail within 5s");
-        let d = done(m.wParam, m.lParam);
+        let d = taken(&m);
         assert_eq!(d.id, 7);
         let mut bm = BITMAP::default();
         let n = unsafe { GetObjectW(HGDIOBJ(d.bitmap.0), size_of::<BITMAP>() as i32, Some(&mut bm as *mut _ as *mut _)) };
@@ -223,7 +308,7 @@ mod tests {
         // A current-generation request still works after invalidate.
         t.request(9, temp_pidl(), 64, true);
         let m = wait_msg(5000).expect("no icon within 5s");
-        let _ = unsafe { DeleteObject(HGDIOBJ(done(m.wParam, m.lParam).bitmap.0)) };
+        let _ = unsafe { DeleteObject(HGDIOBJ(taken(&m).bitmap.0)) };
 
         drop(t);
         let _ = unsafe { DestroyWindow(hwnd) };
@@ -242,19 +327,19 @@ mod tests {
         t.request(9, temp_pidl(), 64, true);
         t.request(2, temp_pidl(), 64, true);
         let m = wait_msg(5000).expect("the request inside the window is delivered");
-        let d = done(m.wParam, m.lParam);
+        let d = taken(&m);
         assert_eq!(d.id, 2);
         let _ = unsafe { DeleteObject(HGDIOBJ(d.bitmap.0)) };
         assert!(wait_msg(1000).is_none(), "the request outside the window was rendered");
         // The listing token in the high bits does not matter: only the item index is compared.
         t.request((3 << 32) | 4, temp_pidl(), 64, true);
         let m = wait_msg(5000).expect("item 4 is inside 0..5");
-        let _ = unsafe { DeleteObject(HGDIOBJ(done(m.wParam, m.lParam).bitmap.0)) };
+        let _ = unsafe { DeleteObject(HGDIOBJ(taken(&m).bitmap.0)) };
         t.invalidate();
         assert!(t.in_window(9));
         t.request(9, temp_pidl(), 64, true);
         let m = wait_msg(5000).expect("invalidate opens the window again");
-        let d = done(m.wParam, m.lParam);
+        let d = taken(&m);
         assert_eq!(d.id, 9);
         let _ = unsafe { DeleteObject(HGDIOBJ(d.bitmap.0)) };
         drop(t);

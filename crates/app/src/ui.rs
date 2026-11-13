@@ -728,7 +728,8 @@ pub(crate) unsafe fn on_crumb_items(app: *mut App, done: CrumbItems) {
 }
 
 pub(crate) unsafe fn more_menu(app: *mut App) {
-    let exe = std::env::current_exe().unwrap_or_default();
+    // --register registers the installed copy, whichever copy runs this menu.
+    let exe = rexplorer_core::install::default_dir().join("rexplorer.exe");
     let reg = if register::is_registered(&rexplorer_core::install::classes(&rexplorer_core::install::reg_base()), &exe) {
         (CMD_UNREGISTER as usize, tr("menu.more.unregister").to_string())
     } else {
@@ -773,8 +774,19 @@ pub(crate) unsafe fn more_menu(app: *mut App) {
 /// install_flow offers (or with `quiet` runs) the rollback of a failed take-over.
 pub(crate) unsafe fn register_flow(owner: Option<HWND>, unregister: bool, quiet: bool) -> InstallOutcome {
     use rexplorer_core::install;
-    let exe = std::env::current_exe().unwrap_or_default();
     let (dir, base) = (install::default_dir(), install::reg_base());
+    // Giving back needs no exe; taking over registers the installed copy only.
+    let exe = match install::registered_exe(&dir) {
+        Ok(exe) => exe,
+        Err(_) if unregister => std::path::PathBuf::new(),
+        Err(e) => {
+            if !quiet {
+                let t = HSTRING::from(e.message());
+                MessageBoxW(owner, PCWSTR(t.as_ptr()), w!("rexplorer"), crate::rtl::message_box() | MB_OK | MB_ICONERROR);
+            }
+            return InstallOutcome::Failed;
+        }
+    };
     if !quiet {
         let question = if unregister {
             tr("dlg.register.stop").to_string()

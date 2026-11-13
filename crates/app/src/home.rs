@@ -61,6 +61,8 @@ pub const HM_SELECT_NAMED: u32 = WM_APP + 0x53;
 pub const HM_RECT: u32 = WM_APP + 0x54;
 /// wparam = generation << 32 | slot, lparam = HBITMAP (ours once received).
 const HM_ICON: u32 = WM_APP + 0x50;
+/// The icons HM_ICON announces: (listing generation, slot, bitmap the receiver owns).
+static ICONS: crate::mailbox::Mailbox<(u64, usize, HBITMAP)> = crate::mailbox::Mailbox::new();
 /// Coalesces the repaints HM_ICON asks for.
 const ICON_TIMER: usize = 1;
 /// Click-again rename: fires one double-click time after the release.
@@ -707,8 +709,8 @@ pub fn set_content(hwnd: HWND, mut content: Content) {
                     }
                     let Ok(bmp) = images::icon(&abs, size) else { continue };
                     images::premultiply(bmp);
-                    let wp = WPARAM(((generation as usize) << 32) | slot);
-                    if PostMessageW(Some(HWND(target as *mut c_void)), HM_ICON, wp, LPARAM(bmp.0 as isize)).is_err() {
+                    // WM_NCDESTROY bumps the generation before its drain: an icon queued after that comes back here.
+                    if let Err((_, _, bmp)) = ICONS.post_while(target, HM_ICON, (generation, slot, bmp), || latest.load(Ordering::SeqCst) == generation) {
                         let _ = DeleteObject(bmp.into());
                     }
                 }
@@ -907,7 +909,7 @@ unsafe fn notify(hwnd: HWND, code: u32, index: usize) {
     if let Ok(parent) = GetParent(hwnd) {
         let id = GetDlgCtrlID(hwnd) as usize;
         let nm = NmHome { hdr: NMHDR { hwndFrom: hwnd, idFrom: id, code }, index };
-        SendMessageW(parent, WM_NOTIFY, Some(WPARAM(id)), Some(LPARAM(&nm as *const _ as isize)));
+        access::send_own(parent, WM_NOTIFY, WPARAM(id), LPARAM(&nm as *const _ as isize));
     }
 }
 
@@ -1111,6 +1113,37 @@ fn drag_image_message() -> u32 {
     *ID.get_or_init(|| unsafe { RegisterWindowMessageW(w!("ShellGetDragImage")) })
 }
 
+thread_local! {
+    /// The window whose drag this thread is starting (0: none): the one drag image request it may answer.
+    static DRAG_FROM: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
+
+/// While alive, lets `source` answer one drag image request: hold it across the drag call that starts from it.
+pub(crate) struct DragImageGrant;
+
+impl Drop for DragImageGrant {
+    fn drop(&mut self) {
+        DRAG_FROM.set(0);
+    }
+}
+
+pub(crate) fn grant_drag_image(source: HWND) -> DragImageGrant {
+    DRAG_FROM.set(source.0 as isize);
+    DragImageGrant
+}
+
+/// Uses up the grant if it is `hwnd`'s. Without it a request is not the shell's: a posted message passes the
+/// InSendMessage test too, and its lParam is an address another program chose.
+fn take_drag_image_grant(hwnd: HWND) -> bool {
+    DRAG_FROM.with(|d| {
+        let ours = d.get() != 0 && d.get() == hwnd.0 as isize;
+        if ours {
+            d.set(0);
+        }
+        ours
+    })
+}
+
 /// Answers DI_GETDRAGIMAGE with a copy of the dragged entry's icon (the helper owns it), the pointer at its center.
 /// shortcut: one icon for any number of entries; Explorer stacks several and adds a count.
 unsafe fn drag_image(s: &State, di: &mut windows::Win32::UI::Shell::SHDRAGIMAGE) -> bool {
@@ -1187,6 +1220,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             for bmp in s.icons.iter().flatten() {
                 let _ = DeleteObject((*bmp).into());
             }
+            while let Some((_, _, bmp)) = ICONS.take(hwnd) {
+                let _ = DeleteObject(bmp.into());
+            }
             s.fonts.delete();
             if !s.edit_brush.is_invalid() {
                 let _ = DeleteObject(s.edit_brush.into());
@@ -1207,7 +1243,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_PAINT => paint(hwnd, s),
         WM_GETOBJECT if access::is_client(lparam) => return s.acc.get_or_insert_with(|| access::Server::new(hwnd)).answer(wparam),
-        access::WM_ACC_ITEMS => {
+        access::WM_ACC_ITEMS if access::own_pointer(lparam) => {
             acc_tree(hwnd, s, &mut *(lparam.0 as *mut access::Tree));
             return LRESULT(1);
         }
@@ -1264,9 +1300,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             return LRESULT((p(r.left) | p(r.top - s.scroll) << 16 | p(r.right) << 32 | p(r.bottom - s.scroll) << 48) as isize);
         }
         HM_ICON => {
-            let bmp = HBITMAP(lparam.0 as *mut c_void);
-            let (generation, slot) = (wparam.0 >> 32, wparam.0 & 0xFFFF_FFFF);
-            if generation as u64 == s.generation.load(Ordering::SeqCst) && slot < s.icons.len() {
+            let Some((generation, slot, bmp)) = ICONS.take(hwnd) else { return LRESULT(0) };
+            if generation == s.generation.load(Ordering::SeqCst) && slot < s.icons.len() {
                 if let Some(old) = s.icons[slot].replace(bmp) {
                     let _ = DeleteObject(old.into());
                 }
@@ -1537,8 +1572,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 announce(hwnd, s);
             }
         }
-        // The drag helper asks from this thread; a sender elsewhere could aim the pointer anywhere.
-        _ if msg == drag_image_message() && lparam.0 != 0 && !windows::Win32::UI::WindowsAndMessaging::InSendMessage().as_bool() => {
+        // The drag helper asks from this thread, once, during a drag Home started; any other sender could aim the
+        // pointer anywhere.
+        _ if msg == drag_image_message()
+            && lparam.0 != 0
+            && !windows::Win32::UI::WindowsAndMessaging::InSendMessage().as_bool()
+            && take_drag_image_grant(hwnd) =>
+        {
             return LRESULT(drag_image(s, &mut *(lparam.0 as *mut windows::Win32::UI::Shell::SHDRAGIMAGE)) as isize);
         }
         _ => {
@@ -1774,6 +1814,19 @@ mod tests {
             assert_eq!(tile_key_at_screen(h, p.x, p.y), None);
             let _ = DestroyWindow(parent);
         }
+    }
+
+    #[test]
+    fn the_drag_image_grant_is_one_request_of_one_window() {
+        let (a, b) = (HWND(std::ptr::without_provenance_mut(0x10)), HWND(std::ptr::without_provenance_mut(0x20)));
+        assert!(!take_drag_image_grant(a), "no drag");
+        let g = grant_drag_image(a);
+        assert!(!take_drag_image_grant(b), "another window's request");
+        assert!(take_drag_image_grant(a));
+        assert!(!take_drag_image_grant(a), "used up");
+        drop(g);
+        drop(grant_drag_image(a));
+        assert!(!take_drag_image_grant(a), "the drag is over");
     }
 
     #[test]
@@ -2109,12 +2162,19 @@ mod tests {
             let (icon, _) = crate::views::dib(40, 40).unwrap();
             state(h).unwrap().icons[0] = Some(icon);
             let mut di = windows::Win32::UI::Shell::SHDRAGIMAGE::default();
-            assert_eq!(SendMessageW(h, drag_image_message(), None, Some(LPARAM(&mut di as *mut _ as isize))).0, 1);
+            let ask = |di: &mut windows::Win32::UI::Shell::SHDRAGIMAGE| SendMessageW(h, drag_image_message(), None, Some(LPARAM(di as *mut _ as isize))).0;
+            assert_eq!(ask(&mut di), 0, "no drag started from Home: not answered");
+            assert!(di.hbmpDragImage.is_invalid());
+            let grant = grant_drag_image(h);
+            assert_eq!(ask(&mut di), 1);
             assert_eq!((di.sizeDragImage.cx, di.sizeDragImage.cy, di.ptOffset.x), (40, 40, 20));
             assert!(!di.hbmpDragImage.is_invalid() && di.hbmpDragImage != icon, "a copy: the helper deletes it");
             let _ = DeleteObject(di.hbmpDragImage.into());
+            assert_eq!(ask(&mut di), 0, "one answer per drag");
+            drop(grant);
             set_selection(h, &[], None);
-            assert_eq!(SendMessageW(h, drag_image_message(), None, Some(LPARAM(&mut di as *mut _ as isize))).0, 0, "nothing selected");
+            let _grant = grant_drag_image(h);
+            assert_eq!(ask(&mut di), 0, "nothing selected");
             DestroyWindow(parent).unwrap();
         }
     }

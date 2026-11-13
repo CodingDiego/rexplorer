@@ -87,6 +87,18 @@ pub fn is_installed(dir: &Path) -> bool {
     dir.join(RECORD).is_file()
 }
 
+/// The exe `--register` points folders, App Paths and the Startup shortcut at: the copy installed in `dir`, never
+/// the exe it runs from (run from a folder other accounts can write to, one of them could swap the exe that then
+/// runs as this user at every sign-in). Err, with the message to show, when `dir` holds no install.
+pub fn registered_exe(dir: &Path) -> Result<PathBuf> {
+    let exe = dir.join(EXE);
+    if is_installed(dir) && exe.is_file() {
+        Ok(exe)
+    } else {
+        Err(fail(trf("inst.err.register_needs_install", &[("dir", &dir.display())])))
+    }
+}
+
 /// What `install` changes, for the confirmation dialog.
 pub fn plan(dir: &Path, reg_base: &str) -> String {
     let mut s = format!("{}\n", trf("inst.plan.copy", &[("path", &dir.join(EXE).display())]));
@@ -512,30 +524,62 @@ fn apply_takeover(dir: &Path, reg_base: &str, exe: &Path, startup: Option<&Path>
 
 /// Reverts the registry and file lines of a record: values that still name rexplorer, the named values it wrote,
 /// then the keys it created (only if empty) and the files other than `keep`. Returns what it left alone.
-fn revert(rec: &[String], keep: &[PathBuf]) -> Result<Vec<String>> {
+/// A record is a file in a user-writable folder, so it may name only rexplorer's own: values of the keys it writes
+/// under `reg_base` (`known_keys`), empty keys on the way to them, and its file names in `dirs`.
+fn revert(rec: &[String], keep: &[PathBuf], reg_base: &str, dirs: &[&Path]) -> Result<Vec<String>> {
     let lines = |kind: &str| -> Vec<String> {
         rec.iter().filter_map(|l| l.strip_prefix(kind).and_then(|r| r.strip_prefix(' ')).map(str::to_string)).collect()
     };
+    let known = known_keys(reg_base);
     let mut left = vec![];
-    for k in lines("value") {
+    for k in lines("value").into_iter().filter(|k| is_our_key(&known, k, false)) {
         if !remove_if_ours(&HSTRING::from(&k))? {
             left.push(trf("inst.un.left", &[("key", &format!("HKCU\\{k}"))]));
         }
     }
     for kn in lines("named") {
-        if let Some((k, n)) = kn.rsplit_once('|') {
+        if let Some((k, n)) = kn.rsplit_once('|')
+            && is_our_key(&known, k, false)
+        {
             delete_value(&HSTRING::from(k), PCWSTR(HSTRING::from(n).as_ptr()))?;
         }
     }
-    let mut keys = lines("key");
+    let mut keys: Vec<String> = lines("key").into_iter().filter(|k| is_our_key(&known, k, true)).collect();
     keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
     for k in &keys {
         delete_empty(k);
     }
-    for f in lines("file").iter().map(PathBuf::from).filter(|f| !keep.contains(f)) {
+    for f in lines("file").iter().map(PathBuf::from).filter(|f| !keep.contains(f) && is_our_file(f, dirs)) {
         let _ = std::fs::remove_file(f);
     }
     Ok(left)
+}
+
+/// Whether `key` is one of `known` or, with `parents`, a key on the path to one (record_missing_keys records those).
+fn is_our_key(known: &[String], key: &str, parents: bool) -> bool {
+    known.iter().any(|k| {
+        k.eq_ignore_ascii_case(key)
+            || (parents && k.as_bytes().get(key.len()) == Some(&b'\\') && k.get(..key.len()).is_some_and(|p| p.eq_ignore_ascii_case(key)))
+    })
+}
+
+/// The file names install and take-over write; restore-explorer.ps1's `$OurFiles` is the same list.
+const OUR_FILES: [&str; 6] = [EXE, OLD, RECORD, TAKEOVER, START_LNK, DESKTOP_LNK];
+
+/// One of `OUR_FILES` directly in one of `dirs`.
+fn is_our_file(path: &Path, dirs: &[&Path]) -> bool {
+    let folder = |p: &Path| p.to_string_lossy().trim_end_matches(['\\', '/']).to_lowercase();
+    path.file_name().and_then(|n| n.to_str()).is_some_and(|n| OUR_FILES.iter().any(|o| o.eq_ignore_ascii_case(n)))
+        && path.parent().is_some_and(|p| dirs.iter().any(|d| folder(d) == folder(p)))
+}
+
+/// The folders install and take-over write files to: `dir`, and the Start menu and Startup folders when they have them.
+fn file_dirs<'a>(dir: &'a Path, links: Option<&'a (PathBuf, PathBuf)>) -> Vec<&'a Path> {
+    let mut v = vec![dir];
+    if let Some((programs, startup)) = links {
+        v.extend([programs.as_path(), startup.as_path()]);
+    }
+    v
 }
 
 fn remove_dirs(rec: &[String]) {
@@ -548,6 +592,11 @@ fn remove_dirs(rec: &[String]) {
 /// `--register`, or a lost record) removes the values of `known_keys` that name rexplorer and the desktop helper's
 /// Startup shortcut. Leaves the program installed. Returns a summary.
 pub fn give_back(dir: &Path, reg_base: &str) -> Result<String> {
+    give_back_in(dir, reg_base, env_shortcut_dirs(reg_base).ok().flatten().as_ref())
+}
+
+/// `give_back` with the (Programs, Startup) folders the shortcuts went to.
+fn give_back_in(dir: &Path, reg_base: &str, links: Option<&(PathBuf, PathBuf)>) -> Result<String> {
     let rec = read_record(dir, TAKEOVER);
     let mut summary = vec![trf("inst.un.restored", &[("explorer", &"explorer.exe")])];
     if rec.is_empty() {
@@ -556,11 +605,11 @@ pub fn give_back(dir: &Path, reg_base: &str) -> Result<String> {
         if !remove_if_ours(&HSTRING::from(&ap))? {
             summary.push(trf("inst.un.left", &[("key", &format!("HKCU\\{ap}"))]));
         }
-        if let Ok(Some((_, startup))) = env_shortcut_dirs(reg_base) {
+        if let Some((_, startup)) = links {
             let _ = std::fs::remove_file(startup.join(DESKTOP_LNK));
         }
     } else {
-        summary.extend(revert(&rec, &[])?);
+        summary.extend(revert(&rec, &[], reg_base, &file_dirs(dir, links))?);
         let _ = std::fs::remove_file(dir.join(TAKEOVER));
         remove_dirs(&rec);
     }
@@ -571,9 +620,14 @@ pub fn give_back(dir: &Path, reg_base: &str) -> Result<String> {
 /// Gives folders back to Explorer first, then reverts what `<dir>\install.txt` lists: the Apps and Features entry,
 /// the keys install created (only if empty), the files, the exe last. Returns a summary.
 pub fn uninstall(dir: &Path, reg_base: &str) -> Result<String> {
+    uninstall_in(dir, reg_base, env_shortcut_dirs(reg_base).ok().flatten().as_ref())
+}
+
+/// `uninstall` with the (Programs, Startup) folders the shortcuts went to.
+fn uninstall_in(dir: &Path, reg_base: &str, links: Option<&(PathBuf, PathBuf)>) -> Result<String> {
     let rec = read_record(dir, RECORD);
     let had_takeover = dir.join(TAKEOVER).is_file();
-    let given_back = give_back(dir, reg_base)?;
+    let given_back = give_back_in(dir, reg_base, links)?;
     if rec.is_empty() {
         return if had_takeover {
             Ok(given_back)
@@ -583,7 +637,7 @@ pub fn uninstall(dir: &Path, reg_base: &str) -> Result<String> {
     }
     let exe = dir.join(EXE);
     let mut summary = vec![given_back];
-    summary.extend(revert(&rec, std::slice::from_ref(&exe))?);
+    summary.extend(revert(&rec, std::slice::from_ref(&exe), reg_base, &file_dirs(dir, links))?);
     register::notify();
     if reg_base == REAL_REG_BASE {
         let _com = crate::com::ComInit::sta();
@@ -890,11 +944,12 @@ mod tests {
         assert!(record.contains(&format!("named {}|DisplayName", arp(&s.base))), "{record}");
         assert!(desktop_lnk.is_file(), "the upgrade does not touch the Startup shortcut");
 
-        give_back(&s.dir, &s.base).unwrap();
+        let links = (programs.clone(), startup.clone());
+        give_back_in(&s.dir, &s.base, Some(&links)).unwrap();
         assert_eq!(s.registry().len(), 8, "only the Apps and Features entry is left: {:?}", s.registry());
         assert!(s.exe().is_file(), "--unregister leaves the program");
 
-        uninstall(&s.dir, &s.base).unwrap();
+        uninstall_in(&s.dir, &s.base, Some(&links)).unwrap();
         assert!(!start_lnk.exists() && !desktop_lnk.exists(), "both shortcuts, the Startup one from the old record");
         assert_eq!(s.registry(), Vec::<String>::new());
         assert!(!key_exists(&s.root), "the base is as before the old install");
@@ -939,7 +994,7 @@ mod tests {
         let me = std::fs::read(std::env::current_exe().unwrap()).unwrap();
         assert!(std::fs::read(s.exe()).unwrap() == me, "the next launch runs the new copy");
         unsafe { FreeLibrary(image) };
-        uninstall(&s.dir, &s.base).unwrap();
+        uninstall_in(&s.dir, &s.base, Some(&(programs.clone(), startup.clone()))).unwrap();
         assert!(!start_lnk.exists() && !desktop_lnk.exists(), "both shortcuts are gone");
         assert_eq!(s.registry(), Vec::<String>::new());
         assert!(!key_exists(&s.root), "every key the install created is gone");
@@ -999,6 +1054,55 @@ mod tests {
         give_back(&s.dir, &s.base).unwrap();
         assert_eq!(s.registry(), Vec::<String>::new());
         assert!(!s.dir.exists(), "no folder is made to give back");
+    }
+
+    #[test]
+    fn a_record_deletes_only_rexplorers_own_files() {
+        let s = Scratch::new("allowlist");
+        std::fs::create_dir_all(&s.dir).unwrap();
+        let elsewhere = s.dir.parent().unwrap().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let (other, ours, foreign_exe) = (s.dir.join("notes.txt"), s.dir.join(DESKTOP_LNK), elsewhere.join(EXE));
+        for f in [&other, &ours, &foreign_exe] {
+            std::fs::write(f, "x").unwrap();
+        }
+        // A value of another program's key, an empty key that is not on the way to one of ours, and our own entry.
+        let (foreign, empty, ap) = (format!(r"{}\Run", s.base), format!(r"{}\Other", s.base), arp(&s.base));
+        register::set_sz(&HSTRING::from(&foreign), w!("DisplayName"), "theirs").unwrap();
+        register::set_sz(&HSTRING::from(&empty), w!("x"), "y").unwrap();
+        register::delete_value(&HSTRING::from(&empty), w!("x")).unwrap();
+        register::set_sz(&HSTRING::from(&ap), w!("DisplayName"), "rexplorer").unwrap();
+        let rec = [
+            format!("file {}", other.display()),
+            format!("file {}", ours.display()),
+            format!("file {}", foreign_exe.display()),
+            format!("named {foreign}|DisplayName"),
+            format!("named {ap}|DisplayName"),
+            format!("key {empty}"),
+        ];
+        revert(&rec, &[], &s.base, &[&s.dir]).unwrap();
+        assert!(other.is_file(), "a record naming another file deletes nothing");
+        assert!(foreign_exe.is_file(), "nor rexplorer.exe in a folder install never writes to");
+        assert!(!ours.exists());
+        assert_eq!(register::read_sz(&HSTRING::from(&foreign), w!("DisplayName")).as_deref(), Some("theirs"), "another key's value stays");
+        assert!(key_exists(&empty), "another empty key stays");
+        assert_eq!(register::read_sz(&HSTRING::from(&ap), w!("DisplayName")), None, "the entry's own value goes");
+        let script = include_str!("../../../scripts/restore-explorer.ps1");
+        let list = format!("$OurFiles = @({})", OUR_FILES.map(|f| format!("'{f}'")).join(", "));
+        assert!(script.contains(&list), "restore-explorer.ps1 keeps the same list: {list}");
+    }
+
+    #[test]
+    fn register_uses_only_the_installed_copy() {
+        let s = Scratch::new("registered");
+        let err = registered_exe(&s.dir).unwrap_err().message();
+        assert!(err.contains(&s.dir.display().to_string()) && err.contains("--install"), "{err}");
+        // An exe without the install record is no install either.
+        std::fs::create_dir_all(&s.dir).unwrap();
+        std::fs::write(s.exe(), "exe").unwrap();
+        assert!(registered_exe(&s.dir).is_err());
+        install(&s.dir, &s.base).unwrap();
+        assert_eq!(registered_exe(&s.dir).unwrap().canonicalize().unwrap(), s.exe().canonicalize().unwrap());
     }
 
     #[test]

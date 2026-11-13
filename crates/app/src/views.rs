@@ -667,8 +667,8 @@ unsafe fn request(app: *mut App, i: usize) -> i32 {
 }
 
 /// WM_THUMB_DONE: copy the bitmap into the image list, or drop it when it belongs to an older listing.
-pub(crate) unsafe fn on_thumb_done(app: *mut App, wparam: WPARAM, lparam: LPARAM) {
-    let d = thumbs::done(wparam, lparam);
+pub(crate) unsafe fn on_thumb_done(app: *mut App) {
+    let Some(d) = thumbs::DONE.take((*app).hwnd) else { return };
     let (token, i) = (d.id >> 32, d.id & 0xFFFF_FFFF);
     let v = &mut (*app).views;
     let live = v.thumbs.is_some() && token == v.token && v.view.px() > 0;
@@ -699,10 +699,7 @@ pub(crate) unsafe fn on_thumb_done(app: *mut App, wparam: WPARAM, lparam: LPARAM
 pub(crate) unsafe fn destroy(app: *mut App) {
     let a = &mut *app;
     a.views.thumbs = None;
-    let mut msg = MSG::default();
-    while PeekMessageW(&mut msg, Some(a.hwnd), WM_THUMB_DONE, WM_THUMB_DONE, PM_REMOVE).as_bool() {
-        let _ = DeleteObject(thumbs::done(msg.wParam, msg.lParam).bitmap.into());
-    }
+    thumbs::forget(a.hwnd);
     if !a.views.normal.is_invalid() {
         let _ = ImageList_Destroy(Some(a.views.normal));
         a.views.normal = HIMAGELIST::default();

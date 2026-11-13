@@ -76,6 +76,14 @@ try {
 
   function Test-Ours($v) { ($v -is [string]) -and $v.ToLowerInvariant().Contains('rexplorer') }
   function Test-Mine($key) { $key.StartsWith("$RegBase\", [StringComparison]::OrdinalIgnoreCase) }
+  # A record is a file in a user-writable folder; like install.rs revert(), it may name only the keys rexplorer
+  # writes ($KnownKeys and the Apps and Features entry), with -Parents also an empty key on the way to one.
+  $ourKeys = @($KnownKeys + $ArpKey | ForEach-Object { "$RegBase\$_" })
+  function Test-OurKey($key, [switch]$Parents) {
+    [bool]($ourKeys | Where-Object { $_ -eq $key -or ($Parents -and $_.StartsWith("$key\", [StringComparison]::OrdinalIgnoreCase)) })
+  }
+  # The folders install and take-over write files to.
+  $ourDirs = @($InstallDir, $ProgramsDir, $StartupDir | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') })
   function Remove-IfEmpty($sub) {
     $k = $HKCU.OpenSubKey($sub)
     if (-not $k) { return $false }
@@ -115,7 +123,8 @@ try {
     Remove-EmptyUp $sub
   }
   function Remove-OurFile($path) {
-    if ($path -and (Test-Path -LiteralPath $path -PathType Leaf) -and ($OurFiles -contains (Split-Path $path -Leaf))) {
+    if ($path -and (Test-Path -LiteralPath $path -PathType Leaf) -and ($OurFiles -contains (Split-Path $path -Leaf)) -and
+      ($ourDirs -contains (Split-Path $path -Parent).TrimEnd('\'))) {
       Change $path 'Delete file' { Remove-Item -LiteralPath $path -Force }
     }
   }
@@ -138,10 +147,10 @@ try {
     foreach ($l in $lines) {
       $kind, $rest = $l -split ' ', 2
       switch ($kind) {
-        'value' { if (Test-Mine $rest) { Clear-Command $rest } }
+        'value' { if (Test-OurKey $rest) { Clear-Command $rest } }
         'named' {
           $i = $rest.LastIndexOf('|')
-          if ($i -gt 0 -and (Test-Mine $rest.Substring(0, $i))) {
+          if ($i -gt 0 -and (Test-OurKey $rest.Substring(0, $i))) {
             $sub = $rest.Substring(0, $i); $n = $rest.Substring($i + 1)
             $k = $HKCU.OpenSubKey($sub, $true)
             if ($k) { try { if ($k.GetValueNames() -contains $n) { Change "HKCU\$sub\$n" 'Delete value' { $k.DeleteValue($n, $false) } } } finally { $k.Close() } }
@@ -150,7 +159,7 @@ try {
         'file' { Remove-OurFile $rest }
       }
     }
-    $lines | Where-Object { $_ -like 'key *' } | ForEach-Object { $_.Substring(4) } | Where-Object { Test-Mine $_ } |
+    $lines | Where-Object { $_ -like 'key *' } | ForEach-Object { $_.Substring(4) } | Where-Object { (Test-Mine $_) -and (Test-OurKey $_ -Parents) } |
       Sort-Object Length -Descending | ForEach-Object { $null = Remove-IfEmpty $_ }
   }
 
@@ -213,7 +222,8 @@ try {
       } elseif ($script:Cmdlet.ShouldProcess('explorer.exe', 'Restart the Windows shell')) {
         Get-Process -Name explorer -ErrorAction SilentlyContinue | Stop-Process -Force
         Start-Sleep -Seconds 3
-        if (-not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) { Start-Process explorer.exe }
+        # By full path: a bare name goes through App Paths (which may still name rexplorer) and the PATH.
+        if (-not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) { Start-Process (Join-Path $env:WINDIR 'explorer.exe') }
         Say 'explorer.exe restarted.'
       }
     }

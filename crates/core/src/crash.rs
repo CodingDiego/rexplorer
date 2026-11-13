@@ -10,7 +10,7 @@
 use std::cell::UnsafeCell;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use windows::Win32::Foundation::{CloseHandle, FILETIME, GENERIC_WRITE, HANDLE, HMODULE, SYSTEMTIME};
@@ -191,8 +191,10 @@ struct SehBuf(UnsafeCell<SehRecord>);
 // SAFETY: only the crash path touches it, and the DUMPED flag lets one thread through.
 unsafe impl Sync for SehBuf {}
 static SEH: SehBuf = SehBuf(UnsafeCell::new(SEH_EMPTY));
-/// This process's `.seh` file, opened by `install` (no sharing, so another start leaves it alone while we live).
-static SEH_FILE: OnceLock<isize> = OnceLock::new();
+/// This process's `.seh` file, opened by `install` (no sharing, so another start leaves it alone while we live); 0
+/// once the crash path or `finish` has taken it.
+static SEH_FILE: AtomicIsize = AtomicIsize::new(0);
+static SEH_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 fn seh_bytes(r: &SehRecord) -> &[u8] {
     // SAFETY: plain-data repr(C) struct with explicit padding, read as bytes for its own size.
@@ -284,9 +286,10 @@ fn convert_seh_records(dir: &Path) {
 
 /// Fills and writes the SEH record; nothing here allocates. `info` is null for a panic, which has its own report.
 fn write_record(info: *const EXCEPTION_POINTERS) {
-    let Some(&h) = SEH_FILE.get() else {
+    let h = SEH_FILE.swap(0, Ordering::SeqCst);
+    if h == 0 {
         return;
-    };
+    }
     let file = HANDLE(h as *mut std::ffi::c_void);
     // SAFETY: `info` is the filter's own exception pointers (or null); DUMPED lets one thread use the static.
     unsafe {
@@ -377,7 +380,8 @@ pub fn install(relaunch_args: &[String]) {
     let seh = HSTRING::from(stem.with_extension("seh").as_os_str());
     // SAFETY: plain file open; the handle stays open for the life of the process.
     if let Ok(h) = unsafe { CreateFileW(&seh, GENERIC_WRITE.0, FILE_SHARE_MODE(0), None, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, None) } {
-        let _ = SEH_FILE.set(h.0 as isize);
+        let _ = SEH_PATH.set(stem.with_extension("seh"));
+        SEH_FILE.store(h.0 as isize, Ordering::SeqCst);
     }
     std::panic::set_hook(Box::new(|info| {
         // The dump of a panic carries no exception record: the message and stack go in a text report beside it.
@@ -390,6 +394,25 @@ pub fn install(relaunch_args: &[String]) {
         std::process::abort();
     }));
     unsafe { SetUnhandledExceptionFilter(Some(filter)) };
+}
+
+/// At a clean exit: closes and deletes this run's empty `.seh` record, so the crashes folder only fills on crashes.
+/// After a crash has begun (the record is being written) it does nothing.
+pub fn finish() {
+    if !DUMPED.load(Ordering::SeqCst)
+        && let Some(path) = SEH_PATH.get()
+    {
+        close_and_remove(&SEH_FILE, path);
+    }
+}
+
+fn close_and_remove(slot: &AtomicIsize, path: &Path) {
+    let h = slot.swap(0, Ordering::SeqCst);
+    if h != 0 {
+        // SAFETY: the handle `install` opened; the swap hands it to this call only.
+        let _ = unsafe { CloseHandle(HANDLE(h as *mut std::ffi::c_void)) };
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// Starts a fresh copy of the process (which applies the crash-loop rule itself); false on failure.
@@ -579,6 +602,25 @@ mod tests {
         assert!(parse_seh(&[]).is_none(), "an empty record (a run that did not crash) is no report");
         assert_eq!(utc(u64::MAX), u64::MAX.to_string(), "a bad time falls back to the number, no overflow");
         assert!(parse_seh(&seh_bytes(&sample_record())[1..]).is_none());
+    }
+
+    #[test]
+    fn a_clean_exit_removes_its_open_record_once() {
+        let dir = std::env::temp_dir().join(format!("rexplorer-seh-exit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rexplorer-00000000100-1.seh");
+        let h = unsafe {
+            CreateFileW(&HSTRING::from(path.as_os_str()), GENERIC_WRITE.0, FILE_SHARE_MODE(0), None, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, None)
+        }
+        .unwrap();
+        let slot = AtomicIsize::new(h.0 as isize);
+        close_and_remove(&slot, &path);
+        assert!(!path.exists() && slot.load(Ordering::SeqCst) == 0);
+        // Taken already (by the crash path, or a second call): nothing more is closed or deleted.
+        std::fs::write(&path, b"").unwrap();
+        close_and_remove(&slot, &path);
+        assert!(path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

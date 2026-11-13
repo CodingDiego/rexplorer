@@ -159,9 +159,19 @@ impl Log {
 
     /// What the reversal did goes to the opposite stack; redo is not cleared here.
     pub fn put(&mut self, redo: bool, done: Vec<Op>) {
+        self.finish(redo, Reversed { done, left: Vec::new() });
+    }
+
+    /// `put`, and what the reversal did not reach goes back on top of the stack it came from, so the next Ctrl+Z
+    /// (or Ctrl+Y) acts on it.
+    pub fn finish(&mut self, redo: bool, r: Reversed) {
         self.busy = false;
-        if !done.is_empty() {
-            if redo { &mut self.undo } else { &mut self.redo }.push(done);
+        let (same, other) = if redo { (&mut self.redo, &mut self.undo) } else { (&mut self.undo, &mut self.redo) };
+        if !r.done.is_empty() {
+            other.push(r.done);
+        }
+        if !r.left.is_empty() {
+            same.push(r.left);
         }
     }
 }
@@ -304,13 +314,27 @@ struct Sink {
 impl Sink_Impl {
     /// The engine's own Cancel code: no error box. The docs say an error from a Pre callback cancels this item and
     /// every one after it in the same operation.
-    fn check(&self, item: Ref<IShellItem>) -> Result<()> {
+    fn check(&self, item: &Ref<IShellItem>) -> Result<()> {
         let Some(i) = item.as_ref() else { return Ok(()) };
         let p = name_of(i);
         match self.expect.iter().find(|(e, _)| e.eq_ignore_ascii_case(&p)) {
             Some((_, id)) if id_of(&p) != Some(*id) => Err(COPYENGINE_E_USER_CANCELLED.into()),
             _ => Ok(()),
         }
+    }
+
+    /// `check`, and a rename or move back must find its target name free, as it was when the undo started: the
+    /// engine calls this before its Replace or Skip dialog, and a swap made while that dialog waits is never seen.
+    fn check_to(&self, item: Ref<IShellItem>, folder: Option<String>, name: &PCWSTR) -> Result<()> {
+        self.check(&item)?;
+        let Some(i) = item.as_ref() else { return Ok(()) };
+        let own = name_of(i);
+        let dir = folder.unwrap_or_else(|| Path::new(&own).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default());
+        let name = if name.is_null() { file_name(&own) } else { unsafe { name.to_string() }.unwrap_or_default() };
+        let target = Path::new(&dir).join(name);
+        // A rename that only changes case targets the item itself.
+        let itself = target.to_string_lossy().eq_ignore_ascii_case(&own);
+        if !self.expect.is_empty() && !itself && target.exists() { Err(COPYENGINE_E_USER_CANCELLED.into()) } else { Ok(()) }
     }
 }
 
@@ -321,14 +345,14 @@ impl IFileOperationProgressSink_Impl for Sink_Impl {
     fn FinishOperations(&self, _: HRESULT) -> Result<()> {
         Ok(())
     }
-    fn PreRenameItem(&self, _: u32, item: Ref<IShellItem>, _: &PCWSTR) -> Result<()> {
-        self.check(item)
+    fn PreRenameItem(&self, _: u32, item: Ref<IShellItem>, name: &PCWSTR) -> Result<()> {
+        self.check_to(item, None, name)
     }
     fn PostRenameItem(&self, _: u32, _: Ref<IShellItem>, _: &PCWSTR, _: HRESULT, _: Ref<IShellItem>) -> Result<()> {
         Ok(())
     }
-    fn PreMoveItem(&self, _: u32, item: Ref<IShellItem>, _: Ref<IShellItem>, _: &PCWSTR) -> Result<()> {
-        self.check(item)
+    fn PreMoveItem(&self, _: u32, item: Ref<IShellItem>, folder: Ref<IShellItem>, name: &PCWSTR) -> Result<()> {
+        self.check_to(item, folder.as_ref().map(name_of), name)
     }
     fn PostMoveItem(&self, _: u32, _: Ref<IShellItem>, _: Ref<IShellItem>, _: &PCWSTR, _: HRESULT, _: Ref<IShellItem>) -> Result<()> {
         Ok(())
@@ -340,7 +364,7 @@ impl IFileOperationProgressSink_Impl for Sink_Impl {
         Ok(())
     }
     fn PreDeleteItem(&self, _: u32, item: Ref<IShellItem>) -> Result<()> {
-        self.check(item)
+        self.check(&item)
     }
     fn PostDeleteItem(&self, _: u32, item: Ref<IShellItem>, hr: HRESULT, created: Ref<IShellItem>) -> Result<()> {
         // `created` is the item now in the Recycle Bin, and null when the delete was permanent.
@@ -506,39 +530,79 @@ fn before_perform() {
     }
 }
 
+/// What a reversal did, for the opposite stack, and what it did not reach and can still be reversed, for the same
+/// stack: when the shell refuses one swapped item it cancels the items after it in the same operation, and a cancel in
+/// its dialog stops the rest too.
+#[derive(Debug, Default, PartialEq)]
+pub struct Reversed {
+    pub done: Vec<Op>,
+    pub left: Vec<Op>,
+}
+
 /// Performs the inverse of `entry` and returns what that did, as an entry for the opposite stack.
 pub fn reverse(hwnd: HWND, entry: Vec<Op>) -> Vec<Op> {
-    reverse_with(hwnd, entry, false)
+    reverse_all(hwnd, entry).done
 }
 
+/// `reverse`, also returning what is still to reverse (`Log::finish` puts it back).
+pub fn reverse_all(hwnd: HWND, entry: Vec<Op>) -> Reversed {
+    reverse_both(hwnd, entry, false)
+}
+
+#[cfg(test)]
 fn reverse_with(hwnd: HWND, entry: Vec<Op>, quiet: bool) -> Vec<Op> {
-    entry.into_iter().rev().flat_map(|op| reverse_op(hwnd, op, quiet)).collect()
+    reverse_both(hwnd, entry, quiet).done
 }
 
-fn reverse_op(hwnd: HWND, op: Op, quiet: bool) -> Vec<Op> {
+fn reverse_both(hwnd: HWND, entry: Vec<Op>, quiet: bool) -> Reversed {
+    let mut r = Reversed::default();
+    let taken = entry.clone();
+    for op in entry.into_iter().rev() {
+        let (done, left) = reverse_op(hwnd, op, quiet);
+        r.done.extend(done);
+        // Back in the entry's own order, which reverses newest first.
+        r.left.splice(0..0, left);
+    }
+    // Nothing changed (a failure that would repeat, or a cancel): not put back, or the entry would sit on top for good.
+    if r.left == taken {
+        r.left.clear();
+    }
+    r
+}
+
+/// (what was done, what is left to do) for one op.
+fn reverse_op(hwnd: HWND, op: Op, quiet: bool) -> (Vec<Op>, Vec<Op>) {
     let exists = |p: &str| Path::new(p).exists();
     // The item recorded is still the one at `p`: a path another item took since is never touched.
     let is = |p: &str, id: Id| id_of(p) == Some(id);
-    let out = match op {
+    let (out, left) = match op {
         Op::Rename { from, to, id } => {
             if !is(&to, id) || (exists(&from) && !from.eq_ignore_ascii_case(&to)) {
-                return Vec::new();
+                return (Vec::new(), Vec::new());
             }
             let _ = run(hwnd, quiet, &to, id, |o| unsafe { o.RenameItem(&item(&to)?, &HSTRING::from(file_name(&from)), None::<&IFileOperationProgressSink>) });
-            // Only a rename that ran leaves `from` holding item `id`.
+            // Only a rename that ran leaves `from` holding item `id`; one cancelled in a dialog can still be undone.
             if id_of(&from) != Some(id) {
-                return Vec::new();
+                let left = if is(&to, id) && !exists(&from) { vec![Op::Rename { from, to, id }] } else { Vec::new() };
+                return (Vec::new(), left);
             }
-            Op::rename(to, from).into_iter().collect()
+            (Op::rename(to, from).into_iter().collect(), Vec::new())
         }
         Op::Created(made) => {
             let live: Vec<(String, Id)> = made.into_iter().filter(|(p, id)| is(p, *id)).collect();
             let paths: Vec<String> = live.iter().map(|(p, _)| p.clone()).collect();
-            vec![Op::Recycled(recycle_expecting(hwnd, &paths, live, quiet))]
+            let gone = recycle_expecting(hwnd, &paths, live.clone(), quiet);
+            // The swapped item fails `is` now and stays out; the ones the shell cancelled after it are still ours.
+            let left = live.into_iter().filter(|(p, id)| !gone.iter().any(|(o, _)| o.eq_ignore_ascii_case(p)) && is(p, *id)).collect();
+            (vec![Op::Recycled(gone)], vec![Op::Created(left)])
         }
-        Op::Recycled(pairs) => vec![Op::created(restore(hwnd, &pairs))],
+        Op::Recycled(pairs) => {
+            let back = restore(hwnd, &pairs);
+            let left = pairs.into_iter().filter(|(o, b)| !back.iter().any(|x| x.eq_ignore_ascii_case(o)) && !exists(o) && exists(b)).collect();
+            (vec![Op::created(back)], vec![Op::Recycled(left)])
+        }
         Op::Moved(moves) => {
-            let mut done = Vec::new();
+            let (mut done, mut left) = (Vec::new(), Vec::new());
             for (from, to, id) in moves.into_iter().filter(|(f, t, id)| is(t, *id) && !exists(f)) {
                 let parent = Path::new(&from).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
                 let _ = run(hwnd, quiet, &to, id, |o| unsafe { o.MoveItem(&item(&to)?, &item(&parent)?, &HSTRING::from(file_name(&from)), None::<&IFileOperationProgressSink>) });
@@ -546,9 +610,11 @@ fn reverse_op(hwnd: HWND, op: Op, quiet: bool) -> Vec<Op> {
                 // appeared at `from` meanwhile. Not by id: a move to another volume gives the item a new one.
                 if exists(&from) && !exists(&to) {
                     done.push((to, from));
+                } else if is(&to, id) && !exists(&from) {
+                    left.push((from, to, id));
                 }
             }
-            vec![Op::moved(done)]
+            (vec![Op::moved(done)], vec![Op::Moved(left)])
         }
         Op::Transfer(sent) => {
             let (mut claimed, mut copies, mut moves) = (Vec::new(), Vec::new(), Vec::new());
@@ -565,13 +631,15 @@ fn reverse_op(hwnd: HWND, op: Op, quiet: bool) -> Vec<Op> {
                     copies.push(d);
                 }
             }
-            let mut v = reverse_op(hwnd, Op::created(copies), quiet);
-            v.extend(reverse_op(hwnd, Op::moved(moves), quiet));
-            v
+            let (mut v, mut left) = reverse_op(hwnd, Op::created(copies), quiet);
+            let (moved, moves_left) = reverse_op(hwnd, Op::moved(moves), quiet);
+            v.extend(moved);
+            left.extend(moves_left);
+            (v, left)
         }
     };
     // A reversal that did nothing is no entry.
-    out.into_iter().filter(Op::recordable).collect()
+    (out.into_iter().filter(Op::recordable).collect(), left.into_iter().filter(Op::recordable).collect())
 }
 
 #[cfg(test)]
@@ -581,6 +649,23 @@ mod tests {
 
     fn s(p: &str) -> String {
         p.to_string()
+    }
+
+    /// Held by every test that runs the shell's file operations or the bin's undelete: one at a time, so the copy
+    /// engine's windows a test waits for, answers or closes (tests/common/dialogs.rs) are its own.
+    static SHELL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Takes `pairs` (original, bin item) back out of the user's Recycle Bin when the test ends, however it ends.
+    struct OutOfBin(Vec<(String, String)>);
+    impl Drop for OutOfBin {
+        fn drop(&mut self) {
+            restore(HWND::default(), &self.0);
+        }
+    }
+
+    /// Declare it after the fixture: it runs first, while the folders to restore into still exist.
+    fn out_of_bin(ops: &[Op]) -> OutOfBin {
+        OutOfBin(ops.iter().flat_map(|op| if let Op::Recycled(v) = op { v.clone() } else { Vec::new() }).collect())
     }
 
     struct Fixture(std::path::PathBuf);
@@ -753,7 +838,7 @@ mod tests {
         std::fs::write(&a, "theirs").unwrap();
         std::fs::write(&b, "theirs").unwrap();
         for op in [made, moved, renamed] {
-            assert!(reverse_with(HWND::default(), vec![op.clone()], true).is_empty(), "{op:?}");
+            assert_eq!(reverse_both(HWND::default(), vec![op.clone()], true), Reversed::default(), "{op:?}: nothing done, nothing left");
         }
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "theirs");
         assert_eq!(std::fs::read_to_string(&b).unwrap(), "theirs");
@@ -850,6 +935,7 @@ mod tests {
 
     #[test]
     fn rename_reverses_and_returns_its_inverse() {
+        let _l = SHELL.lock();
         let _c = ComInit::sta();
         let fx = fixture("rename");
         std::fs::write(fx.0.join("b.txt"), b"x").unwrap();
@@ -863,6 +949,7 @@ mod tests {
 
     #[test]
     fn moved_back_never_overwrites() {
+        let _l = SHELL.lock();
         let _c = ComInit::sta();
         let fx = fixture("moved");
         std::fs::create_dir_all(fx.0.join("src")).unwrap();
@@ -882,6 +969,7 @@ mod tests {
     #[test]
     fn transfer_whose_source_is_gone_moves_back() {
         // A cut and paste that kept both: undo moves the shell's "x (2).txt" back instead of sending it to the bin.
+        let _l = SHELL.lock();
         let _c = ComInit::sta();
         let (fx, sx, dst) = transfer_fixture("cutpaste");
         std::fs::write(p(&fx.0, "dst\\x.txt"), "theirs").unwrap();
@@ -899,6 +987,7 @@ mod tests {
     fn a_moved_folder_stays_when_its_old_path_is_made_again() {
         // The user moves logs into the archive (same volume); a program re-makes an empty logs. Undo must not take
         // the archived folder for a copy and recycle it.
+        let _l = SHELL.lock();
         let _c = ComInit::sta();
         let (fx, _, dst) = transfer_fixture("remade");
         let logs = p(&fx.0, "src\\logs");
@@ -922,6 +1011,7 @@ mod tests {
     fn a_partial_move_across_volumes_is_not_a_copy() {
         // A move to another volume copies, then deletes the source; a locked file keeps the source folder with only
         // that file. The destination is the only whole copy: undo leaves it.
+        let _l = SHELL.lock();
         let _c = ComInit::sta();
         let (fx, _, dst) = transfer_fixture("partial");
         let proj = p(&fx.0, "src\\proj");
@@ -949,6 +1039,7 @@ mod tests {
 
     #[test]
     fn transfer_copy_goes_to_the_bin_and_comes_back() {
+        let _l = SHELL.lock();
         let _c = ComInit::sta();
         let fx = fixture("transfer");
         std::fs::create_dir_all(fx.0.join("src")).unwrap();
@@ -959,6 +1050,7 @@ mod tests {
         let plan = plan_transfer(std::slice::from_ref(&sx), &p(&fx.0, "dst"));
         std::fs::copy(&sx, &dx).unwrap();
         let r = reverse_with(HWND::default(), vec![Op::Transfer(plan)], true);
+        let _bin = out_of_bin(&r);
         if r.is_empty() && !Path::new(&dx).exists() {
             println!("skipped: no Recycle Bin");
             return;
@@ -1015,6 +1107,7 @@ mod tests {
 
     #[test]
     fn undo_rename_skips_an_item_swapped_while_the_shell_runs() {
+        let _l = SHELL.lock();
         let _c = ComInit::sta();
         let (_fx, d) = long_fixture("swaprename");
         let (a, b) = (p(&d, "a.txt"), p(&d, "b.txt"));
@@ -1028,6 +1121,7 @@ mod tests {
 
     #[test]
     fn undo_move_skips_an_item_swapped_while_the_shell_runs() {
+        let _l = SHELL.lock();
         let _c = ComInit::sta();
         let (_fx, d) = long_fixture("swapmove");
         std::fs::create_dir_all(d.join("dst")).unwrap();
@@ -1056,6 +1150,7 @@ mod tests {
 
     #[test]
     fn undo_delete_skips_an_item_swapped_while_the_shell_runs() {
+        let _l = SHELL.lock();
         let _c = ComInit::sta();
         let (_fx, d) = long_fixture("swapdelete");
         let n = format!("rexplorer-undo-test-swap-{}.txt", std::process::id());
@@ -1072,14 +1167,84 @@ mod tests {
         assert!(r.is_empty(), "{r:?}");
     }
 
+    #[path = "../../../tests/common/dialogs.rs"]
+    mod dialogs;
+
+    /// #84: the re-check with the shell's dialog on screen. A file appears at the old path just before the shell runs,
+    /// so the move back would ask Replace or Skip. The engine calls PreMoveItem before that dialog, so a swap made while
+    /// it waited went unseen: pressing Replace moved the swapped-in file over the new one (this test, before the sink
+    /// also required a free target). Now the sink refuses the move at PreMoveItem, the dialog never shows, and a swap
+    /// armed for it never happens: both files stay as they are.
+    #[test]
+    fn undo_never_reaches_the_conflict_dialog_where_a_swap_would_go_unseen() {
+        let _l = SHELL.lock();
+        let _c = ComInit::sta();
+        let (_fx, d) = long_fixture("swapdialog");
+        std::fs::create_dir_all(d.join("dst")).unwrap();
+        let (sx, dx) = (p(&d, "x.txt"), p(&d, "dst\\x.txt"));
+        std::fs::write(&dx, "mine").unwrap();
+        let op = Op::moved(vec![(sx.clone(), dx.clone())]);
+        let s2 = sx.clone();
+        BEFORE_PERFORM.with(|b| *b.borrow_mut() = Some(Box::new(move || std::fs::write(&s2, "placeholder").unwrap())));
+        let d2 = dx.clone();
+        let answer = dialogs::answer_conflict_within(40, dialogs::REPLACE, move || {
+            std::fs::remove_file(&d2).unwrap();
+            std::fs::write(&d2, "theirs").unwrap();
+        });
+        let r = reverse_both(HWND::default(), vec![op], false);
+        let answered = answer.join().unwrap();
+        assert!(answered.as_ref().is_err_and(|e| e.starts_with("no conflict panel")), "{answered:?}");
+        assert_eq!(std::fs::read_to_string(&dx).ok().as_deref(), Some("mine"), "not moved: {r:?}");
+        assert_eq!(std::fs::read_to_string(&sx).unwrap(), "placeholder");
+        assert_eq!(r, Reversed::default());
+    }
+
+    #[test]
+    fn items_the_shell_cancelled_after_a_swapped_one_stay_undoable() {
+        let _l = SHELL.lock();
+        let _c = ComInit::sta();
+        let (_fx, d) = long_fixture("swapleft");
+        let n = format!("rexplorer-undo-test-left-{}.txt", std::process::id());
+        let files = [p(&d, &n), p(&d, &format!("y-{n}")), p(&d, &format!("z-{n}"))];
+        for f in &files {
+            std::fs::write(f, "mine").unwrap();
+        }
+        let mut log = Log::default();
+        log.record(Op::created(files.to_vec()));
+        swap_before_perform(&files[0]);
+        let entry = log.take(false).unwrap();
+        let r = reverse_both(HWND::default(), entry, true);
+        assert_eq!(std::fs::read_to_string(&files[0]).unwrap(), "theirs", "the swapped-in file stays");
+        assert!(Path::new(&files[1]).exists() && Path::new(&files[2]).exists(), "the shell cancelled the rest");
+        assert!(r.done.is_empty(), "{r:?}");
+        assert!(matches!(&r.left[..], [Op::Created(v)] if v.iter().map(|(p, _)| p).eq(&files[1..])), "{r:?}");
+        log.finish(false, r);
+        assert!(log.take(true).is_none(), "nothing to redo");
+        // The second Ctrl+Z recycles the two that are still ours.
+        let again = reverse_both(HWND::default(), log.take(false).expect("still undoable"), true);
+        let _bin = out_of_bin(&again.done);
+        if again.done.is_empty() && Path::new(&files[1]).exists() {
+            println!("skipped: no Recycle Bin");
+            return;
+        }
+        assert!(!Path::new(&files[1]).exists() && !Path::new(&files[2]).exists());
+        assert!(again.left.is_empty(), "{again:?}");
+        assert!(matches!(&again.done[..], [Op::Recycled(v)] if v.len() == 2), "{again:?}");
+        // Out of the bin again, so the test leaves no bin items behind.
+        let back = reverse_with(HWND::default(), again.done, true);
+        assert!(Path::new(&files[1]).exists() && Path::new(&files[2]).exists(), "{back:?}");
+    }
+
     #[test]
     fn recycle_skips_a_path_that_is_gone() {
+        let _l = SHELL.lock();
         let _c = ComInit::sta();
         let fx = fixture("gone");
         let n = format!("rexplorer-undo-test-gone-{}.txt", std::process::id());
         let (gone, here) = (p(&fx.0, "gone.txt"), p(&fx.0, &n));
         std::fs::write(&here, "x").unwrap();
         let done = recycle(HWND::default(), &[gone, here.clone()], true);
+        let _bin = OutOfBin(done.clone());
         if done.is_empty() && !Path::new(&here).exists() {
             println!("skipped: no Recycle Bin");
             return;
