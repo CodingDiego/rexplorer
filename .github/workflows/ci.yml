@@ -13,6 +13,8 @@ permissions:
 jobs:
   build-test:
     runs-on: windows-latest
+    # About three times a normal run (7-8 min): a shell dialog no test answers must not hold the runner for hours.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

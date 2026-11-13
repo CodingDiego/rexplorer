@@ -82,7 +82,7 @@ Sidebar, every row read from the shell with its localized name and icon:
 - **Home** ("Inicio" on a Spanish Windows) on top, without a section title.
 - **Favorites**: the profile's bookmarks, then the folders of Quick Access in the shell's order: the pinned known
   folders, the Recycle Bin, your own pins and the frequent folders. A place is listed once.
-- **This PC**: the drives, connected MTP phones and other devices This PC shows (not the user folders it also
+- **This PC**: a row for This PC itself, then the drives, connected MTP phones and other devices This PC shows (not the user folders it also
   lists).
 - **Devices**: what the desktop root adds that is neither a file on the desktop nor a place shown elsewhere: Phone
   Link phones (`%USERPROFILE%\CrossDevice\...`) and Linux (WSL). Left out when empty.
@@ -96,7 +96,7 @@ pinned Quick Access folder for **Unpin from Home**, a frequent (not pinned) one 
 shell's `System.Home.IsPinned` property. The rows are built on a worker thread, rebuilt when the window is activated, every 30 s while the sidebar shows, when a drive comes or goes, and right after
 a pin or unpin from rexplorer, so the sidebar fills in after the first listing. More > **Folder tree** (a check
 item) shows the shell's folder tree right of the sidebar, or at the left edge when the sidebar is off; it follows
-the current folder. The two panes share one width, set by the splitter after the last one. Ctrl+B shows or hides
+the current folder, and opens the way to it only with Explorer's "Expand to open folder" option on (it follows Explorer's setting; the profile key `expand_to_folder` overrides it) and only on local disks and the quick roots (desktop, This PC, Home, Quick access). The two panes share one width, set by the splitter after the last one. Ctrl+B shows or hides
 only the sidebar.
 
 The folder background's right-click menu opens as Explorer's does: **View** and **Sort by** submenus, **Refresh**,
@@ -679,23 +679,22 @@ through WM_APP+0x54.
 ### Known gaps
 
 **[docs/EXPLORER-PARITY.md](docs/EXPLORER-PARITY.md) is the full checklist against Windows Explorer**: every
-behaviour marked WORKS, BROKEN, UNVERIFIED, PARTIAL or MISSING. On 2026-11-13, for 1.0.0-rc.2: 123 rows, 103
-proven on the exe with a real keyboard and mouse (2026-11-11 to 2026-11-13), 3 more on a scratch install base, 13
-UNVERIFIED and 4 PARTIAL. Dragging into Edge and VS Code was proven on 2026-11-12
+behaviour marked WORKS, BROKEN, UNVERIFIED, PARTIAL or MISSING. On 2026-11-13, after 1.0.0-rc.2: 123 rows, 105
+proven on the exe (2026-11-11 to 2026-11-13, most with a real keyboard and mouse, some by window messages; each note
+says how), 3 more on a scratch install base, 12 UNVERIFIED and 3 PARTIAL. Dragging into Edge and VS Code was proven on 2026-11-12
 ([#75](https://github.com/CodingDiego/rexplorer/issues/75)); WhatsApp was not tried. Still UNVERIFIED (built, not
 proven on the exe): the desktop icons view (`--desktop-icons`, never run), high contrast (never seen under a
 contrast theme), Text size, per-monitor DPI, the light / dark live switch, icon overlays on OneDrive files, Run as
-administrator, Empty Recycle Bin, the drag image from Home, multi-volume .rar, FTP and the default folder handler
+administrator, Empty Recycle Bin, the drag image from Home, FTP and the default folder handler
 on a real install. Narrator and NVDA were never tried.
 
 Open in 1.0.0-rc.2:
 
 - Ctrl+Z after a cancelled folder copy leaves the partial folder: undo never deletes what it cannot prove it made.
-- After Delete in search results no row is selected (Explorer selects the next one).
 - Tearing out a Home tab once landed in the other rexplorer window instead of a new one (1 of 2 tries, not
   reproduced).
 - Not run for this release candidate: the 15-minute soak script, the local smoke and budget scripts (CI runs smoke
-  and budgets), the fuzz targets, and multi-volume .rar (no WinRAR on the test machine; two tests are ignored).
+  and budgets) and the fuzz targets.
 - Only a person can check: MTP devices and OneDrive, Windows settings such as Text size, contrast themes and display
   scale (including how the address bar trims long names), Narrator or NVDA, the 8-hour soak, ARM hardware,
   Windows 10, an install on a clean machine, WhatsApp as a drop target, and Libraries in an icon view before their
@@ -731,8 +730,8 @@ and Ctrl+W do the same).
 - Archive members cannot be sorted by column or renamed (unrar only reads archives; F2 says so, the command bar's
   Rename stays disabled). An encrypted .rar asks for its password, which unrar takes in the ANSI code page, so
   characters outside it cannot be used. A multi-volume .rar opens from its first part; a later `.partN.rar` says it
-  is not the first part instead of redirecting, and a missing part is reported. Multi-volume support was built
-  without a test archive (making one needs WinRAR), and encrypted multi-volume sets are not covered.
+  is not the first part instead of redirecting, and a missing part is reported. Multi-volume sets are tested on
+  WinRAR-made fixtures; encrypted multi-volume sets are not covered.
   An archive rewritten during the session with a same-size member can show the old member until the tab closes.
 - Index results depend on the index being current and may leave out
   hidden or system files it does not hold.

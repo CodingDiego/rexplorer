@@ -97,13 +97,16 @@ pub(crate) unsafe fn theme_tree(app: *mut App) {
 }
 
 /// Selects the active folder in the tree; folders the tree cannot show are ignored. A hidden tree is synced when
-/// it is shown again.
+/// it is shown again. The way to the folder is opened only as `tree::may_expand` allows (Explorer's "Expand to open
+/// folder", or the profile's `expand_to_folder`; local disks with no link on the way, and the quick virtual roots);
+/// otherwise a folder already shown is selected, else nothing.
 pub(crate) unsafe fn sync_tree(app: *mut App) {
     if !(*app).session.show_tree {
         return;
     }
     if let (Some(t), Some(l)) = (&(*app).panes.tree, listing(app)) {
-        let _ = t.select(&l.folder.pidl);
+        let option = (*app).profile.expand_to_folder.unwrap_or_else(rexplorer_core::import_explorer::expand_to_open_folder);
+        let _ = t.select(&l.folder.pidl, tree::may_expand(option, &l.folder.parsing_name, tree::drive_type, tree::is_reparse_point));
     }
 }
 
@@ -461,6 +464,8 @@ fn sidebar_rows(bookmarks: &[(String, String)]) -> SidebarRows {
     }
     let cloud = ui::cloud_roots();
     if let Ok(pc) = ShellFolder::parse("shell:MyComputerFolder") {
+        // This PC itself heads its section, as Explorer's navigation pane node does.
+        b.add(tr("side.this_pc"), pc.name.clone(), pc.parsing_name.clone(), &pc.pidl, Kind::Place, false);
         // Drives, phones and other devices; not the user folders This PC shows too.
         let mut items: Vec<ShellItem> = pc.enumerate().unwrap_or_default();
         items.retain(|i| {

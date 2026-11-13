@@ -90,6 +90,8 @@ const TIMER_PREVIEW: usize = 4;
 /// The pointer has rested on one list item long enough to prefetch its preview.
 const TIMER_HOVER: usize = 10;
 const TIMER_TREE: usize = 5;
+/// The folder tree follows the folder just shown, after the listing has painted: navigation never waits for it.
+const TIMER_TREE_SYNC: usize = 13;
 const TIMER_SIDEBAR: usize = 6;
 /// A navigation has run long enough to show the skeleton.
 const TIMER_SKELETON: usize = 7;
@@ -898,6 +900,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     panes::ensure_tree(app);
                     ui::layout(app);
                 }
+                TIMER_TREE_SYNC => panes::sync_tree(app),
                 TIMER_SKELETON => nav::on_skeleton_timer(app),
                 TIMER_PULSE => nav::on_pulse_timer(app),
                 TIMER_SEARCH => source::on_search_timer(app),

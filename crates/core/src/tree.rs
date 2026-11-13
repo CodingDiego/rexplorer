@@ -8,13 +8,14 @@ use windows::Win32::System::Ole::{DROPEFFECT, IDropTarget, IDropTarget_Impl, IOl
 use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
 use windows::Win32::UI::Shell::{
     IContextMenu, INameSpaceTreeControl2, INameSpaceTreeControlDropHandler, INameSpaceTreeControlDropHandler_Impl,
-    INameSpaceTreeControlEvents, INameSpaceTreeControlEvents_Impl, IShellItem, IShellItemArray, NSTCIS_EXPANDED, NSTCIS_SELECTED,
+    INameSpaceTreeControlEvents, INameSpaceTreeControlEvents_Impl, IShellItem, IShellItemArray, NSTCGNI_PARENT, NSTCIS_EXPANDED, NSTCIS_SELECTED,
     NSTCRS_EXPANDED, NSTCRS_VISIBLE, NSTCS_AUTOHSCROLL, NSTCS_FADEINOUTEXPANDOS,
     NSTCS_FULLROWSELECT, NSTCS_HASEXPANDOS, NSTCS_NOINFOTIP, NSTCS_ROOTHASEXPANDO, NSTCS_SHOWSELECTIONALWAYS,
     NamespaceTreeControl, SHCONTF_FOLDERS, SHCONTF_INCLUDEHIDDEN, SHCreateItemFromIDList, SHCreateItemFromParsingName, SIGDN_FILESYSPATH,
     SHGetIDListFromObject,
 };
-use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, FindWindowExW, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos};
+use windows::Win32::UI::Controls::{TVGN_CARET, TVM_SELECTITEM};
+use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, FindWindowExW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetWindowPos};
 use windows::core::{BOOL, GUID, HSTRING, Interface, PCWSTR, PWSTR, Ref, Result, implement, w};
 
 use crate::com::{Pidl, take_cotaskmem_string};
@@ -159,6 +160,52 @@ fn item_from_name(name: &str) -> Result<IShellItem> {
     unsafe { SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None) }
 }
 
+/// The virtual folders whose way the tree may open, by parsing name: the desktop (its root has none), This PC, Home,
+/// Quick access and the user's files. Their ancestors are the desktop and This PC, quick to list; a folder below one
+/// of them (a phone under This PC, a library) is not.
+const QUICK_ROOTS: [&str; 5] = [
+    "",
+    "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}",
+    "::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}",
+    "::{679F85CB-0220-4080-B29B-5540CC05AAB6}",
+    "::{59031a47-3f72-44a7-89c5-5595fe6b30ee}",
+];
+
+/// Whether the tree may open the ancestors of the folder `name` (a parsing name): only with Explorer's "Expand to
+/// open folder" on (`option`), and only where the control's synchronous listing of each ancestor is quick: one of
+/// the `QUICK_ROOTS`, or a folder on a fixed or RAM disk (`drive`: GetDriveTypeW of its root) none of whose
+/// ancestors, itself included, is a junction, symbolic link or mount point (`reparse`, asked root first and never
+/// past the first one: a link to a share or a mounted volume would list them). Otherwise the tree selects the
+/// folder only when it is already shown.
+pub fn may_expand(option: bool, name: &str, drive: impl FnOnce(&str) -> u32, reparse: impl Fn(&str) -> bool) -> bool {
+    const DRIVE_FIXED: u32 = 3;
+    const DRIVE_RAMDISK: u32 = 6;
+    let path = std::path::Path::new(name);
+    if !option || name.starts_with(r"\\") {
+        return false;
+    }
+    if !path.is_absolute() {
+        return QUICK_ROOTS.iter().any(|r| r.eq_ignore_ascii_case(name));
+    }
+    let local = name.get(..3).is_some_and(|root| matches!(drive(root), DRIVE_FIXED | DRIVE_RAMDISK));
+    let mut down: Vec<&std::path::Path> = path.ancestors().collect();
+    down.reverse();
+    local && !down.iter().skip(1).any(|a| reparse(&a.to_string_lossy()))
+}
+
+/// GetDriveTypeW of a drive root such as `C:\`.
+pub fn drive_type(root: &str) -> u32 {
+    unsafe { windows::Win32::Storage::FileSystem::GetDriveTypeW(&HSTRING::from(root)) }
+}
+
+/// Whether `path` is a reparse point (or unreadable). GetFileAttributesW answers for a link itself, not its target,
+/// so asked of a path with no link above it this is a metadata read on the path's own volume.
+pub fn is_reparse_point(path: &str) -> bool {
+    use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, GetFileAttributesW, INVALID_FILE_ATTRIBUTES};
+    let a = unsafe { GetFileAttributesW(&HSTRING::from(path)) };
+    a == INVALID_FILE_ATTRIBUTES || a & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+}
+
 /// Creates the tree under `parent`, with Quick Access (if available) and This PC as roots; `hidden` lists hidden
 /// folders too. `plan` reads each drop on a folder before the control runs it (for undo).
 /// shortcut: `hidden` is read once, when the tree is made; a later change of the setting shows after a restart.
@@ -216,8 +263,11 @@ impl TreePane {
         };
     }
 
-    /// Selects the item for an absolute PIDL and scrolls it into view.
-    pub fn select(&self, pidl: &Pidl) -> Result<()> {
+    /// Selects the item for an absolute PIDL and scrolls it into view. With `expand` its ancestors are opened first
+    /// (the control lists each one on this thread); without, for a folder the tree does not show now the tree selects
+    /// nothing: a highlight left on the folder before would take Down and Enter relative to a place the window has
+    /// left, and selecting an ancestor instead would navigate there when the tree has the focus (`on_select`).
+    pub fn select(&self, pidl: &Pidl, expand: bool) -> Result<()> {
         unsafe {
             let item: IShellItem = SHCreateItemFromIDList(pidl.as_ptr())?;
             // A folder under the user's profile is reached from the desktop's user folder, which is no root here: the
@@ -229,19 +279,46 @@ impl TreePane {
                 .unwrap_or(item);
             // The tree holds a folder only once its parent was expanded: open the ancestors, outermost first. Those
             // above the roots (the desktop) are not in the tree and fail harmlessly.
-            let mut up = Vec::new();
-            let mut at = item.clone();
-            while let Ok(p) = at.GetParent() {
-                up.push(p.clone());
-                at = p;
-            }
-            let open = NSTCIS_EXPANDED.0 as u32;
-            for a in up.iter().rev() {
-                let _ = self.tree.SetItemState(a, open, open);
-            }
             let sel = NSTCIS_SELECTED.0 as u32;
+            if expand {
+                let mut up = Vec::new();
+                let mut at = item.clone();
+                while let Ok(p) = at.GetParent() {
+                    up.push(p.clone());
+                    at = p;
+                }
+                let open = NSTCIS_EXPANDED.0 as u32;
+                for a in up.iter().rev() {
+                    let _ = self.tree.SetItemState(a, open, open);
+                }
+            } else if !self.shows(&item) {
+                // The control keeps a selection SetItemState cannot drop; its tree view's own message can.
+                if let Ok(view) = FindWindowExW(Some(self.hwnd()), None, w!("SysTreeView32"), None) {
+                    SendMessageW(view, TVM_SELECTITEM, Some(WPARAM(TVGN_CARET as usize)), Some(LPARAM(0)));
+                }
+                return Ok(());
+            }
             self.tree.SetItemState(&item, sel, sel)?;
             self.tree.EnsureItemVisible(&item)
+        }
+    }
+
+    /// The item is in the tree and every folder above it is expanded. GetItemRect cannot tell: it answers for an
+    /// item under a collapsed folder too; GetItemState fails for one the tree does not hold.
+    fn shows(&self, item: &IShellItem) -> bool {
+        let open = NSTCIS_EXPANDED.0 as u32;
+        unsafe {
+            if self.tree.GetItemState(item, open).is_err() {
+                return false;
+            }
+            let mut at = item.clone();
+            while let Ok(p) = self.tree.GetNextItem(&at, NSTCGNI_PARENT) {
+                if !self.tree.GetItemState(&p, open).is_ok_and(|s| s & open != 0) {
+                    return false;
+                }
+                at = p;
+            }
+            true
         }
     }
 }
@@ -377,7 +454,7 @@ mod tests {
         let _c = ComInit::sta();
         let p = parent();
         let pane = create(p, RECT400, false, Box::new(|_| {}), None).unwrap();
-        pane.select(&ShellFolder::parse("shell:MyComputerFolder").unwrap().pidl).unwrap();
+        pane.select(&ShellFolder::parse("shell:MyComputerFolder").unwrap().pidl, true).unwrap();
         drop(pane);
         unsafe { DestroyWindow(p).unwrap() };
     }
@@ -398,15 +475,109 @@ mod tests {
         let windir = std::env::var("SystemRoot").unwrap();
         let deep = format!(r"{windir}\System32\drivers\etc");
         let pane = create(p, RECT400, false, Box::new(|_| {}), None).unwrap();
-        pane.select(&ShellFolder::parse(&deep).unwrap().pidl).unwrap();
+        pane.select(&ShellFolder::parse(&deep).unwrap().pidl, true).unwrap();
         assert!(selected(&pane).eq_ignore_ascii_case(&deep), "{}", selected(&pane));
         drop(pane);
         // The shell answers with long names; %TEMP% can be a short one (RUNNER~1 on CI).
         let temp = std::fs::canonicalize(std::env::temp_dir()).unwrap().to_string_lossy().trim_start_matches(r"\\?\").to_string();
         let pane = create(p, RECT400, true, Box::new(|_| {}), None).unwrap();
-        pane.select(&ShellFolder::parse(&temp).unwrap().pidl).unwrap();
+        pane.select(&ShellFolder::parse(&temp).unwrap().pidl, true).unwrap();
         assert!(selected(&pane).eq_ignore_ascii_case(&temp), "{}", selected(&pane));
         drop(pane);
         unsafe { DestroyWindow(p).unwrap() };
+    }
+
+    #[test]
+    fn without_expand_only_a_shown_folder_is_selected() {
+        let _c = ComInit::sta();
+        let p = parent();
+        let windir = std::env::var("SystemRoot").unwrap();
+        let (sys, deep) = (format!(r"{windir}\System32"), format!(r"{windir}\System32\drivers\etc"));
+        let pidl = |s: &str| ShellFolder::parse(s).unwrap().pidl;
+        let pane = create(p, RECT400, false, Box::new(|_| {}), None).unwrap();
+        let sel = |pane: &TreePane| unsafe {
+            pane.tree.GetSelectedItems().ok().and_then(|a| a.GetItemAt(0).ok()).and_then(|i| i.GetDisplayName(SIGDN_FILESYSPATH).ok()).map(|s| take_cotaskmem_string(s))
+        };
+        pane.select(&pidl(&deep), false).unwrap();
+        let hidden = sel(&pane);
+        // Opened once, then the way to it is collapsed again: it is in the tree but not shown.
+        pane.select(&pidl(&deep), true).unwrap();
+        let open = NSTCIS_EXPANDED.0 as u32;
+        let sys_item = item_from_name(&format!("::{{20D04FE0-3AEA-1069-A2D8-08002B30309D}}\\{sys}")).unwrap();
+        unsafe { pane.tree.SetItemState(&sys_item, open, 0) }.unwrap();
+        pane.select(&pidl(&windir), false).unwrap();
+        let shown = sel(&pane);
+        pane.select(&pidl(&deep), false).unwrap();
+        let collapsed = sel(&pane);
+        drop(pane);
+        unsafe { DestroyWindow(p).unwrap() };
+        assert!(!hidden.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&deep)), "a folder no expanded parent shows: {hidden:?}");
+        assert!(shown.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&windir)), "a shown folder is selected: {shown:?}");
+        assert_eq!(collapsed, None, "under a collapsed folder: the folder left before is no longer selected");
+    }
+
+    #[test]
+    fn without_expand_a_folder_the_tree_cannot_show_clears_the_selection() {
+        let _c = ComInit::sta();
+        let p = parent();
+        let windir = std::env::var("SystemRoot").unwrap();
+        let pane = create(p, RECT400, false, Box::new(|_| {}), None).unwrap();
+        pane.select(&ShellFolder::parse(&windir).unwrap().pidl, true).unwrap();
+        let count = |pane: &TreePane| unsafe { pane.tree.GetSelectedItems().and_then(|a| a.GetCount()).unwrap_or(0) };
+        let before = count(&pane);
+        // Control Panel: under the desktop, which is no root here, so under nothing the tree holds.
+        pane.select(&ShellFolder::parse("::{26EE0668-A00A-44D7-9371-BEB064C98683}").unwrap().pidl, false).unwrap();
+        let after = count(&pane);
+        drop(pane);
+        unsafe { DestroyWindow(p).unwrap() };
+        assert_eq!((before, after), (1, 0));
+    }
+
+    #[test]
+    fn only_quick_local_paths_expand_and_only_with_the_option() {
+        let fixed = |_: &str| 3;
+        let plain = |_: &str| false;
+        assert!(may_expand(true, r"C:\a\b", fixed, plain));
+        assert!(may_expand(true, r"C:\", fixed, |_| unreachable!()), "a drive root has no ancestor to ask about");
+        for root in ["", "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}", "::{679f85cb-0220-4080-b29b-5540cc05aab6}"] {
+            assert!(may_expand(true, root, |_| unreachable!(), plain), "a quick virtual root: {root:?}");
+        }
+        for deep in [r"::{20D04FE0-3AEA-1069-A2D8-08002B30309D}\\?\usb#vid_04e8&pid_6860#phone", r"::{031E4825-7B94-4DC3-B131-E946B44C8DD5}\Documents.library-ms"] {
+            assert!(!may_expand(true, deep, |_| unreachable!(), plain), "a virtual folder below one: {deep}");
+        }
+        assert!(may_expand(true, r"R:\x", |_| 6, plain), "a RAM disk");
+        assert!(!may_expand(false, r"C:\a\b", fixed, plain), "Explorer's option off");
+        assert!(!may_expand(false, "", fixed, plain));
+        for remote in [4, 2, 5, 0, 1] {
+            assert!(!may_expand(true, r"Z:\share\deep", |_| remote, plain), "drive type {remote}");
+        }
+        assert!(!may_expand(true, r"\\server\share\x", |_| unreachable!(), plain), "UNC: never asked");
+        // A junction, symbolic link or mount point on the way (or the folder itself): asked root first, and nothing
+        // past the first one is asked (that would go through the link).
+        let asked = RefCell::new(Vec::new());
+        let link_at_a = |p: &str| {
+            asked.borrow_mut().push(p.to_string());
+            p.eq_ignore_ascii_case(r"C:\a")
+        };
+        assert!(!may_expand(true, r"C:\a\b\c", fixed, link_at_a));
+        assert_eq!(*asked.borrow(), [r"C:\a"]);
+        assert!(!may_expand(true, r"C:\x\link", fixed, |p| p.ends_with("link")), "the folder itself");
+        assert_eq!(drive_type(&std::env::var("SystemDrive").unwrap_or("C:".into()).replace(':', ":\\")), 3);
+    }
+
+    #[test]
+    fn a_junction_reads_as_a_reparse_point_and_a_plain_folder_does_not() {
+        let dir = std::env::temp_dir().join(format!("rexplorer-reparse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        let link = dir.join("link");
+        let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(&link).arg(dir.join("real")).output().is_ok_and(|o| o.status.success());
+        let (plain, junction) = (is_reparse_point(&dir.join("real").to_string_lossy()), is_reparse_point(&link.to_string_lossy()));
+        let missing = is_reparse_point(&dir.join("missing").to_string_lossy());
+        let _ = std::fs::remove_dir(&link);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!plain);
+        assert!(missing, "unreadable counts as one: never expanded");
+        assert!(!made || junction, "a junction");
     }
 }

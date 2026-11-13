@@ -54,6 +54,11 @@ pub fn apps_use_dark() -> bool {
     dword(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", "AppsUseLightTheme") == Some(0)
 }
 
+/// Explorer's "Expand to open folder" (navigation pane), off unless Windows wrote 1. Read only.
+pub fn expand_to_open_folder() -> bool {
+    dword(ADVANCED, "NavPaneExpandToCurrentFolder") == Some(1)
+}
+
 /// Reads Explorer's values from the real HKCU (read only).
 pub fn read() -> Raw {
     Raw {

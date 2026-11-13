@@ -780,9 +780,13 @@ Run-Check 'sidebar-shell' {
     $c = Find-Row $sb 'C:\' 5000
     $t = Get-RowTargets $sb
     $b = [array]::IndexOf([string[]]$t, $bin)
-    # Favorites (Quick Access) come before This PC.
-    $d = "Recycle Bin row=$b, This PC C:\ row=$c, $($t.Count) rows"
-    if ($b -gt 0 -and $c -gt $b) { @('PASS', $d) } else { @('FAIL', "$d; targets: $($t -join ' | ')") }
+    # Favorites (Quick Access) come before This PC; This PC's own row heads its drives, and a click opens it.
+    $pc = [array]::IndexOf([string[]]$t, '::{20D04FE0-3AEA-1069-A2D8-08002B30309D}')
+    $want = (New-Object -ComObject Shell.Application).NameSpace('shell:MyComputerFolder').Self.Name
+    if ($pc -ge 0) { $null = Click-Row $sb $pc }
+    $opened = ($pc -ge 0) -and (Wait-Until { (Get-Title $script:main) -eq "$want - rexplorer" -and (Get-Count $script:main) -gt 0 } 5000)
+    $d = "Recycle Bin row=$b, This PC row=$pc (click opened '$want'=$opened), C:\ row=$c, $($t.Count) rows"
+    if ($b -gt 0 -and $pc -gt $b -and $c -gt $pc -and $opened) { @('PASS', $d) } else { @('FAIL', "$d; targets: $($t -join ' | ')") }
   } finally { Remove-Fresh }
 }
 

@@ -310,6 +310,8 @@ pub struct Profile {
     pub search_archives: bool,
     /// Opt-in: once a day, ask GitHub for the latest release (see `update`).
     pub check_updates: bool,
+    /// The folder tree opens the way to the current folder. None (the key absent): follow Explorer's own option.
+    pub expand_to_folder: Option<bool>,
     pub bookmarks: Vec<(String, String)>,
     /// Keys this build does not read, written back as read.
     pub extra: Vec<(String, String)>,
@@ -341,6 +343,7 @@ impl Profile {
             search_system: true,
             search_archives: false,
             check_updates: false,
+            expand_to_folder: None,
             // The sidebar's Favorites come from Quick Access with the shell's names; bookmarks are the user's own.
             bookmarks: Vec::new(),
             extra: Vec::new(),
@@ -372,6 +375,7 @@ impl Profile {
             ("search_archives".to_string(), self.search_archives.to_string()),
             ("check_updates".to_string(), self.check_updates.to_string()),
         ];
+        k.extend(self.expand_to_folder.map(|v| ("expand_to_folder".to_string(), v.to_string())));
         k.extend(self.bookmarks.iter().map(|(l, t)| (format!("bookmark.{l}"), t.clone())));
         k.extend(self.extra.iter().cloned());
         (format!("profile {}", self.name), k)
@@ -404,6 +408,7 @@ impl Profile {
                 "search_system" => p.search_system = parse_bool(v).unwrap_or(p.search_system),
                 "search_archives" => p.search_archives = parse_bool(v).unwrap_or(p.search_archives),
                 "check_updates" => p.check_updates = parse_bool(v).unwrap_or(p.check_updates),
+                "expand_to_folder" => p.expand_to_folder = parse_bool(v),
                 _ => match k.strip_prefix("bookmark.") {
                     Some(label) => p.bookmarks.push((label.to_string(), v.clone())),
                     None => p.extra.push((k.clone(), v.clone())),
@@ -693,6 +698,7 @@ dark=false").contrast, None);
             search_system: false,
             search_archives: true,
             check_updates: true,
+            expand_to_folder: Some(true),
             bookmarks: vec![("Repos".into(), r"C:\Users\x\My Repos".into())],
             ..Profile::default_profile()
         });
@@ -717,6 +723,10 @@ dark=false").contrast, None);
         assert!(!p.item_checkboxes && !p.search_archives && !p.restore_tabs);
         assert!(!p.check_updates, "the update check is opt-in");
         assert!(!Profile::from_section("x", &[("check_updates".into(), "junk".into())]).check_updates);
+        // Absent (or unreadable): the tree follows Explorer's "Expand to open folder"; set: the profile decides.
+        assert_eq!(p.expand_to_folder, None);
+        assert_eq!(Profile::from_section("x", &[("expand_to_folder".into(), "false".into())]).expand_to_folder, Some(false));
+        assert!(!Profile::default_profile().to_section().1.iter().any(|(k, _)| k == "expand_to_folder"), "not written unless set");
         assert_eq!(Profile::from_section("x", &[("underline_titles".into(), "junk".into())]).underline_titles, "hover");
         let hover = |v: &str| Profile::from_section("x", &[("hover_preview_ms".into(), v.into())]).hover_preview_ms;
         assert_eq!((hover("5"), hover("1500"), hover("999999"), hover("junk")), (200, 1500, 10000, 2000));

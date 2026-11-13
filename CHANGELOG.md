@@ -6,7 +6,27 @@ a line under Unreleased. Sections up to 0.1.4 were rebuilt from git history and 
 
 ## Unreleased
 
-Nothing yet.
+- After you delete the selection in rexplorer, the row that takes its place is selected (the row after the focused
+  deleted one, else the one before it), in search results and in folders, as in Explorer; not on Home and Quick
+  Access. In a folder only the reload that follows your own delete does this: when the selected item goes any other
+  way (another program, an editor's save, an undo, a move out) or the delete was cancelled, nothing is selected
+  ([#88](https://github.com/CodingDiego/rexplorer/issues/88)).
+- The sidebar has a This PC row at the head of its This PC section; it opens This PC
+  ([#88](https://github.com/CodingDiego/rexplorer/issues/88)).
+- A tab torn out and released just beside another rexplorer window opens a window of its own: only a release inside
+  that window's visible frame (not its invisible resize border, not a minimized or cloaked window) moves the tab
+  there ([#88](https://github.com/CodingDiego/rexplorer/issues/88)).
+- The folder tree follows Explorer's "Expand to open folder" option: with it off the tree selects a folder only when
+  it already shows it (otherwise nothing), instead of expanding to every folder opened. The profile key
+  `expand_to_folder` overrides it. The tree now follows a navigation after the listing has painted, and opens the way
+  only to a folder on a fixed or RAM disk with no junction, symbolic link or mount point on the way, or to the
+  desktop, This PC, Home, Quick access or the user's files; network, removable and other virtual folders are never
+  expanded automatically ([#87](https://github.com/CodingDiego/rexplorer/issues/87)).
+- Multi-volume .rar sets have test fixtures, and their tests run everywhere
+  ([#43](https://github.com/CodingDiego/rexplorer/issues/43)).
+- New automated data-operation checks: Skip pressed in the shell's own conflict dialog (copy, move and drop), the
+  dialog's Replace against the flag the other checks use, a drop on a folder, New > Text Document against the copy
+  engine, and a cancelled delete ([#26](https://github.com/CodingDiego/rexplorer/issues/26)).
 
 ## 1.0.0-rc.2 - 2026-11-13
 

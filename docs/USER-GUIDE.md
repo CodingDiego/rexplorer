@@ -213,6 +213,7 @@ starting with `;` or `#` are comments. A missing key takes its default. A value 
 | `view` | `details`, `small`, `medium`, `icons`, `thumbnails`, `extra-large`, `list`, `tiles` or `content` | `details` | View for a first run or `--profile`; later runs use the saved session. |
 | `show_tree` | true or false | `false` | Folder tree, right of the sidebar (alone when the sidebar is hidden). |
 | `show_preview` | true or false | `false` | Preview pane. |
+| `expand_to_folder` | true or false | not set | Whether the folder tree opens the way to the current folder. Not set: it follows Explorer's own "Expand to open folder" option. Off, the tree selects a folder only when it already shows it (otherwise nothing). On, the way is opened only to a folder on a fixed or RAM disk with no junction, symbolic link or mount point on the way, or to the desktop, This PC, Home, Quick access or the user's files; network, removable and other virtual folders are never expanded automatically. |
 | `tree_width` | number | `220` | Width of the sidebar and of the tree (each) in pixels at 96 DPI. |
 | `preview_width` | number | `360` | Preview pane width, same units. |
 | `show_hidden` | true or false | `false` | Show hidden files, folders and drives. |
