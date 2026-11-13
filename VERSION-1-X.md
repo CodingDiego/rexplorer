@@ -1,6 +1,6 @@
 # rexplorer 1.x: requirements for a stable release
 
-rexplorer's newest release is 1.0.0-rc.1 (2026-11-13), a release candidate published as a pre-release; the newest
+rexplorer's newest release is 1.0.0-rc.2 (2026-11-13), the second release candidate, published as a pre-release; the newest
 stable release is 0.2.0 (2026-11-12). It is fast, and in daily use as the default file manager, but tested on one
 Windows 11 machine.
 **1.0 is a promise that anyone can make rexplorer their default file manager on any supported Windows PC without

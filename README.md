@@ -10,7 +10,7 @@ Corporation; they are named here only to say what rexplorer replaces.
 Supported Windows: Windows 10 22H2 and Windows 11. Older versions are not supported. Each release is meant to be
 smoke-tested on both (see CONTRIBUTING.md); the numbers below come from Windows 11 only.
 
-Every release is listed in [CHANGELOG.md](CHANGELOG.md). The newest is 1.0.0-rc.1 (2026-11-13), a release
+Every release is listed in [CHANGELOG.md](CHANGELOG.md). The newest is 1.0.0-rc.2 (2026-11-13), a release
 candidate published as a pre-release; the newest stable release is 0.2.0, which can rename the wrong file (fixed
 in 1.0.0-rc.1, see the changelog). Dependency upkeep and translations are described in
 [CONTRIBUTING.md](CONTRIBUTING.md).
@@ -679,7 +679,7 @@ through WM_APP+0x54.
 ### Known gaps
 
 **[docs/EXPLORER-PARITY.md](docs/EXPLORER-PARITY.md) is the full checklist against Windows Explorer**: every
-behaviour marked WORKS, BROKEN, UNVERIFIED, PARTIAL or MISSING. On 2026-11-13, for 1.0.0-rc.1: 123 rows, 103
+behaviour marked WORKS, BROKEN, UNVERIFIED, PARTIAL or MISSING. On 2026-11-13, for 1.0.0-rc.2: 123 rows, 103
 proven on the exe with a real keyboard and mouse (2026-11-11 to 2026-11-13), 3 more on a scratch install base, 13
 UNVERIFIED and 4 PARTIAL. Dragging into Edge and VS Code was proven on 2026-11-12
 ([#75](https://github.com/CodingDiego/rexplorer/issues/75)); WhatsApp was not tried. Still UNVERIFIED (built, not
@@ -688,10 +688,8 @@ contrast theme), Text size, per-monitor DPI, the light / dark live switch, icon 
 administrator, Empty Recycle Bin, the drag image from Home, multi-volume .rar, FTP and the default folder handler
 on a real install. Narrator and NVDA were never tried.
 
-Open in 1.0.0-rc.1:
+Open in 1.0.0-rc.2:
 
-- Drops onto the folder tree are not undoable (the tree control handles the drop itself, so rexplorer records
-  nothing).
 - Ctrl+Z after a cancelled folder copy leaves the partial folder: undo never deletes what it cannot prove it made.
 - After Delete in search results no row is selected (Explorer selects the next one).
 - Tearing out a Home tab once landed in the other rexplorer window instead of a new one (1 of 2 tries, not

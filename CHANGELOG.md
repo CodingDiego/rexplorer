@@ -6,6 +6,12 @@ a line under Unreleased. Sections up to 0.1.4 were rebuilt from git history and 
 
 ## Unreleased
 
+Nothing yet.
+
+## 1.0.0-rc.2 - 2026-11-13
+
+The second release candidate, published as a pre-release. Changes since 1.0.0-rc.1.
+
 - Drops onto the folder tree are recorded like drops on the list: Ctrl+Z undoes the move or sends the copy to the
   Recycle Bin, Ctrl+Y redoes it, and a drag cancelled with Esc records nothing
   ([#87](https://github.com/CodingDiego/rexplorer/issues/87)).
@@ -15,6 +21,19 @@ a line under Unreleased. Sections up to 0.1.4 were rebuilt from git history and 
   prompts and errors, the preview pane, the update notice, the browser view) no longer travel as pointers in window
   messages: each window keeps them in its own queue, so a forged message cannot crash rexplorer through them, and a
   result that arrives after its window closed is freed instead of leaked ([#84](https://github.com/CodingDiego/rexplorer/issues/84)).
+- Two known gaps of 1.0.0-rc.1 were not bugs. Clicking a selected name again does select the name for renaming
+  ([#86](https://github.com/CodingDiego/rexplorer/issues/86)), and Ctrl+C in Windows Explorer does replace a
+  clipboard rexplorer set ([#85](https://github.com/CodingDiego/rexplorer/issues/85)); both reports came from the
+  test harness.
+
+**Known gaps.** As for 1.0.0-rc.1 below, without the folder tree's undo and the two reports above.
+- A swapped item refused by undo also cancels the items after it in the same undo. The re-check was tested without
+  the shell's dialogs on screen.
+- The accessibility request of rexplorer's own controls and their notifications still carry a pointer, and the
+  thumbnail and Home icon messages a bitmap handle, that another program in the same session could forge (see
+  `SECURITY.md`).
+- Not run live: the update notice, the embedded browser view and image dimensions in the preview pane through the
+  new queues, and a right-drag onto the folder tree.
 
 ## 1.0.0-rc.1 - 2026-11-13
 

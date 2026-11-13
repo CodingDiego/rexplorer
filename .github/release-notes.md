@@ -1,4 +1,13 @@
-rexplorer 1.0.0-rc.1 is a release candidate for 1.0, published as a pre-release: the update notice and winget stay on 0.2.0. The changes since 0.2.0 are listed in full in `CHANGELOG.md` under 1.0.0-rc.1.
+rexplorer 1.0.0-rc.2 is the second release candidate for 1.0, published as a pre-release: the update notice and winget stay on 0.2.0. The changes are listed in full in `CHANGELOG.md` under 1.0.0-rc.2 and 1.0.0-rc.1.
+
+**Since 1.0.0-rc.1.**
+- Drops onto the folder tree can be undone and redone, like drops on the file list.
+- Undo checks a file's identity again when the shell is about to act on it, and cancels the undo if the file was
+  swapped.
+- Results from background work (folder loads, search, the sidebar, the preview pane and others) no longer travel
+  as pointers in window messages, so another program can no longer crash rexplorer by forging one of them.
+- Two known gaps listed for 1.0.0-rc.1 were not bugs: clicking a selected name again does select the name for
+  renaming, and Ctrl+C in Windows Explorer does replace a clipboard rexplorer set.
 
 **If you use 0.2.0, update.** 0.2.0 can rename the wrong file. In a window with Back history, each character typed
 in the rename box sends the window Back, and Enter then renames whatever item sits at the same position in the
@@ -51,22 +60,19 @@ upgrade, run the new `rexplorer.exe --install`.
 
 **Known gaps.** The full checklist is `docs/EXPLORER-PARITY.md`: 123 behaviours, 103 proven on the exe (WORKS) and 3
 more on a scratch install base, 13 built but not proven (UNVERIFIED), 4 PARTIAL.
-- Drops onto the folder tree cannot be undone. Ctrl+Z after a cancelled folder copy leaves the partial folder (undo
-  never deletes what it cannot prove it made). After Delete in search results no row is selected.
+- Ctrl+Z after a cancelled folder copy leaves the partial folder (undo never deletes what it cannot prove it
+  made). After Delete in search results no row is selected. No sidebar row opens This PC itself.
 - Tearing out a Home tab once landed in the other rexplorer window (1 of 2 tries, not reproduced).
-- After Ctrl+C in rexplorer, Ctrl+C in Windows Explorer did not replace the clipboard (seen twice, cause unknown);
-  it works once another program has used the clipboard. Clicking a selected name again to rename puts the caret at
-  the click instead of selecting the name; F2 selects it.
-- Not run for this candidate: the 15-minute soak, the local smoke and budget scripts (CI runs smoke and budgets),
-  the fuzz targets, and multi-volume .rar (no test archive; two tests are skipped).
+- When undo refuses a swapped file it also cancels the files after it in the same undo.
+- Not run for this candidate: the 15-minute soak, the fuzz targets, and multi-volume .rar (no test archive; two
+  tests are skipped).
 - Not yet tried by a person: Narrator or NVDA, a Windows contrast theme, Text size above 100% and other display
   scales (including the address bar trimming), ARM64 hardware, Windows 10, a clean-machine install, MTP phones,
   OneDrive, WhatsApp as a drop target, and Libraries in an icon view before their thumbnails are cached.
 - Undo does not restore a file overwritten by Replace, does not undo a merged folder, and gives no undo for New,
   rename or shortcuts on a share that reports no file ids.
-- Several internal window messages still carry a pointer, so another program in your session can crash rexplorer
-  with a forged message. Undo checks a file's identity before acting but not again while the shell's confirmation
-  dialog is open. See `SECURITY.md`.
+- The accessibility request of rexplorer's own controls and their notifications still carry a pointer, so another
+  program in your session can crash rexplorer with a forged one. See `SECURITY.md`.
 - Run as administrator was never invoked in testing. FTP is deferred (#36). The exe is not code-signed, so
   SmartScreen may warn (#59). The winget submission is pending (#63). There is no app icon yet (#18).
 

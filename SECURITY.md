@@ -54,9 +54,9 @@ Out of scope:
   `api.github.com` for the latest release, follows no redirects, reads at most 1 MiB, downloads nothing and sends
   nothing beyond the request itself.
 
-## Known limitations (1.0.0-rc.1)
+## Known limitations (1.0.0-rc.2)
 
-- **Forgeable window messages.** The worker results no longer carry a pointer: since the Unreleased round each
+- **Forgeable window messages.** The worker results no longer carry a pointer: since 1.0.0-rc.2 each
   window keeps them in its own queue and the message carries nothing. Two kinds still carry one: the accessibility
   request rexplorer's own controls answer (`WM_ACC_ITEMS`), and the notifications its custom controls send their
   parent (`WM_NOTIFY` with rexplorer's own structures, as every Win32 control does). The thumbnail and Home icon
@@ -68,7 +68,7 @@ Out of scope:
   message can already read and change everything the user can.
 - **Undo's identity check leaves a short window.** Before an undo moves, renames or recycles something, rexplorer
   checks that the item is still the one it recorded (its file id, or for a paste or drop a free name of the shell's
-  form with the source's size and time). Since the Unreleased round it checks the file id again when the shell is
+  form with the source's size and time). Since 1.0.0-rc.2 it checks the file id again when the shell is
   about to act on the item, and a swapped item cancels that item and the rest of the undo (tested without the
   shell's dialogs; not yet seen with a confirmation dialog on screen). What remains is the moment between that check and the shell's own move, rename or delete. The shell's
   own operations still apply (a delete goes to the Recycle Bin, where it can be restored), and only files the user
