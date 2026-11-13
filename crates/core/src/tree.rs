@@ -218,7 +218,8 @@ mod tests {
         pane.select(&ShellFolder::parse(&deep).unwrap().pidl).unwrap();
         assert!(selected(&pane).eq_ignore_ascii_case(&deep), "{}", selected(&pane));
         drop(pane);
-        let temp = std::env::temp_dir().to_string_lossy().trim_end_matches('\\').to_string();
+        // The shell answers with long names; %TEMP% can be a short one (RUNNER~1 on CI).
+        let temp = std::fs::canonicalize(std::env::temp_dir()).unwrap().to_string_lossy().trim_start_matches(r"\\?\").to_string();
         let pane = create(p, RECT400, true, Box::new(|_| {})).unwrap();
         pane.select(&ShellFolder::parse(&temp).unwrap().pidl).unwrap();
         assert!(selected(&pane).eq_ignore_ascii_case(&temp), "{}", selected(&pane));
