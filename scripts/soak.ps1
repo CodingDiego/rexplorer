@@ -1,10 +1,15 @@
 # rexplorer soak test (#29). Windows PowerShell 5.1. Runs one rexplorer for -Minutes, looping navigation, tabs,
 # search, the preview pane, thumbnails and file operations in a scratch tree, and samples the process's GDI objects,
-# USER objects, handles, threads and private bytes into a CSV. Exits 1 when the process died or a resource grew past
-# the margin, else 0.
+# USER objects, handles, threads and private bytes into a CSV. Exits 1 when the process died, a resource grew past
+# the margin, or fewer than -MinIterations rounds ran, else 0. It prints how many of each operation it did.
+# The release run is one hour (`-Minutes 60`), before every release: a leak grows with the number of operations,
+# not with the clock, and an hour is about 400 rounds here (6.8 a minute on 2026-11-11), each round 3 navigations,
+# 2 tab switches plus a new and a closed tab, 1 search, 6 previewed rows, 1 thumbnails view, a copy and a paste and
+# 60 file changes (20 creates, 20 renames, 20 deletes).
 #   -Exe <path>          the rexplorer.exe to test (default target\release\rexplorer.exe)
-#   -Minutes <n>         run length (default 10, a harness check; the release run is 480)
+#   -Minutes <n>         run length (default 10, a harness check; the release run is 60)
 #   -SampleSeconds <n>   time between samples (default 30)
+#   -MinIterations <n>   rounds the run must reach (default 5 a minute: 300 for the hour); a stuck run fails
 #   -Csv <path>          where the samples go (default %TEMP%\rexplorer-soak-<pid>.csv, kept)
 # Margin: the first 5 minutes (at most a fifth of the run) are warm-up and not judged. Of the judged samples, the
 # baseline is the median of the first fifth and the end value the median of the last fifth; a resource fails when
@@ -19,7 +24,8 @@
 # are not used. Copy and Paste go through the clipboard, which is restored at the end; leave the clipboard alone
 # while it runs.
 param([string]$Exe = (Join-Path (Split-Path $PSScriptRoot -Parent) 'target\release\rexplorer.exe'),
-  [double]$Minutes = 10, [int]$SampleSeconds = 30, [string]$Csv = (Join-Path $env:TEMP "rexplorer-soak-$PID.csv"))
+  [double]$Minutes = 10, [int]$SampleSeconds = 30, [int]$MinIterations = -1, [string]$Csv = (Join-Path $env:TEMP "rexplorer-soak-$PID.csv"))
+if ($MinIterations -lt 0) { $MinIterations = [int]($Minutes * 5) }
 $ErrorActionPreference = 'Stop'
 if (-not (Test-Path $Exe)) { Write-Output "FAIL exe missing: $Exe"; exit 1 }
 $Exe = (Resolve-Path $Exe).Path
@@ -73,6 +79,7 @@ function Wait-Until([scriptblock]$cond, $ms, $what) {
 }
 # Ctrl+L, the path into the address Edit (ID_ADDR 100), Enter (CMD_ADDRESS 5, CMD_ENTER 7).
 function Go($path, $n) {
+  $script:ops.navigations++
   Cmd 5; Start-Sleep -Milliseconds 200
   $null = [S]::SendText([S]::GetDlgItem($script:main, 100), 0x0C, [IntPtr]::Zero, $path)
   Cmd 7
@@ -83,30 +90,33 @@ function Iteration {
   Go $Docs 200
   Cmd 24; Key (List) 0x24
   for ($k = 0; $k -lt 5; $k++) { Start-Sleep -Milliseconds 300; Key (List) 0x28 }
-  Start-Sleep -Milliseconds 300; Cmd 24
+  Start-Sleep -Milliseconds 300; Cmd 24; $script:ops.previews += 6
   # Thumbnails (CMD_VIEW1 + 2), back to Details (CMD_VIEW1).
   Go $Pics 40
-  Cmd 27; Start-Sleep -Milliseconds 1500; Cmd 25
+  Cmd 27; Start-Sleep -Milliseconds 1500; Cmd 25; $script:ops.thumbnails++
   # Tabs: new (10), next (12) twice, close (11) the new one, so the pictures tab stays (closing it instead left the
   # window on Home, where the search below found nothing every round).
   Cmd 10; Start-Sleep -Milliseconds 500; Cmd 12; Start-Sleep -Milliseconds 300; Cmd 12; Start-Sleep -Milliseconds 300; Cmd 11; Start-Sleep -Milliseconds 300
+  $script:ops.tabSwitches += 2; $script:ops.tabsOpenedClosed++
   # Search the pictures from the search box (ID_SEARCH 109): pic10 to pic19.
   $box = [S]::GetDlgItem($script:main, 109); $t0 = [S]::Title($script:main)
-  $null = [S]::SendText($box, 0x0C, [IntPtr]::Zero, 'pic1'); Key $box 0x0D
+  $null = [S]::SendText($box, 0x0C, [IntPtr]::Zero, 'pic1'); Key $box 0x0D; $script:ops.searches++
   Wait-Until { (Count) -ge 1 -and ([S]::Title($script:main)) -ne $t0 } 5000 'search results'
   Start-Sleep -Milliseconds 500
   # File operations: the app's Copy (43) and Paste (44) of keep.txt, then this script's own churn in the folder.
   Go $Work 1
   # Only in the work folder: after a missed navigation, Copy and Paste would act on whatever folder is showing.
   if ((Count) -ge 1 -and [S]::Title($script:main) -eq "$(Split-Path $Work -Leaf) - rexplorer") {
-    Key (List) 0x24; Start-Sleep -Milliseconds 200; Cmd 43; Start-Sleep -Milliseconds 300; Cmd 44; $script:copies++
+    Key (List) 0x24; Start-Sleep -Milliseconds 200; Cmd 43; Start-Sleep -Milliseconds 300; Cmd 44; $script:copies++; $script:ops.fileOps += 2
     Wait-Until { (Count) -ge 2 } 5000 'paste'
   } else { $script:misses++; $script:missedBy['not in the work folder']++ }
   $tag = $script:iterations
   for ($k = 0; $k -lt 20; $k++) { [IO.File]::WriteAllText((Join-Path $Work "churn-$tag-$k.tmp"), 'x') }
   for ($k = 0; $k -lt 20; $k++) { [IO.File]::Move((Join-Path $Work "churn-$tag-$k.tmp"), (Join-Path $Work "churn-$tag-$k.txt")) }
   # A file the app still holds open is left for the next round.
-  Get-ChildItem -LiteralPath $Work -File | Where-Object { $_.FullName -ne $Keep } | Remove-Item -Force -ErrorAction SilentlyContinue
+  $gone = @(Get-ChildItem -LiteralPath $Work -File | Where-Object { $_.FullName -ne $Keep })
+  $gone | Remove-Item -Force -ErrorAction SilentlyContinue
+  $script:ops.fileOps += 40 + $gone.Count
   Wait-Until { (Count) -eq 1 } 5000 'churn removed'
 }
 function Sample {
@@ -139,6 +149,7 @@ function Restore-Clipboard($d) {
 # ---- run --------------------------------------------------------------------------------------------
 $clip = Save-Clipboard
 $script:misses = 0; $script:missedBy = @{}; $script:iterations = 0; $script:copies = 0; $samples = New-Object Collections.ArrayList; $died = $null
+$script:ops = [ordered]@{ navigations = 0; tabSwitches = 0; tabsOpenedClosed = 0; searches = 0; previews = 0; thumbnails = 0; fileOps = 0 }
 $script:p = $null
 try {
   $script:p = [Diagnostics.Process]::Start($psi); $null = $script:p.Handle
@@ -184,5 +195,9 @@ foreach ($m in $slack.Keys) {
   Write-Output ("{0} {1}: {2} -> {3} (limit {4:N1}{5})" -f $status, $m, $base, $end, $limit, $(if ($allow[$m]) { ", incl. $($allow[$m]) for the pastes" }))
 }
 Write-Output "$iterations iterations in $Minutes min, $($script:misses) waits missed$(if ($script:misses) { ' (' + (($script:missedBy.GetEnumerator() | ForEach-Object { "$($_.Key) x$($_.Value)" }) -join ', ') + ')' }); samples in $Csv"
+Write-Output ("operations: {0}" -f (($script:ops.GetEnumerator() | ForEach-Object { "$($_.Key) $($_.Value)" }) -join ', '))
+$s0 = $samples[0]; $s1 = $samples[$samples.Count - 1]
+Write-Output ("first and last sample: GDI {0} -> {1}, USER {2} -> {3}, handles {4} -> {5}, threads {6} -> {7}, private {8} -> {9} MB" -f $s0.gdi, $s1.gdi, $s0.user, $s1.user, $s0.handles, $s1.handles, $s0.threads, $s1.threads, $s0.privateMB, $s1.privateMB)
+if ($iterations -lt $MinIterations) { Write-Output "FAIL soak: $iterations iterations, fewer than the stated $MinIterations"; $failed = $true }
 if ($failed) { exit 1 }
 exit 0

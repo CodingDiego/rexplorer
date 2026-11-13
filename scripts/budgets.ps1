@@ -5,6 +5,12 @@
 #          smoke.ps1) until the load finishes and its list holds every file             (-ListMs, default 400)
 #   idle   CPU time of the process over -IdleSeconds (default 10) once that listing settled, in % of one core
 #                                                                                        (-IdlePct, default 0.5)
+#   churn  a scratch folder on screen while a file is created and deleted in it nonstop for -ChurnSeconds (default 10):
+#          finished reloads per second, from rexplorer.loads; zero reloads fails     (-ChurnPerSec, default 1)
+#          (the app reloads at most once a second, main.rs change_gate, so 10 s allow about 10)
+#   ui     the slowest message the window's UI thread handled over that whole session (five 100k loads, idle, churn),
+#          from rexplorer.slowest / rexplorer.slowestmsg (watchdog.rs `timed`)  (-UiMs, default 100)
+# The churn and UI defaults are the issue's budgets (#48), not measured multiples.
 # The defaults are about twice the medians measured on 2026-11-11 (scripts\bench-results.md: start 185-195 ms,
 # list 181-185 ms, idle 0.0 %; the CPU counter's 15.6 ms tick is 0.16 % of 10 s, so 0.5 % is three ticks).
 #   -Exe <path>  the rexplorer.exe to test (default target\release\rexplorer.exe)
@@ -18,7 +24,8 @@
 # Safety: the app runs on a scratch %APPDATA% and %LOCALAPPDATA%, scratch install folder and scratch registry base, is driven only by
 # window messages to its own window and is killed by pid. No input is sent.
 param([string]$Exe = (Join-Path (Split-Path $PSScriptRoot -Parent) 'target\release\rexplorer.exe'),
-  [int]$Runs = 5, [double]$StartMs = 400, [double]$ListMs = 400, [double]$IdlePct = 0.5, [int]$IdleSeconds = 10, [switch]$Focus)
+  [int]$Runs = 5, [double]$StartMs = 400, [double]$ListMs = 400, [double]$IdlePct = 0.5, [int]$IdleSeconds = 10, [switch]$Focus,
+  [double]$ChurnPerSec = 1, [int]$ChurnSeconds = 10, [double]$UiMs = 100)
 $ErrorActionPreference = 'Stop'
 [Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::InvariantCulture
 if (-not (Test-Path $Exe)) { Write-Output "FAIL exe missing: $Exe"; exit 1 }
@@ -132,12 +139,38 @@ try {
     $p.Refresh(); $pct = ($p.TotalProcessorTime - $cpu0).TotalMilliseconds / $sw.Elapsed.TotalMilliseconds * 100
     Write-Host "idle sample: foreground ours=$([B]::GetForegroundWindow() -eq $main)"
     Judge 'idle CPU' @($pct) $IdlePct '% of a core'
+
+    # churn: a folder of its own on screen, one file written and deleted over and over for -ChurnSeconds; reloads are
+    # the finished loads (rexplorer.loads) counted at the end of the churn. None at all fails too: then the churn was
+    # not seen, and the budget would pass for the wrong reason.
+    $Churn = Join-Path $Scratch 'churn'
+    New-Item -ItemType Directory -Path $Churn -Force | Out-Null
+    $null = Go $Churn 0
+    Start-Sleep -Milliseconds 1500
+    $loads0 = [B]::Prop($main, 'rexplorer.loads'); $changes = 0
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.Elapsed.TotalSeconds -lt $ChurnSeconds) {
+      $f = Join-Path $Churn ('churn{0}.txt' -f ($changes % 20))
+      [IO.File]::WriteAllText($f, 'x'); [IO.File]::Delete($f); $changes += 2
+    }
+    $reloads = [B]::Prop($main, 'rexplorer.loads') - $loads0; $secs = $sw.Elapsed.TotalSeconds
+    Write-Host ("churn: {0} creates and deletes in {1:N1} s, {2} reloads" -f $changes, $secs, $reloads)
+    Judge 'churn reloads' @($(if ($reloads -gt 0) { $reloads / $secs } else { -1 })) $ChurnPerSec 'reloads/s'
+
+    # UI thread: the slowest message the window's pump handled in this whole session (five 100k loads, idle, churn),
+    # from rexplorer.slowest (ms) and rexplorer.slowestmsg ((message << 32) | wParam), set by watchdog::timed.
+    $slow = [B]::Prop($main, 'rexplorer.slowest'); $sm = [B]::Prop($main, 'rexplorer.slowestmsg')
+    Write-Host ("slowest UI-thread message: 0x{0:X4} wParam 0x{1:X} ({2} ms)" -f ($sm -shr 32), ($sm -band 4294967295), $slow)
+    Judge 'slowest UI-thread message' @($(if ($slow -gt 0) { $slow } else { -1 })) $UiMs 'ms'
   } finally { Stop-Rex $p }
 } catch { Write-Output "FAIL budgets: $($_.Exception.Message)"; $results += $false }
 finally {
   Start-Sleep -Milliseconds 300
+  # The watchdog's hang lines (all builds) and slow lines (debug builds) name the message and operation behind a FAIL.
+  Get-ChildItem $Scratch -Recurse -Filter rexplorer.log -ErrorAction SilentlyContinue | ForEach-Object { Get-Content $_.FullName } |
+    Select-String -Pattern 'hang:|slow:' | ForEach-Object { Write-Host "app log: $($_.Line)" }
   Remove-Item $Scratch -Recurse -Force -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath "HKCU:\Software\rexplorer-test\budgets-$PID" -Recurse -Force -ErrorAction SilentlyContinue
 }
-if ($results -contains $false -or $results.Count -lt 3) { exit 1 }
+if ($results -contains $false -or $results.Count -lt 5) { exit 1 }
 exit 0

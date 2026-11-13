@@ -333,7 +333,7 @@ pub(crate) fn load_archive(archive: &Path, dir: &str) -> Result<Loaded> {
     }
     let icon = sys_icon(&name, false);
     let icons = vec![ICON_UNKNOWN; rows.len()];
-    Ok(Loaded { source: Source::Archive(ArchiveView { listing, rows, icons }), crumbs, icon, unsorted: false })
+    Ok(Loaded { source: Source::Archive(ArchiveView { listing, rows, icons }), crumbs, icon, unsorted: false, parked: false })
 }
 
 /// System image list and small icon index for a name, by extension only (no disk access).

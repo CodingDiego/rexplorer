@@ -550,11 +550,12 @@ fn main() -> Result<()> {
             // Enter on a Home filter pill picks the pill, not the entry selected before.
             let home = focus == (*app).home && !(msg.message == WM_KEYDOWN && msg.wParam.0 == VK_RETURN.0 as usize && home::on_pill(focus));
             let ours = focus == (*app).list || home || addr || focus == hwnd || pane_accel(app, &msg, focus);
-            if ours && TranslateAcceleratorW(hwnd, accel_table, &msg) != 0 {
+            // Timed too: an accelerator sends its WM_COMMAND from inside TranslateAcceleratorW, not through dispatch.
+            if ours && watchdog::timed(&msg, || TranslateAcceleratorW(hwnd, accel_table, &msg)) != 0 {
                 continue;
             }
             let _ = TranslateMessage(&msg);
-            watchdog::dispatch(&msg);
+            watchdog::timed(&msg, || DispatchMessageW(&msg));
         }
     }
     // Last, after every teardown main does (COM above, the instance claim here): until then a crash keeps its record.
@@ -669,6 +670,10 @@ unsafe fn open_startup_tabs(app: *mut App, args: &cli::Args) {
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // A window move or resize, a menu and a dialog box each run a message loop inside the message that began them.
+    if matches!(msg, WM_ENTERSIZEMOVE | WM_ENTERMENULOOP | WM_ENTERIDLE) {
+        watchdog::modal();
+    }
     if msg == WM_GETMINMAXINFO {
         let mmi = &mut *(lparam.0 as *mut MINMAXINFO);
         let dpi = GetDpiForWindow(hwnd) as i32;
@@ -929,6 +934,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             ui::rescale(app);
         }
         WM_DESTROY => {
+            let _op = watchdog::op("close the window (save placement and session)");
             if !(*app).secondary {
                 save_placement(hwnd, (*app).fullscreen.map(|f| f.0));
             }

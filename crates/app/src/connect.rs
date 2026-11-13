@@ -58,15 +58,39 @@ fn valid_host(h: &str) -> bool {
     !h.is_empty() && !h.chars().any(|c| matches!(c, '@' | '/' | '\\' | '?' | '#' | ':') || c.is_whitespace() || c.is_control())
 }
 
-/// `ftp://user:pw@host/..` without the password, for titles, messages and the session file; other names unchanged.
+/// An `ftp://` address, in any case.
+pub fn is_ftp(name: &str) -> bool {
+    name.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("ftp://"))
+}
+
+/// The first `scheme://user:pw@host/..` in `name` without the password, for titles, the address bar, the recent
+/// list, the session file, new-window arguments and messages; other names unchanged. The scheme is any run of two or
+/// more scheme characters (one is a drive letter) wherever it starts, so blanks, quotes or invisible characters
+/// before it and a sentence around it (an error text) do not hide it, and it may be followed by one or two slashes
+/// of either kind (`ftp:/`, `ftp:\\`).
+/// The password ends at the last `@` of the authority (the text before the next slash), so an `@` in the path never
+/// moves the host: a folder named `x@other.example` cannot turn a saved address into one for `other.example`.
+/// `ftp_url` percent-encodes `/`, `@`, `:` and `%`, but a password typed raw into the address bar may hold a `/`:
+/// when the authority has a `:` and no `@`, and what follows the `:` is not a port number, the password runs to the
+/// last `@` of the whole name. Such a name is not a URL the shell can open, so it is only ever shown, never loaded.
+/// shortcut: a raw password that is all digits up to its first `/` reads as a port and is shown; encode the `/`.
 pub fn redact(name: &str) -> String {
-    if !name.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("ftp://")) {
+    let b = name.as_bytes();
+    let scheme_char = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.');
+    let slash = |c: u8| matches!(c, b'/' | b'\\');
+    let Some(colon) = (2..b.len().saturating_sub(1)).find(|&i| b[i] == b':' && slash(b[i + 1]) && scheme_char(b[i - 1]) && scheme_char(b[i - 2])) else {
         return name.to_string();
-    }
-    let rest = &name[6..];
-    let auth = &rest[..rest.find('/').unwrap_or(rest.len())];
-    match auth.rfind('@').and_then(|at| auth[..at].find(':').map(|c| (c, at))) {
-        Some((colon, at)) => format!("{}{}", &name[..6 + colon], &rest[at..]),
+    };
+    let start = colon + 2 + usize::from(b.get(colon + 2).is_some_and(|&c| slash(c)));
+    let rest = &name[start..];
+    let auth = &rest[..rest.find(['/', '\\']).unwrap_or(rest.len())];
+    let Some(user_end) = auth.find(':') else { return name.to_string() };
+    let after = &auth[user_end + 1..];
+    // `[` starts an IPv6 host, whose colons are not a user name's.
+    let raw = !auth.starts_with('[') && !after.bytes().all(|d| d.is_ascii_digit());
+    let at = after.rfind('@').map(|i| user_end + 1 + i).or_else(|| rest.rfind('@').filter(|&at| raw && at > user_end));
+    match at {
+        Some(at) => format!("{}{}", &name[..start + user_end], &rest[at..]),
         None => name.to_string(),
     }
 }
@@ -558,9 +582,63 @@ mod tests {
         assert_eq!(redact("ftp://bob:s3cret@h:2121/x"), "ftp://bob@h:2121/x");
         assert_eq!(redact("ftp://me%40x.org:p%40ss@h/"), "ftp://me%40x.org@h/");
         assert_eq!(redact("ftp://bob@h/x"), "ftp://bob@h/x");
+        assert!(is_ftp("FTP://h/") && is_ftp("ftp://u:p@h:2121/x"));
+        assert!(!is_ftp("ftp:/h") && !is_ftp("ftps://h/") && !is_ftp(r"C:\ftp://") && !is_ftp("ñtp://h"), "only the scheme");
         assert_eq!(redact("ftp://h/a:b@c"), "ftp://h/a:b@c"); // the colon and @ are in the path
         assert_eq!(redact("C:\\a:b@c"), "C:\\a:b@c");
         assert_eq!(redact(&ftp_url("h", None, "u", "p@:/", "")), "ftp://u@h/");
+    }
+
+    #[test]
+    fn redact_finds_raw_passwords_other_schemes_and_leading_blanks() {
+        // What the Connect dialog makes: every one of / @ : % in the password is encoded, so the raw form never
+        // reaches the URL from there.
+        let made = ftp_url("127.0.0.1", Some(2121), "tester", "a/b@c:d%e", "docs");
+        assert_eq!(made, "ftp://tester:a%2Fb%40c%3Ad%25e@127.0.0.1:2121/docs");
+        assert_eq!(redact(&made), "ftp://tester@127.0.0.1:2121/docs");
+        // Typed raw into the address bar.
+        assert_eq!(redact("ftp://u:p/w@h"), "ftp://u@h");
+        assert_eq!(redact("ftp://u:p/w@h/docs/"), "ftp://u@h/docs/");
+        assert_eq!(redact("ftp://u:a/b@c:d%e@h:2121/x"), "ftp://u@h:2121/x");
+        assert_eq!(redact("ftp://me@x.org:pw@h/"), "ftp://me@x.org@h/", "a raw @ in the user name");
+        assert_eq!(redact("  ftp://u:pw@h/x"), "  ftp://u@h/x");
+        assert_eq!(redact("\tFTP://u:pw@h/x"), "\tFTP://u@h/x");
+        for scheme in ["ftps", "sftp", "SFTP", "http"] {
+            assert_eq!(redact(&format!("{scheme}://u:pw@h/x")), format!("{scheme}://u@h/x"));
+        }
+        // No password: unchanged.
+        let plain = [
+            "ftp://h/",
+            "ftp://u@h/x",
+            "ftps://h:990/x",
+            "sftp://u@h",
+            "ftp://h:2121/a:b",
+            "ftp://bob@h:2121/a@b",
+            "ftp://[::1]:2121/a@b",
+            "shell:::{20D04FE0-3AEA-1069-A2D8-08002B30309D}",
+            r"search-ms:displayname=x&crumb=location:\\server\share",
+            r"C:\a:b@c",
+            r#""C:\a:b@c""#,
+            r"\\?\C:\a:b@c",
+        ];
+        for plain in plain {
+            assert_eq!(redact(plain), plain);
+        }
+        // An @ in the path never moves the host: a folder a server names `x@evil.example` cannot rewrite the address.
+        assert_eq!(redact("ftp://h:2121/a@b"), "ftp://h:2121/a@b");
+        assert_eq!(redact("ftp://u:pw@h/dir@evil.example/"), "ftp://u@h/dir@evil.example/");
+        assert_eq!(redact("ftp://u:pw@h:2121/dir@evil.example/"), "ftp://u@h:2121/dir@evil.example/");
+        assert_eq!(redact("ftp://me@x.org:p/w@h"), "ftp://me@x.org@h", "a raw @ in the user and a raw / in the password");
+        // Whatever comes before the scheme, one slash or two, of either kind, and inside a sentence.
+        assert_eq!(redact("x ftp:/u:p@h"), "x ftp:/u@h");
+        assert_eq!(redact(r#""ftp://u:pw@h/x""#), r#""ftp://u@h/x""#);
+        assert_eq!(redact("\u{200b}\u{feff}ftp://u:pw@h/x"), "\u{200b}\u{feff}ftp://u@h/x");
+        assert_eq!(redact(r"ftp:\\u:pw@h\x"), r"ftp:\\u@h\x");
+        assert_eq!(redact("The folder ftp://u:pw@h/x was not found."), "The folder ftp://u@h/x was not found.");
+        assert_eq!(redact("ñ ftp://u:pw@h/ñ"), "ñ ftp://u@h/ñ");
+        for typed in ["ftp://u:p/w@h", "ftp://u:a/b@c@h/", "sftp://u:s3cr/e@t@h:22/"] {
+            assert!(!redact(typed).contains("p/w") && !redact(typed).contains("a/b@c") && !redact(typed).contains("s3cr"), "{typed}");
+        }
     }
 
     #[test]

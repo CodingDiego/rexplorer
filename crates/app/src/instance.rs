@@ -74,10 +74,12 @@ pub fn mark(hwnd: HWND) {
 }
 
 // Signals for scripts/budgets.ps1 (#48), read from outside with GetProp: the tick count (ms since boot) of the first
-// paint, how many folder loads have finished, and the tick count of the last one.
+// paint, how many folder loads have finished, the tick count of the last one, and the slowest UI-thread message.
 const PAINTED_PROP: PCWSTR = w!("rexplorer.painted");
 const LOADS_PROP: PCWSTR = w!("rexplorer.loads");
 const LOAD_TICK_PROP: PCWSTR = w!("rexplorer.loadtick");
+const SLOWEST_PROP: PCWSTR = w!("rexplorer.slowest");
+const SLOWEST_MSG_PROP: PCWSTR = w!("rexplorer.slowestmsg");
 
 fn set_prop(hwnd: HWND, name: PCWSTR, v: usize) {
     unsafe {
@@ -101,6 +103,13 @@ pub fn signal_painted(hwnd: HWND) {
 pub fn signal_loaded(hwnd: HWND) {
     set_prop(hwnd, LOADS_PROP, unsafe { GetPropW(hwnd, LOADS_PROP) }.0 as usize + 1);
     set_prop(hwnd, LOAD_TICK_PROP, tick());
+}
+
+/// The UI thread's slowest message so far (`watchdog::timed`): `rexplorer.slowest` in ms, `rexplorer.slowestmsg` as
+/// (message << 32) | low 32 bits of wParam.
+pub fn signal_slowest(hwnd: HWND, ms: usize, msg: u64) {
+    set_prop(hwnd, SLOWEST_PROP, ms.max(1));
+    set_prop(hwnd, SLOWEST_MSG_PROP, msg as usize);
 }
 
 /// The main window of this settings folder's instance.
@@ -284,6 +293,10 @@ mod tests {
         signal_loaded(h);
         assert_eq!(read(LOADS_PROP), 2);
         assert!(read(LOAD_TICK_PROP) >= first);
+        signal_slowest(h, 0, 0x0111_0000_0007);
+        assert_eq!((read(SLOWEST_PROP), read(SLOWEST_MSG_PROP)), (1, 0x0111_0000_0007), "0 ms reads as 1, not as unset");
+        signal_slowest(h, 140, 0x8001_0000_0003);
+        assert_eq!((read(SLOWEST_PROP), read(SLOWEST_MSG_PROP)), (140, 0x8001_0000_0003));
         let _ = unsafe { DestroyWindow(h) };
     }
 

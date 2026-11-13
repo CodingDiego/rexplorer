@@ -1,5 +1,5 @@
-# Long checks that do not fit a pull request: fuzzing the parsers (#57) and a 30-minute soak (#29), a signal between
-# the 8-hour soak runs done before a release. Weekly and by hand only, never on pull requests.
+# Long checks that do not fit a pull request: fuzzing the parsers (#57) and the one-hour soak (#29), the same run as
+# the one before every release (CONTRIBUTING.md). Weekly and by hand only, never on pull requests.
 name: Fuzz and soak
 
 on:
@@ -21,35 +21,43 @@ jobs:
       - run: cargo install cargo-fuzz --version 0.13.2 --locked
       # Three minutes per target, every target fuzz/Cargo.toml lists; a crash in one does not stop the others.
       # --sanitizer none: the targets are safe Rust, so the finds are panics (debug assertions are on), and an
-      # ASan build on MSVC would also need the ASan runtime DLL on PATH.
+      # ASan build on MSVC would also need the ASan runtime DLL on PATH. Without ASan nothing defines the coverage
+      # section delimiters on MSVC (LNK2001 __start___sancov_cntrs, run 43431291987); fuzz/src/lib.rs does.
+      # A run that ends without libFuzzer's "Done N runs" line (a build or link error) counts as failed.
       - name: Fuzz every target
         run: |
           $failed = @()
           foreach ($t in (cargo +nightly fuzz list --fuzz-dir fuzz)) {
             New-Item -ItemType Directory -Force fuzz/work/$t | Out-Null
-            cargo +nightly fuzz run $t fuzz/work/$t fuzz/corpus/$t --fuzz-dir fuzz --sanitizer none -- -max_total_time=180 -max_len=65536
-            if ($LASTEXITCODE) { $failed += $t }
+            cargo +nightly fuzz run $t fuzz/work/$t fuzz/corpus/$t --fuzz-dir fuzz --sanitizer none -- -max_total_time=180 -max_len=65536 2>&1 | Tee-Object -Variable log
+            $code = $LASTEXITCODE
+            $done = $log | Select-String -Pattern '^Done \d+ runs' | Select-Object -Last 1
+            "$t exit=$code new_corpus=$((Get-ChildItem fuzz/work/$t -File).Count) $done" | Tee-Object -Append fuzz-summary.txt
+            if ($code -or -not $done) { $failed += $t }
           }
           if ($failed) { throw "fuzz targets failed: $($failed -join ', '); inputs in the fuzz-artifacts upload" }
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: fuzz-artifacts
-          path: fuzz/artifacts/
+          path: |
+            fuzz/artifacts/
+            fuzz-summary.txt
           if-no-files-found: ignore
           retention-days: 7
 
   soak:
     if: github.repository == 'CodingDiego/rexplorer'
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 100
     steps:
       - uses: actions/checkout@v7
       # The release toolchain (release.yml), so the soaked exe is built like the one that ships.
       - uses: dtolnay/rust-toolchain@1.99.1
       - run: cargo build --release --locked
-      - name: Soak, 30 minutes
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\soak.ps1 -Minutes 30 -Csv soak.csv
+      # Prints the operation counts and each resource's baseline, end and limit; fails under 300 rounds.
+      - name: Soak, 60 minutes
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\soak.ps1 -Minutes 60 -Csv soak.csv
       - uses: actions/upload-artifact@v4
         if: always()
         with:

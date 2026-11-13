@@ -30,9 +30,12 @@ jobs:
         run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke.ps1 -Hosted
       # Performance budgets (#48) on the same exe. A regression tripwire, not a performance claim: about 10x the
       # medians in scripts\bench-results.md (start ~190 ms, 100,000-file list ~183 ms, idle 0.0 %), because a shared
-      # runner is slower and noisier than the machine the script's defaults were set on.
+      # runner is slower and noisier than the machine the script's defaults were set on. Churn keeps the issue's
+      # 1 reload/s (the app's own one-second gate; 0.5-0.6 measured); the slowest UI-thread message gets 1000 ms
+      # (43-46 ms measured on 2026-11-13 on a quiet laptop, 69-11,542 ms on a busy one, a 100,000-file load's
+      # WM_ENUM_DONE; the issue's 100 ms is the script's default).
       - name: Performance budgets (hosted values)
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\budgets.ps1 -StartMs 2000 -ListMs 2000 -IdlePct 3
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\budgets.ps1 -StartMs 2000 -ListMs 2000 -IdlePct 3 -ChurnPerSec 1 -UiMs 1000
 
   # Builds with exactly the rust-version in Cargo.toml (read here, not repeated), so code or a dependency that needs a
   # newer Rust fails CI (#56).
