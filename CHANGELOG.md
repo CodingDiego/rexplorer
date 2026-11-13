@@ -8,7 +8,101 @@ a line under Unreleased. Sections up to 0.1.4 were rebuilt from git history and 
 
 Nothing yet.
 
-## 0.2.0 - 2026-11-11
+## 1.0.0-rc.1 - 2026-11-13
+
+A release candidate, published as a pre-release. Changes since 0.2.0. Most of them were run on copies of the release
+exe with real keyboard and mouse input on 2026-11-12 and 2026-11-13; `docs/EXPLORER-PARITY.md` says which rows were
+proven and how, and the release notes list what was not.
+
+**Changed.**
+- Backspace goes Back, as in Windows 11 Explorer. It went up to the parent folder before; Alt+Up still does that.
+- Long names in the address bar: each parent folder's crumb is capped at about 160 px (scaled with the display and
+  text size) and ends with "...", the current folder gets the rest of the space, and a trimmed crumb shows its full
+  name in a tooltip.
+- New > Shortcut selects the new shortcut without opening a rename, because the shortcut wizard names it.
+- The folder tree no longer replaces the sidebar: it sits right of it (or alone when the sidebar is off), and both
+  share one width. Ctrl+B toggles only the sidebar; More > Folder tree is a check item. A session that had both on
+  now shows both.
+- F4 opens the address bar with a dropdown of recent places, newest first (`cmd.address_history`). Ctrl+L and Alt+D
+  still open the plain bar.
+- Esc in the address bar closes the suggestion list first; a second Esc leaves the bar.
+- Tab and F6 leave the preview pane, and other shortcuts no longer fire from inside it (Ctrl+Z in a text preview no
+  longer undoes a file operation).
+
+**Added.**
+- Undo and redo of Keep-both copies (`x (2)`, `x - Copy`) and of pastes or drops answered with Skip (nothing to
+  undo), drops on Home tiles, items made by the context menu's New submenu, paste and drop in `--desktop-icons`, and
+  Delete in the `--desktop` helper (done inside Explorer, so Explorer's own Ctrl+Z on the desktop undoes it). Undo
+  touches only an item it can prove it made or moved.
+- Alt or F10 alone moves the focus to the command bar, and back.
+- Press and hold Back or Forward (or Down on a focused one) opens the history menu.
+- Home: the Recent, Favorites and Shared pills are keyboard stops (Down from the tiles, Left and Right, Space or
+  Enter); a drag from Home shows the dragged entry's icon.
+- Dropping a tab on another rexplorer window moves it there.
+- Multi-volume .rar sets open from their first part; a middle part or a missing part gives a clear message, and a
+  member cut off by a missing part is not left half-written.
+- F2 or Rename inside a .rar explains that archives are read-only.
+- A native crash also gets a short `.txt` report (written at the next start), beside its minidump.
+- Right-to-left layout for a language file that declares `direction=rtl` under `[meta]`. No right-to-left
+  translation ships yet.
+- New text, in English and Spanish: `err.archive_readonly`, `err.rar_middle_volume`, `err.rar_volume_missing`.
+- Engineering: three more fuzz targets (search query, update response, session and folders files), seed corpora,
+  hostile-input tests; CI builds with the minimum supported Rust (`msrv` job) and runs the performance budgets on
+  every pull request; a weekly "Fuzz and soak" workflow; `#![deny(clippy::unwrap_used, clippy::expect_used)]` outside
+  tests in both crates; `budgets.ps1` times start to the first paint through window properties the app sets.
+
+**Fixes.**
+- Rename could rename the wrong file (data loss, present in 0.2.0). In a window with Back history, each character
+  typed in the rename box went Back, and Enter then renamed the item at the same position in the folder now shown.
+  Typing no longer navigates, and the rename always applies to the item it was opened on.
+- Libraries and .zip folders showed rows without names; library rows could not be opened and Ctrl+C on a zip member
+  did nothing.
+- Opening Libraries in an icon view could crash rexplorer. The thumbnail and preview workers now run in
+  single-threaded apartments.
+- The address text being typed was replaced by the current path whenever the folder refreshed.
+- A rename box stayed open after its file was deleted by another program, and closing it then raised an error box.
+  The box now closes and nothing is renamed.
+- In the Recycle Bin, the Name column showed each item's full original path.
+- A click on a sidebar row left the keyboard focus in the file list.
+- Packaged-app menu entries (such as Open with Code) appeared on Recycle Bin items.
+- Every undo of a delete left an orphan `$I` record in the Recycle Bin.
+- A drop that did nothing (a right-drag menu closed with Esc) was recorded, so the next Ctrl+Z could act on it.
+- Undo of a copied folder checks the folder's file id instead of trusting its name.
+- Search results lost the chosen sort on F5 and after an undo.
+- The folder tree did not follow the current folder past the first level.
+- Hardening: one internal window message no longer carries a pointer, a cross-thread call can no longer reach the
+  Home drag image, and an oversized crash record is deleted unread.
+- New from the context menu on the Desktop root could open the rename on another item (unit-tested; New was run
+  live in an ordinary folder).
+- A library's own rows could still show without names: the rebind to the window thread only probed one kind of name.
+- Opening a Quick Access folder from the folder tree pushed two history entries.
+- Undo took a moved folder for a copy, and recycled it, when something had re-created its old path. A landed item is
+  now a copy only while its source is unchanged; the moved source itself is only ever moved back; a copied empty
+  folder is never undone.
+- The update notice could not parse a pre-release version, so a release candidate would never have announced 1.0.0.
+- The Recycle Bin, This PC and Network are sorted off the window thread again. A trimmed crumb's tooltip could show
+  the previous folder's name. Empty text no longer reaches the text measuring calls in the address bar and Folder
+  Options.
+- Not run on the exe: the address text is redacted after a failed refresh; packaged-app entries are also kept off
+  Recycle Bin items on shares, `\\?\` paths and mounted volumes.
+- Release: a tag with a hyphen is published as a pre-release and not as latest; the weekly fuzz job pins its tool.
+- `soak.ps1` allows GDI growth only for the pastes made between its baseline and end samples.
+- The winget manifests carry the real v0.2.0 URLs and hashes (schema 1.6.0).
+
+**Known gaps.** As in the release notes: 103 behaviours of `docs/EXPLORER-PARITY.md` were proven on the exe (and 3
+more on a scratch install base), 13 are built but not proven, 4 are partial.
+- Drops onto the folder tree are not undoable. Ctrl+Z after a cancelled folder copy leaves the partial folder (undo
+  never deletes what it cannot prove it made). After Delete in search results no row is selected.
+- After Ctrl+C in rexplorer, Ctrl+C in Windows Explorer did not replace the clipboard (seen twice, cause unknown).
+  Click-again rename puts the caret at the click instead of selecting the name.
+- Not run for this release: the 15-minute soak, the local smoke and budget scripts (CI runs smoke and budgets), the
+  fuzz targets, and multi-volume .rar (no WinRAR fixture; two tests are ignored).
+- Several internal window messages still carry a pointer another program in the same session could forge; undo does
+  not re-check a file's identity while the shell's confirmation dialog is open (see `SECURITY.md`).
+- FTP stays deferred (#36). The exe is not code-signed (#59). The winget submission is pending (#63). No app icon yet
+  (#18).
+
+## 0.2.0 - 2026-11-12
 
 Changes since 0.1.4. The release notes of this version (`.github/release-notes.md` at the tag) carry its Known gaps;
 `docs/EXPLORER-PARITY.md` marks what was proven on the exe (WORKS) and what is built but not yet tried (UNVERIFIED).

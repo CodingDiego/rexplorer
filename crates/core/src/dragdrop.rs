@@ -361,7 +361,10 @@ impl IDropTarget_Impl for DropForwarder_Impl {
             }
         };
         if let Some(a) = after {
-            a(if r.is_ok() { unsafe { *pdweffect } } else { DROPEFFECT_NONE });
+            let shown = if r.is_ok() { unsafe { *pdweffect } } else { DROPEFFECT_NONE };
+            // An optimized move ends with NONE and says what it did only in "Performed DropEffect".
+            let performed = pdataobj.as_ref().map_or(0, performed_effect);
+            a(if shown == DROPEFFECT_NONE && r.is_ok() { DROPEFFECT(performed) } else { shown });
         }
         r
     }

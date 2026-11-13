@@ -31,7 +31,7 @@ use windows::Win32::UI::Controls::{NMHDR, SetScrollInfo, WC_EDITW, WM_MOUSELEAVE
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetFocus, GetKeyState, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VIRTUAL_KEY, VK_A, VK_CONTROL, VK_DOWN, VK_END,
-    VK_ESCAPE, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_UP,
+    VK_DELETE, VK_ESCAPE, VK_F2, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_UP,
 };
 use windows::Win32::UI::Shell::Common::SHELLDETAILS;
 use windows::Win32::UI::Shell::{DefSubclassProc, IShellFolder, IShellFolder2, SetWindowSubclass};
@@ -457,6 +457,25 @@ fn key_select(selected: &mut [bool], anchor: &mut Option<usize>, to: usize, ctrl
     }
 }
 
+/// Whether Up/Down from entry `focus` goes to the filter pills, which sit between the tiles and the rows: Up from
+/// the first row, Down from the last row of tiles.
+fn to_pills(n: usize, tiles: usize, per_row: usize, focus: Option<usize>, key: VIRTUAL_KEY) -> bool {
+    match (focus, key) {
+        (Some(f), VK_UP) => f == tiles && f < n,
+        (Some(f), VK_DOWN) => f < tiles && f / per_row.max(1) == (tiles - 1) / per_row.max(1),
+        _ => false,
+    }
+}
+
+/// The entry Up/Down leaves the pills for: the first tile of the last row of tiles, or the first row.
+fn from_pills(n: usize, tiles: usize, per_row: usize, key: VIRTUAL_KEY) -> Option<usize> {
+    match key {
+        VK_UP => tiles.checked_sub(1).map(|t| t - t % per_row.max(1)),
+        VK_DOWN => (tiles < n).then_some(tiles),
+        _ => None,
+    }
+}
+
 // ---- window -------------------------------------------------------------------------------------------
 
 struct Fonts {
@@ -492,6 +511,8 @@ struct State {
     /// Per entry.
     selected: Vec<bool>,
     focus: Option<usize>,
+    /// The filter pill the keyboard is on, instead of an entry.
+    pill: Option<usize>,
     /// Where Shift+arrows extend from.
     anchor: Option<usize>,
     typed: String,
@@ -588,6 +609,7 @@ pub fn create(parent: HWND, id: usize) -> Result<HWND> {
             icon_timer: false,
             selected: Vec::new(),
             focus: None,
+            pill: None,
             anchor: None,
             typed: String::new(),
             typed_at: 0,
@@ -727,6 +749,11 @@ pub fn set_filter(hwnd: HWND, f: Filter) {
 
 pub fn filter(hwnd: HWND) -> Filter {
     unsafe { state(hwnd).map(|s| s.filter).unwrap_or_default() }
+}
+
+/// Whether the keyboard is on a filter pill rather than an entry.
+pub fn on_pill(hwnd: HWND) -> bool {
+    unsafe { state(hwnd).is_some_and(|s| s.pill.is_some()) }
 }
 
 /// The table's column titles (name first) and its sort: column and descending; None is the shell's order.
@@ -1030,7 +1057,11 @@ fn part(nt: usize, count: usize, i: usize) -> Option<Part> {
 
 /// Tells screen readers the focused entry and whether it is selected. Call after the change, before notifying.
 unsafe fn announce(hwnd: HWND, s: &State) {
-    if let Some(e) = s.focus.filter(|&e| e < s.count()) {
+    if let Some(p) = s.pill {
+        if GetFocus() == hwnd {
+            access::event(EVENT_OBJECT_FOCUS, hwnd, Some(s.content.tiles.len() + p));
+        }
+    } else if let Some(e) = s.focus.filter(|&e| e < s.count()) {
         let i = acc_index(s.content.tiles.len(), e);
         if GetFocus() == hwnd {
             access::event(EVENT_OBJECT_FOCUS, hwnd, Some(i));
@@ -1052,6 +1083,51 @@ unsafe fn pick_pill(hwnd: HWND, s: &mut State, i: usize) {
     notify(hwnd, HN_SELCHANGE, 0);
 }
 
+/// A key while the keyboard is on pill `p`: Left/Right move between the pills, Space/Enter pick one, Up/Down leave
+/// for the tiles above or the rows below.
+unsafe fn pill_key(hwnd: HWND, s: &mut State, p: usize, key: VIRTUAL_KEY, ctrl: bool, shift: bool) {
+    match key {
+        VK_LEFT => s.pill = Some(p.saturating_sub(1)),
+        VK_RIGHT => s.pill = Some((p + 1).min(PILLS.len() - 1)),
+        VK_SPACE | VK_RETURN => return pick_pill(hwnd, s, p),
+        _ => {
+            let Some(e) = from_pills(s.count(), s.content.tiles.len(), current_layout(hwnd, s).per_row, key) else { return };
+            s.pill = None;
+            key_select(&mut s.selected, &mut s.anchor, e, ctrl, shift);
+            s.focus = Some(e);
+            ensure_visible(hwnd, s, e);
+        }
+    }
+    let _ = InvalidateRect(Some(hwnd), None, false);
+    announce(hwnd, s);
+    if s.pill.is_none() {
+        notify(hwnd, HN_SELCHANGE, 0);
+    }
+}
+
+/// The shell's drag image helper asks the window a drag starts from for its picture (DI_GETDRAGIMAGE).
+fn drag_image_message() -> u32 {
+    static ID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *ID.get_or_init(|| unsafe { RegisterWindowMessageW(w!("ShellGetDragImage")) })
+}
+
+/// Answers DI_GETDRAGIMAGE with a copy of the dragged entry's icon (the helper owns it), the pointer at its center.
+/// shortcut: one icon for any number of entries; Explorer stacks several and adds a count.
+unsafe fn drag_image(s: &State, di: &mut windows::Win32::UI::Shell::SHDRAGIMAGE) -> bool {
+    let e = s.focus.filter(|&e| s.selected.get(e) == Some(&true)).or_else(|| s.selected.iter().position(|&b| b));
+    let Some(bmp) = e.and_then(|e| s.icon(e)) else { return false };
+    let Ok(copy) = CopyImage(windows::Win32::Foundation::HANDLE(bmp.0), IMAGE_BITMAP, 0, 0, LR_CREATEDIBSECTION) else { return false };
+    let mut bm = BITMAP::default();
+    GetObjectW(HGDIOBJ(copy.0), size_of::<BITMAP>() as i32, Some(&mut bm as *mut _ as *mut c_void));
+    let (w, h) = (bm.bmWidth, bm.bmHeight.abs());
+    di.sizeDragImage = windows::Win32::Foundation::SIZE { cx: w, cy: h };
+    di.ptOffset = POINT { x: w / 2, y: h / 2 };
+    di.hbmpDragImage = HBITMAP(copy.0);
+    // CLR_NONE: the bitmap's own alpha, no color key.
+    di.crColorKey = COLORREF(0xFFFF_FFFF);
+    true
+}
+
 /// Reads only (no layout caching, no scroll sync): a client may ask at any time.
 unsafe fn acc_tree(hwnd: HWND, s: &State, t: &mut access::Tree) {
     let l = current_layout(hwnd, s);
@@ -1060,7 +1136,7 @@ unsafe fn acc_tree(hwnd: HWND, s: &State, t: &mut access::Tree) {
     t.name = tr("home.window_name").into();
     t.role = ROLE_SYSTEM_LIST;
     t.focusable = true;
-    t.focus = s.focus.map(|e| acc_index(nt, e));
+    t.focus = s.pill.map(|p| nt + p).or(s.focus.map(|e| acc_index(nt, e)));
     let item = |e: usize| {
         let x = s.entry(e)?;
         let description = if e < nt { x.subtitle.clone() } else { std::iter::once(&x.subtitle).chain(&x.cells).filter(|c| !c.is_empty()).cloned().collect::<Vec<_>>().join(", ") };
@@ -1273,11 +1349,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_LBUTTONDOWN | WM_RBUTTONDOWN => {
             cancel_rename(hwnd, s);
             s.press = None;
+            s.pill = None;
             let _ = SetFocus(Some(hwnd));
             if msg == WM_LBUTTONDOWN {
                 let (x, y) = (lparam.0 as i16 as i32, (lparam.0 >> 16) as i16 as i32 + s.scroll);
                 let l = current_layout(hwnd, s);
                 if let Some(i) = l.pills.iter().position(|p| x >= p.left && x < p.right && y >= p.top && y < p.bottom) {
+                    // The keyboard carries on from the clicked pill.
+                    s.pill = Some(i);
                     pick_pill(hwnd, s, i);
                     return LRESULT(0);
                 }
@@ -1343,7 +1422,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         // Shift+F10 and the Menu key: the focused entry's menu, else the background's.
         WM_CONTEXTMENU if lparam.0 as i32 == -1 => {
-            let index = s.focus.filter(|&e| s.selected[e]).and_then(|e| s.entry(e)).map_or(usize::MAX, |x| x.index);
+            let index = s.focus.filter(|&e| s.pill.is_none() && s.selected[e]).and_then(|e| s.entry(e)).map_or(usize::MAX, |x| x.index);
             notify(hwnd, HN_CONTEXT_KEY, index);
         }
         WM_RBUTTONUP => {
@@ -1353,11 +1432,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_KEYDOWN => {
             cancel_rename(hwnd, s);
-            let key = VIRTUAL_KEY(wparam.0 as u16);
+            let key = crate::rtl::key(VIRTUAL_KEY(wparam.0 as u16));
             let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
             let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
             match key {
+                VK_UP | VK_DOWN | VK_LEFT | VK_RIGHT | VK_SPACE | VK_RETURN if s.pill.is_some() => pill_key(hwnd, s, s.pill.unwrap_or_default(), key, ctrl, shift),
+                VK_UP | VK_DOWN if to_pills(s.count(), s.content.tiles.len(), current_layout(hwnd, s).per_row, s.focus, key) => {
+                    s.pill = PILLS.iter().position(|p| p.0 == s.filter);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                    announce(hwnd, s);
+                }
                 VK_UP | VK_DOWN | VK_LEFT | VK_RIGHT | VK_HOME | VK_END | VK_PRIOR | VK_NEXT => {
+                    s.pill = None;
                     let (n, nt) = (s.count(), s.content.tiles.len());
                     let l = current_layout(hwnd, s);
                     let to = match key {
@@ -1411,6 +1497,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         notify(hwnd, HN_ACTIVATE, index);
                     }
                 }
+                // On a pill the selection is not what the keyboard is on: no delete or rename of it.
+                VK_DELETE | VK_F2 if s.pill.is_some() => {}
                 _ => notify(hwnd, HN_KEYDOWN, key.0 as usize),
             }
         }
@@ -1423,6 +1511,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let start = if needle.chars().count() == 1 { s.focus.map_or(0, |f| f + 1) } else { s.focus.unwrap_or(0) };
                 let found = crate::list::find_prefix(s.count(), start, true, &needle, |e| s.entry(e).map(|x| x.name.clone()).unwrap_or_default());
                 if let Some(e) = found {
+                    s.pill = None;
                     select_only(s, Some(e));
                     ensure_visible(hwnd, s, e);
                     let _ = InvalidateRect(Some(hwnd), None, false);
@@ -1435,10 +1524,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if msg == WM_KILLFOCUS {
                 cancel_rename(hwnd, s);
             }
+            if msg == WM_SETFOCUS && s.focus.is_none() && s.pill.is_none() {
+                // The focus always shows: on the first entry, else (an empty page) on the active pill.
+                if s.count() > 0 {
+                    s.focus = Some(0);
+                } else {
+                    s.pill = PILLS.iter().position(|p| p.0 == s.filter);
+                }
+            }
             let _ = InvalidateRect(Some(hwnd), None, false);
             if msg == WM_SETFOCUS {
                 announce(hwnd, s);
             }
+        }
+        // The drag helper asks from this thread; a sender elsewhere could aim the pointer anywhere.
+        _ if msg == drag_image_message() && lparam.0 != 0 && !windows::Win32::UI::WindowsAndMessaging::InSendMessage().as_bool() => {
+            return LRESULT(drag_image(s, &mut *(lparam.0 as *mut windows::Win32::UI::Shell::SHDRAGIMAGE)) as isize);
         }
         _ => {
             let r = DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -1457,7 +1558,7 @@ unsafe fn text(dc: HDC, s: &str, r: RECT, flags: DRAW_TEXT_FORMAT) {
     }
     let mut w: Vec<u16> = s.encode_utf16().collect();
     let mut r = r;
-    DrawTextW(dc, &mut w, &mut r, flags | DT_NOPREFIX);
+    DrawTextW(dc, &mut w, &mut r, crate::rtl::text(flags | DT_NOPREFIX));
 }
 
 unsafe fn draw_bitmap(dc: HDC, bmp: HBITMAP, x: i32, y: i32, size: i32) {
@@ -1471,6 +1572,7 @@ unsafe fn draw_bitmap(dc: HDC, bmp: HBITMAP, x: i32, y: i32, size: i32) {
     let (dw, dh) = ((w as f64 * k) as i32, (h as f64 * k) as i32);
     let src = CreateCompatibleDC(Some(dc));
     let old = SelectObject(src, bmp.into());
+    crate::rtl::match_dc(src, dc);
     let bf = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
     let _ = AlphaBlend(dc, x + (size - dw) / 2, y + (size - dh) / 2, dw, dh, src, 0, 0, w, h, bf);
     SelectObject(src, old);
@@ -1488,6 +1590,7 @@ unsafe fn paint(hwnd: HWND, s: &mut State) {
     let dc = CreateCompatibleDC(Some(wdc));
     let bmp = CreateCompatibleBitmap(wdc, cw, ch);
     let old_bmp = SelectObject(dc, bmp.into());
+    crate::rtl::match_dc(dc, wdc);
     let t = &s.theme;
     let bg = CreateSolidBrush(COLORREF(t.surface));
     FillRect(dc, &rc, bg);
@@ -1506,7 +1609,7 @@ unsafe fn paint(hwnd: HWND, s: &mut State) {
             theme::hot_outline(dc, r, t, radius, dpi);
         }
         // A selected entry shows its fill; the outline marks one Ctrl+arrows moved to without selecting (always in a contrast theme).
-        if focused && s.focus == Some(e) && (t.contrast.is_some() || !picked(e)) {
+        if focused && s.pill.is_none() && s.focus == Some(e) && (t.contrast.is_some() || !picked(e)) {
             SetTextColor(dc, COLORREF(t.text));
             SetBkColor(dc, COLORREF(t.surface));
             let _ = DrawFocusRect(dc, r);
@@ -1568,13 +1671,18 @@ unsafe fn paint(hwnd: HWND, s: &mut State) {
 
     // The pills (the active one filled), the header, the rows.
     SelectObject(dc, ui.into());
-    for (p, (f, label, _)) in l.pills.iter().zip(PILLS) {
+    for (i, (p, (f, label, _))) in l.pills.iter().zip(PILLS).enumerate() {
         let p = dy(*p);
         if f == s.filter {
             theme::fill_round(dc, &p, t.selection, (p.bottom - p.top) / 2);
         }
         SetTextColor(dc, COLORREF(if f == s.filter { theme::on_selection(t, t.text) } else { t.secondary_text }));
         text(dc, tr(label), p, one | DT_CENTER);
+        if focused && s.pill == Some(i) {
+            SetTextColor(dc, COLORREF(t.text));
+            SetBkColor(dc, COLORREF(t.surface));
+            let _ = DrawFocusRect(dc, &RECT { left: p.left + 1, top: p.top + 1, right: p.right - 1, bottom: p.bottom - 1 });
+        }
     }
     let header = dy(l.header);
     let cols = column_lefts(header.left, header.right, s.content.columns.len().max(1));
@@ -1936,6 +2044,78 @@ mod tests {
                 assert_eq!(part(nt, 6, nt + p), Some(Part::Pill(p)));
             }
             assert_eq!(part(nt, 6, 9), None);
+        }
+    }
+
+    #[test]
+    fn up_and_down_cross_the_pills() {
+        // 7 tiles in rows of 3 (0 1 2 / 3 4 5 / 6), then 2 rows (7, 8).
+        assert!(to_pills(9, 7, 3, Some(6), VK_DOWN), "the last row of tiles");
+        assert!(!to_pills(9, 7, 3, Some(3), VK_DOWN));
+        assert!(to_pills(9, 7, 3, Some(7), VK_UP), "the first row");
+        assert!(!to_pills(9, 7, 3, Some(8), VK_UP) && !to_pills(9, 7, 3, None, VK_UP) && !to_pills(9, 7, 3, Some(6), VK_LEFT));
+        assert!(to_pills(7, 7, 3, Some(6), VK_DOWN), "no rows: the pills still take the focus");
+        assert!(!to_pills(2, 0, 3, Some(0), VK_DOWN), "no tiles: Down stays in the rows");
+        assert_eq!((from_pills(9, 7, 3, VK_UP), from_pills(9, 7, 3, VK_DOWN)), (Some(6), Some(7)));
+        assert_eq!((from_pills(9, 6, 3, VK_UP), from_pills(6, 6, 3, VK_DOWN), from_pills(2, 0, 3, VK_UP)), (Some(3), None, None));
+    }
+
+    #[test]
+    fn pills_by_keyboard_and_the_drag_image() {
+        let _com = ComInit::sta();
+        let abs = ShellFolder::parse(std::env::temp_dir().to_str().unwrap()).unwrap().pidl;
+        let entry = |index: usize, recent: bool| Entry {
+            index,
+            key: format!("C:/{index}"),
+            name: format!("e{index}"),
+            subtitle: String::new(),
+            cells: Vec::new(),
+            sort_keys: Vec::new(),
+            abs: abs.clone(),
+            pinned: !recent,
+            recent,
+            shared: false,
+        };
+        unsafe {
+            let hinst = GetModuleHandleW(None).unwrap().into();
+            let wc = WNDCLASSW { lpfnWndProc: Some(acc_parent), hInstance: hinst, lpszClassName: w!("RexHomePillParent"), ..Default::default() };
+            RegisterClassW(&wc);
+            let parent = CreateWindowExW(WINDOW_EX_STYLE(0), w!("RexHomePillParent"), PCWSTR::null(), WS_OVERLAPPEDWINDOW, 0, 0, 1000, 700, None, None, Some(hinst), None).unwrap();
+            let h = create(parent, 9).unwrap();
+            let _ = MoveWindow(h, 0, 0, 956, 600, false);
+            set_content(h, Content { columns: vec!["Name".into()], tiles: vec![entry(100, false)], rows: vec![entry(101, true), entry(102, false)] });
+            let key = |k: VIRTUAL_KEY| SendMessageW(h, WM_KEYDOWN, Some(WPARAM(k.0 as usize)), None);
+            SendMessageW(h, WM_SETFOCUS, None, None);
+            assert_eq!((state(h).unwrap().focus, state(h).unwrap().pill), (Some(0), None), "the focus shows on the first entry");
+            key(VK_DOWN);
+            assert_eq!(state(h).unwrap().pill, Some(0), "Down from the tiles: the active pill");
+            key(VK_RIGHT);
+            ACC_NOTES.with(|n| n.borrow_mut().clear());
+            key(VK_SPACE);
+            assert_eq!(filter(h), Filter::Favorites);
+            assert_eq!(ACC_NOTES.with(|n| n.borrow().first().copied()), Some((HN_FILTER, 1)));
+            assert_eq!(state(h).unwrap().pill, Some(1), "Space keeps the keyboard on the pill");
+            assert!(on_pill(h));
+            ACC_NOTES.with(|n| n.borrow_mut().clear());
+            key(VK_DELETE);
+            assert!(ACC_NOTES.with(|n| n.borrow().is_empty()), "Delete on a pill leaves the selection alone");
+            key(VK_DOWN);
+            assert_eq!((state(h).unwrap().pill, selection(h).0), (None, vec![102]), "Down: the first row, selected");
+            key(VK_UP);
+            assert_eq!(state(h).unwrap().pill, Some(1));
+            key(VK_UP);
+            assert_eq!(selection(h).0, vec![100], "Up from the pills: the tiles");
+            // The drag image is a copy of the dragged entry's icon.
+            let (icon, _) = crate::views::dib(40, 40).unwrap();
+            state(h).unwrap().icons[0] = Some(icon);
+            let mut di = windows::Win32::UI::Shell::SHDRAGIMAGE::default();
+            assert_eq!(SendMessageW(h, drag_image_message(), None, Some(LPARAM(&mut di as *mut _ as isize))).0, 1);
+            assert_eq!((di.sizeDragImage.cx, di.sizeDragImage.cy, di.ptOffset.x), (40, 40, 20));
+            assert!(!di.hbmpDragImage.is_invalid() && di.hbmpDragImage != icon, "a copy: the helper deletes it");
+            let _ = DeleteObject(di.hbmpDragImage.into());
+            set_selection(h, &[], None);
+            assert_eq!(SendMessageW(h, drag_image_message(), None, Some(LPARAM(&mut di as *mut _ as isize))).0, 0, "nothing selected");
+            DestroyWindow(parent).unwrap();
         }
     }
 

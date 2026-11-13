@@ -1,7 +1,8 @@
 # Architecture
 
-An overview for contributors. File and line references are to the tree as of 2026-11-10 and drift; search for the
-names if a line has moved. For what the program does, see the README; for features still in flight, see the release
+An overview for contributors. File and line references are to the tree as of 2026-11-10 and drift (the 2026-11-13
+round moved many lines in `main.rs`; its own additions are named, not numbered); search for the names if a line has
+moved. For what the program does, see the README; for features still in flight, see the release
 notes.
 
 ## Crates
@@ -31,19 +32,24 @@ drag and drop and the clipboard).
 
 The UI thread is a single-threaded apartment with OLE: `ComInit::ole()` at `crates/app/src/main.rs:406`. The
 `--desktop-icons` process does the same on its own UI thread (`desktop_icons.rs:279`), and so does the `--desktop`
-menu process (`desktop.rs:90`). Worker threads use MTA unless a shell object they need insists on an STA.
+menu process (`desktop.rs:90`). Worker threads use MTA unless a shell object they need insists on an STA. The
+thumbnail and preview workers use an STA since 1.0.0-rc.1: extracting a library item's thumbnail in an MTA crashed
+the process. Apartment-threaded folders (the Libraries root, zip folders) answer `RPC_E_WRONG_THREAD` when the
+folder load's MTA object is used from the UI thread, so the UI thread rebinds such a folder itself
+(`core/folder.rs` `ShellFolder::adopt`), and libraries and archive folders are sorted on the UI thread
+(`nav.rs` `sorts_on_ui_thread`).
 
 Every thread the program starts (production code; test threads are left out):
 
 | Thread | Spawned at | Apartment | What it does |
 |---|---|---|---|
 | UI | process main | STA + OLE, `main.rs:406` | Window, message loop, all controls, all timers |
-| Folder load | `nav.rs:240` | MTA, `nav.rs:241` | Enumerates and sorts a folder; posts `WM_ENUM_DONE` |
+| Folder load | `nav.rs` (`navigate`) | MTA | Enumerates and sorts a folder (libraries and archive folders arrive unsorted and are sorted on the UI thread); posts `WM_ENUM_DONE` |
 | Search | `source.rs:634` | MTA, `source.rs:635` | Queries the Windows Search index (`core::wsearch`) where it covers the root, walks the rest; posts `WM_SEARCH_BATCH` |
-| Thumbnails/icons | `thumbs.rs:54` | MTA, `thumbs.rs:55` | One long-lived worker fed by a channel; posts `WM_THUMB_DONE` |
+| Thumbnails/icons | `thumbs.rs` (`start`) | STA | One long-lived worker fed by a channel; posts `WM_THUMB_DONE` |
 | Sidebar rows | `panes.rs:299` | MTA, `panes.rs:301` | Builds the sidebar rows; posts `WM_SIDEBAR_ROWS` |
 | Quick access pin/unpin | `panes.rs:379` | STA, `panes.rs:381` | Runs the shell verb on the Quick access folder (serialized by a lock); posts `WM_QUICK_ACCESS_DONE` |
-| Preview fetch | `preview_pane.rs:144` | MTA, `preview_pane.rs:148` | Loads text or an image for the preview pane; posts `PV_READY` |
+| Preview fetch | `preview_pane.rs` (`fetch`) | STA | Loads text or an image for the preview pane; posts `PV_READY` |
 | Image dimensions | `preview_pane.rs:692` | MTA, `preview_pane.rs:694` | Reads image size; posts `PV_DIMS` |
 | Archive member for the preview | `panes.rs:684` | none | Extracts one archive member, then posts `WM_TIMER` (`TIMER_PREVIEW`) so the preview asks again |
 | Home icons | `home.rs:680` | MTA, `home.rs:681` | Looks up Home page icons; posts to the Home control |
@@ -59,6 +65,7 @@ Every thread the program starts (production code; test threads are left out):
 | Mouse and keyboard hook | `desktop.rs:95` (`hook_thread`, `desktop.rs:106`) | none | `--desktop` mode only; low-level hooks with their own message loop |
 | Jump list | `main.rs:570` (`refresh_jump_list`) | STA, `main.rs:572` | Rewrites the taskbar jump list after a navigation, one at a time |
 | Crash test | `main.rs:398` | none | Only when `REXPLORER_CRASH_AFTER_MS` is set |
+| Tab hand-off | `nav.rs` `tear_tab` (2026-11-13) | none | A tab dropped on another rexplorer window: `instance::send` with the tab's place; holds only handles and owned strings; a refused tab's place goes into a queue in `nav.rs` and `WM_TAB_RETURN` is posted with no pointer |
 
 Other helper windows run on the UI thread, for example the in-place name editor and the palette; they are not
 separate threads. `notify.rs` has no thread of its own: the shell delivers change notifications to the window
@@ -103,6 +110,7 @@ Custom messages are `WM_APP + n`. The main window's:
 | `WM_UPDATE_FOUND` | `WM_APP+11` (`main.rs:76`) | Update check worker | `Box<String>`, the newer version |
 | `WM_ARCHIVE_PASSWORD` | `WM_APP+12` (`source.rs:417`) | Archive job worker | `Box<(PathBuf, bool, ArchiveJob)>`; the UI thread asks and runs the job again |
 | `WM_CRUMB_ITEMS` | `WM_APP+13` (`main.rs:78`) | Breadcrumb dropdown worker | `Box<CrumbItems>` |
+| `WM_TAB_RETURN` | `WM_APP+14` (`nav.rs`) | Tab hand-off worker | none; the places of refused tabs wait in a queue (`nav.rs` `take_returned`), and the UI thread drains it and reopens them |
 | `WM_HEARTBEAT` | `WM_APP+31` (`watchdog.rs:16`) | Hang watchdog | none; the UI thread answers by stamping the time |
 
 Others, owned by one control: `PV_READY` `WM_APP+0x51` and `PV_DIMS` `WM_APP+0x52` (preview pane,
@@ -113,6 +121,11 @@ Others, owned by one control: `PV_READY` `WM_APP+0x51` and `PV_DIMS` `WM_APP+0x5
 
 `WM_COPYDATA` carries the single-instance hand-off (see below). Controls tell their parent about user actions
 with `WM_NOTIFY` and a small struct (`NmTab`, `NmSidebar`, and so on); the parent reads it during the call.
+
+`WM_COMMAND` runs a command only when it comes from a menu or an accelerator, or is a plain click on one of
+rexplorer's toolbars (`main.rs` `is_command`). Child controls also send `WM_COMMAND` notifications: the list's
+rename edit has control id 1, the same number as the Back command, and before 1.0.0-rc.1 each character typed in
+it ran Back. A rename commit follows the item the edit was opened on, not its row (`list.rs`).
 
 ## Timers
 
@@ -135,8 +148,8 @@ All timers are `SetTimer` on the main window, handled in the main window procedu
 | `TIMER_COLUMNS` | 12 | 100 ms (`list.rs:998,1393`) | A column was resized or dragged: remember the layout |
 
 Controls and the desktop-icons window keep a few small timers of their own (for example `ICON_TIMER` and
-`RENAME_TIMER` in `home.rs`, `MARQUEE_TIMER` in `list.rs`, `HOVER_TIMER` in `tabs.rs`, `TIMER_RELOAD` in
-`desktop_icons.rs`).
+`RENAME_TIMER` in `home.rs`, `MARQUEE_TIMER` in `list.rs`, `HOVER_TIMER` in `tabs.rs`, `HOLD_TIMER` (press and
+hold on Back / Forward, 500 ms) in `toolbar.rs`, `TIMER_RELOAD` in `desktop_icons.rs`).
 
 ## Custom controls
 
@@ -173,7 +186,21 @@ dialog) and `RexOptList` inside `RexFolderOptions` (`folder_options.rs`). The fi
   (a value's prior type and bytes, keys, folders, files) before it is made, so a failure rolls back, and
   `--unregister` / `--uninstall` revert exactly what was recorded (uninstall gives back first).
   `scripts\restore-explorer.ps1` reverts the same records without the exe, with `known_keys()` as its fixed list.
-- Crash handling: `crash.rs` installs a handler that relaunches with `--recover`.
+- Crash handling: `crash.rs` installs a handler that relaunches with `--recover`. A native (SEH) crash writes a
+  fixed-size `.seh` record without touching the heap (`write_record`); the next start converts finished records into
+  `.txt` reports (`convert_seh_records`) before pruning old dumps.
+- Outside-observable signals: the main window carries the properties `rexplorer.painted` (tick count of the first
+  paint, kept), `rexplorer.loads` (finished folder loads) and `rexplorer.loadtick` (tick of the last load), set by
+  `instance::signal_painted` / `signal_loaded`. `scripts\budgets.ps1` reads them; keep them when changing paint or
+  load code.
+- Undo (`core/undo.rs`): every record carries what proves the item is ours: a file id (volume serial and file
+  index, read right after the operation) for rename, new items and moves; for a paste or drop (`Op::Transfer`), the
+  destination names taken before the shell ran and each source's size and time. An undo that cannot prove it does
+  nothing and beeps.
+- Right-to-left layout: `i18n::is_rtl` (a language file's `[meta]` `direction=rtl`) and `crates/app/src/rtl.rs`.
+  Anything new that paints into a memory DC calls `rtl::match_dc` after selecting the bitmap; anything that draws
+  words passes its DrawText flags through `rtl::text`; a menu anchored on a screen rectangle uses `rtl::menu_x`. The
+  helpers must not run before `i18n::init` in `main`, or the table freezes to English.
 
 ## Rules that keep the UI thread free
 

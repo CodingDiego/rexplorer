@@ -480,6 +480,29 @@ mod tests {
     }
 
     #[test]
+    fn hostile_session_and_folders_files() {
+        let big = "9".repeat(40);
+        let lone = String::from_utf16_lossy(&[0xD800, 0x61]);
+        for t in [
+            "a".repeat(1 << 20),
+            "=".repeat(100_000),
+            format!("tab={}\nactive={big}\ntree_width={big}\npreview_width=-{big}\nformat={big}", "t".repeat(1 << 20)),
+            format!("\0=\0\ntab=\0\n{lone}={lone}"),
+            format!("icons\t{big}\t1\t-\t0:100\tC:\\a\nicons\t3\t1\t{big}\t{big}:{big}\tC:\\b\nformat={big}"),
+            format!("icons\t3\t1\t-\t{}\tC:\\a", "1:5,".repeat(100_000)),
+            "\t".repeat(100_000),
+        ] {
+            let s = parse(&t);
+            assert!(s.active < s.tabs.len().max(1) && (120..=1200).contains(&s.tree_width) && (120..=1200).contains(&s.preview_width));
+            assert_eq!(format(&parse(&format(&s))), format(&s));
+            let (f, extra) = parse_folders(&t);
+            assert!(f.len() <= MAX_FOLDERS && f.iter().all(|(_, v)| v.cols.len() <= MAX_COLS));
+            let out = format_folders(&f, &extra);
+            assert_eq!(format_folders(&parse_folders(&out).0, &extra), out);
+        }
+    }
+
+    #[test]
     fn fuzz_folders_file_keeps_its_caps() {
         let mut parsed = 0;
         for seed in 0..500 {

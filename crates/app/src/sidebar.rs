@@ -438,7 +438,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             s.hover = None;
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
-        WM_LBUTTONDOWN => s.pressed = row_at(hwnd, s, lparam),
+        WM_LBUTTONDOWN => {
+            // As Explorer's navigation pane: a click takes the keyboard focus, onto the row clicked.
+            s.pressed = row_at(hwnd, s, lparam);
+            if s.pressed.is_some() {
+                s.focus = s.pressed;
+            }
+            let _ = InvalidateRect(Some(hwnd), None, false);
+            let _ = SetFocus(Some(hwnd));
+        }
         WM_LBUTTONUP | WM_RBUTTONUP => {
             let (picked, code) = if msg == WM_LBUTTONUP {
                 (s.pressed.take().filter(|&i| row_at(hwnd, s, lparam) == Some(i)), SN_PICK)
@@ -527,6 +535,7 @@ unsafe fn paint(hwnd: HWND, s: &mut State) {
     let dc = CreateCompatibleDC(Some(wdc));
     let bmp = CreateCompatibleBitmap(wdc, cw, ch);
     let old_bmp = SelectObject(dc, bmp.into());
+    crate::rtl::match_dc(dc, wdc);
     let t = &s.theme;
     let bg = CreateSolidBrush(COLORREF(t.background));
     FillRect(dc, &rc, bg);
@@ -548,7 +557,7 @@ unsafe fn paint(hwnd: HWND, s: &mut State) {
             SetTextColor(dc, COLORREF(t.secondary_text));
             let mut hr = RECT { left: 2 * inset, top: top - scale(HEADER, tdpi), right: cw - inset, bottom: top - scale(4, tdpi) };
             let mut text: Vec<u16> = row.section.encode_utf16().collect();
-            DrawTextW(dc, &mut text, &mut hr, DT_SINGLELINE | DT_BOTTOM | DT_NOPREFIX | DT_END_ELLIPSIS);
+            DrawTextW(dc, &mut text, &mut hr, crate::rtl::text(DT_SINGLELINE | DT_BOTTOM | DT_NOPREFIX | DT_END_ELLIPSIS));
             SelectObject(dc, font.into());
         }
         let pill = RECT { left: inset, top, right: cw - inset, bottom };
@@ -559,7 +568,7 @@ unsafe fn paint(hwnd: HWND, s: &mut State) {
             theme::hot_outline(dc, &pill, t, sc(6), dpi);
         }
         if let Some(h) = row.icon {
-            let _ = DrawIconEx(dc, pill.left + inset, top + (bottom - top - icon) / 2, h, icon, icon, 0, None, DI_NORMAL);
+            let _ = DrawIconEx(dc, pill.left + inset, top + (bottom - top - icon) / 2, h, icon, icon, 0, None, DI_NORMAL | DI_NOMIRROR);
         }
         SetTextColor(dc, COLORREF(if s.selected == Some(i) { theme::on_selection(t, t.text) } else { t.text }));
         let mut lr = RECT { left: pill.left + inset + icon + inset, top, right: pill.right - inset, bottom };
@@ -774,6 +783,7 @@ mod tests {
             SendMessageW(sb, WM_LBUTTONDOWN, Some(WPARAM(1)), Some(LPARAM(10 | (y << 16))));
             SendMessageW(sb, WM_LBUTTONUP, Some(WPARAM(0)), Some(LPARAM(10 | (y << 16))));
             assert_eq!(ACC_NOTES.with(|n| n.borrow().clone()), [(SN_PICK, 1)], "the same record as a click");
+            assert_eq!(state(sb).unwrap().focus, Some(1), "a click moves the keyboard to the row clicked");
             let hk = hook();
             select(sb, "C:\\");
             assert!(hk.take().contains(&(EVENT_OBJECT_SELECTION, sb, 2)));

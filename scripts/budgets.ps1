@@ -1,8 +1,8 @@
 # rexplorer performance budgets (#48). Windows PowerShell 5.1. Times three things from outside the process and
 # exits 1 when a median is over its budget, else 0:
-#   start  process start to its first visible top-level window, on an empty folder       (-StartMs, default 400)
+#   start  process start to the window's first paint, on an empty folder                 (-StartMs, default 400)
 #   list   an open window sent to %TEMP%\rexplorer-bench (100,000 empty files, made once if missing, shared with
-#          smoke.ps1) until its list holds every file                                   (-ListMs, default 400)
+#          smoke.ps1) until the load finishes and its list holds every file             (-ListMs, default 400)
 #   idle   CPU time of the process over -IdleSeconds (default 10) once that listing settled, in % of one core
 #                                                                                        (-IdlePct, default 0.5)
 # The defaults are about twice the medians measured on 2026-11-11 (scripts\bench-results.md: start 185-195 ms,
@@ -11,6 +11,9 @@
 #   -Runs <n>    timed runs per budget after one warm-up (default 5)
 #   -Focus       brings the window to the front for the idle sample (the budget is for a focused window); it takes
 #                the foreground, so use it only on a machine nobody is typing on
+# Both are read from window properties the app sets on its main window (instance.rs: rexplorer.painted = tick count
+# of the first paint, rexplorer.loads = finished folder loads, rexplorer.loadtick = tick count of the last one), not
+# from titles. Budgets are parameters: CI passes looser values, e.g. -StartMs 1500 -ListMs 1500 -IdlePct 2.
 # The budgets were measured on a 12-core laptop; a shared CI runner is slower, so pass looser values there.
 # Safety: the app runs on a scratch %APPDATA% and %LOCALAPPDATA%, scratch install folder and scratch registry base, is driven only by
 # window messages to its own window and is killed by pid. No input is sent.
@@ -30,6 +33,8 @@ public static class B {
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowEx(IntPtr p, IntPtr a, string cls, string t);
   [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
   [DllImport("user32.dll", CharSet=CharSet.Unicode, EntryPoint="SendMessageW")] public static extern IntPtr SendText(IntPtr h, uint m, IntPtr w, string l);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern IntPtr GetProp(IntPtr h, string name);
+  public static long Prop(IntPtr h, string name) { return GetProp(h, name).ToInt64(); }
   [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
   [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr h, int id);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
@@ -81,7 +86,10 @@ try {
     $sw = [Diagnostics.Stopwatch]::StartNew(); $p = [Diagnostics.Process]::Start($psi)
     try {
       $ms = -1
-      while ($sw.ElapsedMilliseconds -lt 10000) { if ([B]::OfProcess([uint32]$p.Id) -ne [IntPtr]::Zero) { $ms = $sw.Elapsed.TotalMilliseconds; break } }
+      while ($sw.ElapsedMilliseconds -lt 10000) {
+        $w = [B]::OfProcess([uint32]$p.Id)
+        if ($w -ne [IntPtr]::Zero -and [B]::Prop($w, 'rexplorer.painted') -ne 0) { $ms = $sw.Elapsed.TotalMilliseconds; break }
+      }
     } finally { Stop-Rex $p }
     if ($i -gt 0 -and $ms -ge 0) { $start += $ms }
     Start-Sleep -Milliseconds 700
@@ -89,7 +97,7 @@ try {
   Judge 'start' $start $StartMs 'ms'
 
   # list: one window, sent to the big folder and back to the empty one; the clock runs from Enter (CMD_ENTER 7) in
-  # the address Edit (ID_ADDR 100, shown by CMD_ADDRESS 5) to LVM_GETITEMCOUNT = every file.
+  # the address Edit (ID_ADDR 100, shown by CMD_ADDRESS 5) until rexplorer.loads goes up and LVM_GETITEMCOUNT = every file.
   $p = [Diagnostics.Process]::Start((Start-Rex $Empty))
   try {
     $main = [IntPtr]::Zero; $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -100,8 +108,11 @@ try {
     function Go($path, $n) {
       $null = [B]::PostMessage($main, 0x111, [IntPtr]5, [IntPtr]::Zero); Start-Sleep -Milliseconds 300
       $null = [B]::SendText([B]::GetDlgItem($main, 100), 0x0C, [IntPtr]::Zero, $path)
+      $loads = [B]::Prop($main, 'rexplorer.loads')
       $sw = [Diagnostics.Stopwatch]::StartNew(); $null = [B]::PostMessage($main, 0x111, [IntPtr]7, [IntPtr]::Zero)
-      while ([int][B]::SendMessage($list, 0x1004, [IntPtr]::Zero, [IntPtr]::Zero) -ne $n) { if ($sw.ElapsedMilliseconds -gt 30000) { return -1 } }
+      while ([B]::Prop($main, 'rexplorer.loads') -le $loads -or [int][B]::SendMessage($list, 0x1004, [IntPtr]::Zero, [IntPtr]::Zero) -ne $n) {
+        if ($sw.ElapsedMilliseconds -gt 30000) { return -1 }
+      }
       $sw.Elapsed.TotalMilliseconds
     }
     $list100k = @()

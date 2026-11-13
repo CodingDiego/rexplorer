@@ -1,5 +1,5 @@
 # Draft for microsoft/winget-pkgs, not submitted yet.
-# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.10.0.schema.json
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
 
 PackageIdentifier: CodingDiego.rexplorer
 PackageVersion: 0.2.0
@@ -24,4 +24,4 @@ Tags:
   - files
 ReleaseNotesUrl: https://github.com/CodingDiego/rexplorer/releases/tag/v0.2.0
 ManifestType: defaultLocale
-ManifestVersion: 1.10.0
+ManifestVersion: 1.6.0

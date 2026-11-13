@@ -6,12 +6,13 @@ use windows::Win32::UI::WindowsAndMessaging::{ACCEL, ACCEL_VIRT_FLAGS, FALT, FCO
 use crate::*;
 
 /// The commands a `[keys]` line can name.
-const NAMES: [(&str, u16); 42] = [
+const NAMES: [(&str, u16); 43] = [
     ("cmd.back", CMD_BACK),
     ("cmd.forward", CMD_FORWARD),
     ("cmd.up", CMD_UP),
     ("cmd.refresh", CMD_REFRESH),
     ("cmd.address", CMD_ADDRESS),
+    ("cmd.address_history", CMD_ADDRESS_HISTORY),
     ("cmd.explorer", CMD_EXPLORER),
     ("cmd.enter", CMD_ENTER),
     ("cmd.escape", CMD_ESCAPE),
@@ -231,6 +232,15 @@ mod tests {
         let t = apply(&ACCELS, &[("cmd.undo".into(), "Alt+Z".into())]);
         let u: Vec<_> = t.iter().filter(|a| a.cmd == CMD_UNDO).map(|a| (a.fVirt.0, a.key)).collect();
         assert_eq!(u, vec![(FVIRTKEY.0 | FALT.0, VK_Z.0)]);
+    }
+
+    #[test]
+    fn f4_opens_the_address_history() {
+        let t = apply(&ACCELS, &[]);
+        let on_f4: Vec<u16> = t.iter().filter(|a| a.fVirt.0 == FVIRTKEY.0 && a.key == VK_F4.0).map(|a| a.cmd).collect();
+        assert_eq!(on_f4, [CMD_ADDRESS_HISTORY]);
+        let t = apply(&ACCELS, &[("cmd.address_history".into(), "Alt+H".into())]);
+        assert_eq!(t.iter().filter(|a| a.cmd == CMD_ADDRESS_HISTORY).map(|a| (a.fVirt.0, a.key)).collect::<Vec<_>>(), [(FVIRTKEY.0 | FALT.0, VK_H.0)]);
     }
 
     #[test]

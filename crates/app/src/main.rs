@@ -3,6 +3,8 @@
 //! All shell logic lives in rexplorer-core; this crate is plumbing and drawing.
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 #![allow(unsafe_op_in_unsafe_fn)]
+// A shell, COM or window failure must degrade, not panic (#28); tests may still unwrap.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 #[cfg(test)]
 mod acc_test;
@@ -24,6 +26,7 @@ mod nav;
 mod palette;
 mod panes;
 mod preview_pane;
+mod rtl;
 mod session;
 mod sidebar;
 mod source;
@@ -193,6 +196,8 @@ const CMD_UPDATE: u16 = 71;
 const CMD_PASTE_SHORTCUT: u16 = 72;
 /// Ctrl+Shift+Enter: the selected program through the shell's runas verb.
 const CMD_RUN_AS: u16 = 73;
+/// F4: the address bar with its history dropdown.
+const CMD_ADDRESS_HISTORY: u16 = 74;
 /// Two crashes this close together (seconds) send the folder to Windows Explorer instead of a third start.
 const CRASH_GUARD_SECS: u64 = 60;
 
@@ -232,7 +237,7 @@ const ACCELS: [ACCEL; 47] = [
     accel(FCONTROL.0 | FSHIFT.0, VK_7, CMD_VIEW_TILES),
     accel(FCONTROL.0 | FSHIFT.0, VK_8, CMD_VIEW_CONTENT),
     accel(FCONTROL.0 | FSHIFT.0, VK_N, CMD_NEW_FOLDER),
-    accel(0, VK_F4, CMD_ADDRESS),
+    accel(0, VK_F4, CMD_ADDRESS_HISTORY),
     accel(FCONTROL.0, VK_E, CMD_SEARCH),
     accel(0, VK_F3, CMD_SEARCH),
     accel(FCONTROL.0, VK_RETURN, CMD_OPEN_TAB),
@@ -268,6 +273,8 @@ pub(crate) struct App {
     home: HWND,
     /// After New > ...: start renaming the item that appears in this folder (parsing name, names before).
     new_item: Option<(String, std::collections::HashSet<String>)>,
+    /// The parsing name of the item the list's label edit was opened on; its commit renames only that item.
+    renaming: Option<String>,
     /// F11: the window placement and style to return to, while full screen.
     fullscreen: Option<(WINDOWPLACEMENT, isize)>,
     /// The rounded field the window paints behind the search Edit.
@@ -461,6 +468,7 @@ fn main() -> Result<()> {
             cmdbar: HWND::default(),
             home: HWND::default(),
             new_item: None,
+            renaming: None,
             fullscreen: None,
             search_field: RECT::default(),
             crumb_icon: HICON::default(),
@@ -492,7 +500,7 @@ fn main() -> Result<()> {
             undo: Default::default(),
         }));
         let hwnd = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
+            rtl::layout(),
             class,
             w!("rexplorer"),
             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
@@ -517,7 +525,7 @@ fn main() -> Result<()> {
         open_startup_tabs(app, &args);
         if args.recover && crash::has_dumps() {
             let q = HSTRING::from(rexplorer_core::i18n::tr("dlg.crash.saved"));
-            if MessageBoxW(Some(hwnd), PCWSTR(q.as_ptr()), w!("rexplorer"), MB_YESNO | MB_ICONINFORMATION) == IDYES {
+            if MessageBoxW(Some(hwnd), PCWSTR(q.as_ptr()), w!("rexplorer"), MB_YESNO | MB_ICONINFORMATION | rtl::message_box()) == IDYES {
                 nav::new_tab(app, nav::Target::Name(crash::crash_dir().to_string_lossy().into_owned()), true, None);
             }
         }
@@ -533,7 +541,11 @@ fn main() -> Result<()> {
             // search box's Enter / Escape keep their keys. Key messages go to the focus window, so their target
             // is the focus (and a key posted to one control is not taken for another).
             let focus = msg.hwnd;
-            let ours = focus == (*app).list || focus == (*app).home || focus == (*app).addr || focus == hwnd || pane_accel(app, &msg, focus);
+            // Esc while the address bar's suggestions show is theirs: it closes the list, and only the next one leaves the bar.
+            let addr = focus == (*app).addr && !(msg.message == WM_KEYDOWN && msg.wParam.0 == VK_ESCAPE.0 as usize && edit::suggestions_open());
+            // Enter on a Home filter pill picks the pill, not the entry selected before.
+            let home = focus == (*app).home && !(msg.message == WM_KEYDOWN && msg.wParam.0 == VK_RETURN.0 as usize && home::on_pill(focus));
+            let ours = focus == (*app).list || home || addr || focus == hwnd || pane_accel(app, &msg, focus);
             if ours && TranslateAcceleratorW(hwnd, accel_table, &msg) != 0 {
                 continue;
             }
@@ -615,7 +627,9 @@ unsafe fn pane_accel(app: *mut App, msg: &MSG, focus: HWND) -> bool {
     let undo_key = GetKeyState(VK_CONTROL.0 as i32) < 0 && matches!(VIRTUAL_KEY(msg.wParam.0 as u16), VK_Z | VK_Y);
     let panes = (*app).panes.tree.as_ref().is_some_and(|t| inside(t.hwnd())) || (!undo_key && source::browser_hwnd(app).is_some_and(inside));
     let bars = [(*app).nav, (*app).tools, (*app).cmdbar].contains(&focus);
-    bars || focus == (*app).search || focus == (*app).sidebar || focus == (*app).strip || focus == (*app).crumbs || (panes && !edit_keeps_tab(msg))
+    // The preview's text, reached by a click, is no trap: Tab and F6 leave it. Its other keys stay its own.
+    let leaves_preview = matches!(VIRTUAL_KEY(msg.wParam.0 as u16), VK_TAB | VK_F6) && inside((*app).panes.preview);
+    bars || leaves_preview || focus == (*app).search || focus == (*app).sidebar || focus == (*app).strip || focus == (*app).crumbs || (panes && !edit_keeps_tab(msg))
 }
 
 /// Tab in an Edit (a rename in the tree or the embedded view) is the Edit's: it commits and edits the next item.
@@ -715,7 +729,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if UPDATE.get().is_some() {
                     on_command(app, CMD_UPDATE);
                 }
-            } else {
+            } else if is_command(code, (lparam.0 != 0).then(|| GetDlgCtrlID(HWND(lparam.0 as *mut c_void)) as usize)) {
                 on_command(app, id as u16);
             }
         }
@@ -766,9 +780,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
+        WM_SYSCOMMAND if ui::is_bare_menu_key(wparam.0, lparam.0, GetKeyState(VK_SHIFT.0 as i32) < 0) => ui::focus_command_bar(app),
         WM_CONTEXTMENU if HWND(wparam.0 as *mut c_void) == (*app).nav => nav::on_nav_context(app, lparam),
         WM_ENUM_DONE => nav::on_enum_done(app, Box::from_raw(lparam.0 as *mut nav::EnumDone)),
         WM_CRUMB_ITEMS => ui::on_crumb_items(app, *Box::from_raw(lparam.0 as *mut ui::CrumbItems)),
+        nav::WM_TAB_RETURN => {
+            // The other window did not take the tab: it opens here again.
+            for name in nav::take_returned() {
+                let _ = MessageBeep(MB_OK);
+                nav::new_tab(app, nav::Target::Name(name), true, None);
+            }
+        }
         WM_UPDATE_FOUND => {
             let _ = UPDATE.set(*Box::from_raw(lparam.0 as *mut String));
             ui::update_status(app);
@@ -918,15 +940,7 @@ unsafe fn on_notify(app: *mut App, lparam: LPARAM) -> LRESULT {
             tabs::TN_MOVE => nav::tab_moved(app, nm.index, nm.to),
             tabs::TN_CONTEXT => nav::tab_menu(app, nm.index, None),
             tabs::TN_CONTEXT_KEY => nav::tab_menu(app, nm.index, Some(tabs::menu_point(from, nm.index))),
-            tabs::TN_TEAR => {
-                let name = (&(*app).tabs).get(nm.index).map(|t| t.name.clone()).unwrap_or_default();
-                // Only a place the command line can carry moves out (no FTP password, not empty); the last tab stays.
-                if (*app).tabs.len() > 1 && instance::new_window_args(&name).len() == 2 && instance::open_new_window(&name) {
-                    nav::close_tab(app, nm.index);
-                } else {
-                    let _ = MessageBeep(MB_OK);
-                }
-            }
+            tabs::TN_TEAR => nav::tear_tab(app, nm.index),
             _ => {}
         }
     } else if from == (*app).crumbs {
@@ -981,6 +995,7 @@ unsafe fn on_command(app: *mut App, cmd: u16) {
         CMD_UP => nav::go_up(app),
         CMD_REFRESH => nav::refresh(app),
         CMD_ADDRESS => ui::show_edit(app),
+        CMD_ADDRESS_HISTORY => ui::address_history(app),
         CMD_EXPLORER => {
             if let Some(s) = nav::source(app) {
                 let _ = open_in_explorer(&s.explorer_name());
@@ -1006,8 +1021,7 @@ unsafe fn on_command(app: *mut App, cmd: u16) {
         }
         CMD_ESCAPE => {
             if GetFocus() == addr {
-                // shortcut: Explorer's first Escape only closes the suggestion dropdown; ours leaves the bar at once.
-                // Losing focus hides the Edit and restores its text.
+                // Losing focus hides the Edit and restores its text. An Esc that closes the suggestions never gets here.
                 let _ = SetFocus(Some(ui::view_hwnd(app)));
             } else {
                 if !source::cancel_search(app) {
@@ -1117,7 +1131,7 @@ unsafe fn window_text(hwnd: HWND) -> String {
 
 unsafe fn message(hwnd: HWND, text: &str) {
     let h = HSTRING::from(text);
-    MessageBoxW(Some(hwnd), PCWSTR(h.as_ptr()), w!("rexplorer"), MB_OK | MB_ICONERROR);
+    MessageBoxW(Some(hwnd), PCWSTR(h.as_ptr()), w!("rexplorer"), MB_OK | MB_ICONERROR | rtl::message_box());
 }
 
 /// The Windows UI language as a locale name (`es-ES`); `en` when the system gives none.
@@ -1132,7 +1146,7 @@ fn system_language() -> String {
 /// A message box before any window exists (--help, bad arguments).
 fn info_box(text: &str, icon: MESSAGEBOX_STYLE) {
     let h = HSTRING::from(text);
-    unsafe { MessageBoxW(None, PCWSTR(h.as_ptr()), w!("rexplorer"), MB_OK | icon) };
+    unsafe { MessageBoxW(None, PCWSTR(h.as_ptr()), w!("rexplorer"), MB_OK | icon | rtl::message_box()) };
 }
 
 fn placement_path() -> Option<PathBuf> {
@@ -1150,7 +1164,9 @@ unsafe fn save_placement(hwnd: HWND, saved: Option<WINDOWPLACEMENT>) {
     }
     let r = wp.rcNormalPosition;
     let show = if wp.showCmd == SW_SHOWMINIMIZED.0 as u32 { SW_SHOWNORMAL.0 as u32 } else { wp.showCmd };
-    let _ = std::fs::create_dir_all(path.parent().unwrap());
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
     let _ = std::fs::write(path, format!("{show} {} {} {} {}", r.left, r.top, r.right, r.bottom));
 }
 
@@ -1176,8 +1192,32 @@ fn address_refreshes(text: &str, current: &str, searching: bool) -> bool {
     text.trim().is_empty() || (text == current && !searching)
 }
 
+/// Whether a WM_COMMAND carries a command: a menu item (code 0) or accelerator (code 1) with no control, or a click
+/// on one of our toolbars. Other controls forward their notifications here too (the list's label edit is id 1 =
+/// CMD_BACK and sends EN_CHANGE per key), and none of those may run a command.
+fn is_command(code: usize, control: Option<usize>) -> bool {
+    match control {
+        None => code <= 1,
+        Some(id) => code == 0 && matches!(id, ID_NAV | ID_TOOLS | ID_CMDBAR),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_menus_accelerators_and_toolbars_send_commands() {
+        use super::*;
+        assert!(is_command(0, None));
+        assert!(is_command(1, None));
+        assert!(is_command(0, Some(ID_NAV)) && is_command(0, Some(ID_TOOLS)) && is_command(0, Some(ID_CMDBAR)));
+        // The label edit (id 1): EN_UPDATE 0x400, EN_CHANGE 0x300, EN_SETFOCUS 0x100, EN_KILLFOCUS 0x200.
+        for code in [0x100, 0x200, 0x300, 0x400] {
+            assert!(!is_command(code, Some(1)));
+        }
+        assert!(!is_command(0, Some(1)));
+        assert!(!is_command(0x300, Some(ID_NAV)));
+    }
+
     #[test]
     fn address_enter_refreshes_only_the_place_shown() {
         use super::address_refreshes;

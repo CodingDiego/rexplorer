@@ -617,11 +617,15 @@ fn process_alive(pid: u32) -> bool {
     }
 }
 
+fn remove_old_in(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join(OLD));
+}
+
 /// Deletes copies moved aside by `install` (next to the exe) and `uninstall` (in %TEMP%). Touches the disk:
 /// call on a worker thread.
 pub fn cleanup_old() {
     if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) {
-        let _ = std::fs::remove_file(dir.join(OLD));
+        remove_old_in(&dir);
     }
     // Same name as archive_view::extract_dir(): one subfolder per archive version. A day old is past any app that
     // still has one of its files open (another instance, or a scratch profile, may be using the recent ones).
@@ -826,10 +830,78 @@ mod tests {
     fn a_successful_update_over_a_running_exe_moves_it_to_old() {
         let s = Scratch::new("running");
         install(&s.dir, &s.base).unwrap();
+        let user = user_files(&s);
         let image = run_image(&s.exe());
         install(&s.dir, &s.base).unwrap();
         unsafe { FreeLibrary(image) };
+        for (p, bytes) in user {
+            assert_eq!(std::fs::read(&p).unwrap(), bytes, "settings carry over: {}", p.display());
+        }
         assert_eq!(files(&s.dir), ["install.txt", "rexplorer.exe", "rexplorer.old"]);
+        remove_old_in(&s.dir);
+        assert_eq!(files(&s.dir), ["install.txt", "rexplorer.exe"], "the next start deletes the old copy");
+    }
+
+    /// Settings, themes and the session file as the app keeps them (outside the install dir), plus their bytes.
+    fn user_files(s: &Scratch) -> Vec<(PathBuf, Vec<u8>)> {
+        let data = s.dir.parent().unwrap().join("appdata");
+        std::fs::create_dir_all(data.join("themes")).unwrap();
+        let paths = [data.join("settings.ini"), data.join("themes").join("mine.ini"), data.join("session.ini")];
+        paths.into_iter().map(|p| { std::fs::write(&p, format!("keep {}", p.display())).unwrap(); let b = std::fs::read(&p).unwrap(); (p, b) }).collect()
+    }
+
+    /// #64 and #65 from a 0.1.4 install: its one record holds the folder keys and the Startup shortcut and there is no
+    /// takeover.txt. The new --install, then --unregister, then --uninstall leave the base as it was before.
+    #[test]
+    fn a_0_1_4_install_upgrades_unregisters_and_uninstalls_to_the_original_base() {
+        let s = Scratch::new("v014");
+        let scratch = s.dir.parent().unwrap().to_path_buf();
+        let (programs, startup) = (scratch.join("Programs"), scratch.join("Startup"));
+        std::fs::create_dir_all(&programs).unwrap();
+        std::fs::create_dir_all(&startup).unwrap();
+        let user = user_files(&s);
+        assert!(!key_exists(&s.root));
+        // What 0.1.4 left: keys, folder, exe, the verbs and App Paths, both shortcuts, and install.txt listing them.
+        let (classes, ap) = (classes(&s.base), app_paths(&s.base));
+        let leaves: Vec<String> = register::command_keys(&classes).into_iter().map(|(k, _)| k.to_string()).chain(Some(ap.clone())).collect();
+        let mut rec = vec![];
+        for leaf in &leaves {
+            record_missing_keys(&mut rec, leaf);
+        }
+        std::fs::create_dir_all(&s.dir).unwrap();
+        std::fs::copy(std::env::current_exe().unwrap(), s.exe()).unwrap();
+        register::register(&classes, &s.exe()).unwrap();
+        register::set_sz(&HSTRING::from(&ap), PCWSTR::null(), &s.exe().display().to_string()).unwrap();
+        register::set_sz(&HSTRING::from(&ap), w!("Path"), &s.dir.display().to_string()).unwrap();
+        let (start_lnk, desktop_lnk) = (programs.join(START_LNK), startup.join(DESKTOP_LNK));
+        for f in [&start_lnk, &desktop_lnk] {
+            std::fs::write(f, "0.1.4 shortcut").unwrap();
+        }
+        rec.push(format!("dir {}", s.dir.display()));
+        rec.push(format!("file {}", s.exe().display()));
+        rec.extend(leaves.iter().map(|k| format!("value {k}")));
+        rec.extend([&start_lnk, &desktop_lnk].map(|f| format!("file {}", f.display())));
+        std::fs::write(s.dir.join(RECORD), rec.join("\n") + "\n").unwrap();
+        assert!(!s.dir.join(TAKEOVER).exists());
+
+        install_to(&s.dir, &s.base, Some(&programs)).unwrap();
+        let record = std::fs::read_to_string(s.dir.join(RECORD)).unwrap();
+        assert!(rec.iter().all(|l| record.lines().any(|r| r == l)), "the upgrade keeps every line of the old record\n{record}");
+        assert!(record.contains(&format!("named {}|DisplayName", arp(&s.base))), "{record}");
+        assert!(desktop_lnk.is_file(), "the upgrade does not touch the Startup shortcut");
+
+        give_back(&s.dir, &s.base).unwrap();
+        assert_eq!(s.registry().len(), 8, "only the Apps and Features entry is left: {:?}", s.registry());
+        assert!(s.exe().is_file(), "--unregister leaves the program");
+
+        uninstall(&s.dir, &s.base).unwrap();
+        assert!(!start_lnk.exists() && !desktop_lnk.exists(), "both shortcuts, the Startup one from the old record");
+        assert_eq!(s.registry(), Vec::<String>::new());
+        assert!(!key_exists(&s.root), "the base is as before the old install");
+        assert!(!s.dir.exists());
+        for (p, bytes) in user {
+            assert_eq!(std::fs::read(&p).unwrap(), bytes, "{} is untouched", p.display());
+        }
     }
 
     #[test]

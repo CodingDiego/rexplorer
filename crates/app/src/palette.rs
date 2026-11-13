@@ -170,7 +170,7 @@ pub fn open(parent: HWND, id: usize, candidates: Vec<Candidate>, t: &Theme, font
             acc: None,
         }));
         let hwnd = CreateWindowExW(
-            WS_EX_TOOLWINDOW,
+            WS_EX_TOOLWINDOW | crate::rtl::layout(),
             class,
             PCWSTR::null(),
             WS_POPUP,
@@ -254,7 +254,7 @@ unsafe fn on_create(hwnd: HWND, st: *mut State) -> bool {
     let dpi = (*st).dpi;
     let pad = sc(TEXT_X, dpi);
     let Ok(edit) = CreateWindowExW(
-        WINDOW_EX_STYLE(0),
+        crate::rtl::reading(),
         w!("EDIT"),
         PCWSTR::null(),
         WS_CHILD | WS_VISIBLE | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
@@ -450,6 +450,7 @@ unsafe fn paint(hwnd: HWND, st: *mut State) {
     let mem = CreateCompatibleDC(Some(hdc));
     let bmp = CreateCompatibleBitmap(hdc, cw, ch);
     let old_bmp = SelectObject(mem, bmp.into());
+    crate::rtl::match_dc(mem, hdc);
     let s = &*st;
     let [bg, text, secondary, sel, on_sel] = s.colors;
     let font = if s.font.is_invalid() { GetStockObject(DEFAULT_GUI_FONT) } else { s.font.into() };

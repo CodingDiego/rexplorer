@@ -170,6 +170,17 @@ fn tokens(text: &str) -> Vec<String> {
     out
 }
 
+/// Any text as a search box entry, against several dates: neither parsing nor matching panics.
+#[cfg(any(test, fuzzing))]
+pub fn fuzz_check(text: &str) {
+    for (today, week_start) in [(0, 0), (20_000, 6), (-800_000, 3), (2_000_000, 1)] {
+        let q = Query::parse_at(text, today, week_start);
+        let _ = q.name_matches(text);
+        let _ = q.meta_matches(text, false, || Some(u64::MAX), || Some(today));
+        let _ = q.meta_matches(text, true, || Some(0), || Some(i64::MIN));
+    }
+}
+
 /// Words that start a date phrase of up to three words (`last week`, `la semana pasada`).
 const PHRASE_START: &[&str] = &["this", "last", "esta", "este", "la", "el", "semana", "mes", "año", "ano"];
 

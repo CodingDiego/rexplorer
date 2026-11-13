@@ -1,15 +1,15 @@
 use std::collections::HashSet;
 use std::ptr;
 
-use windows::Win32::Foundation::{HWND, LPARAM, PROPERTYKEY};
+use windows::Win32::Foundation::{HWND, LPARAM, PROPERTYKEY, RPC_E_WRONG_THREAD};
 use windows::Win32::System::Registry::{
     HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegEnumKeyExW, RegOpenKeyExW,
 };
-use windows::Win32::UI::Shell::Common::{ITEMIDLIST, SHCOLSTATE, SHCOLSTATE_HIDDEN, SHCOLSTATE_ONBYDEFAULT, SHCOLSTATE_SECONDARYUI, SHCOLSTATE_TYPEMASK, SHCOLSTATE_TYPE_DATE, SHCOLSTATE_TYPE_INT, SHELLDETAILS};
+use windows::Win32::UI::Shell::Common::{ITEMIDLIST, SHCOLSTATE, SHCOLSTATE_HIDDEN, SHCOLSTATE_ONBYDEFAULT, SHCOLSTATE_SECONDARYUI, SHCOLSTATE_TYPEMASK, SHCOLSTATE_TYPE_DATE, SHCOLSTATE_TYPE_INT, SHELLDETAILS, STRRET};
 use windows::Win32::UI::Shell::{
     BHID_SFObject, CSIDL_DESKTOP, IEnumIDList, SHGetFolderLocation, ILClone, ILCombine, ILFindLastID, ILRemoveLastID, IShellFolder,
     IShellFolder2, IShellItem, SHCONTF_FOLDERS, SHCONTF_INCLUDEHIDDEN, SHCONTF_NONFOLDERS,
-    SHCreateItemFromIDList, SHCreateItemFromParsingName, SHGetIDListFromObject,
+    SHCreateItemFromIDList, SHCreateItemFromParsingName, SHGDN_INFOLDER, SHGDN_NORMAL, SHGDNF, SHGetIDListFromObject,
     SHParseDisplayName, SIGDN_DESKTOPABSOLUTEEDITING, SIGDN_DESKTOPABSOLUTEPARSING,
     SIGDN_NORMALDISPLAY,
 };
@@ -107,6 +107,39 @@ impl ShellFolder {
     /// Lists folders and files, hidden ones included (the UI decides what to show).
     pub fn enumerate(&self) -> Result<Vec<ShellItem>> {
         self.enumerate_with(SHCONTF_FOLDERS.0 | SHCONTF_NONFOLDERS.0, usize::MAX)
+    }
+
+    /// Makes this folder and its `items`, bound on another thread, callable from this one. An apartment-threaded
+    /// namespace (Libraries, .zip folders) refuses calls from any thread but the one it was bound on
+    /// (RPC_E_WRONG_THREAD: empty names, no open, no copy), so it is bound again here and its items, whose child IDs
+    /// stay valid, point at the new binding. Anything else is left as it is.
+    pub fn adopt(&mut self, items: &mut [ShellItem]) -> Result<()> {
+        // No one call tells: the Libraries root enumerates from any thread but refuses its items' display names, a
+        // library answers those and refuses to enumerate (and then gives no in-folder names).
+        let refused = |r: Result<()>| r.is_err_and(|e| e.code() == RPC_E_WRONG_THREAD);
+        let name = |flags: SHGDNF| {
+            items.first().map_or(Ok(()), |i| unsafe {
+                let mut ret = STRRET::default();
+                let r = i.parent.GetDisplayNameOf(i.pidl.as_ptr(), flags, &mut ret);
+                if r.is_ok() {
+                    strret_to_string(&mut ret, i.pidl.as_ptr()); // frees it
+                }
+                r
+            })
+        };
+        let listing = || unsafe {
+            let mut e: Option<IEnumIDList> = None;
+            self.folder.EnumObjects(HWND::default(), SHCONTF_FOLDERS.0 as u32, &mut e).ok()
+        };
+        if !refused(name(SHGDN_NORMAL)) && !refused(name(SHGDN_INFOLDER)) && !refused(listing()) {
+            return Ok(());
+        }
+        let fresh = Self::from_pidl(&self.pidl)?;
+        for i in items.iter_mut().filter(|i| i.parent.as_raw() == self.folder.as_raw()) {
+            i.parent = fresh.folder.clone();
+        }
+        *self = fresh;
+        Ok(())
     }
 
     /// Subfolders only, and no more than `max` of them (UI-thread callers bound their work).
@@ -263,6 +296,59 @@ mod tests {
         assert!(in_menu(st(SHCOLSTATE(SHCOLSTATE_ONBYDEFAULT.0 | SHCOLSTATE_SECONDARYUI.0)), 3));
         assert!(in_menu(None, 0));
         assert!(!in_menu(None, 5));
+    }
+
+    #[test]
+    fn adopt_gives_libraries_their_names_here() {
+        let _c = ComInit::sta();
+        // The Libraries root and a library; none on a server image, and an empty one has nothing to look at.
+        for lib in [r"::{031E4825-7B94-4DC3-B131-E946B44C8DD5}", r"::{031E4825-7B94-4DC3-B131-E946B44C8DD5}\Documents.library-ms"] {
+            if !ShellFolder::parse(lib).and_then(|f| f.enumerate()).is_ok_and(|v| !v.is_empty()) {
+                continue;
+            }
+            let (mut f, mut items) = bound_elsewhere(std::path::Path::new(lib));
+            f.adopt(&mut items).unwrap();
+            assert!(!items[0].display_name().is_empty() && !items[0].in_folder_name().is_empty(), "{lib}: rebound here, it answers");
+            assert!(f.enumerate().is_ok(), "{lib}");
+        }
+    }
+
+    /// Binds `name` and lists it on an MTA thread, as the app's loader does.
+    fn bound_elsewhere(name: &std::path::Path) -> (ShellFolder, Vec<ShellItem>) {
+        let name = name.to_str().unwrap().to_string();
+        let addr = std::thread::spawn(move || {
+            let _c = ComInit::mta();
+            let f = ShellFolder::parse(&name).unwrap();
+            let items = f.enumerate().unwrap();
+            Box::into_raw(Box::new((f, items))) as usize
+        })
+        .join()
+        .unwrap();
+        // The MTA ended with its thread; the shell keeps the objects alive (the app's loader thread ends too).
+        *unsafe { Box::from_raw(addr as *mut (ShellFolder, Vec<ShellItem>)) }
+    }
+
+    #[test]
+    fn adopt_rebinds_only_a_folder_this_thread_cannot_call() {
+        let _c = ComInit::sta();
+        let dir = std::env::temp_dir().join(format!("rexplorer-test-adopt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"x").unwrap();
+        // An empty .zip, as New > Compressed (zipped) Folder makes it: the end-of-central-directory record alone.
+        let zip = dir.join("e.zip");
+        std::fs::write(&zip, [b"PK\x05\x06".as_slice(), &[0u8; 18]].concat()).unwrap();
+
+        let (mut f, mut items) = bound_elsewhere(&dir);
+        let before = f.folder.as_raw();
+        f.adopt(&mut items).unwrap();
+        assert_eq!(f.folder.as_raw(), before, "a file system folder works from any thread");
+        assert!(items.iter().any(|i| i.file_name() == "a.txt"));
+
+        let (mut z, mut none) = bound_elsewhere(&zip);
+        assert!(z.enumerate().is_err(), "zipfldr refuses another thread");
+        z.adopt(&mut none).unwrap();
+        assert!(z.enumerate().is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

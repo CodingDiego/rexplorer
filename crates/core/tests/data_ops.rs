@@ -190,7 +190,7 @@ fn delete_to_the_bin_comes_back_and_permanent_does_not_use_it() {
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    assert_eq!(back, vec![Op::Created(vec![a_str.clone()])]);
+    assert_eq!(back, vec![Op::created(vec![a_str.clone()])]);
     assert_eq!(std::fs::read_to_string(&a).unwrap(), "a");
     // Shift+Delete: the same engine without FOFX_RECYCLEONDELETE; gone, and nothing to restore.
     op(FOF_NO_UI, None, |o| unsafe { o.DeleteItem(&item(&a), None) }).unwrap();
@@ -223,7 +223,7 @@ fn rename_onto_an_existing_name_loses_nothing() {
     if !Path::new(&a).exists() {
         let to = t.keys().find(|k| t[*k] == "a").map(|k| d.join(k).to_string_lossy().into_owned()).unwrap();
         std::fs::write(&a, "taken").unwrap();
-        assert!(undo::reverse(HWND::default(), vec![Op::Rename { from: a.clone(), to }]).is_empty());
+        assert!(undo::reverse(HWND::default(), vec![Op::rename(a.clone(), to).unwrap()]).is_empty());
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "taken");
     }
 }

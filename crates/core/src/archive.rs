@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use unrar_ng::Archive;
-use unrar_ng::error::{Code, UnrarError};
+use unrar_ng::{Archive, VolumeInfo};
+use unrar_ng::error::{Code, UnrarError, When};
 use windows::Win32::Foundation::{E_FAIL, ERROR_INVALID_PASSWORD, ERROR_NOT_AUTHENTICATED};
 use windows::Win32::Globalization::{CP_ACP, WideCharToMultiByte};
 use windows::core::{Error, HRESULT, Result};
@@ -103,7 +103,22 @@ fn rar_err(archive: &Path, e: UnrarError) -> Error {
             forget_password(archive);
             Error::new(E_PASSWORD_WRONG, crate::i18n::tr("err.password_wrong"))
         }
+        Code::EOpen if !matches!(e.when, When::Open) => err(crate::i18n::tr("err.rar_volume_missing")),
         _ => err(e),
+    }
+}
+
+/// A set is read from its first volume: a middle one would list and extract a partial run of members.
+fn first_volume(v: VolumeInfo) -> Result<()> {
+    if matches!(v, VolumeInfo::Subsequent) { Err(err(crate::i18n::tr("err.rar_middle_volume"))) } else { Ok(()) }
+}
+
+/// A member whose data stops at a missing volume is left half written by unrar: it must not stay.
+fn drop_partial(dest_dir: &Path, path: &str) {
+    for p in [dest_dir.join(path), dest_dir.join(usable(path))] {
+        if p.symlink_metadata().is_ok_and(|m| m.is_file()) {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }
 
@@ -217,7 +232,9 @@ pub fn is_rar(path: &Path) -> bool {
 pub fn list(archive: &Path) -> Result<Vec<Entry>> {
     let mut out: Vec<Entry> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    for h in with_archive(archive, |a| a.open_for_listing()).map_err(|e| rar_err(archive, e))? {
+    let opened = with_archive(archive, |a| a.open_for_listing()).map_err(|e| rar_err(archive, e))?;
+    first_volume(opened.volume_info())?;
+    for h in opened {
         let h = h.map_err(|e| rar_err(archive, e))?;
         let path = norm(&h.filename);
         if path.is_empty() || escapes(&path) || !seen.insert(path.to_lowercase()) {
@@ -278,12 +295,16 @@ pub fn extract(archive: &Path, entry_path: &str, dest_dir: &Path) -> Result<Path
     }
     let fail = |e| rar_err(archive, e);
     let mut cur = with_archive(archive, |a| a.open_for_processing()).map_err(fail)?;
+    first_volume(cur.volume_info())?;
     while let Some(h) = cur.read_header().map_err(fail)? {
         let path = norm(&h.entry().filename);
         if !escapes(&path) && path.eq_ignore_ascii_case(want) && !h.entry().is_directory() {
             // The base-path form: with a whole destination name unrar has no base to keep a link's target inside
             // (dll.cpp DllDestName) and resolves it against the working directory.
-            h.extract_with_base(dest_dir).map_err(fail)?;
+            h.extract_with_base(dest_dir).map_err(|e| {
+                drop_partial(dest_dir, &path);
+                fail(e)
+            })?;
             let at = [dest_dir.join(&path), dest_dir.join(usable(&path))];
             return match at.into_iter().find(|p| p.symlink_metadata().is_ok()) {
                 Some(target) if single_file(&target) => {
@@ -306,6 +327,7 @@ pub fn extract(archive: &Path, entry_path: &str, dest_dir: &Path) -> Result<Path
 fn check_password(archive: &Path) -> Result<()> {
     let fail = |e| rar_err(archive, e);
     let mut cur = with_archive(archive, |a| a.open_for_processing()).map_err(fail)?;
+    first_volume(cur.volume_info())?;
     while let Some(h) = cur.read_header().map_err(fail)? {
         if h.entry().is_encrypted() && h.entry().is_file() {
             h.test().map_err(fail)?;
@@ -333,7 +355,10 @@ pub fn extract_all(archive: &Path, dest_dir: &Path) -> Result<()> {
         let taken = file && (dest_dir.join(&path).symlink_metadata().is_ok() || dest_dir.join(usable(&path)).symlink_metadata().is_ok());
         kept += usize::from(taken || refused);
         cur = if file && !taken {
-            let next = h.extract_with_base(dest_dir).map_err(fail)?;
+            let next = h.extract_with_base(dest_dir).map_err(|e| {
+                drop_partial(dest_dir, &path);
+                fail(e)
+            })?;
             let at = [dest_dir.join(&path), dest_dir.join(usable(&path))];
             let made: Vec<&PathBuf> = at.iter().filter(|p| p.symlink_metadata().is_ok()).collect();
             if made.is_empty() {
@@ -656,6 +681,67 @@ mod tests {
         let mut v = vec![1u16, 2, 3];
         wipe(&mut v);
         assert_eq!(v, [0, 0, 0]);
+    }
+
+    #[test]
+    fn only_the_first_volume_opens() {
+        assert!(first_volume(VolumeInfo::None).is_ok() && first_volume(VolumeInfo::First).is_ok());
+        assert_eq!(first_volume(VolumeInfo::Subsequent).unwrap_err().message(), crate::i18n::tr("err.rar_middle_volume"));
+    }
+
+    /// The set under tests/fixtures/multivol (`set.part1.rar`, `set.part2.rar`, `set.part3.rar`, made by
+    /// `rar a -v1k -ep set.rar` on a few files bigger than a volume) needs rar.exe or WinRAR to build, and neither
+    /// was installed when this was written; unrar cannot write archives.
+    fn multivol(tag: &str, skip: Option<&str>) -> PathBuf {
+        let from = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/multivol");
+        let dir = tmp(tag);
+        std::fs::create_dir_all(&dir).unwrap();
+        for part in ["set.part1.rar", "set.part2.rar", "set.part3.rar"] {
+            if Some(part) != skip {
+                std::fs::copy(from.join(part), dir.join(part)).unwrap();
+            }
+        }
+        dir
+    }
+
+    #[test]
+    #[ignore = "needs tests/fixtures/multivol/set.part{1,2,3}.rar, which need rar.exe or WinRAR to make"]
+    fn multi_volume_set_lists_and_extracts_across_volumes() {
+        let dir = multivol("mv-ok", None);
+        let rar = dir.join("set.part1.rar");
+        let files: Vec<Entry> = list(&rar).unwrap().into_iter().filter(|e| !e.is_dir).collect();
+        extract_all(&rar, &dir.join("out")).unwrap();
+        let ok = !files.is_empty() && files.iter().all(|e| std::fs::metadata(dir.join("out").join(&e.path)).is_ok_and(|m| m.len() == e.size));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(ok, "every member is whole, including the one that crosses a volume");
+    }
+
+    #[test]
+    #[ignore = "needs tests/fixtures/multivol/set.part{1,2,3}.rar, which need rar.exe or WinRAR to make"]
+    fn multi_volume_middle_or_missing_volume_fails_clearly() {
+        let dir = multivol("mv-bad", None);
+        let middle = dir.join("set.part2.rar");
+        let (l, x) = (list(&middle), extract_all(&middle, &dir.join("o1")));
+        let wrote = dir.join("o1").exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        let want = crate::i18n::tr("err.rar_middle_volume");
+        assert_eq!(l.unwrap_err().message(), want);
+        assert_eq!(x.unwrap_err().message(), want);
+        assert!(!wrote, "nothing written");
+
+        // Sizes come from the whole set: listing the set with a gap fails too.
+        let whole = list(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/multivol/set.part1.rar")).unwrap();
+        let dir = multivol("mv-gap", Some("set.part2.rar"));
+        let rar = dir.join("set.part1.rar");
+        let (l, x) = (list(&rar), extract_all(&rar, &dir.join("out")));
+        let left: Vec<(String, u64)> = tree(&dir.join("out")).into_iter().filter_map(|(p, _)| std::fs::metadata(dir.join("out").join(&p)).ok().filter(|m| m.is_file()).map(|m| (p, m.len()))).collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        let missing = crate::i18n::tr("err.rar_volume_missing");
+        assert_eq!(l.unwrap_err().message(), missing);
+        assert_eq!(x.unwrap_err().message(), missing);
+        for (p, n) in left {
+            assert!(whole.iter().any(|e| e.path.eq_ignore_ascii_case(&p) && e.size == n), "no partial file: {p}");
+        }
     }
 
     #[test]

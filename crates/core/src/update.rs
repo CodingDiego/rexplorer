@@ -45,9 +45,53 @@ pub fn parse_latest(body: &[u8]) -> Option<[u32; 3]> {
     parse_version(&rest[..rest.find('"')?])
 }
 
-/// `latest` as text when it is newer than `current`.
+/// Any bytes as a release answer or a version: no panic, and what parses reads back through its own text.
+#[cfg(any(test, fuzzing))]
+pub fn fuzz_check(body: &[u8]) {
+    if let Some(v) = parse_latest(body) {
+        assert_eq!(parse_version(&format(v)), Some(v), "{body:?}");
+    }
+    let text = String::from_utf8_lossy(body);
+    assert!(parse_version(&text).is_none_or(|v| parse_version(&format(v)) == Some(v)), "{body:?}");
+    let _ = newer([u32::MAX; 3], &text);
+}
+
+/// One dot-separated part of a pre-release (`rc`, `1`): numbers before words, numbers by value (SemVer).
+#[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Pre {
+    Num(u64),
+    Word(String),
+}
+
+/// This build's version, a pre-release too, in SemVer order: 0.2.0 < 1.0.0-rc.1 < 1.0.0-rc.2 < 1.0.0. Field order is
+/// the comparison order.
+#[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct Current {
+    core: [u32; 3],
+    release: bool,
+    pre: Vec<Pre>,
+}
+
+fn parse_current(s: &str) -> Option<Current> {
+    let s = s.split_once('+').map_or(s, |(v, _)| v);
+    let (core, pre) = s.split_once('-').map_or((s, None), |(c, p)| (c, Some(p)));
+    let pre = match pre {
+        None => Vec::new(),
+        Some(p) => p
+            .split('.')
+            .map(|id| match id.parse::<u64>() {
+                Ok(n) if id.bytes().all(|b| b.is_ascii_digit()) => Some(Pre::Num(n)),
+                _ if !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') => Some(Pre::Word(id.to_string())),
+                _ => None,
+            })
+            .collect::<Option<_>>()?,
+    };
+    Some(Current { core: parse_version(core)?, release: pre.is_empty(), pre })
+}
+
+/// `latest` (a release, never a pre-release) as text when it is newer than `current`.
 fn newer(latest: [u32; 3], current: &str) -> Option<String> {
-    (latest > parse_version(current)?).then(|| format(latest))
+    (Current { core: latest, release: true, pre: Vec::new() } > parse_current(current)?).then(|| format(latest))
 }
 
 /// Checked under a day ago; a stamp from the future (the clock moved back) is stale.
@@ -141,6 +185,24 @@ mod tests {
         assert_eq!(newer([0, 1, 4], "0.1.4"), None);
         assert_eq!(newer([0, 1, 3], "0.1.4"), None);
         assert_eq!(newer([9, 9, 9], "junk"), None);
+        // A release candidate is told about its release, not about older ones.
+        assert_eq!(newer([1, 0, 0], "1.0.0-rc.1"), Some("1.0.0".into()));
+        assert_eq!(newer([0, 2, 0], "1.0.0-rc.1"), None);
+        assert_eq!(newer([1, 0, 0], "1.0.0"), None);
+    }
+
+    #[test]
+    fn pre_releases_order_as_semver() {
+        let v = |s| parse_current(s).unwrap_or_else(|| panic!("{s}"));
+        let order = ["0.2.0", "1.0.0-alpha", "1.0.0-alpha.1", "1.0.0-rc.1", "1.0.0-rc.2", "1.0.0-rc.10", "1.0.0", "1.0.1-rc.1", "1.0.1"];
+        for w in order.windows(2) {
+            assert!(v(w[0]) < v(w[1]), "{} < {}", w[0], w[1]);
+        }
+        assert_eq!(v("1.0.0+build.5"), v("1.0.0"), "build metadata does not count");
+        assert!(parse_current(env!("CARGO_PKG_VERSION")).is_some(), "this build's own version parses");
+        for bad in ["1.0.0-", "1.0.0-rc..1", "1.0.0-rc!", "-rc.1", "1.0.x-rc.1"] {
+            assert_eq!(parse_current(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

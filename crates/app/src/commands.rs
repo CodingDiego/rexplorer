@@ -139,7 +139,7 @@ unsafe fn share_files(hwnd: HWND, paths: Vec<String>) -> windows::core::Result<(
 /// Below the button that sends `cmd`.
 unsafe fn anchor(app: *mut App, cmd: u16) -> (i32, i32) {
     let r = toolbar::button_rect((*app).cmdbar, cmd).unwrap_or_default();
-    (r.left, r.bottom)
+    (crate::rtl::menu_x(&r), r.bottom)
 }
 
 /// New v: "Folder", then the shell's own New submenu (its file types). The new item is renamed in place once the
@@ -174,47 +174,60 @@ pub(crate) unsafe fn new_folder(app: *mut App) {
 
 /// Runs `invoke` and arms the rename of the item it adds.
 unsafe fn add_item(app: *mut App, menu: &ContextMenu, invoke: impl FnOnce(&ContextMenu) -> Result<()>) {
-    let hwnd = (*app).hwnd;
     // The popup pumps messages: a refresh may have replaced the listing meanwhile.
-    let Some(l) = listing(app) else { return };
-    let before: HashSet<String> = l.items.iter().map(|i| i.parsing_name()).collect();
-    let folder = l.folder.parsing_name.clone();
+    let Some(before) = names_now(app) else { return };
     match invoke(menu) {
-        Ok(()) => {
-            (*app).new_item = Some((folder, before));
-            // The change watch may reload first; whichever reload starts cancels the other.
-            SetTimer(Some(hwnd), TIMER_REFRESH, 300, None);
-        }
+        // The change watch may reload first; whichever reload starts cancels the other.
+        Ok(()) => new_item_made(app, before),
         Err(_) => {
             let _ = MessageBeep(MB_OK);
         }
     }
 }
 
-/// The context menu's New has made an item: rename and record it as the toolbar's New does. The caller makes sure
-/// the listing does not show the new item yet.
-pub(crate) unsafe fn new_item_made(app: *mut App) {
-    let Some(l) = listing(app) else { return };
-    (*app).new_item = Some((l.folder.parsing_name.clone(), l.items.iter().map(|i| i.parsing_name()).collect()));
+/// The current folder and what is in it now (lowercased parsing names), taken before a context menu's New runs: the
+/// listing's items (on the Desktop root these include This PC and the Public Desktop's files, which no read_dir sees),
+/// plus the disk for a folder on a fixed drive, since a change notification may reload the listing with the new item
+/// while the menu is still open. Not read on other drives: this runs on the UI thread before every background menu.
+pub(crate) unsafe fn names_now(app: *mut App) -> Option<(String, HashSet<String>)> {
+    let l = listing(app)?;
+    let folder = l.folder.parsing_name.clone();
+    let disk = ui::is_fixed_drive(&folder).then(|| std::fs::read_dir(&folder).ok()).flatten();
+    let on_disk = disk.into_iter().flatten().filter_map(|e| e.ok()).map(|e| e.path().to_string_lossy().into_owned());
+    Some((folder, names_before(l.items.iter().map(|i| i.parsing_name()), on_disk)))
+}
+
+/// The lowercased union of what the listing shows and what the disk holds.
+fn names_before(listed: impl Iterator<Item = String>, on_disk: impl Iterator<Item = String>) -> HashSet<String> {
+    listed.chain(on_disk).map(|n| n.to_lowercase()).collect()
+}
+
+/// The context menu's New has made an item in `before`'s folder (from `names_now`): rename and record it as the
+/// toolbar's New does, at the next load.
+pub(crate) unsafe fn new_item_made(app: *mut App, before: (String, HashSet<String>)) {
+    (*app).new_item = Some(before);
     SetTimer(Some((*app).hwnd), TIMER_REFRESH, 300, None);
 }
 
-/// After a load: the item New made has appeared, so select it and edit its name.
+/// After a load: the item New made has appeared, so select it and edit its name. New > Shortcut's stub is only
+/// selected: its wizard, open now, names it.
 pub(crate) unsafe fn rename_new_item(app: *mut App) {
     let Some((folder, before)) = &(*app).new_item else { return };
     let Some(l) = listing(app) else { return };
     if !l.folder.parsing_name.eq_ignore_ascii_case(folder) {
         return;
     }
-    let mut added = l.items.iter().enumerate().filter(|(_, it)| !before.contains(&it.parsing_name()));
+    let mut added = l.items.iter().enumerate().filter(|(_, it)| !before.contains(&it.parsing_name().to_lowercase()));
     // A New that made nothing must not stay armed: a later download would be renamed and claimed for undo.
     let Some((i, _)) = added.next() else {
         (*app).new_item = None;
         return;
     };
+    let path = l.items[i].parsing_name();
+    let shortcut = path.to_lowercase().ends_with(".lnk");
     // Two new items: one is somebody else's (a download landing now), so undo must not claim either.
-    if added.next().is_none() {
-        (*app).undo.record(Op::Created(vec![l.items[i].parsing_name()]));
+    if added.next().is_none() && !shortcut {
+        (*app).undo.record(Op::created(vec![path]));
     }
     (*app).new_item = None;
     let list = (*app).list;
@@ -222,7 +235,9 @@ pub(crate) unsafe fn rename_new_item(app: *mut App) {
     list::set_item_state(list, usize::MAX, LIST_VIEW_ITEM_STATE_FLAGS(0), both);
     list::set_item_state(list, i, both, both);
     SendMessageW(list, LVM_ENSUREVISIBLE, Some(WPARAM(i)), Some(LPARAM(0)));
-    list::begin_rename(app);
+    if !shortcut {
+        list::begin_rename(app);
+    }
 }
 
 const SORT_ASC: usize = 0x100;
@@ -390,7 +405,7 @@ pub(crate) unsafe fn view_entries(app: *mut App) -> (Vec<(usize, String)>, Vec<u
         (CMD_TOGGLE_DETAILS as usize, ui::hinted("menu.view.details_pane", "Alt+Shift+P")),
     ]);
     let mut checked = vec![(*app).views.view.command() as usize];
-    for (on, cmd) in [(s.show_sidebar && !s.show_tree, CMD_TOGGLE_SIDEBAR), (s.show_tree, CMD_FOLDER_TREE), (s.show_preview, CMD_TOGGLE_PREVIEW), (s.show_details, CMD_TOGGLE_DETAILS)] {
+    for (on, cmd) in [(s.show_sidebar, CMD_TOGGLE_SIDEBAR), (s.show_tree, CMD_FOLDER_TREE), (s.show_preview, CMD_TOGGLE_PREVIEW), (s.show_details, CMD_TOGGLE_DETAILS)] {
         if on {
             checked.push(cmd as usize);
         }
@@ -400,11 +415,8 @@ pub(crate) unsafe fn view_entries(app: *mut App) -> (Vec<(usize, String)>, Vec<u
 
 /// Applies a pick from `view_entries`.
 pub(crate) unsafe fn pick_view(app: *mut App, id: usize) {
-    match id {
-        0 => {}
-        // Sidebar while the tree shows: the sidebar comes back in its place (Ctrl+B would hide both).
-        id if id == CMD_TOGGLE_SIDEBAR as usize && (*app).session.show_tree => panes::toggle_tree(app),
-        id => on_command(app, id as u16),
+    if id != 0 {
+        on_command(app, id as u16);
     }
 }
 
@@ -426,6 +438,20 @@ mod tests {
         assert_eq!(home_pick(2, 6, None), Some((1, true)), "Date modified starts newest first");
         assert_eq!(home_pick(2, 6, Some((1, false))), Some((1, false)), "the menu keeps the direction");
         assert_eq!((home_pick(7, 6, None), home_pick(0, 6, None), home_pick(GROUP_NONE, 6, None)), (None, None, None));
+    }
+
+    #[test]
+    fn new_item_is_told_apart_on_the_desktop_root() {
+        let listed = ["::{20D04FE0-3AEA-1069-A2D8-08002B30309D}", "C:\\Users\\Public\\Desktop\\Edge.lnk", "C:\\Users\\u\\Desktop\\a.txt"];
+        // The stub landed before the menu returned, the listing has not reloaded yet: the disk sees it, the listing does not.
+        let on_disk = ["c:\\users\\u\\desktop\\a.txt", "c:\\users\\u\\desktop\\stub.lnk"];
+        let before = names_before(listed.iter().map(|s| s.to_string()), on_disk.iter().map(|s| s.to_string()));
+        let after = [listed[0], listed[1], listed[2], "C:\\Users\\u\\Desktop\\Stub.lnk", "C:\\Users\\u\\Desktop\\Nuevo documento.txt"];
+        let added: Vec<&str> = after.iter().copied().filter(|n| !before.contains(&n.to_lowercase())).collect();
+        assert_eq!(added, ["C:\\Users\\u\\Desktop\\Nuevo documento.txt"]);
+        // No disk read (a share): the listing alone still keeps This PC and the Public Desktop out.
+        let before = names_before(listed.iter().map(|s| s.to_string()), std::iter::empty());
+        assert_eq!(after.iter().filter(|n| !before.contains(&n.to_lowercase())).count(), 2);
     }
 
     #[test]

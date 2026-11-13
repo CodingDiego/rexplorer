@@ -9,8 +9,8 @@ use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, GetPropW, IsHungAppWindow, SMTO_ABORTIFHUNG, SMTO_NORMAL, SetPropW, SW_SHOWNORMAL, SendMessageTimeoutW,
-    SetForegroundWindow, WM_COPYDATA,
+    FindWindowExW, GA_ROOT, GetAncestor, GetClassNameW, GetPropW, IsHungAppWindow, SMTO_ABORTIFHUNG, SMTO_NORMAL, SetPropW, SW_SHOWNORMAL,
+    SendMessageTimeoutW, SetForegroundWindow, WM_COPYDATA,
 };
 use windows::core::{Error, HSTRING, PCWSTR, Result, w};
 
@@ -73,6 +73,36 @@ pub fn mark(hwnd: HWND) {
     }
 }
 
+// Signals for scripts/budgets.ps1 (#48), read from outside with GetProp: the tick count (ms since boot) of the first
+// paint, how many folder loads have finished, and the tick count of the last one.
+const PAINTED_PROP: PCWSTR = w!("rexplorer.painted");
+const LOADS_PROP: PCWSTR = w!("rexplorer.loads");
+const LOAD_TICK_PROP: PCWSTR = w!("rexplorer.loadtick");
+
+fn set_prop(hwnd: HWND, name: PCWSTR, v: usize) {
+    unsafe {
+        let _ = SetPropW(hwnd, name, Some(HANDLE(v as *mut _)));
+    }
+}
+
+fn tick() -> usize {
+    // Never 0: a property of 0 reads the same as no property.
+    (unsafe { windows::Win32::System::SystemInformation::GetTickCount64() } as usize).max(1)
+}
+
+/// Called on every paint; the property keeps the first one.
+pub fn signal_painted(hwnd: HWND) {
+    if unsafe { GetPropW(hwnd, PAINTED_PROP) }.0.is_null() {
+        set_prop(hwnd, PAINTED_PROP, tick());
+    }
+}
+
+/// A folder load finished and its items are on screen.
+pub fn signal_loaded(hwnd: HWND) {
+    set_prop(hwnd, LOADS_PROP, unsafe { GetPropW(hwnd, LOADS_PROP) }.0 as usize + 1);
+    set_prop(hwnd, LOAD_TICK_PROP, tick());
+}
+
 /// The main window of this settings folder's instance.
 pub fn find_main_window() -> Option<HWND> {
     let mut after = None;
@@ -83,6 +113,21 @@ pub fn find_main_window() -> Option<HWND> {
         after = Some(h);
     }
     None
+}
+
+/// Another rexplorer window, of any profile, whose part is `at` (a child or the window itself); not `own`.
+pub fn other_main_window(at: HWND, own: HWND) -> Option<HWND> {
+    unsafe {
+        let root = GetAncestor(at, GA_ROOT);
+        let mut class = [0u16; 16];
+        let n = GetClassNameW(root, &mut class).max(0) as usize;
+        (root != own && !root.is_invalid() && String::from_utf16_lossy(&class[..n]) == "RexplorerMain").then_some(root)
+    }
+}
+
+/// The hand-off that opens `place` in a new tab of the receiving window.
+pub fn tab_payload(place: &str) -> String {
+    rexplorer_core::cli::payload(&rexplorer_core::cli::Args { paths: vec![place.to_string()], new_tab: true, ..Default::default() })
 }
 
 pub fn send(hwnd: HWND, payload: &str) -> bool {
@@ -193,6 +238,31 @@ mod tests {
         assert_eq!(receive(LPARAM(&cds as *const _ as isize)), None);
     }
 
+    /// The budget script reads these three properties (#48): the first paint is kept, each load adds one.
+    #[test]
+    fn budget_signals_keep_the_first_paint_and_count_loads() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE,
+        };
+        let h = unsafe {
+            CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR::null(), WINDOW_STYLE(0), 0, 0, 0, 0, Some(HWND_MESSAGE), None, None, None)
+        }
+        .unwrap();
+        let read = |name| unsafe { GetPropW(h, name) }.0 as usize;
+        assert_eq!((read(PAINTED_PROP), read(LOADS_PROP)), (0, 0));
+        signal_painted(h);
+        let first = read(PAINTED_PROP);
+        assert!(first > 0);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        signal_painted(h);
+        assert_eq!(read(PAINTED_PROP), first, "a later paint does not move it");
+        signal_loaded(h);
+        signal_loaded(h);
+        assert_eq!(read(LOADS_PROP), 2);
+        assert!(read(LOAD_TICK_PROP) >= first);
+        let _ = unsafe { DestroyWindow(h) };
+    }
+
     #[test]
     fn send_waits_out_a_busy_receiver() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -246,6 +316,33 @@ mod tests {
         assert_eq!(new_window_args("ftp://bob@h/x").len(), 2);
         let a = rexplorer_core::cli::parse(new_window_args("C:\\a b")).unwrap();
         assert!(a.new_window && a.paths == ["C:\\a b"]);
+    }
+
+    #[test]
+    fn a_tab_moves_only_onto_another_rexplorer_window() {
+        use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, WINDOW_EX_STYLE, WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW};
+        unsafe {
+            unsafe extern "system" fn plain(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> windows::Win32::Foundation::LRESULT {
+                unsafe { DefWindowProcW(h, m, w, l) }
+            }
+            let hinst = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).unwrap().into();
+            let wc = WNDCLASSW { lpfnWndProc: Some(plain), hInstance: hinst, lpszClassName: w!("RexplorerMain"), ..Default::default() };
+            RegisterClassW(&wc);
+            let other = CreateWindowExW(WINDOW_EX_STYLE(0), w!("RexplorerMain"), PCWSTR::null(), WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, None, None, Some(hinst), None).unwrap();
+            let child = CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR::null(), WS_CHILD, 0, 0, 10, 10, Some(other), None, None, None).unwrap();
+            let stranger = CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR::null(), WS_OVERLAPPEDWINDOW, 0, 0, 10, 10, None, None, None, None).unwrap();
+            assert_eq!(other_main_window(child, stranger), Some(other), "a control of another window: that window");
+            assert_eq!(other_main_window(other, stranger), Some(other));
+            assert_eq!(other_main_window(child, other), None, "our own window");
+            assert_eq!(other_main_window(stranger, other), None, "not rexplorer");
+            let _ = DestroyWindow(other);
+            let _ = DestroyWindow(stranger);
+        }
+        // Versioned like a second launch's hand-off; the receiver reads it as one new tab.
+        let p = tab_payload("C:\\a b");
+        assert!(p.starts_with(&format!("v={}\n", rexplorer_core::cli::PROTOCOL)));
+        let a = rexplorer_core::cli::parse_payload(&p).unwrap();
+        assert!(a.new_tab && a.paths == ["C:\\a b"]);
     }
 
     #[test]

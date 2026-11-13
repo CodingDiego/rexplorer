@@ -1,6 +1,6 @@
 [package]
 name = "rexplorer-core"
-version = "0.2.0"
+version = "1.0.0-rc.1"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT"
@@ -30,6 +30,7 @@ windows = { workspace = true, features = [
     "Win32_System_IO",
     "Win32_System_Ioctl",
     "Win32_System_Kernel",
+    "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Ole",
     "Win32_System_Registry",

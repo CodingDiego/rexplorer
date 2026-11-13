@@ -15,6 +15,17 @@ pub const AREAS: [&str; 19] =
 
 pub struct Table {
     map: HashMap<String, String>,
+    rtl: bool,
+}
+
+/// What a language file's `[meta]` section says with `direction=rtl` or `direction=ltr`; None when it says nothing.
+fn direction(text: &str) -> Option<bool> {
+    crate::settings::parse_ini(text)
+        .into_iter()
+        .filter(|(s, _)| s.eq_ignore_ascii_case("meta"))
+        .flat_map(|(_, keys)| keys)
+        .rfind(|(k, _)| k.eq_ignore_ascii_case("direction"))
+        .map(|(_, v)| v.eq_ignore_ascii_case("rtl"))
 }
 
 fn unescape(v: &str) -> String {
@@ -67,7 +78,7 @@ impl Table {
         if let Some(t) = lang {
             map.extend(Table::parse(t));
         }
-        Table { map }
+        Table { map, rtl: lang.and_then(direction).unwrap_or(false) }
     }
 
     /// English, the built-in table for `code`, then `<dir>\lang\<code>.ini` when it exists, is UTF-8 and under 1 MiB.
@@ -80,8 +91,14 @@ impl Table {
             && let Ok(text) = std::fs::read_to_string(&p)
         {
             t.map.extend(Table::parse(&text).into_iter().filter(|(_, v)| !v.is_empty()));
+            t.rtl = direction(&text).unwrap_or(t.rtl);
         }
         t
+    }
+
+    /// The language is written right to left: its file's `[meta]` section says `direction=rtl`.
+    pub fn rtl(&self) -> bool {
+        self.rtl
     }
 
     pub fn get<'a>(&'a self, key: &'a str) -> &'a str {
@@ -151,6 +168,11 @@ pub fn init(dir: &Path, setting: &str, system: &str) -> String {
 
 fn active() -> &'static Table {
     ACTIVE.get_or_init(|| Table::new(None))
+}
+
+/// The active language is right to left: the app mirrors its windows (#39).
+pub fn is_rtl() -> bool {
+    active().rtl
 }
 
 pub fn tr(key: &'static str) -> &'static str {
@@ -354,6 +376,18 @@ mod tests {
         let av = available(&d);
         assert!(["en", "es", "xx"].iter().all(|c| av.iter().any(|a| a == c)), "{av:?}");
         cleanup("load");
+    }
+
+    #[test]
+    fn direction_comes_from_the_meta_section() {
+        // The hidden test language: only a file under tests\lang, never built in.
+        let xr = Table::load(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests"), "xr");
+        assert!(xr.rtl());
+        assert_eq!(xr.get("status.items.one"), Table::new(None).get("status.items.one"));
+        assert!(!BUILTIN.iter().any(|(c, text)| *c == "xr" || Table::new(Some(text)).rtl()), "no built-in language is right to left");
+        assert!(!Table::new(Some("[meta]\ndirection=ltr")).rtl());
+        assert!(!Table::new(Some("[other]\ndirection=rtl")).rtl(), "only [meta] says it");
+        assert!(Table::new(Some("[Meta]\nDirection = RTL")).rtl());
     }
 
     /// Every `"<area>.…"` literal in non-test code: (file:line, literal).

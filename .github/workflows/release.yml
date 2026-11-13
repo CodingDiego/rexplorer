@@ -99,4 +99,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $v = $env:TAG.TrimStart('v')
-          gh release create $env:TAG "rexplorer-$v-x64.zip" "rexplorer-$v-arm64.zip" SHA256SUMS.txt --title "rexplorer $env:TAG" --notes-file .github/release-notes.md --verify-tag
+          # A pre-release tag (v1.0.0-rc.1) is never "latest": the update notice and the winget manifests follow latest.
+          $pre = if ($v.Contains('-')) { '--prerelease', '--latest=false' } else { @() }
+          gh release create $env:TAG "rexplorer-$v-x64.zip" "rexplorer-$v-arm64.zip" SHA256SUMS.txt --title "rexplorer $env:TAG" --notes-file .github/release-notes.md --verify-tag @pre

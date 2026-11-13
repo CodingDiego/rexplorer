@@ -15,6 +15,22 @@ pub(crate) unsafe fn autocomplete(edit: HWND) -> Result<()> {
     SHAutoComplete(edit, SHACF_FILESYSTEM | SHACF_URLALL | SHACF_AUTOSUGGEST_FORCE_ON | SHACF_AUTOAPPEND_FORCE_OFF)
 }
 
+/// Whether the address bar's suggestion list shows: SHAutoComplete's popup, a top-level window of this thread.
+pub(crate) unsafe fn suggestions_open() -> bool {
+    unsafe extern "system" fn find(h: HWND, found: LPARAM) -> windows::core::BOOL {
+        let mut class = [0u16; 32];
+        let n = unsafe { GetClassNameW(h, &mut class) }.max(0) as usize;
+        if String::from_utf16_lossy(&class[..n]) == "Auto-Suggest Dropdown" && unsafe { IsWindowVisible(h) }.as_bool() {
+            unsafe { *(found.0 as *mut bool) = true };
+            return windows::core::BOOL(0);
+        }
+        windows::core::BOOL(1)
+    }
+    let mut found = false;
+    let _ = EnumThreadWindows(windows::Win32::System::Threading::GetCurrentThreadId(), Some(find), LPARAM(&mut found as *mut bool as isize));
+    found
+}
+
 /// 0 blank, 1 word character, 2 punctuation.
 fn class(c: u16) -> u8 {
     match char::from_u32(c as u32) {
@@ -108,6 +124,24 @@ mod tests {
             let n = SendMessageW(edit, WM_GETTEXT, Some(WPARAM(buf.len())), Some(LPARAM(buf.as_mut_ptr() as isize))).0 as usize;
             assert_eq!(String::from_utf16_lossy(&buf[..n]), r"C:\x ");
             let _ = DestroyWindow(parent);
+        }
+    }
+
+    #[test]
+    fn suggestions_open_sees_only_a_shown_dropdown() {
+        unsafe {
+            assert!(!suggestions_open());
+            let hinst = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).unwrap().into();
+            unsafe extern "system" fn plain(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+                unsafe { DefWindowProcW(h, m, w, l) }
+            }
+            let wc = WNDCLASSW { lpfnWndProc: Some(plain), hInstance: hinst, lpszClassName: w!("Auto-Suggest Dropdown"), ..Default::default() };
+            RegisterClassW(&wc);
+            let popup = CreateWindowExW(WINDOW_EX_STYLE(0), w!("Auto-Suggest Dropdown"), PCWSTR::null(), WS_POPUP, 0, 0, 10, 10, None, None, Some(hinst), None).unwrap();
+            assert!(!suggestions_open(), "hidden");
+            let _ = ShowWindow(popup, SW_SHOWNOACTIVATE);
+            assert!(suggestions_open());
+            let _ = DestroyWindow(popup);
         }
     }
 

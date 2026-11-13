@@ -145,7 +145,9 @@ fn fetch(path: PathBuf, abs: Pidl, size: i32, kind: Kind, notify: isize) {
         if notify == 0 {
             crate::ui::background_priority();
         }
-        let _com = ComInit::mta();
+        // An STA: a thumbnail asked from an MTA for a file seen through a library crashes thumbcache's worker (an
+        // access violation in Windows.Storage.Search), and the whole process with it.
+        let _com = ComInit::sta();
         if kind == Kind::Text {
             let _ = cached_text(&path);
         } else {
@@ -451,6 +453,7 @@ unsafe fn paint(hwnd: HWND, s: *mut State) {
         let mem = CreateCompatibleDC(Some(hdc));
         let bmp = CreateCompatibleBitmap(hdc, w, h);
         let old = SelectObject(mem, bmp.into());
+        crate::rtl::match_dc(mem, hdc);
         FillRect(mem, &rc, (*s).brush);
 
         if (*s).details.is_some() {
@@ -484,7 +487,7 @@ unsafe fn paint(hwnd: HWND, s: *mut State) {
                 if !text.is_empty() {
                     SetTextColor(mem, COLORREF(color));
                     let mut t: Vec<u16> = text.encode_utf16().collect();
-                    DrawTextW(mem, &mut t, r, fmt);
+                    DrawTextW(mem, &mut t, r, crate::rtl::text(fmt));
                 }
             }
             SelectObject(mem, of);
@@ -502,6 +505,7 @@ unsafe fn paint(hwnd: HWND, s: *mut State) {
 unsafe fn blend(hdc: HDC, mem: HDC, hb: &Bmp, (x, y, dw, dh): (i32, i32, i32, i32), (bw, bh): (i32, i32)) {
     let src = CreateCompatibleDC(Some(hdc));
     let prev = SelectObject(src, hb.0.into());
+    crate::rtl::match_dc(src, mem);
     let bf = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
     let _ = AlphaBlend(mem, x, y, dw, dh, src, 0, 0, bw, bh, bf);
     SelectObject(src, prev);
@@ -541,7 +545,7 @@ unsafe fn paint_details(hwnd: HWND, s: *mut State, hdc: HDC, mem: HDC) {
         let mut r = RECT { left, top: y, right, bottom: y + h };
         SetTextColor(mem, COLORREF(color));
         let mut t: Vec<u16> = text.encode_utf16().collect();
-        DrawTextW(mem, &mut t, &mut r, fmt);
+        DrawTextW(mem, &mut t, &mut r, crate::rtl::text(fmt));
     };
     let (h_head, h_row, gap) = (text_scale(hwnd, 24), text_scale(hwnd, 20), scale(hwnd, 8));
     line(y, c.left, c.right, h_head, (*s).text, &d.heading);

@@ -81,6 +81,12 @@ impl ShellItem {
         self.name(SHGDN_NORMAL)
     }
 
+    /// The name its folder lists it by, as Explorer's Name column shows it (a Recycle Bin item's display name is its
+    /// original path; this is its file name).
+    pub fn in_folder_name(&self) -> String {
+        self.name(SHGDN_INFOLDER)
+    }
+
     /// Full parsing name, e.g. `C:\Users` or `::{20D04FE0-...}`.
     pub fn parsing_name(&self) -> String {
         self.name(SHGDN_FORPARSING)

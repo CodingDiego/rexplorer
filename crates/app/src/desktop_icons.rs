@@ -519,10 +519,27 @@ unsafe fn delete_selection(hwnd: HWND, shift: bool) {
     }
 }
 
+/// The user's Desktop folder: the desktop root's paste and drops land there.
+fn desktop_dir() -> Option<String> {
+    known(&FOLDERID_Desktop).map(|f| f.parsing_name)
+}
+
+/// What a paste into `dest` may make, read before the shell runs it.
+fn plan_paste(dest: Option<String>) -> Vec<undo::Sent> {
+    dest.map(|d| crate::list::plan_transfer(&dragdrop::clipboard_paths(), &d)).unwrap_or_default()
+}
+
+/// Pastes into the user's Desktop with `menu` (the desktop root's background menu), recorded for Ctrl+Z.
+unsafe fn paste_with(hwnd: HWND, menu: &ContextMenu, plan: Vec<undo::Sent>) {
+    if menu.invoke_verb(hwnd, "paste", false).is_ok() {
+        UNDO.with(|u| u.borrow_mut().record(undo::Op::Transfer(plan)));
+    }
+}
+
 unsafe fn paste(hwnd: HWND) {
     let Ok(root) = ShellFolder::desktop() else { return };
     if let Ok(menu) = ContextMenu::for_background(&root, hwnd) {
-        let _ = menu.invoke_verb(hwnd, "paste", false);
+        paste_with(hwnd, &menu, plan_paste(desktop_dir()));
     }
 }
 
@@ -631,7 +648,9 @@ unsafe fn end_edit(hwnd: HWND, index: i32, name: &str) {
     };
     BUSY.set(was_busy);
     if done.is_ok() {
-        UNDO.with(|u| u.borrow_mut().record(undo::Op::Rename { from: before, to: target.parsing_name() }));
+        if let Some(op) = undo::Op::rename(before, target.parsing_name()) {
+            UNDO.with(|u| u.borrow_mut().record(op));
+        }
         // The renamed item keeps its cell: the reload finds it under its new key.
         let new_key = target.parsing_name().to_lowercase();
         desk(|d| {
@@ -674,20 +693,24 @@ unsafe fn rearrange(list: HWND, pt: POINTL) {
     save();
 }
 
+/// The folder icon under screen point `pt` a drop goes into (never a selected one, which may be the one dragged),
+/// and whether our own icons are being dragged.
+unsafe fn drop_folder(list: HWND, pt: POINTL) -> (Option<ShellItem>, bool) {
+    let mut p = POINT { x: pt.x, y: pt.y };
+    let _ = ScreenToClient(list, &mut p);
+    let mut ht = LVHITTESTINFO { pt: p, ..Default::default() };
+    let hit = usize::try_from(SendMessageW(list, LVM_HITTEST, None, Some(LPARAM(&mut ht as *mut _ as isize))).0).ok();
+    let is_selected = |i: usize| SendMessageW(list, LVM_GETITEMSTATE, Some(WPARAM(i)), Some(LPARAM(LVIS_SELECTED.0 as isize))).0 != 0;
+    let folder_item = hit.filter(|&i| !is_selected(i)).and_then(|i| desk(|d| d.items.get(i).cloned()).flatten()).filter(|it| it.is_folder());
+    (folder_item, DRAG.with(|d| d.borrow().is_some()))
+}
+
 unsafe fn register_drop(list: HWND) {
     let position: IDropTarget = dragdrop::position_target(Box::new(move |pt| unsafe { rearrange(list, pt) }));
     // One shell target per destination, kept while the pointer stays on it (DropForwarder compares them).
     let last: RefCell<Option<(String, IDropTarget)>> = RefCell::new(None);
     let pick = move |pt: POINTL| -> Option<IDropTarget> {
-        let mut p = POINT { x: pt.x, y: pt.y };
-        let (hit, dragging) = unsafe {
-            let _ = ScreenToClient(list, &mut p);
-            let mut ht = LVHITTESTINFO { pt: p, ..Default::default() };
-            let hit = SendMessageW(list, LVM_HITTEST, None, Some(LPARAM(&mut ht as *mut _ as isize))).0;
-            (usize::try_from(hit).ok(), DRAG.with(|d| d.borrow().is_some()))
-        };
-        let is_selected = |i: usize| unsafe { SendMessageW(list, LVM_GETITEMSTATE, Some(WPARAM(i)), Some(LPARAM(LVIS_SELECTED.0 as isize))).0 != 0 };
-        let folder_item = hit.filter(|&i| !is_selected(i)).and_then(|i| desk(|d| d.items.get(i).cloned()).flatten()).filter(|it| it.is_folder());
+        let (folder_item, dragging) = unsafe { drop_folder(list, pt) };
         // Our own icons dropped anywhere but on another folder rearrange; they never run a shell move onto the desktop
         // root (that would move a public Desktop item into the user's).
         if dragging && folder_item.is_none() {
@@ -707,7 +730,18 @@ unsafe fn register_drop(list: HWND) {
         *last.borrow_mut() = Some((key, target.clone()));
         Some(target)
     };
-    let _ = dragdrop::register(list, Box::new(pick), None::<dragdrop::OnDrop>);
+    // Before the shell runs the drop: into a folder icon or the user's Desktop, recorded for Ctrl+Z; a rearrange of
+    // our own icons is no file operation.
+    let on_drop = move |pt: POINTL, data: &windows::Win32::System::Com::IDataObject| -> Option<dragdrop::AfterDrop> {
+        let dest = match unsafe { drop_folder(list, pt) } {
+            (Some(it), _) => it.parsing_name(),
+            (None, false) => desktop_dir()?,
+            (None, true) => return None,
+        };
+        let op = crate::list::plan_drop(data, dest);
+        Some(Box::new(move |effect| UNDO.with(|u| u.borrow_mut().record(op(effect)))))
+    };
+    let _ = dragdrop::register(list, Box::new(pick), Some(Box::new(on_drop)));
 }
 
 // ---- menu ---------------------------------------------------------------------------------------------------------
@@ -750,6 +784,12 @@ unsafe fn menu_for(hwnd: HWND, list: HWND, lparam: LPARAM) {
     let refs: Vec<&ShellItem> = items.iter().collect();
     let menu = if refs.is_empty() { ContextMenu::for_background(&root, hwnd) } else { ContextMenu::for_items(&root, &refs, hwnd) };
     let Ok(menu) = menu else { return };
+    // The shell's Paste (and ours) runs into the Desktop, or into the one selected folder: read now, while names are free.
+    let plan = plan_paste(match refs[..] {
+        [] => desktop_dir(),
+        [it] if it.is_folder() => Some(it.parsing_name()),
+        _ => None,
+    });
     let own = if refs.is_empty() {
         vec![
             Entry::new(REFRESH, tr("menu.list.refresh"), 0xE72C),
@@ -784,8 +824,11 @@ unsafe fn menu_for(hwnd: HWND, list: HWND, lparam: LPARAM) {
             reload(hwnd);
         }
         Some(Ok(Picked::Own(PASTE))) => {
-            let _ = menu.map(|m| m.invoke_verb(hwnd, "paste", false));
+            if let Some(m) = &menu {
+                paste_with(hwnd, m, plan);
+            }
         }
+        Some(Ok(Picked::Invoked(verb))) if verb.eq_ignore_ascii_case("paste") => UNDO.with(|u| u.borrow_mut().record(undo::Op::Transfer(plan))),
         Some(Ok(Picked::Own(ARRANGE_NAME))) => arrange_by_name(list),
         Some(Ok(Picked::Own(CLOSE))) => {
             let _ = DestroyWindow(hwnd);

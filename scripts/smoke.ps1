@@ -589,28 +589,33 @@ Run-Check 'tree' {
   try {
     if (-not (Launch-Fresh 'C:\Windows')) { return @('FAIL', 'no main window within 5 s') }
     Wait-Until { (Get-Count $script:main) -ge 1 } 3000 | Out-Null
-    # More > Folder tree (command 30) shows the tree instead of the sidebar.
+    # More > Folder tree (command 30) shows the tree right of the sidebar.
     $null = [W]::PostMessage($script:main, 0x111, [IntPtr]30, [IntPtr]::Zero)
     # The control creates its inner SysTreeView32 a moment after itself.
     $found = Wait-Until { $script:nstc = [W]::FindDescendant($script:main, 'NamespaceTreeControl'); $script:nstc -ne [IntPtr]::Zero -and [W]::FindDescendant($script:main, 'SysTreeView32') -ne [IntPtr]::Zero } 3000
     $tv = [W]::FindDescendant($script:main, 'SysTreeView32')
     if (-not $found -or $tv -eq [IntPtr]::Zero) { return @('FAIL', "NamespaceTreeControl found=$found SysTreeView32=$($tv -ne [IntPtr]::Zero)") }
-    # Drag the splitter right of the tree 100 px with posted mouse messages (client x = screen x - tree's left).
-    $list = Get-List $script:main
-    # The tree is created once the first listing is on screen, then laid out.
-    Wait-Until { ([W]::Left($list) - [W]::Left($script:nstc)) -gt 100 } 2000 | Out-Null
-    $x0 = [W]::Left($list) - [W]::Left($script:nstc); $y = 200
+    # Drag the splitter right of the tree 100 px with posted mouse messages. The sidebar starts at the client's left
+    # edge, so client x = screen x - sidebar's left.
+    $list = Get-List $script:main; $side = Get-Sidebar
+    # The tree is created once the first listing is on screen, then laid out right of the sidebar.
+    Wait-Until { ([W]::Left($script:nstc) - [W]::Left($side)) -gt 100 -and ([W]::Left($list) - [W]::Left($script:nstc)) -gt 100 } 2000 | Out-Null
+    $x0 = [W]::Left($list) - [W]::Left($side); $y = 200
     $lp = { param($x) [IntPtr](($y -shl 16) -bor ($x -band 0xFFFF)) }
     $null = [W]::PostMessage($script:main, 0x201, [IntPtr]1, (& $lp ($x0 - 2)))
     $null = [W]::PostMessage($script:main, 0x200, [IntPtr]1, (& $lp ($x0 + 98)))
     $null = [W]::PostMessage($script:main, 0x202, [IntPtr]0, (& $lp ($x0 + 98)))
     Start-Sleep -Milliseconds 300
-    $moved = ([W]::Left($list) - [W]::Left($script:nstc)) - $x0
+    $moved = ([W]::Left($list) - [W]::Left($side)) - $x0
+    # Ctrl+B hides only the sidebar; More > Folder tree again hides the tree.
     $how = Send-Command 23
+    $sideGone = Wait-Until { -not [W]::IsWindowVisible($side) } 2000
+    $treeStays = [W]::IsWindowVisible($script:nstc)
+    $null = Send-Command 30
     $hidden = Wait-Until { -not [W]::IsWindowVisible($script:nstc) } 2000
     $drop = [W]::GetProp($list, 'OleDropTargetInterface') -ne [IntPtr]::Zero
-    $d = "More > Folder tree showed it; splitter drag moved the list $moved px; Ctrl+B ($how) hid it=$hidden; list drop target registered=$drop"
-    if ($moved -ge 90 -and $moved -le 115 -and $hidden -and $drop) { @('PASS', $d) } else { @('FAIL', $d) }
+    $d = "More > Folder tree showed it beside the sidebar; splitter drag moved the list $moved px; Ctrl+B ($how) hid the sidebar=$sideGone and left the tree=$treeStays; More > Folder tree hid it=$hidden; list drop target registered=$drop"
+    if ($moved -ge 90 -and $moved -le 115 -and $sideGone -and $treeStays -and $hidden -and $drop) { @('PASS', $d) } else { @('FAIL', $d) }
   } finally { Remove-Fresh }
 }
 
