@@ -714,11 +714,13 @@ reading order, Left and Right swapped in the strips, menus opening leftwards). N
 yet; `crates/core/tests/lang/xr.ini` is a test language for it, and the layout was checked on screenshots with it on
 2026-11-13.
 
-Known and not fixed: several internal window messages still carry a pointer (one was changed to carry none, and the Home drag image now refuses cross-thread senders), so
-another program running as the same user at the same integrity level can crash rexplorer by sending one with a bad
-value. Windows blocks lower-integrity senders, and a program
-at the same level could already inject code, so this is a robustness gap, not a privilege boundary. A worker result
-posted to a window that has already closed leaks its memory.
+Known and not fixed: two kinds of internal window message still carry a pointer, the accessibility request of
+rexplorer's own controls (`WM_ACC_ITEMS`) and their notifications to the parent (`WM_NOTIFY`); worker results now
+wait in a per-window queue and their message carries nothing. The thumbnail and Home icon messages carry a bitmap
+handle, which a forged message can only use to spoil drawing. Another program running as the same user at the same
+integrity level can crash rexplorer by sending one of the two with a bad value. Windows blocks lower-integrity
+senders, and a program at the same level could already inject code, so this is a robustness gap, not a privilege
+boundary.
 
 Where rexplorer differs from Explorer on purpose: Ctrl+D pins, Ctrl+Shift+E opens Explorer,
 F4's list holds rexplorer's recent places rather than Explorer's typed paths, and Alt or F10 focuses the command bar

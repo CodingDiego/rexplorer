@@ -606,7 +606,7 @@ fn drop_entry(effect: windows::Win32::System::Ole::DROPEFFECT, pairs: Vec<undo::
 }
 
 /// Records a drop into `dest` for undo (`plan_drop`).
-fn record_drop(app: usize, data: &IDataObject, dest: String) -> dragdrop::AfterDrop {
+pub(crate) fn record_drop(app: usize, data: &IDataObject, dest: String) -> dragdrop::AfterDrop {
     let op = plan_drop(data, dest);
     Box::new(move |effect| unsafe { (*(app as *mut App)).undo.record(op(effect)) })
 }

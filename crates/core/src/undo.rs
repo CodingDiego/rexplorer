@@ -13,7 +13,7 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::Win32::UI::Shell::{
-    FILEOPERATION_FLAGS, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NO_UI, FOF_WANTNUKEWARNING, FOFX_RECYCLEONDELETE, FileOperation, IFileOperation,
+    COPYENGINE_E_USER_CANCELLED, FILEOPERATION_FLAGS, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NO_UI, FOF_WANTNUKEWARNING, FOFX_RECYCLEONDELETE, FileOperation, IFileOperation,
     IFileOperationProgressSink, IFileOperationProgressSink_Impl, IShellItem, SHCreateItemFromParsingName, SHELLSTATEA, SHGetSetSettings,
     SIGDN_DESKTOPABSOLUTEPARSING, SSF_NOCONFIRMRECYCLE,
 };
@@ -293,9 +293,26 @@ fn file_name(p: &str) -> String {
 
 type Pairs = Rc<RefCell<Vec<(String, String)>>>;
 
-/// Collects (original, Recycle Bin item) of every successful delete.
+/// Collects (original, Recycle Bin item) of every successful delete, and refuses to rename, move or delete an item
+/// listed in `expect` (path, id) that is no longer that item: the shell's confirmation leaves time to swap it.
 #[implement(IFileOperationProgressSink)]
-struct Sink(Pairs);
+struct Sink {
+    got: Pairs,
+    expect: Vec<(String, Id)>,
+}
+
+impl Sink_Impl {
+    /// The engine's own Cancel code: no error box. The docs say an error from a Pre callback cancels this item and
+    /// every one after it in the same operation.
+    fn check(&self, item: Ref<IShellItem>) -> Result<()> {
+        let Some(i) = item.as_ref() else { return Ok(()) };
+        let p = name_of(i);
+        match self.expect.iter().find(|(e, _)| e.eq_ignore_ascii_case(&p)) {
+            Some((_, id)) if id_of(&p) != Some(*id) => Err(COPYENGINE_E_USER_CANCELLED.into()),
+            _ => Ok(()),
+        }
+    }
+}
 
 impl IFileOperationProgressSink_Impl for Sink_Impl {
     fn StartOperations(&self) -> Result<()> {
@@ -304,14 +321,14 @@ impl IFileOperationProgressSink_Impl for Sink_Impl {
     fn FinishOperations(&self, _: HRESULT) -> Result<()> {
         Ok(())
     }
-    fn PreRenameItem(&self, _: u32, _: Ref<IShellItem>, _: &PCWSTR) -> Result<()> {
-        Ok(())
+    fn PreRenameItem(&self, _: u32, item: Ref<IShellItem>, _: &PCWSTR) -> Result<()> {
+        self.check(item)
     }
     fn PostRenameItem(&self, _: u32, _: Ref<IShellItem>, _: &PCWSTR, _: HRESULT, _: Ref<IShellItem>) -> Result<()> {
         Ok(())
     }
-    fn PreMoveItem(&self, _: u32, _: Ref<IShellItem>, _: Ref<IShellItem>, _: &PCWSTR) -> Result<()> {
-        Ok(())
+    fn PreMoveItem(&self, _: u32, item: Ref<IShellItem>, _: Ref<IShellItem>, _: &PCWSTR) -> Result<()> {
+        self.check(item)
     }
     fn PostMoveItem(&self, _: u32, _: Ref<IShellItem>, _: Ref<IShellItem>, _: &PCWSTR, _: HRESULT, _: Ref<IShellItem>) -> Result<()> {
         Ok(())
@@ -322,13 +339,13 @@ impl IFileOperationProgressSink_Impl for Sink_Impl {
     fn PostCopyItem(&self, _: u32, _: Ref<IShellItem>, _: Ref<IShellItem>, _: &PCWSTR, _: HRESULT, _: Ref<IShellItem>) -> Result<()> {
         Ok(())
     }
-    fn PreDeleteItem(&self, _: u32, _: Ref<IShellItem>) -> Result<()> {
-        Ok(())
+    fn PreDeleteItem(&self, _: u32, item: Ref<IShellItem>) -> Result<()> {
+        self.check(item)
     }
     fn PostDeleteItem(&self, _: u32, item: Ref<IShellItem>, hr: HRESULT, created: Ref<IShellItem>) -> Result<()> {
         // `created` is the item now in the Recycle Bin, and null when the delete was permanent.
         if let (true, Some(i), Some(c)) = (hr.is_ok(), item.as_ref(), created.as_ref()) {
-            self.0.borrow_mut().push((name_of(i), name_of(c)));
+            self.got.borrow_mut().push((name_of(i), name_of(c)));
         }
         Ok(())
     }
@@ -355,6 +372,11 @@ impl IFileOperationProgressSink_Impl for Sink_Impl {
 /// Sends `paths` to the Recycle Bin through IFileOperation (never a permanent delete without the shell's warning);
 /// returns (original, bin item) of what went. `quiet` shows no UI (tests).
 pub fn recycle(hwnd: HWND, paths: &[String], quiet: bool) -> Vec<(String, String)> {
+    recycle_expecting(hwnd, paths, Vec::new(), quiet)
+}
+
+/// `recycle`, refusing (with every item after it) an item of `expect` that is no longer the one recorded.
+fn recycle_expecting(hwnd: HWND, paths: &[String], expect: Vec<(String, Id)>, quiet: bool) -> Vec<(String, String)> {
     if paths.is_empty() {
         return Vec::new();
     }
@@ -369,10 +391,11 @@ pub fn recycle(hwnd: HWND, paths: &[String], quiet: bool) -> Vec<(String, String
             if !hwnd.is_invalid() {
                 op.SetOwnerWindow(hwnd)?;
             }
-            let sink: IFileOperationProgressSink = Sink(got.clone()).into();
+            let sink: IFileOperationProgressSink = Sink { got: got.clone(), expect }.into();
             let cookie = op.Advise(&sink)?;
             // A path gone meanwhile (a stale search result) is skipped, not a reason to delete none of the rest.
             let queued = paths.iter().filter_map(|p| item(p).ok()).try_for_each(|i| op.DeleteItem(&i, None::<&IFileOperationProgressSink>));
+            before_perform();
             // A cancel returns Err; what the sink saw is still recorded.
             let _ = queued.and_then(|_| op.PerformOperations());
             let _ = op.Unadvise(cookie);
@@ -450,16 +473,36 @@ fn record_path(b: &[u8]) -> Option<String> {
     }
 }
 
-/// One IFileOperation: `add` queues the work. `quiet` shows no UI (tests).
-fn run(hwnd: HWND, quiet: bool, add: impl FnOnce(&IFileOperation) -> Result<()>) -> Result<()> {
+/// One IFileOperation: `add` queues the work on the item at `path`, which must still be item `id` when the shell
+/// acts on it. `quiet` shows no UI (tests).
+fn run(hwnd: HWND, quiet: bool, path: &str, id: Id, add: impl FnOnce(&IFileOperation) -> Result<()>) -> Result<()> {
     unsafe {
         let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER)?;
         op.SetOperationFlags(if quiet { FOF_NO_UI } else { FOF_ALLOWUNDO })?;
         if !hwnd.is_invalid() {
             op.SetOwnerWindow(hwnd)?;
         }
-        add(&op)?;
-        op.PerformOperations()
+        let sink: IFileOperationProgressSink = Sink { got: Rc::default(), expect: vec![(path.to_string(), id)] }.into();
+        let cookie = op.Advise(&sink)?;
+        let done = add(&op).and_then(|_| {
+            before_perform();
+            op.PerformOperations()
+        });
+        let _ = op.Unadvise(cookie);
+        done
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs once between queueing and PerformOperations: where a test swaps the item.
+    static BEFORE_PERFORM: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+fn before_perform() {
+    #[cfg(test)]
+    if let Some(f) = BEFORE_PERFORM.with(|b| b.borrow_mut().take()) {
+        f();
     }
 }
 
@@ -481,20 +524,27 @@ fn reverse_op(hwnd: HWND, op: Op, quiet: bool) -> Vec<Op> {
             if !is(&to, id) || (exists(&from) && !from.eq_ignore_ascii_case(&to)) {
                 return Vec::new();
             }
-            let _ = run(hwnd, quiet, |o| unsafe { o.RenameItem(&item(&to)?, &HSTRING::from(file_name(&from)), None::<&IFileOperationProgressSink>) });
+            let _ = run(hwnd, quiet, &to, id, |o| unsafe { o.RenameItem(&item(&to)?, &HSTRING::from(file_name(&from)), None::<&IFileOperationProgressSink>) });
+            // Only a rename that ran leaves `from` holding item `id`.
+            if id_of(&from) != Some(id) {
+                return Vec::new();
+            }
             Op::rename(to, from).into_iter().collect()
         }
         Op::Created(made) => {
-            let live: Vec<String> = made.into_iter().filter(|(p, id)| is(p, *id)).map(|(p, _)| p).collect();
-            vec![Op::Recycled(recycle(hwnd, &live, quiet))]
+            let live: Vec<(String, Id)> = made.into_iter().filter(|(p, id)| is(p, *id)).collect();
+            let paths: Vec<String> = live.iter().map(|(p, _)| p.clone()).collect();
+            vec![Op::Recycled(recycle_expecting(hwnd, &paths, live, quiet))]
         }
         Op::Recycled(pairs) => vec![Op::created(restore(hwnd, &pairs))],
         Op::Moved(moves) => {
             let mut done = Vec::new();
-            for (from, to, _) in moves.into_iter().filter(|(f, t, id)| is(t, *id) && !exists(f)) {
+            for (from, to, id) in moves.into_iter().filter(|(f, t, id)| is(t, *id) && !exists(f)) {
                 let parent = Path::new(&from).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-                let _ = run(hwnd, quiet, |o| unsafe { o.MoveItem(&item(&to)?, &item(&parent)?, &HSTRING::from(file_name(&from)), None::<&IFileOperationProgressSink>) });
-                if exists(&from) {
+                let _ = run(hwnd, quiet, &to, id, |o| unsafe { o.MoveItem(&item(&to)?, &item(&parent)?, &HSTRING::from(file_name(&from)), None::<&IFileOperationProgressSink>) });
+                // Only a move that ran leaves `to` free: a refused one (the item was swapped) leaves it taken, whatever
+                // appeared at `from` meanwhile. Not by id: a move to another volume gives the item a new one.
+                if exists(&from) && !exists(&to) {
                     done.push((to, from));
                 }
             }
@@ -943,6 +993,83 @@ mod tests {
         assert_eq!(record_path(&[3, 0, 0, 0, 0, 0, 0, 0]), None);
         assert_eq!(record_of("C:\\$RECYCLE.BIN\\S-1\\$RAB12.txt"), Some(std::path::PathBuf::from("C:\\$RECYCLE.BIN\\S-1\\$IAB12.txt")));
         assert_eq!(record_of("C:\\x\\a.txt"), None);
+    }
+
+    /// A fixture whose path is the long form (CI's %TEMP% is a short name; the shell reports long ones).
+    fn long_fixture(tag: &str) -> (Fixture, std::path::PathBuf) {
+        let fx = fixture(tag);
+        let long = std::fs::canonicalize(&fx.0).unwrap().to_string_lossy().trim_start_matches(r"\\?\").into();
+        (fx, long)
+    }
+
+    /// Replaces the file at `p` with another one holding "theirs" just before the shell runs.
+    fn swap_before_perform(p: &str) {
+        let p = p.to_string();
+        BEFORE_PERFORM.with(|b| {
+            *b.borrow_mut() = Some(Box::new(move || {
+                std::fs::remove_file(&p).unwrap();
+                std::fs::write(&p, "theirs").unwrap();
+            }))
+        });
+    }
+
+    #[test]
+    fn undo_rename_skips_an_item_swapped_while_the_shell_runs() {
+        let _c = ComInit::sta();
+        let (_fx, d) = long_fixture("swaprename");
+        let (a, b) = (p(&d, "a.txt"), p(&d, "b.txt"));
+        std::fs::write(&b, "mine").unwrap();
+        let op = Op::rename(a.clone(), b.clone()).unwrap();
+        swap_before_perform(&b);
+        assert!(reverse_with(HWND::default(), vec![op], true).is_empty());
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "theirs");
+        assert!(!Path::new(&a).exists());
+    }
+
+    #[test]
+    fn undo_move_skips_an_item_swapped_while_the_shell_runs() {
+        let _c = ComInit::sta();
+        let (_fx, d) = long_fixture("swapmove");
+        std::fs::create_dir_all(d.join("dst")).unwrap();
+        let (sx, dx) = (p(&d, "x.txt"), p(&d, "dst\\x.txt"));
+        std::fs::write(&dx, "mine").unwrap();
+        let op = Op::moved(vec![(sx.clone(), dx.clone())]);
+        swap_before_perform(&dx);
+        assert!(reverse_with(HWND::default(), vec![op], true).is_empty());
+        assert_eq!(std::fs::read_to_string(&dx).unwrap(), "theirs");
+        assert!(!Path::new(&sx).exists());
+        // The same refusal while another program makes a file at the old path: nothing to redo, or Ctrl+Y would move
+        // that file.
+        std::fs::write(&dx, "mine").unwrap();
+        let op = Op::moved(vec![(sx.clone(), dx.clone())]);
+        let (s2, d2) = (sx.clone(), dx.clone());
+        BEFORE_PERFORM.with(|b| {
+            *b.borrow_mut() = Some(Box::new(move || {
+                std::fs::remove_file(&d2).unwrap();
+                std::fs::write(&d2, "theirs").unwrap();
+                std::fs::write(&s2, "someone else's").unwrap();
+            }))
+        });
+        assert!(reverse_with(HWND::default(), vec![op], true).is_empty());
+        assert_eq!(std::fs::read_to_string(&sx).unwrap(), "someone else's");
+    }
+
+    #[test]
+    fn undo_delete_skips_an_item_swapped_while_the_shell_runs() {
+        let _c = ComInit::sta();
+        let (_fx, d) = long_fixture("swapdelete");
+        let n = format!("rexplorer-undo-test-swap-{}.txt", std::process::id());
+        let (made, later) = (p(&d, &n), p(&d, &format!("z-{n}")));
+        std::fs::write(&made, "mine").unwrap();
+        std::fs::write(&later, "mine too").unwrap();
+        let op = Op::created(vec![made.clone(), later.clone()]);
+        swap_before_perform(&made);
+        let r = reverse_with(HWND::default(), vec![op], true);
+        assert_eq!(std::fs::read_to_string(&made).unwrap(), "theirs", "the swapped-in file stays");
+        // The refusal cancels the items after it in the same operation (the documented behaviour): `later` stays too,
+        // and nothing that did not go to the bin is recorded.
+        assert!(Path::new(&later).exists());
+        assert!(r.is_empty(), "{r:?}");
     }
 
     #[test]

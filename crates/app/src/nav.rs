@@ -247,10 +247,12 @@ pub(crate) unsafe fn navigate(app: *mut App, t: usize, target: Target, history: 
         if superseded() {
             return;
         }
-        let done = Box::new(EnumDone { generation, history, result });
-        let _ = PostMessageW(Some(HWND(hwnd as *mut c_void)), WM_ENUM_DONE, WPARAM(0), LPARAM(Box::into_raw(done) as isize));
+        let _ = ENUM_DONE.post(hwnd, WM_ENUM_DONE, Box::new(EnumDone { generation, history, result }));
     });
 }
+
+/// Finished loads, for WM_ENUM_DONE.
+pub(crate) static ENUM_DONE: crate::mailbox::Mailbox<Box<EnumDone>> = crate::mailbox::Mailbox::new();
 
 /// Navigates the active tab.
 pub(crate) unsafe fn go(app: *mut App, target: Target, history: History) {

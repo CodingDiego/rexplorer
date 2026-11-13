@@ -6,7 +6,15 @@ a line under Unreleased. Sections up to 0.1.4 were rebuilt from git history and 
 
 ## Unreleased
 
-Nothing yet.
+- Drops onto the folder tree are recorded like drops on the list: Ctrl+Z undoes the move or sends the copy to the
+  Recycle Bin, Ctrl+Y redoes it, and a drag cancelled with Esc records nothing
+  ([#87](https://github.com/CodingDiego/rexplorer/issues/87)).
+- Undo checks each item's file id again when the shell is about to act on it, and a swapped item
+  cancels that item and the rest of the undo ([#84](https://github.com/CodingDiego/rexplorer/issues/84)).
+- Worker results (folder loads, search batches, crumb menus, sidebar rows, the tree's selection, archive password
+  prompts and errors, the preview pane, the update notice, the browser view) no longer travel as pointers in window
+  messages: each window keeps them in its own queue, so a forged message cannot crash rexplorer through them, and a
+  result that arrives after its window closed is freed instead of leaked ([#84](https://github.com/CodingDiego/rexplorer/issues/84)).
 
 ## 1.0.0-rc.1 - 2026-11-13
 

@@ -699,12 +699,12 @@ pub(crate) unsafe fn crumb_dropdown(app: *mut App, index: usize, at: Option<POIN
             items.truncate(500);
             Some(items.iter().map(|it| (it.display_name(), folder.child_pidl(it))).collect())
         })();
-        let done = Box::into_raw(Box::new(CrumbItems { token, generation, at: at_pt, keyboard, items }));
-        if unsafe { PostMessageW(Some(HWND(hwnd as *mut c_void)), WM_CRUMB_ITEMS, WPARAM(0), LPARAM(done as isize)) }.is_err() {
-            drop(unsafe { Box::from_raw(done) });
-        }
+        let _ = CRUMB_ITEMS.post(hwnd, WM_CRUMB_ITEMS, CrumbItems { token, generation, at: at_pt, keyboard, items });
     });
 }
+
+/// Listed dropdowns, for WM_CRUMB_ITEMS.
+pub(crate) static CRUMB_ITEMS: crate::mailbox::Mailbox<CrumbItems> = crate::mailbox::Mailbox::new();
 
 /// A dropdown's listing is in: shown unless a newer one was asked for, the tab navigated, or the window lost the
 /// foreground meanwhile.
