@@ -56,18 +56,23 @@ Out of scope:
 
 ## Known limitations (1.0.0-rc.1)
 
-- **Forgeable window messages.** Several of rexplorer's internal window messages still carry a memory pointer in
-  their parameters (two were changed in this release to carry none). Another program running in the same session,
-  as the same user and at the same or a higher integrity level, can post such a message with a bad pointer and
-  crash rexplorer. Windows blocks these messages from lower-integrity programs. The impact is a crash (lost tabs
-  until the automatic recovery start), not code running with more rights: a program that can send the message can
-  already read and change everything the user can.
-- **Undo checks a file's identity once.** Before an undo moves, renames or recycles something, rexplorer checks that
-  the item is still the one it recorded (its file id, or for a paste or drop a free name of the shell's form with the
-  source's size and time). It does not check again while the shell's confirmation dialog is open. If another
-  program swaps the file in that window, undo can act on the swapped file. The shell's own operations still apply
-  (a delete goes to the Recycle Bin, where it can be restored), and only files the user can already change are
-  reachable.
+- **Forgeable window messages.** The worker results no longer carry a pointer: since the Unreleased round each
+  window keeps them in its own queue and the message carries nothing. Two kinds still carry one: the accessibility
+  request rexplorer's own controls answer (`WM_ACC_ITEMS`), and the notifications its custom controls send their
+  parent (`WM_NOTIFY` with rexplorer's own structures, as every Win32 control does). The thumbnail and Home icon
+  messages carry a bitmap handle instead: a forged one makes rexplorer draw, and later free, another of its own
+  bitmaps, which spoils drawing and not memory. Another program running in the
+  same session, as the same user and at the same or a higher integrity level, can send such a message with a bad
+  pointer and crash rexplorer. Windows blocks these messages from lower-integrity programs. The impact is a crash
+  (lost tabs until the automatic recovery start), not code running with more rights: a program that can send the
+  message can already read and change everything the user can.
+- **Undo's identity check leaves a short window.** Before an undo moves, renames or recycles something, rexplorer
+  checks that the item is still the one it recorded (its file id, or for a paste or drop a free name of the shell's
+  form with the source's size and time). Since the Unreleased round it checks the file id again when the shell is
+  about to act on the item, and a swapped item cancels that item and the rest of the undo (tested without the
+  shell's dialogs; not yet seen with a confirmation dialog on screen). What remains is the moment between that check and the shell's own move, rename or delete. The shell's
+  own operations still apply (a delete goes to the Recycle Bin, where it can be restored), and only files the user
+  can already change are reachable.
 
 ## Sending a crash report
 

@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::archive_view::ArchiveListing;
+use crate::mailbox::Mailbox;
 use rexplorer_core::i18n::{tr, trf};
 use crate::nav::{Crumb, Listing, Loaded, Show, Target, cur, go, source};
 use rexplorer_core::archive::{self, Entry};
@@ -23,12 +24,15 @@ use windows::Win32::UI::Shell::{
 };
 use windows::core::Interface;
 
-/// lparam = Box<SearchBatch>.
+/// Search results are in SEARCH_BATCH.
 pub(crate) const WM_SEARCH_BATCH: u32 = WM_APP + 4;
-/// lparam = Box<Pidl>: the embedded browser finished a navigation.
+pub(crate) static SEARCH_BATCH: Mailbox<Box<SearchBatch>> = Mailbox::new();
+/// The embedded browser finished a navigation; where to is in BROWSER_NAV.
 pub(crate) const WM_BROWSER_NAV: u32 = WM_APP + 5;
-/// lparam = Box<String>: a worker failed (archive extraction); shown as an error box.
+pub(crate) static BROWSER_NAV: Mailbox<Box<Pidl>> = Mailbox::new();
+/// A worker failed (archive extraction): the text in WORKER_ERROR is shown as an error box.
 pub(crate) const WM_WORKER_ERROR: u32 = WM_APP + 6;
+pub(crate) static WORKER_ERROR: Mailbox<String> = Mailbox::new();
 /// Most results the volume index returns per search.
 const USN_LIMIT: usize = 5000;
 
@@ -412,9 +416,10 @@ pub(crate) enum ArchiveJob {
     Extract(PathBuf),
 }
 
-/// lparam = Box<(PathBuf, bool, ArchiveJob)>: the job needs the archive's password (the bool: the one given was
-/// wrong); the UI thread asks for it and runs the job again.
+/// A job needs the archive's password; (archive, whether the one given was wrong, the job) waits in
+/// ARCHIVE_PASSWORD. The UI thread asks for it and runs the job again.
 pub(crate) const WM_ARCHIVE_PASSWORD: u32 = WM_APP + 12;
+pub(crate) static ARCHIVE_PASSWORD: Mailbox<Box<(PathBuf, bool, ArchiveJob)>> = Mailbox::new();
 
 /// Runs `job` on a worker; an error goes back to window `hwnd` as a message box, a missing or wrong password as
 /// WM_ARCHIVE_PASSWORD.
@@ -427,10 +432,7 @@ pub(crate) fn run_job(hwnd: isize, archive: PathBuf, job: ArchiveJob) {
         };
         let Err(err) = r else { return };
         if let Some(wrong) = archive::password_needed(&err) {
-            let b = Box::into_raw(Box::new((archive, wrong, job)));
-            if unsafe { PostMessageW(Some(HWND(hwnd as *mut c_void)), WM_ARCHIVE_PASSWORD, WPARAM(0), LPARAM(b as isize)) }.is_err() {
-                drop(unsafe { Box::from_raw(b) });
-            }
+            let _ = ARCHIVE_PASSWORD.post(hwnd, WM_ARCHIVE_PASSWORD, Box::new((archive, wrong, job)));
             return;
         }
         let text = match &job {
@@ -502,10 +504,7 @@ unsafe fn pick_folder(owner: HWND) -> Option<PathBuf> {
 }
 
 fn post_error(hwnd: isize, text: String) {
-    let b = Box::into_raw(Box::new(text));
-    if unsafe { PostMessageW(Some(HWND(hwnd as *mut c_void)), WM_WORKER_ERROR, WPARAM(0), LPARAM(b as isize)) }.is_err() {
-        drop(unsafe { Box::from_raw(b) });
-    }
+    let _ = WORKER_ERROR.post(hwnd, WM_WORKER_ERROR, text);
 }
 
 // ---- activation ----------------------------------------------------------------------------------
@@ -644,10 +643,7 @@ pub(crate) unsafe fn start_search(app: *mut App, t: usize, needle: &str, push: b
     std::thread::spawn(move || {
         let _com = ComInit::mta();
         let post = |rows: Vec<SearchRow>, done: bool| {
-            let b = Box::into_raw(Box::new(SearchBatch { generation, rows, done }));
-            if unsafe { PostMessageW(Some(HWND(hwnd as *mut c_void)), WM_SEARCH_BATCH, WPARAM(0), LPARAM(b as isize)) }.is_err() {
-                drop(unsafe { Box::from_raw(b) });
-            }
+            let _ = SEARCH_BATCH.post(hwnd, WM_SEARCH_BATCH, Box::new(SearchBatch { generation, rows, done }));
         };
         // The walk has no result limit of its own; stop it where the USN path stops.
         let mut n = 0usize;
@@ -985,10 +981,7 @@ pub(crate) unsafe fn enter_browser(app: *mut App, place: &BrowserPlace) {
         let hwnd = a.hwnd.0 as isize;
         // Runs inside the browser's own message handling: only post.
         let post = move |p: Pidl| {
-            let b = Box::into_raw(Box::new(p));
-            if unsafe { PostMessageW(Some(HWND(hwnd as *mut c_void)), WM_BROWSER_NAV, WPARAM(0), LPARAM(b as isize)) }.is_err() {
-                drop(unsafe { Box::from_raw(b) });
-            }
+            let _ = BROWSER_NAV.post(hwnd, WM_BROWSER_NAV, Box::new(p));
         };
         match browser::create(a.hwnd, a.panes.list_rect, Box::new(post)) {
             Ok(b) => a.browser = Some(b),

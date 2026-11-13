@@ -22,6 +22,7 @@ mod home;
 mod instance;
 mod keys;
 mod list;
+mod mailbox;
 mod nav;
 mod palette;
 mod panes;
@@ -75,9 +76,10 @@ use source::Source;
 
 const WM_ENUM_DONE: u32 = WM_APP + 1;
 const WM_SHELL_CHANGE: u32 = WM_APP + 2;
-/// The update check found a newer release: lparam is a Box<String> with its version.
+/// The update check found a newer release: its version waits in UPDATE_FOUND.
 const WM_UPDATE_FOUND: u32 = WM_APP + 11;
-/// A breadcrumb dropdown's folders are listed: lparam is a Box<ui::CrumbItems>.
+static UPDATE_FOUND: mailbox::Mailbox<String> = mailbox::Mailbox::new();
+/// A breadcrumb dropdown's folders are listed: they wait in ui::CRUMB_ITEMS.
 const WM_CRUMB_ITEMS: u32 = WM_APP + 13;
 /// That version, for the status bar and the More menu.
 static UPDATE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -562,7 +564,7 @@ fn check_updates(hwnd: HWND) {
     std::thread::spawn(move || {
         ui::background_priority();
         if let Some(v) = rexplorer_core::update::check(&settings::dir(), env!("CARGO_PKG_VERSION")) {
-            let _ = unsafe { PostMessageW(Some(HWND(hwnd as *mut c_void)), WM_UPDATE_FOUND, WPARAM(0), LPARAM(Box::into_raw(Box::new(v)) as isize)) };
+            let _ = UPDATE_FOUND.post(hwnd, WM_UPDATE_FOUND, v);
         }
     });
 }
@@ -782,8 +784,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_SYSCOMMAND if ui::is_bare_menu_key(wparam.0, lparam.0, GetKeyState(VK_SHIFT.0 as i32) < 0) => ui::focus_command_bar(app),
         WM_CONTEXTMENU if HWND(wparam.0 as *mut c_void) == (*app).nav => nav::on_nav_context(app, lparam),
-        WM_ENUM_DONE => nav::on_enum_done(app, Box::from_raw(lparam.0 as *mut nav::EnumDone)),
-        WM_CRUMB_ITEMS => ui::on_crumb_items(app, *Box::from_raw(lparam.0 as *mut ui::CrumbItems)),
+        // Worker results: each message stands for one payload in a mailbox; the message itself carries none.
+        WM_ENUM_DONE => {
+            if let Some(d) = nav::ENUM_DONE.take(hwnd) {
+                nav::on_enum_done(app, d);
+            }
+        }
+        WM_CRUMB_ITEMS => {
+            if let Some(c) = ui::CRUMB_ITEMS.take(hwnd) {
+                ui::on_crumb_items(app, c);
+            }
+        }
         nav::WM_TAB_RETURN => {
             // The other window did not take the tab: it opens here again.
             for name in nav::take_returned() {
@@ -792,15 +803,41 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
         }
         WM_UPDATE_FOUND => {
-            let _ = UPDATE.set(*Box::from_raw(lparam.0 as *mut String));
-            ui::update_status(app);
+            if let Some(v) = UPDATE_FOUND.take(hwnd) {
+                let _ = UPDATE.set(v);
+                ui::update_status(app);
+            }
         }
-        source::WM_SEARCH_BATCH => source::on_search_batch(app, Box::from_raw(lparam.0 as *mut source::SearchBatch)),
-        source::WM_BROWSER_NAV => source::on_browser_nav(app, Box::from_raw(lparam.0 as *mut Pidl)),
-        source::WM_WORKER_ERROR => message(hwnd, &Box::from_raw(lparam.0 as *mut String)),
-        source::WM_ARCHIVE_PASSWORD => source::on_archive_password(app, Box::from_raw(lparam.0 as *mut _)),
-        panes::WM_SIDEBAR_ROWS => panes::on_sidebar_rows(app, Box::from_raw(lparam.0 as *mut panes::SidebarRows)),
-        panes::WM_TREE_SELECT => panes::on_tree_select(app, Box::from_raw(lparam.0 as *mut Pidl)),
+        source::WM_SEARCH_BATCH => {
+            if let Some(b) = source::SEARCH_BATCH.take(hwnd) {
+                source::on_search_batch(app, b);
+            }
+        }
+        source::WM_BROWSER_NAV => {
+            if let Some(p) = source::BROWSER_NAV.take(hwnd) {
+                source::on_browser_nav(app, p);
+            }
+        }
+        source::WM_WORKER_ERROR => {
+            if let Some(e) = source::WORKER_ERROR.take(hwnd) {
+                message(hwnd, &e);
+            }
+        }
+        source::WM_ARCHIVE_PASSWORD => {
+            if let Some(a) = source::ARCHIVE_PASSWORD.take(hwnd) {
+                source::on_archive_password(app, a);
+            }
+        }
+        panes::WM_SIDEBAR_ROWS => {
+            if let Some(r) = panes::SIDEBAR_ROWS.take(hwnd) {
+                panes::on_sidebar_rows(app, r);
+            }
+        }
+        panes::WM_TREE_SELECT => {
+            if let Some(p) = panes::TREE_SELECT.take(hwnd) {
+                panes::on_tree_select(app, p);
+            }
+        }
         panes::WM_QUICK_ACCESS_DONE => {
             if wparam.0 == 1 {
                 panes::sidebar_changed(app);
@@ -905,6 +942,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let _ = std::fs::remove_dir_all(archive_view::session_dir());
             rexplorer_core::archive::forget_passwords();
             (*app).panes.tree = None;
+            // Workers that finish later fail to post and queue nothing.
+            UPDATE_FOUND.forget(hwnd);
+            nav::ENUM_DONE.forget(hwnd);
+            ui::CRUMB_ITEMS.forget(hwnd);
+            source::SEARCH_BATCH.forget(hwnd);
+            source::BROWSER_NAV.forget(hwnd);
+            source::WORKER_ERROR.forget(hwnd);
+            source::ARCHIVE_PASSWORD.forget(hwnd);
+            panes::SIDEBAR_ROWS.forget(hwnd);
+            panes::TREE_SELECT.forget(hwnd);
             // The shell asks for a window's properties to be cleared before it goes.
             let _ = rexplorer_core::jumplist::set_window_app_id(hwnd, true);
             PostQuitMessage(0);

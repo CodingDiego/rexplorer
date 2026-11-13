@@ -205,6 +205,20 @@ pub fn picked(hwnd: HWND) -> Option<String> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Set by a test that reads the open palette: the windows other tests activate at the same time would close it.
+    static STAY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether losing the activation or the focus leaves the palette open: never outside tests.
+fn stays() -> bool {
+    #[cfg(test)]
+    return STAY.with(|s| s.get());
+    #[cfg(not(test))]
+    false
+}
+
 pub fn close(hwnd: HWND) {
     unsafe {
         let st = state_of(hwnd);
@@ -386,11 +400,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_APP_BLUR => {
             let next = HWND(wparam.0 as *mut c_void);
-            if next != hwnd && next != (*st).edit {
+            if next != hwnd && next != (*st).edit && !stays() {
                 finish(hwnd, st, PN_CLOSE);
             }
         }
-        WM_ACTIVATE if wparam.0 & 0xFFFF == 0 => finish(hwnd, st, PN_CLOSE),
+        WM_ACTIVATE if wparam.0 & 0xFFFF == 0 && !stays() => finish(hwnd, st, PN_CLOSE),
         WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
         WM_MOUSEMOVE => {
             if !(*st).tracking {
@@ -574,16 +588,11 @@ mod tests {
             let wc = WNDCLASSW { lpfnWndProc: Some(rec_parent), hInstance: hinst, lpszClassName: w!("RexPaletteAccParent"), ..Default::default() };
             RegisterClassW(&wc);
             let parent = CreateWindowExW(WINDOW_EX_STYLE(0), w!("RexPaletteAccParent"), PCWSTR::null(), WS_OVERLAPPEDWINDOW, 0, 0, 800, 600, None, None, Some(hinst), None).unwrap();
-            // The palette closes when it loses activation (the user clicked another window): that says nothing
-            // about its accessible tree, so open it again.
-            let mut p = HWND::default();
-            for _ in 0..5 {
-                p = open(parent, 7, vec![c("Documents"), c("Downloads")], &Theme::light(), HFONT::default()).unwrap();
-                pump();
-                if IsWindow(Some(p)).as_bool() {
-                    break;
-                }
-            }
+            // The palette closes when it loses activation, and the windows of the tests running beside this one take
+            // it at any moment: that says nothing about its accessible tree, so it stays open here.
+            STAY.with(|s| s.set(true));
+            let p = open(parent, 7, vec![c("Documents"), c("Downloads")], &Theme::light(), HFONT::default()).unwrap();
+            pump();
             NOTES.with(|n| n.borrow_mut().clear());
             let acc = object(p);
             let k = kids(&acc);

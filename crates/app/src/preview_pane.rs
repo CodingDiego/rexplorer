@@ -26,12 +26,14 @@ use windows::core::{GUID, HSTRING, PCWSTR, Result, w};
 
 /// Reserved for the parent's notifications; the pane currently sends none.
 pub const PVN_FIRST: u32 = 0x9000;
-/// Posted to the pane by a worker that filled the cache for a file (lparam = Box<PathBuf> of it); the pane shows the
+/// Posted to the pane by a worker that filled the cache for a file (its path waits in READY); the pane shows the
 /// subject again from the cache if it is still that file.
 const PV_READY: u32 = WM_APP + 0x51;
+static READY: crate::mailbox::Mailbox<PathBuf> = crate::mailbox::Mailbox::new();
 
-/// Posted to the pane by the Dimensions worker (lparam = Box<(PathBuf, String)>: the file and its "2 x 3" text).
+/// Posted to the pane by the Dimensions worker; the file and its "2 x 3" text wait in DIMS.
 const PV_DIMS: u32 = WM_APP + 0x52;
+static DIMS: crate::mailbox::Mailbox<(PathBuf, String)> = crate::mailbox::Mailbox::new();
 
 // The Edit word-wraps all of its text on every set and resize, so keep what goes in small.
 const MAX_TEXT: u64 = 64 * 1024;
@@ -154,12 +156,7 @@ fn fetch(path: PathBuf, abs: Pidl, size: i32, kind: Kind, notify: isize) {
             let _ = cached_thumb(Some(&path), &abs, size);
         }
         if notify != 0 {
-            // shortcut: one still queued when the pane is destroyed leaks its path (only at exit today); drain
-            // PV_READY in WM_DESTROY if panes ever close earlier.
-            let p = Box::into_raw(Box::new(path));
-            if unsafe { PostMessageW(Some(HWND(notify as *mut c_void)), PV_READY, WPARAM(0), LPARAM(p as isize)) }.is_err() {
-                drop(unsafe { Box::from_raw(p) });
-            }
+            let _ = READY.post(notify, PV_READY, path);
         }
     });
 }
@@ -377,12 +374,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         PV_READY => {
-            let ready = Box::from_raw(lparam.0 as *mut PathBuf);
+            let Some(ready) = READY.take(hwnd) else { return LRESULT(0) };
             // Cache only: a file that cannot be cached (vanished) would otherwise spawn a worker per PV_READY.
             // A handler already showing stays (a stale PV_READY must not open a second one), and so does a
             // completion for a file no longer shown (it would re-run a folder thumbnail on the UI thread).
             if let Some(sub) = (*s).subject.take() {
-                if (*s).preview.is_none() && sub.path.as_ref() == Some(&*ready) {
+                if (*s).preview.is_none() && sub.path.as_ref() == Some(&ready) {
                     present(hwnd, s, &sub, false);
                     announce(hwnd, s);
                     let _ = InvalidateRect(Some(hwnd), None, false);
@@ -392,7 +389,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         PV_DIMS => {
-            let (path, text) = *Box::from_raw(lparam.0 as *mut (PathBuf, String));
+            let Some((path, text)) = DIMS.take(hwnd) else { return LRESULT(0) };
             let shown = (*s).subject.as_ref().and_then(|sub| sub.path.as_ref()) == Some(&path);
             if let (Some(d), true) = (&mut (*s).details, shown)
                 && !d.rows.iter().any(|r| r.0 == tr("preview.dimensions")) {
@@ -403,6 +400,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_DESTROY => {
+            READY.forget(hwnd);
+            DIMS.forget(hwnd);
             (*s).preview = None;
             (*s).subject = None;
             clear_bitmap(s);
@@ -697,10 +696,7 @@ pub fn show_details(hwnd: HWND, subject: Option<Subject>, text: DetailsText, dim
                     crate::ui::background_priority();
                     let _com = ComInit::mta();
                     let Some(text) = image_dimensions(&path) else { return };
-                    let b = Box::into_raw(Box::new((path, text)));
-                    if PostMessageW(Some(HWND(notify as *mut c_void)), PV_DIMS, WPARAM(0), LPARAM(b as isize)).is_err() {
-                        drop(Box::from_raw(b));
-                    }
+                    let _ = DIMS.post(notify, PV_DIMS, (path, text));
                 });
             }
             (*s).subject = Some(sub);

@@ -16,10 +16,12 @@ use windows::Win32::UI::Shell::{
 };
 use windows::core::{GUID, Interface};
 
-/// lparam = Box<Pidl> picked in the tree.
+/// A folder was picked in the tree; it waits in TREE_SELECT.
 pub(crate) const WM_TREE_SELECT: u32 = WM_APP + 3;
-/// lparam = Box<SidebarRows> built by the sidebar worker.
+pub(crate) static TREE_SELECT: crate::mailbox::Mailbox<Box<Pidl>> = crate::mailbox::Mailbox::new();
+/// The sidebar worker built its rows; they wait in SIDEBAR_ROWS.
 pub(crate) const WM_SIDEBAR_ROWS: u32 = WM_APP + 8;
+pub(crate) static SIDEBAR_ROWS: crate::mailbox::Mailbox<Box<SidebarRows>> = crate::mailbox::Mailbox::new();
 /// wparam = 1 when the shell ran the pin or unpin verb, 0 when it refused it.
 pub(crate) const WM_QUICK_ACCESS_DONE: u32 = WM_APP + 9;
 /// Gap between the side panes and the cards, and the cards' margin from the window edges; it is the splitter.
@@ -69,12 +71,12 @@ pub(crate) unsafe fn ensure_tree(app: *mut App) {
     }
     let hwnd = a.hwnd.0 as isize;
     let post = move |p: Pidl| {
-        let boxed = Box::into_raw(Box::new(p));
-        if unsafe { PostMessageW(Some(HWND(hwnd as *mut c_void)), WM_TREE_SELECT, WPARAM(0), LPARAM(boxed as isize)) }.is_err() {
-            drop(unsafe { Box::from_raw(boxed) });
-        }
+        let _ = TREE_SELECT.post(hwnd, WM_TREE_SELECT, Box::new(p));
     };
-    match tree::create(a.hwnd, RECT::default(), a.profile.show_hidden, Box::new(post)) {
+    // A drop on a tree folder is undone like one on the list.
+    let app_ptr = app as usize;
+    let plan: tree::PlanDrop = Box::new(move |data, dest| Some(list::record_drop(app_ptr, data, dest)));
+    match tree::create(a.hwnd, RECT::default(), a.profile.show_hidden, Box::new(post), Some(plan)) {
         Ok(t) => a.panes.tree = Some(t),
         Err(_) => return,
     }
@@ -307,9 +309,7 @@ pub(crate) unsafe fn refresh_sidebar(app: *mut App) {
         let _com = ComInit::mta();
         let rows = Box::new(sidebar_rows(&bookmarks));
         SIDEBAR_BUSY.store(false, Ordering::SeqCst);
-        let p = Box::into_raw(rows);
-        if unsafe { PostMessageW(Some(HWND(hwnd as *mut c_void)), WM_SIDEBAR_ROWS, WPARAM(0), LPARAM(p as isize)) }.is_err() {
-            let rows = unsafe { Box::from_raw(p) };
+        if let Err(rows) = SIDEBAR_ROWS.post(hwnd, WM_SIDEBAR_ROWS, rows) {
             for i in rows.rows.iter().filter_map(|r| r.icon) {
                 let _ = unsafe { DestroyIcon(i) };
             }

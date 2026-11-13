@@ -361,12 +361,19 @@ impl IDropTarget_Impl for DropForwarder_Impl {
             }
         };
         if let Some(a) = after {
-            let shown = if r.is_ok() { unsafe { *pdweffect } } else { DROPEFFECT_NONE };
-            // An optimized move ends with NONE and says what it did only in "Performed DropEffect".
-            let performed = pdataobj.as_ref().map_or(0, performed_effect);
-            a(if shown == DROPEFFECT_NONE && r.is_ok() { DROPEFFECT(performed) } else { shown });
+            a(dropped_effect(r.is_ok(), unsafe { *pdweffect }, pdataobj.as_ref()));
         }
         r
+    }
+}
+
+/// What a drop did: the effect the target returned, or for an optimized move (which ends with NONE) what it wrote in
+/// "Performed DropEffect"; NONE when the target's Drop failed.
+pub fn dropped_effect(ok: bool, shown: DROPEFFECT, data: Option<&IDataObject>) -> DROPEFFECT {
+    match (ok, shown) {
+        (false, _) => DROPEFFECT_NONE,
+        (true, DROPEFFECT_NONE) => DROPEFFECT(data.map_or(0, performed_effect)),
+        (true, e) => e,
     }
 }
 
