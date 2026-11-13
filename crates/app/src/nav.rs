@@ -139,6 +139,77 @@ pub(crate) struct Tab {
     pub home_filter: home::Filter,
     /// Search results in this tab's history, oldest first, at most KEPT.
     pub kept: Vec<Kept>,
+    /// A delete the user made here, for the reload that follows it.
+    pub deleted: Option<Deleted>,
+}
+
+/// A delete of the selection the user made in a folder. The reload after it selects the row that took the deleted
+/// rows' place, as Explorer does; any other reload leaves nothing selected when the selected items are gone (another
+/// program's rename, an editor's save by replace, an undo): a row the user never chose must not take their next key.
+pub(crate) struct Deleted {
+    folder: String,
+    names: Vec<String>,
+    /// Parsing name of the row that takes the selection (`row_taking_place`).
+    next: Option<String>,
+    /// When the delete returned; None while it runs (its confirmation and progress pump messages, so reloads land).
+    at: Option<Instant>,
+}
+
+/// How long a finished delete waits for its reload.
+const DELETED_WAIT: Duration = Duration::from_secs(10);
+
+impl Deleted {
+    /// The delete returned: kept only when one of its items is known to be gone. A cancel in the confirmation
+    /// deletes nothing and disarms; so does a delete of items that are not files (nothing tells they went).
+    fn over(mut self, now: Instant, gone: impl Fn(&str) -> bool) -> Option<Self> {
+        self.at = Some(now);
+        self.names.iter().any(|n| gone(n)).then_some(self)
+    }
+
+    /// The row a finished load of `folder` selects when the listing no longer holds the selection it replaced
+    /// (`replaced`): only a reload of the folder deleted in, soon after the delete, of a selection of deleted rows.
+    /// Never on Home or Quick Access, whose page orders the items its own way (the list behind it would select a
+    /// row the page does not show next to the deleted one).
+    fn next_for(self, refresh: bool, folder: &str, home: bool, replaced: &[String], now: Instant) -> Option<String> {
+        let recent = self.at.is_some_and(|at| now.duration_since(at) < DELETED_WAIT);
+        let names: std::collections::HashSet<&str> = self.names.iter().map(String::as_str).collect();
+        let ours = refresh && !home && recent && self.folder.eq_ignore_ascii_case(folder) && !replaced.is_empty() && replaced.iter().all(|r| names.contains(r.as_str()));
+        if ours { self.next } else { None }
+    }
+}
+
+/// The row that takes the selection after the `selected` rows (ascending) go: the first survivor after the focused
+/// one (the first selected when the focus is elsewhere), else the last survivor before it; None when none survives.
+fn row_taking_place(len: usize, selected: &[usize], focused: Option<usize>) -> Option<usize> {
+    let at = focused.filter(|f| selected.binary_search(f).is_ok()).or_else(|| selected.first().copied())?;
+    let survives = |i: &usize| selected.binary_search(i).is_err();
+    (at + 1..len).find(survives).or_else(|| (0..at.min(len)).rev().find(survives))
+}
+
+/// Arms the active tab for the reload after the user deletes `rows` of its folder (any delete route calls this
+/// before the delete runs and `delete_over` after); returns the tab, which the delete's dialogs may move.
+pub(crate) unsafe fn delete_starts(app: *mut App, rows: &[usize]) -> Arc<AtomicU64> {
+    let list = (*app).list;
+    let focused = usize::try_from(SendMessageW(list, LVM_GETNEXTITEM, Some(WPARAM(usize::MAX)), Some(LPARAM(LVNI_FOCUSED as isize))).0).ok();
+    let tab = cur(app);
+    tab.deleted = match &tab.source {
+        Some(Source::Shell(l)) => Some(Deleted {
+            folder: l.folder.parsing_name.clone(),
+            names: rows.iter().filter_map(|&i| l.items.get(i)).map(|i| i.parsing_name()).collect(),
+            next: row_taking_place(l.items.len(), rows, focused).and_then(|i| l.items.get(i)).map(|i| i.parsing_name()),
+            at: None,
+        }),
+        _ => None,
+    };
+    tab.latest.clone()
+}
+
+/// The delete `delete_starts` armed has returned; a cancelled one disarms (`Deleted::over`).
+pub(crate) unsafe fn delete_over(app: *mut App, id: &Arc<AtomicU64>) {
+    let Some(t) = find_tab((*app).tabs.iter().map(|x| &x.latest), id) else { return };
+    let tab = &mut (&mut (*app).tabs)[t];
+    let gone = |n: &str| ui::is_fs_path(n) && matches!(std::path::Path::new(n).try_exists(), Ok(false));
+    tab.deleted = tab.deleted.take().and_then(|d| d.over(Instant::now(), gone));
 }
 
 impl Tab {
@@ -211,6 +282,7 @@ pub(crate) unsafe fn navigate(app: *mut App, t: usize, target: Target, history: 
     tab.dirty = false;
     if history != History::Refresh {
         (*app).new_item = None;
+        tab.deleted = None;
         let (name, parsing) = destination(&target);
         tabs::set_title((*app).strip, t, &name);
         tab.loading = Some(Loading { name, parsing, since: Instant::now(), history });
@@ -524,8 +596,12 @@ pub(crate) unsafe fn on_enum_done(app: *mut App, done: Box<EnumDone>) {
     if let Some(sel) = tab.select_after.take() {
         keep = vec![sel];
     }
-
     let mut src = loaded.source;
+    // One shot: any load of the tab ends the delete's wait, except a reload while the delete still runs.
+    let deleted = if refresh && tab.deleted.as_ref().is_some_and(|d| d.at.is_none()) { None } else { tab.deleted.take() };
+    let home = matches!(&src, Source::Shell(l) if is_home(l));
+    let after_delete = deleted.filter(|_| active).and_then(|d| d.next_for(refresh, &src.parsing_name(), home, &keep, Instant::now()));
+
     if let Source::Shell(l) = &mut src {
         // A reload keeps the header, so the listing keeps the columns it shows (a column toggled while it ran), their
         // layout and the view.
@@ -566,6 +642,13 @@ pub(crate) unsafe fn on_enum_done(app: *mut App, done: Box<EnumDone>) {
     }
     if active {
         show(app, if refresh { Show::Restore { top, selected: keep, columns: false } } else { Show::Fresh(keep) });
+        // The deleted rows are gone for good only when none of them is selected again.
+        if let Some(next) = after_delete.filter(|_| list::selected_indices(list).is_empty())
+            && let Some(l) = listing(app)
+            && let Some(&i) = selection_matches(&[next], l.items.iter().map(|i| i.parsing_name())).first()
+        {
+            list::select_after_delete(list, i, l.items.len());
+        }
         commands::rename_new_item(app);
     } else {
         tab.top = top;
@@ -657,8 +740,8 @@ unsafe fn show_source(app: *mut App, mode: Show) {
     SendMessageW(list, LVM_SETITEMCOUNT, Some(WPARAM(count)), Some(LPARAM(LVSICF_NOSCROLL as isize)));
     list::set_groups(app, true);
     list::set_item_state(list, usize::MAX, LIST_VIEW_ITEM_STATE_FLAGS(0), LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0));
-    if !matches!(mode, Show::Restore { columns: false, .. }) {
-        panes::sync_tree(app);
+    if !matches!(mode, Show::Restore { columns: false, .. }) && (*app).panes.tree.is_some() {
+        SetTimer(Some(hwnd), crate::TIMER_TREE_SYNC, 1, None);
     }
     let select = |names: &[String]| -> Option<usize> {
         let hits = match src {
@@ -1309,6 +1392,7 @@ pub(crate) unsafe fn new_tab(app: *mut App, target: Target, activate: bool, sele
         loading: None,
         home_filter: home::Filter::Recent,
         kept: Vec::new(),
+        deleted: None,
     });
     let t = (*app).tabs.len() - 1;
     tabs::add((*app).strip, &title);
@@ -1486,8 +1570,9 @@ pub(crate) unsafe fn tear_tab(app: *mut App, t: usize) {
     }
     // Where the button came up: the message being handled is the strip's WM_LBUTTONUP.
     let pos = GetMessagePos();
-    let at = WindowFromPoint(POINT { x: (pos & 0xFFFF) as i16 as i32, y: (pos >> 16) as i16 as i32 });
-    match instance::other_main_window(at, (*app).hwnd) {
+    let pt = ((pos & 0xFFFF) as i16 as i32, (pos >> 16) as i16 as i32);
+    let at = WindowFromPoint(POINT { x: pt.0, y: pt.1 });
+    match instance::other_main_window(at, (*app).hwnd).filter(|&w| instance::release_lands_on(w, pt)) {
         Some(other) => {
             // A busy window can take seconds to answer: the hand-off runs on a worker, and a refusal brings the tab back.
             let (other, own, payload) = (other.0 as isize, (*app).hwnd.0 as isize, instance::tab_payload(&name));
@@ -1688,6 +1773,69 @@ pub(crate) unsafe fn save_session(app: *mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn names(n: &[&str]) -> Vec<String> {
+        n.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The marker a delete of `sel` (rows of a..e in C:\d) leaves once it returned at `t0`, everything gone.
+    fn deleted(sel: &[usize], focused: Option<usize>, t0: Instant) -> Option<Deleted> {
+        let rows = ["a", "b", "c", "d", "e"].map(|n| format!(r"C:\d\{n}"));
+        let d = Deleted {
+            folder: r"C:\d".into(),
+            names: sel.iter().map(|&i| rows[i].clone()).collect(),
+            next: row_taking_place(rows.len(), sel, focused).map(|i| rows[i].clone()),
+            at: None,
+        };
+        d.over(t0, |_| true)
+    }
+
+    #[test]
+    fn a_reload_selects_the_next_row_only_after_the_users_own_delete() {
+        let t0 = Instant::now();
+        let soon = t0 + Duration::from_secs(1);
+        let reload = |d: Option<Deleted>, replaced: &[&str]| d.and_then(|d| d.next_for(true, r"c:\D", false, &names(replaced), soon));
+        assert_eq!(reload(deleted(&[1], Some(1), t0), &[r"C:\d\b"]), Some(r"C:\d\c".into()), "the next row");
+        assert_eq!(reload(deleted(&[4], Some(4), t0), &[r"C:\d\e"]), Some(r"C:\d\d".into()), "the last row went: the new last row");
+        assert_eq!(reload(None, &[r"C:\d\b"]), None, "another program removed the selected file: nothing");
+        // Several rows: where the focused one was (the first selected when the focus is not on one of them).
+        assert_eq!(reload(deleted(&[0, 3], Some(3), t0), &[r"C:\d\a", r"C:\d\d"]), Some(r"C:\d\e".into()));
+        assert_eq!(reload(deleted(&[0, 1, 4], Some(2), t0), &[r"C:\d\a", r"C:\d\b", r"C:\d\e"]), Some(r"C:\d\c".into()));
+        assert_eq!(row_taking_place(3, &[0, 1, 2], Some(1)), None, "nothing survives");
+        // A reload while the delete ran took part of the selection; the rest is what the next one replaces.
+        assert_eq!(reload(deleted(&[0, 3], Some(3), t0), &[r"C:\d\d"]), Some(r"C:\d\e".into()));
+        assert_eq!(reload(deleted(&[1], Some(1), t0), &[r"C:\d\c"]), None, "the user selected another row since");
+        assert_eq!(reload(deleted(&[1], Some(1), t0), &[]), None, "nothing was selected when the reload came");
+        let other = deleted(&[1], Some(1), t0).and_then(|d| d.next_for(true, r"C:\elsewhere", false, &names(&[r"C:\d\b"]), soon));
+        assert_eq!(other, None, "another folder");
+        let late = deleted(&[1], Some(1), t0).and_then(|d| d.next_for(true, r"C:\d", false, &names(&[r"C:\d\b"]), t0 + DELETED_WAIT));
+        assert_eq!(late, None, "no reload came soon after the delete");
+        let running = Deleted { at: None, ..deleted(&[1], Some(1), t0).unwrap() };
+        assert_eq!(running.next_for(true, r"C:\d", false, &names(&[r"C:\d\b"]), soon), None, "the delete still runs");
+    }
+
+    #[test]
+    fn a_cancelled_delete_disarms() {
+        let t0 = Instant::now();
+        let armed = Deleted { at: None, ..deleted(&[1], Some(1), t0).unwrap() };
+        // The confirmation was cancelled: the file is still there, so an unrelated reload later (another program
+        // removing it) selects nothing.
+        assert!(armed.over(t0, |_| false).is_none());
+        let d = Deleted { at: None, ..deleted(&[1, 2], Some(1), t0).unwrap() };
+        assert!(d.over(t0, |n| n.ends_with('c')).is_some(), "one of them went");
+    }
+
+    #[test]
+    fn a_navigation_or_home_never_selects_after_a_delete() {
+        let t0 = Instant::now();
+        let soon = t0 + Duration::from_secs(1);
+        let replaced = names(&[r"C:\d\b"]);
+        // A navigation (and Back to the folder) consumes the marker without selecting.
+        assert_eq!(deleted(&[1], Some(1), t0).and_then(|d| d.next_for(false, r"C:\d", false, &replaced, soon)), None);
+        // On Home and Quick Access the list behind the page would select a row the page does not show there.
+        let home = Deleted { folder: HOME.into(), ..deleted(&[1], Some(1), t0).unwrap() };
+        assert_eq!(home.next_for(true, HOME, true, &replaced, soon), None);
+    }
 
     #[test]
     fn find_tab_follows_the_tab_not_its_old_index() {

@@ -689,9 +689,9 @@ mod tests {
         assert_eq!(first_volume(VolumeInfo::Subsequent).unwrap_err().message(), crate::i18n::tr("err.rar_middle_volume"));
     }
 
-    /// The set under tests/fixtures/multivol (`set.part1.rar`, `set.part2.rar`, `set.part3.rar`, made by
-    /// `rar a -v1k -ep set.rar` on a few files bigger than a volume) needs rar.exe or WinRAR to build, and neither
-    /// was installed when this was written; unrar cannot write archives.
+    /// The set under tests/fixtures/multivol, made by WinRAR 7.23's `rar a -v1k -m0 -ep set.rar first.bin note.txt
+    /// last.bin` (1500 and 900 seeded random bytes and one line of text): `first.bin` runs from part 1 into part 2,
+    /// `note.txt` sits in part 2 and `last.bin` runs from part 2 into part 3. unrar cannot write archives.
     fn multivol(tag: &str, skip: Option<&str>) -> PathBuf {
         let from = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/multivol");
         let dir = tmp(tag);
@@ -705,19 +705,22 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs tests/fixtures/multivol/set.part{1,2,3}.rar, which need rar.exe or WinRAR to make"]
     fn multi_volume_set_lists_and_extracts_across_volumes() {
         let dir = multivol("mv-ok", None);
         let rar = dir.join("set.part1.rar");
-        let files: Vec<Entry> = list(&rar).unwrap().into_iter().filter(|e| !e.is_dir).collect();
-        extract_all(&rar, &dir.join("out")).unwrap();
-        let ok = !files.is_empty() && files.iter().all(|e| std::fs::metadata(dir.join("out").join(&e.path)).is_ok_and(|m| m.len() == e.size));
+        let mut files: Vec<(String, u64)> = list(&rar).unwrap().into_iter().filter(|e| !e.is_dir).map(|e| (e.path, e.size)).collect();
+        files.sort();
+        let x = extract_all(&rar, &dir.join("out"));
+        let written: Vec<Option<u64>> = files.iter().map(|(p, _)| std::fs::metadata(dir.join("out").join(p)).ok().map(|m| m.len())).collect();
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(ok, "every member is whole, including the one that crosses a volume");
+        x.unwrap();
+        let names: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(names, ["first.bin", "last.bin", "note.txt"]);
+        assert_eq!(files[0].1, 1500, "first.bin's size, read across parts 1 and 2");
+        assert_eq!(written, files.iter().map(|f| Some(f.1)).collect::<Vec<_>>(), "every member is whole, first.bin and last.bin cross a volume");
     }
 
     #[test]
-    #[ignore = "needs tests/fixtures/multivol/set.part{1,2,3}.rar, which need rar.exe or WinRAR to make"]
     fn multi_volume_middle_or_missing_volume_fails_clearly() {
         let dir = multivol("mv-bad", None);
         let middle = dir.join("set.part2.rar");

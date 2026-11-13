@@ -31,7 +31,7 @@ kept out of git) lists what is left; the parity checklist's notes say what each 
 
 | Done (code, CI or the release meets every clause) | Only a person can finish (hardware, account, Windows setting, judgment, certificate, store submission, a live run) | Still needs code or agent work |
 |---|---|---|
-| #19 notices, #28 panic audit, #40 desktop menu, #41 indexed search and results (proven live 2026-11-11 and 2026-11-13), #50 command line, #51 settings format, #52 hand-off, #55 data-operation tests in CI, no BROKEN parity rows | #18 icon art approval, #21 Narrator and NVDA, #22 the focus rectangle under a contrast theme, #23 contrast theme, #27 undo of Home tile drops and in `--desktop` / `--desktop-icons` (test account), #29 the 8-hour soak, #32 Windows 10 and two Windows 11 releases, #33 DPI and monitors, #34 places (OneDrive, MTP, WSL, drives), #37 proofreader and large Text size, #54 `-NoSkip -UserState` run on a test account, #59 signing certificate, #63 winget submission, #64 a real upgrade on a VM, #65 uninstall on a clean VM, #68 cold read and the revert steps on a VM | #26 automated Skip and New > text document checks, #27 drops onto the folder tree are not undoable, #48 churn-reload and 100 ms UI-call budgets, #60 the security review of this round's diff and of the desktop helper's hooks, daily-use parity rows (the drag image from Home; the sidebar has no row for This PC itself) |
+| #19 notices, #28 panic audit, #40 desktop menu, #41 indexed search and results (proven live 2026-11-11 and 2026-11-13), #50 command line, #51 settings format, #52 hand-off, #55 data-operation tests in CI, #26 automated checks for every data operation (2026-11-13), #43 multi-volume .rar fixtures and tests (2026-11-13), no BROKEN parity rows | #18 icon art approval, #21 Narrator and NVDA, #22 the focus rectangle under a contrast theme, #23 contrast theme, #27 undo of Home tile drops and in `--desktop` / `--desktop-icons` (test account), #29 the 8-hour soak, #32 Windows 10 and two Windows 11 releases, #33 DPI and monitors, #34 places (OneDrive, MTP, WSL, drives), #37 proofreader and large Text size, #54 `-NoSkip -UserState` run on a test account, #59 signing certificate, #63 winget submission, #64 a real upgrade on a VM, #65 uninstall on a clean VM, #68 cold read and the revert steps on a VM | #27 drops onto the folder tree are not undoable, #48 churn-reload and 100 ms UI-call budgets, #60 the security review of this round's diff and of the desktop helper's hooks, daily-use parity rows (the drag image from Home) |
 
 ## 1. Legal and branding
 
@@ -135,6 +135,22 @@ Automation clients read through Windows' bridge. None of it has been tried with 
   Enter renamed the wrong file. Fixed in 1.0.0-rc.1 and proven live (22 of 22 renames). The shell's conflict dialog
   (Skip, Replace, keep both), its progress dialog and Cancel, Shift+Delete and New > Text document were driven live
   and left the expected files. Left: the automated Skip and New checks above.
+  *Status 2026-11-13, later:* the automated checks are written and pass (11 tests in `data_ops.rs`, three suite
+  runs): Skip pressed in the shell's own conflict dialog through its accessibility tree (copy and move,
+  `paste_with_skip_in_the_shells_dialog_keeps_both_sides_and_does_the_rest`), the dialog's Replace against the
+  `FOF_NO_UI` flag the other checks stand in with (`the_dialogs_replace_matches_the_no_ui_flag`), a copy and a move
+  dropped on a folder's own drop target with and without a conflict (`a_drop_on_a_folder_does_what_a_paste_does`),
+  New > Text Document twice against the engine's names (`new_text_document_names_match_the_engine`) and a cancelled
+  delete, to the bin and for good (in `cancel_leaves_the_source_and_no_partial_destination`). Each operation and
+  its check: delete `delete_to_the_bin_comes_back_and_permanent_does_not_use_it`; move
+  `move_onto_an_existing_name_replace_and_keep_both`; rename `rename_onto_an_existing_name_loses_nothing`; paste with
+  conflicts `copy_onto_an_existing_name_replace`, `copy_onto_an_existing_name_keep_both` and the two dialog tests;
+  drag and drop `a_drop_on_a_folder_does_what_a_paste_does`; archive extraction (rexplorer's own, for .rar; zip is
+  the shell's copy engine) `archive.rs` `extract_all_never_replaces_or_escapes`, `extract_one_never_escapes`,
+  `multi_volume_middle_or_missing_volume_fails_clearly`; New > item `new_folder_names_match_the_engine`,
+  `new_text_document_names_match_the_engine`; cancel `cancel_leaves_the_source_and_no_partial_destination`. Not
+  automated: Keep both has no button of its own in Windows 11's dialog (it sits behind Compare, a second dialog
+  with check boxes), so it stays the `FOF_RENAMEONCOLLISION` stand-in; it was driven live on 2026-11-13.
 - [ ] **[blocker] Undo and redo.** ([#27](https://github.com/CodingDiego/rexplorer/issues/27)) Explorer users rely on Ctrl+Z. *Done when:* Ctrl+Z undoes the last copy, move, rename,
   delete-to-Recycle-Bin and new item through the shell's undo (or an equivalent), and Ctrl+Y redoes.
   *Status 2026-11-10:* now also recorded: drops on the sidebar, crumbs, tabs and Home (`list.rs:545-572`), the
@@ -308,6 +324,8 @@ The row-by-row status of every Explorer behaviour is in [docs/EXPLORER-PARITY.md
   *Live 2026-11-12/13:* Rename in .rar, Ctrl+Z, the folder tree and the keyboard on Home are WORKS. Left: the drag
   image from Home (UNVERIFIED), and "Quick access, This PC, drives, Network" is PARTIAL: the sidebar has no row that
   opens This PC itself. Build that row or accept the gap in the release notes, then tick.
+  *2026-11-13, later:* the sidebar has a This PC row (`panes.rs` `sidebar_rows`); a posted click and posted keys
+  opened This PC, and the row is WORKS. Left: the drag image from Home (UNVERIFIED), then tick.
 
 - [x] **[blocker] Desktop menu completeness** ([#40](https://github.com/CodingDiego/rexplorer/issues/40)). The desktop menu shipped in 0.1.3
   (`rexplorer --desktop`). *Done when:* right-dragging desktop icons works as in Explorer, and Shift+F10 and the Menu
@@ -332,6 +350,16 @@ The row-by-row status of every Explorer behaviour is in [docs/EXPLORER-PARITY.md
   *Live 2026-11-13:* ticked. Real header clicks sorted results by each column both ways; F2 renamed a result and
   Ctrl+Z undid it; Delete removed its row; F5 picked up a new file and kept the sort (fixed that day). Open, minor:
   after a Delete no row is selected (Explorer selects the next one).
+  *2026-11-13, later:* fixed: after Delete the row that takes the deleted one's place is selected and focused, the
+  last row when the last went (`list.rs` `row_after_delete`, `select_after_delete`; search results in
+  `source.rs` `prune_search`, folders on the reload in `nav.rs` `on_enum_done`). Proven by posted Delete keys, 3 of 3 in
+  search results and 3 of 3 in a folder, including deleting the last row twice.
+  *2026-11-13, after review:* in a folder only the reload after the user's own delete selects the next row: every
+  delete of the selection goes through `list.rs` `verb_on_selection`, which arms the tab's `nav.rs` `Deleted`
+  (folder, deleted names, the row after the focused one) and disarms it when nothing went (a cancelled
+  confirmation); the reload of that folder within 10 s consumes it. Any other reload with the selection gone (another
+  program, an editor's save, Ctrl+Z, a move out) selects nothing, and Home and Quick Access never do. Unit tested;
+  not rerun live.
 - [x] **[should] Search results context menu and Back** ([#42](https://github.com/CodingDiego/rexplorer/issues/42)) across results from different folders, and Back returns to the results.
   *Status 2026-11-10:* `menu.rs:72` `for_scattered`; `nav.rs:29-41` keeps the last 4 results per tab. Not run on
   the exe.
@@ -353,6 +381,10 @@ The row-by-row status of every Explorer behaviour is in [docs/EXPLORER-PARITY.md
   and a text member were seen on screenshots; F2 on a member shows the read-only message (English and Spanish).
   Zip folders, broken in 0.2.0 (no names), now list, open members and copy them out. Left: multi-volume sets (needs
   WinRAR for the fixture).
+  *2026-11-13, later:* WinRAR 7.23 made `crates/core/tests/fixtures/multivol/set.part{1,2,3}.rar` (own content:
+  seeded random bytes and a line of text); the two set tests run everywhere and pass. In the app (posted messages,
+  copy of the release exe): part 1 lists the three members and Extract here writes them whole; a middle part and a
+  set with a part missing show their messages and write nothing. Every clause of the done-when now holds.
 - [x] **[should] Themed embedded Explorer view** ([#44](https://github.com/CodingDiego/rexplorer/issues/44)) follows the theme, or the difference is documented.
   *Status:* documented in the README Known gaps (it keeps Windows' own colors).
 - [x] **[should] Home page completeness.** ([#45](https://github.com/CodingDiego/rexplorer/issues/45)) *Done when:* the location-status column exists, sort works, and the undocumented
@@ -384,6 +416,11 @@ The row-by-row status of every Explorer behaviour is in [docs/EXPLORER-PARITY.md
   *Live 2026-11-13:* a tab dragged onto a second window moved there; a folder tab and a Home tab released elsewhere
   each opened a new window; a file dropped on a tab moved and was undone. Open: once a torn Home tab landed in the
   other window instead (1 of 2, not reproduced).
+  *2026-11-13, later (built, not run live):* WindowFromPoint answers a top-level window for its invisible resize
+  border too (about 8 px around the visible edge), so a release just beside the other window counted as over it.
+  A release now moves the tab only inside that window's DWM frame bounds, and never onto a minimized or cloaked
+  window (`instance.rs` `release_lands_on`, `lands_on`; two unit tests). Left: the six live tear-outs (two windows
+  overlapping, side by side, one behind a third program), an agent with the input guard while the PC is idle.
 
 ## 7. Performance budgets (enforced, not just measured)
 

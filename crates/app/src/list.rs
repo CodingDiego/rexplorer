@@ -1087,11 +1087,16 @@ pub(crate) unsafe fn verb_on_selection(app: *mut App, verb: &str, shift: bool) {
         let _ = MessageBeep(MB_OK);
         return;
     }
+    // Every delete of the selection (key, menu, command bar, palette) comes here: the reload after it selects the next row.
+    let deleting = (verb == "delete").then(|| nav::delete_starts(app, &rows));
     // To the Recycle Bin through IFileOperation, so Ctrl+Z can restore it; Shift+Delete, Home and virtual items keep the shell's verb.
     if verb == "delete" && !shift
         && let Some(paths) = selected_paths(app, &rows) {
             let done = undo::recycle(hwnd, &paths, false);
             (*app).undo.record(Op::Recycled(done));
+            if let Some(id) = &deleting {
+                nav::delete_over(app, id);
+            }
             source::prune_search(app, &rows);
             return;
         }
@@ -1104,6 +1109,9 @@ pub(crate) unsafe fn verb_on_selection(app: *mut App, verb: &str, shift: bool) {
         if verb == "delete" {
             source::prune_search(app, &rows);
         }
+    }
+    if let Some(id) = &deleting {
+        nav::delete_over(app, id);
     }
 }
 
@@ -1622,6 +1630,21 @@ pub(crate) unsafe fn set_item_state(list: HWND, index: usize, state: LIST_VIEW_I
     SendMessageW(list, LVM_SETITEMSTATE, Some(WPARAM(index)), Some(LPARAM(&lvi as *const _ as isize)));
 }
 
+/// The row Explorer selects after a delete: the one that took the first deleted row's place, or the last row.
+pub(crate) fn row_after_delete(first_gone: usize, len: usize) -> Option<usize> {
+    (len > 0).then(|| first_gone.min(len - 1))
+}
+
+/// Selects and focuses `row_after_delete`'s row (the list already holds the `len` rows left).
+pub(crate) unsafe fn select_after_delete(list: HWND, first_gone: usize, len: usize) {
+    if let Some(i) = row_after_delete(first_gone, len) {
+        let both = LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0);
+        set_item_state(list, i, both, both);
+        SendMessageW(list, LVM_SETSELECTIONMARK, None, Some(LPARAM(i as isize)));
+        SendMessageW(list, LVM_ENSUREVISIBLE, Some(WPARAM(i)), Some(LPARAM(0)));
+    }
+}
+
 unsafe fn copy_text(text: &str, dst: PWSTR, max: i32) {
     if dst.is_null() || max <= 0 {
         return;
@@ -1648,6 +1671,14 @@ mod tests {
         assert_eq!(edit_row(r"C:\b\x.txt", 1, 3, rows(&[r"C:\a\1", r"C:\a\2", r"C:\a\3"])), None);
         assert_eq!(edit_row(r"C:\b\x.txt", 5, 0, rows(&[])), None);
         assert_eq!(edit_row("", 1, 3, rows(&[r"C:\b\a", "", r"C:\b\z"])), None, "an empty name matches nothing");
+    }
+
+    #[test]
+    fn after_a_delete_the_next_row_takes_the_selection() {
+        assert_eq!(row_after_delete(2, 5), Some(2), "the row that moved up into the deleted one's place");
+        assert_eq!(row_after_delete(4, 4), Some(3), "the last row was deleted: the new last row");
+        assert_eq!(row_after_delete(9, 3), Some(2));
+        assert_eq!(row_after_delete(0, 0), None, "nothing left");
     }
 
     #[test]

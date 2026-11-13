@@ -886,9 +886,7 @@ pub(crate) unsafe fn prune_search(app: *mut App, rows: &[usize]) {
     s.icons = vec![ICON_UNKNOWN; len];
     SendMessageW(list, LVM_SETITEMCOUNT, Some(WPARAM(len)), Some(LPARAM(LVSICF_NOSCROLL as isize)));
     list::set_item_state(list, usize::MAX, LIST_VIEW_ITEM_STATE_FLAGS(0), LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0));
-    if len > 0 {
-        list::set_item_state(list, first.min(len - 1), LVIS_FOCUSED, LVIS_FOCUSED);
-    }
+    list::select_after_delete(list, first, len);
     views::reset(app, len);
     ui::update_status(app);
 }
@@ -1207,6 +1205,7 @@ mod tests {
             loading: None,
             home_filter: crate::home::Filter::Recent,
             kept: Vec::new(),
+            deleted: None,
         };
         let (target, label) = tab.leave(Source::Search(listing(1)));
         assert!(matches!(target, Target::Search(1, _)));

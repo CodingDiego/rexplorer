@@ -125,6 +125,30 @@ pub fn other_main_window(at: HWND, own: HWND) -> Option<HWND> {
     }
 }
 
+/// A tab released at `pt` lands on a window only inside the frame a person sees (`frame`: DWM's extended frame
+/// bounds, without the invisible resize border and the shadow) of a window that is `shown` (visible, not
+/// minimized, not cloaked on another virtual desktop).
+fn lands_on(pt: (i32, i32), frame: windows::Win32::Foundation::RECT, shown: bool) -> bool {
+    shown && pt.0 >= frame.left && pt.0 < frame.right && pt.1 >= frame.top && pt.1 < frame.bottom
+}
+
+/// `lands_on` for window `w`. WindowFromPoint also answers a top-level window for the ~8 px invisible resize border
+/// around its visible edge, so a release just beside it counted as over it.
+pub fn release_lands_on(w: HWND, pt: (i32, i32)) -> bool {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsIconic, IsWindowVisible};
+    unsafe {
+        let mut cloaked = 0u32;
+        let _ = DwmGetWindowAttribute(w, DWMWA_CLOAKED, (&mut cloaked as *mut u32).cast(), 4);
+        let mut frame = RECT::default();
+        if DwmGetWindowAttribute(w, DWMWA_EXTENDED_FRAME_BOUNDS, (&mut frame as *mut RECT).cast(), size_of::<RECT>() as u32).is_err() {
+            let _ = GetWindowRect(w, &mut frame);
+        }
+        lands_on(pt, frame, IsWindowVisible(w).as_bool() && !IsIconic(w).as_bool() && cloaked == 0)
+    }
+}
+
 /// The hand-off that opens `place` in a new tab of the receiving window.
 pub fn tab_payload(place: &str) -> String {
     rexplorer_core::cli::payload(&rexplorer_core::cli::Args { paths: vec![place.to_string()], new_tab: true, ..Default::default() })
@@ -343,6 +367,31 @@ mod tests {
         assert!(p.starts_with(&format!("v={}\n", rexplorer_core::cli::PROTOCOL)));
         let a = rexplorer_core::cli::parse_payload(&p).unwrap();
         assert!(a.new_tab && a.paths == ["C:\\a b"]);
+    }
+
+    #[test]
+    fn a_release_counts_only_inside_the_visible_frame_of_a_shown_window() {
+        use windows::Win32::Foundation::RECT;
+        let frame = RECT { left: 100, top: 50, right: 900, bottom: 650 };
+        assert!(lands_on((100, 50), frame, true) && lands_on((899, 649), frame, true));
+        // The invisible resize border WindowFromPoint still answers for: just outside the visible edge.
+        for beside in [(95, 300), (904, 300), (500, 45), (500, 656), (900, 300), (500, 650)] {
+            assert!(!lands_on(beside, frame, true), "{beside:?}");
+        }
+        assert!(!lands_on((500, 300), frame, false), "a minimized, hidden or cloaked window takes nothing");
+    }
+
+    #[test]
+    fn release_lands_on_a_real_window_only_when_shown() {
+        use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, SW_SHOWNOACTIVATE, ShowWindow, WINDOW_EX_STYLE, WS_OVERLAPPEDWINDOW};
+        unsafe {
+            let w = CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR::null(), WS_OVERLAPPEDWINDOW, 200, 200, 300, 300, None, None, None, None).unwrap();
+            assert!(!release_lands_on(w, (350, 350)), "hidden");
+            let _ = ShowWindow(w, SW_SHOWNOACTIVATE);
+            let shown = release_lands_on(w, (350, 350));
+            let _ = DestroyWindow(w);
+            assert!(shown);
+        }
     }
 
     #[test]
