@@ -3,7 +3,7 @@
 What Windows File Explorer does, and where rexplorer stands on each point. This file is the backlog: a row
 changes status only when the behaviour was proven on the built exe.
 
-**Totals, 2026-11-13 (1.0.0-rc.1): 123 rows. WORKS 103, WORKS (scratch base) 3, PARTIAL 4, UNVERIFIED 13,
+**Totals, 2026-11-13 (1.0.0-rc.2): 123 rows. WORKS 103, WORKS (scratch base) 3, PARTIAL 4, UNVERIFIED 13,
 BROKEN 0, MISSING 0.** Counted by script from the table rows. (2026-11-11: 118 rows, WORKS 61, WORKS (scratch
 base) 3, PARTIAL 10, UNVERIFIED 44.)
 
