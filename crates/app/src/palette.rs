@@ -232,7 +232,7 @@ pub fn close(hwnd: HWND) {
 unsafe fn notify(hwnd: HWND, id: usize, code: u32) {
     let nm = NmPalette { hdr: NMHDR { hwndFrom: hwnd, idFrom: id, code } };
     let parent = GetParent(hwnd).unwrap_or_default();
-    SendMessageW(parent, WM_NOTIFY, Some(WPARAM(id)), Some(LPARAM(&nm as *const _ as isize)));
+    access::send_own(parent, WM_NOTIFY, WPARAM(id), LPARAM(&nm as *const _ as isize));
 }
 
 /// The parent may close us from inside the handler, so never touch `st` after notifying.
@@ -369,7 +369,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_ERASEBKGND => return LRESULT(1),
         WM_PAINT => paint(hwnd, st),
         WM_GETOBJECT if access::is_client(lparam) => return (*st).acc.get_or_insert_with(|| access::Server::new(hwnd)).answer(wparam),
-        access::WM_ACC_ITEMS => {
+        access::WM_ACC_ITEMS if access::own_pointer(lparam) => {
             acc_tree(hwnd, st, &mut *(lparam.0 as *mut access::Tree));
             return LRESULT(1);
         }

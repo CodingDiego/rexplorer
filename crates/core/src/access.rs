@@ -69,6 +69,30 @@ impl Drop for Server {
     }
 }
 
+thread_local! {
+    /// The lParam this thread's `send_own` is sending right now; 0 when none.
+    static SENDING: Cell<isize> = const { Cell::new(0) };
+}
+
+/// Sends a private message whose lParam is a pointer (WM_ACC_ITEMS, a control's WM_NOTIFY) to `hwnd`, a window of
+/// this thread, marked so that its handler's `own_pointer` accepts it. Any program on the desktop can post or send
+/// these message ids with a pointer of its choosing; only a send made here is marked.
+pub fn send_own(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let before = SENDING.replace(lparam.0);
+    let r = unsafe { SendMessageW(hwnd, msg, Some(wparam), Some(lparam)) };
+    SENDING.set(before);
+    r
+}
+
+/// Whether the message being handled, with this `lparam`, is a `send_own` of this thread: the send to a window of
+/// the same thread is a direct call, so the mark is still set. A posted message (rexplorer posts none of these, and a
+/// modal loop dispatches posted ones too) or one sent from another thread or process is not marked. InSendMessageEx
+/// cannot decide it: inside a message another thread sent (WM_GETOBJECT from a screen reader, say) it reports a send
+/// for our own nested same-thread sends as well.
+pub fn own_pointer(lparam: LPARAM) -> bool {
+    lparam.0 != 0 && SENDING.get() == lparam.0
+}
+
 pub fn is_client(lparam: LPARAM) -> bool {
     lparam.0 as u32 as i32 == OBJID_CLIENT.0
 }
@@ -109,8 +133,7 @@ impl Accessible {
     fn tree(&self) -> Result<(HWND, Tree)> {
         let hwnd = self.hwnd.get();
         let mut tree = Tree::default();
-        let ok = !hwnd.is_invalid()
-            && unsafe { SendMessageW(hwnd, WM_ACC_ITEMS, None, Some(LPARAM(&mut tree as *mut Tree as isize))) }.0 == 1;
+        let ok = !hwnd.is_invalid() && send_own(hwnd, WM_ACC_ITEMS, WPARAM(0), LPARAM(&mut tree as *mut Tree as isize)).0 == 1;
         if ok { Ok((hwnd, tree)) } else { Err(CO_E_OBJNOTCONNECTED.into()) }
     }
 
@@ -395,6 +418,7 @@ mod tests {
         static SERVER: RefCell<Option<Server>> = const { RefCell::new(None) };
         static TREE: RefCell<Option<Tree>> = const { RefCell::new(None) };
         static INVOKED: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+        static REFUSED: Cell<usize> = const { Cell::new(0) };
     }
 
     fn rc(l: i32, t: i32, r: i32, b: i32) -> RECT {
@@ -430,7 +454,7 @@ mod tests {
             WM_GETOBJECT if is_client(lparam) => {
                 return SERVER.with(|s| s.borrow_mut().get_or_insert_with(|| Server::new(hwnd)).answer(wparam));
             }
-            WM_ACC_ITEMS => {
+            WM_ACC_ITEMS if own_pointer(lparam) => {
                 return TREE.with(|t| match &*t.borrow() {
                     Some(tree) => {
                         let out = unsafe { &mut *(lparam.0 as *mut Tree) };
@@ -443,6 +467,10 @@ mod tests {
                     }
                     None => LRESULT(0),
                 });
+            }
+            WM_ACC_ITEMS => {
+                REFUSED.with(|r| r.set(r.get() + 1));
+                return LRESULT(0);
             }
             WM_ACC_INVOKE => {
                 INVOKED.with(|v| v.borrow_mut().push(wparam.0));
@@ -680,6 +708,46 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(client.join().unwrap(), "a call after the window died must fail");
+    }
+
+    #[test]
+    fn only_our_own_send_of_a_pointer_message_is_read() {
+        let _c = ComInit::sta();
+        let h = window();
+        REFUSED.with(|r| r.set(0));
+        // Ours: filled.
+        let mut tree = Tree::default();
+        assert_eq!(send_own(h, WM_ACC_ITEMS, WPARAM(0), LPARAM(&mut tree as *mut Tree as isize)).0, 1);
+        assert_eq!(tree.name, "Test");
+        assert!(!own_pointer(LPARAM(&mut tree as *mut Tree as isize)), "the mark ends with the send");
+        // The same message posted to the window (as another program could), even with a pointer that is valid here.
+        let mut posted = Tree::default();
+        unsafe { PostMessageW(Some(h), WM_ACC_ITEMS, WPARAM(0), LPARAM(&mut posted as *mut Tree as isize)).unwrap() };
+        pump();
+        assert!(posted.name.is_empty());
+        // A plain send, and a send from another thread.
+        assert_eq!(unsafe { SendMessageW(h, WM_ACC_ITEMS, None, Some(LPARAM(&mut posted as *mut Tree as isize))) }.0, 0);
+        let target = h.0 as isize;
+        let other = std::thread::spawn(move || {
+            let mut t = Tree::default();
+            let r = unsafe { SendMessageW(HWND(target as *mut _), WM_ACC_ITEMS, None, Some(LPARAM(&mut t as *mut Tree as isize))) };
+            (r.0, t.name)
+        });
+        while !other.is_finished() {
+            pump();
+            std::thread::yield_now();
+        }
+        assert_eq!(other.join().unwrap(), (0, String::new()));
+        assert_eq!(REFUSED.with(|r| r.get()), 3, "posted, plain send, other thread");
+        assert!(posted.name.is_empty());
+        // Nested sends keep the outer mark.
+        let outer = LPARAM(1234);
+        SENDING.set(outer.0);
+        let mut inner = Tree::default();
+        assert_eq!(send_own(h, WM_ACC_ITEMS, WPARAM(0), LPARAM(&mut inner as *mut Tree as isize)).0, 1);
+        assert!(own_pointer(outer));
+        SENDING.set(0);
+        unsafe { DestroyWindow(h).unwrap() };
     }
 
     #[test]

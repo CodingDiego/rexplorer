@@ -298,7 +298,7 @@ unsafe fn notify(hwnd: HWND, code: u32, index: usize) {
         let id = GetWindowLongPtrW(hwnd, GWLP_ID) as usize;
         let nm = NmCrumb { hdr: NMHDR { hwndFrom: hwnd, idFrom: id, code }, index };
         if let Ok(parent) = GetParent(hwnd) {
-            SendMessageW(parent, WM_NOTIFY, Some(WPARAM(id)), Some(LPARAM(&nm as *const _ as isize)));
+            access::send_own(parent, WM_NOTIFY, WPARAM(id), LPARAM(&nm as *const _ as isize));
         }
     }
 }
@@ -343,7 +343,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         match msg {
             WM_ERASEBKGND => return LRESULT(1),
             WM_GETOBJECT if access::is_client(lparam) => return st.acc.get_or_insert_with(|| access::Server::new(hwnd)).answer(wparam),
-            access::WM_ACC_ITEMS => {
+            access::WM_ACC_ITEMS if access::own_pointer(lparam) => {
                 acc_tree(hwnd, st, &mut *(lparam.0 as *mut access::Tree));
                 return LRESULT(1);
             }

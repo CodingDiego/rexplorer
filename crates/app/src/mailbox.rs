@@ -30,6 +30,12 @@ impl<T> Mailbox<T> {
     /// Queues `v` for `hwnd` and posts it `msg`; gives `v` back, with nothing left queued, when the post fails (the
     /// window is gone or its queue full).
     pub(crate) fn post(&self, hwnd: isize, msg: u32, v: T) -> Result<(), T> {
+        self.post_while(hwnd, msg, v, || true)
+    }
+
+    /// `post`, also giving `v` back when `wanted` is false once it is queued. The receiver makes `wanted` false before
+    /// its last drain (`forget` or a `take` loop), so a payload queued after that drain is not left behind.
+    pub(crate) fn post_while(&self, hwnd: isize, msg: u32, v: T, wanted: impl Fn() -> bool) -> Result<(), T> {
         // Pushed before the post, and posted outside the lock: the message never arrives before its payload, and the
         // UI thread never waits in `take` on a worker that runs at background priority.
         let n = {
@@ -39,7 +45,7 @@ impl<T> Mailbox<T> {
             q.1.push((hwnd, n, v));
             n
         };
-        if unsafe { PostMessageW(Some(HWND(hwnd as *mut _)), msg, WPARAM(0), LPARAM(0)) }.is_err() {
+        if unsafe { PostMessageW(Some(HWND(hwnd as *mut _)), msg, WPARAM(0), LPARAM(0)) }.is_err() || !wanted() {
             let mut q = self.lock();
             // Not there any more: a forged message already delivered it.
             return match q.1.iter().position(|e| e.1 == n) {
@@ -120,6 +126,20 @@ mod tests {
             // A post to a window that is gone fails and leaves nothing queued.
             assert_eq!(Q.post(a.0 as isize, WM_APP + 2, 3), Err(3), "the payload comes back");
             assert!(Q.lock().1.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_payload_no_longer_wanted_is_not_left_queued() {
+        static Q: Mailbox<u32> = Mailbox::new();
+        unsafe {
+            let h = window();
+            // The receiver gave up (and drained) while the worker was producing: it gets its payload back.
+            assert_eq!(Q.post_while(h.0 as isize, WM_APP + 3, 1, || false), Err(1));
+            assert!(Q.lock().1.is_empty());
+            assert_eq!(Q.post_while(h.0 as isize, WM_APP + 3, 2, || true), Ok(()));
+            assert_eq!(Q.take(h), Some(2));
+            let _ = DestroyWindow(h);
         }
     }
 }

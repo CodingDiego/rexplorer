@@ -27,6 +27,41 @@ a line under Unreleased. Sections up to 0.1.4 were rebuilt from git history and 
 - New automated data-operation checks: Skip pressed in the shell's own conflict dialog (copy, move and drop), the
   dialog's Replace against the flag the other checks use, a drop on a folder, New > Text Document against the copy
   engine, and a cancelled delete ([#26](https://github.com/CodingDiego/rexplorer/issues/26)).
+- The desktop helper (`--desktop`) takes a right-click or the menu keys only on the shell's own desktop icon list:
+  a window of another program built to look like it (the same window classes) is left alone. The helper asks the
+  desktop list for its selection before anything else and shows no menu when the list does not answer within a
+  second, and it drops a click or menu key it could not get to within 2 seconds, so clicks taken while Explorer hung
+  do not come out later as a run of menus; the calls it makes into Explorer after that first answer (finding the
+  desktop's view, building and running the menu) still have no timeout. A Delete chosen in its menu runs in
+  Explorer only when Explorer's selection is still exactly the icons the menu was built for. A right-drag released
+  while the helper was handing the press back to Explorer no longer leaves the right button down, and a Menu key or
+  Shift+F10 whose release the helper missed is no longer swallowed in another window
+  ([#60](https://github.com/CodingDiego/rexplorer/issues/60)).
+- `--register` always registers the installed copy (`%LOCALAPPDATA%\Programs\rexplorer\rexplorer.exe`), never the
+  exe it was started from; without an install it changes nothing and says to install first. Uninstall,
+  `--unregister` and `restore-explorer.ps1` undo only what rexplorer writes, whatever their records list: its own
+  file names in the install, Start menu and Startup folders, values of the registry keys it writes, and empty keys
+  on the way to those. `scripts\install.ps1` in a release
+  folder fails with a message instead of trying to build when `rexplorer.exe` is missing, and
+  `restore-explorer.ps1 -RestartShell` starts `%WINDIR%\explorer.exe` by its full path
+  ([#60](https://github.com/CodingDiego/rexplorer/issues/60)).
+- The taskbar jump list opens a drive root (`C:\`) again: its argument kept a quote that broke it.
+- A tab whose name holds a line break (an FTP server can send one) is not written to the session file, where it could
+  have added lines.
+- rexplorer's custom controls read their accessibility requests and their notifications only when rexplorer itself
+  sent them; a message another program sends or posts with those ids is ignored. The thumbnail and Home icon results
+  wait in the window's own queue, like the other worker results: their messages carry no bitmap handle
+  ([#84](https://github.com/CodingDiego/rexplorer/issues/84)).
+- When an undo refuses an item that was swapped since, the items the shell then cancelled stay on the undo stack: the
+  next Ctrl+Z undoes them. An undo that moves or renames back refuses an item whose old name was taken meanwhile
+  before the shell can ask Replace or Skip (a swap made while that dialog waited went unseen)
+  ([#84](https://github.com/CodingDiego/rexplorer/issues/84)).
+- A clean exit removes the empty crash record (`.seh`) it kept open, so `%LOCALAPPDATA%\rexplorer\crashes` only
+  fills on real crashes. The thumbnail worker answers COM and window messages while it waits for work. Search
+  results select the row after a delete by the folder view's rule, from the focused row. The packaged context-menu
+  commands are left out for Recycle Bin items, told by the item's folder or by a `$Recycle.Bin` folder on the way to
+  it, so an item inside a recycled folder opened from the bin gets none either
+  ([#84](https://github.com/CodingDiego/rexplorer/issues/84)).
 
 ## 1.0.0-rc.2 - 2026-11-13
 

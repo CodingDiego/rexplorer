@@ -186,12 +186,17 @@ pub fn parse(text: &str) -> Session {
 
 pub fn format(s: &Session) -> String {
     let mut out = format!("format={}\n", s.format);
-    for t in &s.tabs {
-        out.push_str(&format!("tab={}\n", crate::connect::redact(t)));
+    // A name from an FTP server can hold a line break: written as is it would add lines (another tab=, opened at
+    // the next start) to this file.
+    let kept: Vec<usize> = (0..s.tabs.len()).filter(|&i| !s.tabs[i].contains(['\r', '\n'])).collect();
+    for &i in &kept {
+        out.push_str(&format!("tab={}\n", crate::connect::redact(&s.tabs[i])));
     }
+    // The active tab among those written; when it is the one skipped, the nearest one.
+    let active = kept.iter().enumerate().min_by_key(|(_, i)| i.abs_diff(s.active)).map_or(0, |(n, _)| n);
     out.push_str(&format!(
         "active={}\nview={}\ntree={}\nsidebar={}\npreview={}\ndetails={}\ntree_width={}\npreview_width={}\n",
-        s.active, s.view, s.show_tree as u8, s.show_sidebar as u8, s.show_preview as u8, s.show_details as u8, s.tree_width, s.preview_width
+        active, s.view, s.show_tree as u8, s.show_sidebar as u8, s.show_preview as u8, s.show_details as u8, s.tree_width, s.preview_width
     ));
     for (k, v) in &s.extra {
         out.push_str(&format!("{k}={v}\n"));
@@ -307,6 +312,22 @@ mod tests {
         let s = Session { tabs: vec!["ftp://u:pw@h/x".into()], ..Session::default() };
         assert!(!format(&s).contains("pw"));
         assert_eq!(parse(&format(&s)).tabs, vec!["ftp://u@h/x".to_string()]);
+    }
+
+    #[test]
+    fn a_tab_with_a_line_break_adds_no_lines() {
+        let s = Session { tabs: vec!["ftp://h/a\ntab=\\\\attacker\\share\nview=x".into(), "C:\\b".into()], ..Session::default() };
+        let back = parse(&format(&s));
+        assert_eq!((back.tabs, back.view.as_str()), (vec!["C:\\b".to_string()], "details"));
+        // The active tab keeps its place among the tabs written, and a skipped active one gives way to the nearest.
+        let tabs = |v: &[&str]| v.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+        let s = Session { tabs: tabs(&["C:\\a", "ftp://h/x\ny", "C:\\c", "C:\\d"]), active: 2, ..Session::default() };
+        let back = parse(&format(&s));
+        assert_eq!((back.tabs[back.active].as_str(), back.tabs.len()), ("C:\\c", 3));
+        let s = Session { active: 1, ..s };
+        assert_eq!(parse(&format(&s)).active, 0, "C:\\a, before the skipped one");
+        let s = Session { tabs: tabs(&["ftp://h/x\ny", "C:\\b"]), active: 0, ..Session::default() };
+        assert_eq!(parse(&format(&s)).active, 0, "C:\\b, after it");
     }
 
     #[test]

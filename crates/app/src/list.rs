@@ -504,7 +504,11 @@ pub(crate) unsafe fn begin_drag(app: *mut App) {
     // Physical buttons: a button already up when the loop starts makes it drop at once where the pointer is.
     let button_down = GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 || GetAsyncKeyState(VK_RBUTTON.0 as i32) < 0;
     let start = std::time::Instant::now();
-    let r = dragdrop::drag(&d, ui::view_hwnd(app));
+    let r = {
+        // Home answers the shell's request for the drag image only inside this call.
+        let _grant = crate::home::grant_drag_image(ui::view_hwnd(app));
+        dragdrop::drag(&d, ui::view_hwnd(app))
+    };
     // Every drag that moved nothing is logged, so the next live run can say why a target never got it.
     if let Some(note) = dragdrop::drag_note(&r, dragdrop::performed_effect(&d), button_down, start.elapsed().as_millis()) {
         rexplorer_core::crash::log(&note);
@@ -1163,9 +1167,10 @@ pub(crate) unsafe fn undo_step(app: *mut App, redo: bool) {
         return;
     };
     // The shell's progress UI pumps messages: no borrow of the log is held across it.
-    let done = undo::reverse((*app).hwnd, entry);
-    let any = !done.is_empty();
-    (*app).undo.put(redo, done);
+    let r = undo::reverse_all((*app).hwnd, entry);
+    let any = !r.done.is_empty();
+    // What the shell did not reach (it cancels the items after one it refused) stays for the next Ctrl+Z.
+    (*app).undo.finish(redo, r);
     if any {
         SetTimer(Some((*app).hwnd), TIMER_REFRESH, 150, None);
     } else {

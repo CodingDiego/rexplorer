@@ -14,7 +14,9 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::UI::Controls::{LVM_GETNEXTITEM, LVNI_FOCUSED, LVNI_SELECTED};
-use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetParent, OBJID_CLIENT, SendMessageW};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetClassNameW, GetParent, GetShellWindow, GetWindowThreadProcessId, OBJID_CLIENT, SMTO_ABORTIFHUNG, SendMessageTimeoutW,
+};
 use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::UI::Shell::{FOLDERFLAGS, FVM_ICON, FWF_AUTOARRANGE, FWF_SNAPTOGRID, IFolderView2, SORT_ASCENDING, SORTCOLUMN, SVSI_EDIT};
 use windows::core::{GUID, Interface, Result};
@@ -85,32 +87,33 @@ impl DesktopView {
         unsafe { Ok(Pidl::from_raw(self.view.Item(index as i32)?)) }
     }
 
-    /// Indices of the selected items of desktop list `list`. Read from the list itself: the view's own selection
-    /// calls (ItemCount, GetSelectedItem) come back empty across the process boundary.
-    pub fn selection(list: HWND) -> Vec<usize> {
+    /// Indices of the selected items of desktop list `list`, None when the list does not answer within a second.
+    /// Read from the list itself: the view's own selection calls (ItemCount, GetSelectedItem) come back empty across
+    /// the process boundary.
+    pub fn selection(list: HWND) -> Option<Vec<usize>> {
         let mut out = Vec::new();
         let mut i = -1isize;
         loop {
-            i = unsafe { SendMessageW(list, LVM_GETNEXTITEM, Some(WPARAM(i as usize)), Some(LPARAM(LVNI_SELECTED as isize))) }.0;
+            i = next_item(list, i, LVNI_SELECTED)?;
             if i < 0 {
-                return out;
+                return Some(out);
             }
             out.push(i as usize);
         }
     }
 
-    /// Index of the focused item of desktop list `list`, if any.
+    /// Index of the focused item of desktop list `list`, if any (None also when the list does not answer).
     pub fn focused(list: HWND) -> Option<usize> {
-        let i = unsafe { SendMessageW(list, LVM_GETNEXTITEM, Some(WPARAM(usize::MAX)), Some(LPARAM(LVNI_FOCUSED as isize))) }.0;
-        usize::try_from(i).ok()
+        usize::try_from(next_item(list, -1, LVNI_FOCUSED)?).ok()
     }
 
     /// What a right-button press does in Explorer: on an unselected icon, select just it; on a selected one, keep
     /// the selection; on the background, clear it.
-    pub fn select_for_menu(&self, list: HWND, index: Option<usize>) -> Result<()> {
+    /// `selection` is the list's selection now.
+    pub fn select_for_menu(&self, index: Option<usize>, selection: &[usize]) -> Result<()> {
         unsafe {
             match index {
-                Some(i) if Self::selection(list).contains(&i) => Ok(()),
+                Some(i) if selection.contains(&i) => Ok(()),
                 Some(i) => self.shell_view.SelectItem(self.item(i)?.as_ptr(), (SVSI_SELECT.0 | SVSI_DESELECTOTHERS.0 | SVSI_FOCUSED.0) as u32),
                 None => self.shell_view.SelectItem(std::ptr::null(), SVSI_DESELECTOTHERS.0 as u32),
             }
@@ -151,15 +154,20 @@ impl DesktopView {
         unsafe { self.shell_view.Refresh() }
     }
 
-    /// Deletes the `count` selected icons inside explorer.exe (Shell automation), so Explorer's own Ctrl+Z on the
-    /// desktop undoes it: a delete run in this process lands in no undo history the desktop has. Fails, doing
-    /// nothing, only when Explorer cannot be asked or reports another selection; a cancel in Explorer's own
-    /// confirmation is no failure (the caller would ask again).
-    pub fn delete_selection(&self, count: usize) -> Result<()> {
+    /// Deletes the selected icons inside explorer.exe (Shell automation), so Explorer's own Ctrl+Z on the desktop
+    /// undoes it: a delete run in this process lands in no undo history the desktop has. `paths` are the parsing
+    /// names of the items the menu was built for. Fails, doing nothing, when Explorer cannot be asked or its
+    /// selection is no longer exactly those items; a cancel in Explorer's own confirmation is no failure (the caller
+    /// would ask again).
+    pub fn delete_selection(&self, paths: &[String]) -> Result<()> {
         unsafe {
             let dual: IShellFolderViewDual = self.shell_view.GetItemObject(SVGIO_BACKGROUND)?;
             let items: FolderItems2 = dual.SelectedItems()?.cast()?;
-            if usize::try_from(items.Count()?).ok() != Some(count) {
+            let mut selected = Vec::new();
+            for i in 0..items.Count()? {
+                selected.push(items.Item(&VARIANT::from(i))?.Path()?.to_string());
+            }
+            if !same_items(&selected, paths) {
                 return Err(E_FAIL.into());
             }
             let _ = items.InvokeVerbEx(&VARIANT::from("delete"), &VARIANT::default());
@@ -168,14 +176,117 @@ impl DesktopView {
     }
 }
 
-/// Whether `hwnd` is the desktop's icon list: a SysListView32 in a SHELLDLL_DefView hosted by Progman or WorkerW.
+/// Whether two lists of parsing names hold the same items, in any order (paths compare case-insensitively).
+fn same_items(a: &[String], b: &[String]) -> bool {
+    let sorted = |v: &[String]| {
+        let mut v: Vec<String> = v.iter().map(|s| s.to_lowercase()).collect();
+        v.sort();
+        v
+    };
+    sorted(a) == sorted(b)
+}
+
+/// LVM_GETNEXTITEM, waiting at most a second: a list that does not answer (a hung or hostile owner) must not
+/// freeze the helper's main thread while the hooks keep taking the desktop's right-clicks. None on a timeout.
+fn next_item(list: HWND, from: isize, flags: u32) -> Option<isize> {
+    let mut out = 0usize;
+    let sent = unsafe {
+        SendMessageTimeoutW(list, LVM_GETNEXTITEM, WPARAM(from as usize), LPARAM(flags as isize), SMTO_ABORTIFHUNG, 1000, Some(&mut out))
+    };
+    (sent.0 != 0).then_some(out as isize)
+}
+
+/// Whether `hwnd` is the desktop's icon list: a SysListView32 in a SHELLDLL_DefView hosted by Progman or WorkerW,
+/// all three owned by the shell's process. Any program can build that class chain; only the shell owns the real one.
+/// Safe inside a low-level hook: GetParent, GetClassNameW, GetWindowThreadProcessId and GetShellWindow read window
+/// data and send no message.
 pub fn is_desktop_list(hwnd: HWND) -> bool {
+    let Some((classes, owners)) = chain(hwnd) else { return false };
+    let shell = unsafe { GetShellWindow() };
+    let shell_pid = if shell.is_invalid() { 0 } else { owner(shell) };
+    is_shell_desktop_list(classes.each_ref().map(String::as_str), owners, shell_pid)
+}
+
+fn owner(h: HWND) -> u32 {
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
+    pid
+}
+
+/// The classes and owning processes of `hwnd`, its parent and its grandparent.
+fn chain(hwnd: HWND) -> Option<([String; 3], [u32; 3])> {
     let class = |h: HWND| {
         let mut buf = [0u16; 32];
         let n = unsafe { GetClassNameW(h, &mut buf) };
         String::from_utf16_lossy(&buf[..n.max(0) as usize])
     };
-    let Ok(view) = (unsafe { GetParent(hwnd) }) else { return false };
-    let Ok(host) = (unsafe { GetParent(view) }) else { return false };
-    class(hwnd) == "SysListView32" && class(view) == "SHELLDLL_DefView" && matches!(class(host).as_str(), "Progman" | "WorkerW")
+    let view = unsafe { GetParent(hwnd) }.ok()?;
+    let host = unsafe { GetParent(view) }.ok()?;
+    Some(([hwnd, view, host].map(class), [hwnd, view, host].map(owner)))
+}
+
+/// The decision of `is_desktop_list`: the classes of (list, its parent, its grandparent), the processes owning them,
+/// and the shell's process (0 when there is no shell window).
+fn is_shell_desktop_list(classes: [&str; 3], owners: [u32; 3], shell_pid: u32) -> bool {
+    classes[0] == "SysListView32"
+        && classes[1] == "SHELLDLL_DefView"
+        && matches!(classes[2], "Progman" | "WorkerW")
+        && shell_pid != 0
+        && owners.iter().all(|&p| p == shell_pid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_shells_own_list_is_the_desktop() {
+        let real = ["SysListView32", "SHELLDLL_DefView", "Progman"];
+        assert!(is_shell_desktop_list(real, [7, 7, 7], 7));
+        assert!(is_shell_desktop_list(["SysListView32", "SHELLDLL_DefView", "WorkerW"], [7, 7, 7], 7));
+        // The same class chain built by another program, or a list of its own planted inside the shell's view.
+        assert!(!is_shell_desktop_list(real, [9, 9, 9], 7));
+        assert!(!is_shell_desktop_list(real, [9, 7, 7], 7));
+        assert!(!is_shell_desktop_list(real, [7, 7, 9], 7));
+        // No shell window: nothing is the desktop.
+        assert!(!is_shell_desktop_list(real, [0, 0, 0], 0));
+        assert!(!is_shell_desktop_list(["SysListView32", "SHELLDLL_DefView", "CabinetWClass"], [7, 7, 7], 7));
+        assert!(!is_shell_desktop_list(["SysTreeView32", "SHELLDLL_DefView", "Progman"], [7, 7, 7], 7));
+    }
+
+    #[test]
+    fn a_forged_class_chain_is_refused_live() {
+        // Windows of this process with the desktop's class names: the chain matches, the owner does not. The host is
+        // message-only and nothing is shown, so no other program (FindWindow, EnumWindows, a click) can come upon them.
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DestroyWindow, HWND_MESSAGE, RegisterClassW, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
+            WS_CHILD,
+        };
+        use windows::core::{PCWSTR, w};
+        unsafe extern "system" fn proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> windows::Win32::Foundation::LRESULT {
+            unsafe { DefWindowProcW(h, m, w, l) }
+        }
+        let make = |class: PCWSTR, parent: HWND, style: WINDOW_STYLE| unsafe {
+            RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(proc), lpszClassName: class, ..Default::default() });
+            CreateWindowExW(WINDOW_EX_STYLE(0), class, None, style, 0, 0, 1, 1, Some(parent), None, None, None).unwrap()
+        };
+        let host = make(w!("Progman"), HWND_MESSAGE, WINDOW_STYLE(0));
+        let view = make(w!("SHELLDLL_DefView"), host, WS_CHILD);
+        let list = make(w!("SysListView32"), view, WS_CHILD);
+        let (classes, owners) = chain(list).unwrap();
+        let me = std::process::id();
+        assert!(is_shell_desktop_list(classes.each_ref().map(String::as_str), owners, me), "{classes:?} {owners:?}");
+        assert!(!is_desktop_list(list));
+        unsafe { DestroyWindow(host).unwrap() };
+    }
+
+    #[test]
+    fn selections_compare_as_sets_of_paths() {
+        let v = |s: &[&str]| s.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(same_items(&v(&[r"C:\Users\me\Desktop\a.txt", r"C:\Users\me\Desktop\B"]), &v(&[r"c:\users\me\desktop\b", r"C:\Users\me\Desktop\a.txt"])));
+        assert!(same_items(&[], &[]));
+        assert!(!same_items(&v(&[r"C:\d\a.txt"]), &v(&[r"C:\d\b.txt"])));
+        assert!(!same_items(&v(&[r"C:\d\a.txt", r"C:\d\b.txt"]), &v(&[r"C:\d\a.txt"])));
+        assert!(!same_items(&v(&[r"C:\d\a.txt", r"C:\d\a.txt"]), &v(&[r"C:\d\a.txt", r"C:\d\b.txt"])));
+    }
 }

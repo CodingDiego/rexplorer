@@ -9,7 +9,7 @@
 # only reads them): -ImportExplorer says yes, -NoImport says no, neither asks (default yes); with -Quiet it never asks
 # (no import unless -ImportExplorer) and the exe shows no dialog.
 # -Exe <path> defaults to rexplorer.exe next to this script (a release zip), else target\release\rexplorer.exe, built
-# with cargo build --release when missing.
+# with cargo build --release when missing. In a release zip (LICENSE next to this script) a missing exe is an error.
 # -InstallDir / -RegBase / -ProgramsDir / -StartupDir carry REXPLORER_INSTALL_DIR / REXPLORER_REG_BASE /
 # REXPLORER_PROGRAMS_DIR / REXPLORER_STARTUP_DIR (tests). -WhatIf shows what would run and changes nothing.
 # Exit codes: 0 done, 1 failed, 2 cancelled (nothing changed).
@@ -28,9 +28,14 @@ try {
   $app = Join-Path $dir 'rexplorer.exe'
   # Next to the script in a release zip; the repo's release build otherwise.
   if (-not $Exe) { $Exe = Join-Path $PSScriptRoot 'rexplorer.exe' }
-  if (-not (Test-Path -LiteralPath $Exe)) { $Exe = Join-Path (Split-Path $PSScriptRoot -Parent) 'target\release\rexplorer.exe' }
+  # A release zip has LICENSE next to this script and no source tree above it: nothing to fall back to or build.
+  $releaseZip = Test-Path -LiteralPath (Join-Path $PSScriptRoot 'LICENSE')
+  if (-not $releaseZip -and -not (Test-Path -LiteralPath $Exe)) { $Exe = Join-Path (Split-Path $PSScriptRoot -Parent) 'target\release\rexplorer.exe' }
   # Uninstalling needs no build: the installed copy can do it.
   if ($Uninstall -and -not (Test-Path -LiteralPath $Exe) -and (Test-Path -LiteralPath $app)) { $Exe = $app }
+  if ($releaseZip -and -not (Test-Path -LiteralPath $Exe)) {
+    throw "Not found: $Exe. This is a release folder, so nothing is built: extract the whole release zip again (rexplorer.exe belongs next to this script), or pass -Exe <path to rexplorer.exe>."
+  }
   if (-not (Test-Path -LiteralPath $Exe) -and -not $Uninstall -and $PSCmdlet.ShouldProcess('cargo build --release', 'Build rexplorer.exe')) {
     Write-Host 'rexplorer.exe not found, building it with cargo build --release...'
     Push-Location (Split-Path $PSScriptRoot -Parent)

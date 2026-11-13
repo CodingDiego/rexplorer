@@ -869,8 +869,9 @@ fn remove_indices<T>(v: &mut Vec<T>, gone: &[usize]) {
 /// stat'ed, so no pass over network paths. A delete made outside rexplorer shows up after F5.
 pub(crate) unsafe fn prune_search(app: *mut App, rows: &[usize]) {
     let list = (*app).list;
+    let focused = usize::try_from(SendMessageW(list, LVM_GETNEXTITEM, Some(WPARAM(usize::MAX)), Some(LPARAM(LVNI_FOCUSED as isize))).0).ok();
     let Some(Source::Search(s)) = &mut cur(app).source else { return };
-    let gone: Vec<usize> = rows
+    let mut gone: Vec<usize> = rows
         .iter()
         .copied()
         .filter(|&i| {
@@ -880,15 +881,28 @@ pub(crate) unsafe fn prune_search(app: *mut App, rows: &[usize]) {
             })
         })
         .collect();
-    let Some(&first) = gone.iter().min() else { return };
+    gone.sort_unstable();
+    gone.dedup();
+    if gone.is_empty() {
+        return;
+    }
+    let next = row_after_pruning(s.rows.len(), &gone, focused);
     remove_indices(&mut s.rows, &gone);
     let len = s.rows.len();
     s.icons = vec![ICON_UNKNOWN; len];
     SendMessageW(list, LVM_SETITEMCOUNT, Some(WPARAM(len)), Some(LPARAM(LVSICF_NOSCROLL as isize)));
     list::set_item_state(list, usize::MAX, LIST_VIEW_ITEM_STATE_FLAGS(0), LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0));
-    list::select_after_delete(list, first, len);
+    if let Some(i) = next {
+        list::select_after_delete(list, i, len);
+    }
     views::reset(app, len);
     ui::update_status(app);
+}
+
+/// The row, counted after the `gone` rows (ascending) are removed, that takes the selection: the folder view's rule
+/// (`nav::row_taking_place`, from the focused row).
+fn row_after_pruning(len: usize, gone: &[usize], focused: Option<usize>) -> Option<usize> {
+    crate::nav::row_taking_place(len, gone, focused).map(|i| i - gone.partition_point(|&g| g < i))
 }
 
 /// A search row's absolute PIDL.
@@ -1070,6 +1084,21 @@ mod tests {
         let mut v = vec!["a", "b", "c", "d"];
         remove_indices(&mut v, &[3, 1, 3, 9]);
         assert_eq!(v, ["a", "c"]);
+    }
+
+    #[test]
+    fn search_results_select_like_a_folder_after_a_delete() {
+        // Rows 1, 2 and 5 of 7 go, the focus on 5: the row after it (6) takes the place, which is row 3 once they are gone.
+        let (gone, len) = ([1, 2, 5], 7);
+        let next = row_after_pruning(len, &gone, Some(5));
+        assert_eq!(next, Some(3));
+        let mut rows: Vec<usize> = (0..len).collect();
+        remove_indices(&mut rows, &gone);
+        assert_eq!(rows[3], 6);
+        // Focus elsewhere: from the first deleted row; the last rows gone: the survivor before them.
+        assert_eq!(row_after_pruning(len, &gone, Some(0)), Some(1), "row 3, now second");
+        assert_eq!(row_after_pruning(4, &[2, 3], Some(3)), Some(1));
+        assert_eq!(row_after_pruning(2, &[0, 1], None), None);
     }
 
     #[test]

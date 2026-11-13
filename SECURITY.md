@@ -54,25 +54,33 @@ Out of scope:
   `api.github.com` for the latest release, follows no redirects, reads at most 1 MiB, downloads nothing and sends
   nothing beyond the request itself.
 
-## Known limitations (1.0.0-rc.2)
+## Known limitations (after the 2026-11-13 review)
 
-- **Forgeable window messages.** The worker results no longer carry a pointer: since 1.0.0-rc.2 each
-  window keeps them in its own queue and the message carries nothing. Two kinds still carry one: the accessibility
-  request rexplorer's own controls answer (`WM_ACC_ITEMS`), and the notifications its custom controls send their
-  parent (`WM_NOTIFY` with rexplorer's own structures, as every Win32 control does). The thumbnail and Home icon
-  messages carry a bitmap handle instead: a forged one makes rexplorer draw, and later free, another of its own
-  bitmaps, which spoils drawing and not memory. Another program running in the
-  same session, as the same user and at the same or a higher integrity level, can send such a message with a bad
-  pointer and crash rexplorer. Windows blocks these messages from lower-integrity programs. The impact is a crash
-  (lost tabs until the automatic recovery start), not code running with more rights: a program that can send the
-  message can already read and change everything the user can.
+- **The list view's own notifications.** No message rexplorer's own code sends or posts carries a pointer or a
+  handle that it trusts from the sender any more: worker results (thumbnails and Home icons included) wait in the
+  window's own queue and their message carries nothing, and the accessibility request (`WM_ACC_ITEMS`) and the custom
+  controls' notifications (`WM_NOTIFY` with rexplorer's own structures) are read only when rexplorer itself sent them
+  on that thread. Two messages from the system are read through their pointer. The shell's drag image request
+  (`ShellGetDragImage`) is answered by Home once per drag, only from Home's own thread and only during the call
+  that starts a drag from Home; at any other time, or a second time, it is ignored. And what every Win32 program
+  has: the notifications the system's list view sends the main window (`WM_NOTIFY` from comctl32) are read through
+  their pointer, so another program running in the same
+  session, as the same user and at the same or a higher integrity level, can crash rexplorer with a forged one.
+  Windows blocks such messages from lower-integrity programs, and a program at the same level could already inject
+  code: a robustness gap, not a privilege boundary.
 - **Undo's identity check leaves a short window.** Before an undo moves, renames or recycles something, rexplorer
   checks that the item is still the one it recorded (its file id, or for a paste or drop a free name of the shell's
-  form with the source's size and time). Since 1.0.0-rc.2 it checks the file id again when the shell is
-  about to act on the item, and a swapped item cancels that item and the rest of the undo (tested without the
-  shell's dialogs; not yet seen with a confirmation dialog on screen). What remains is the moment between that check and the shell's own move, rename or delete. The shell's
-  own operations still apply (a delete goes to the Recycle Bin, where it can be restored), and only files the user
-  can already change are reachable.
+  form with the source's size and time), and checks the file id again when the shell is about to act on each item
+  (the shell's Pre callbacks); a move or rename back also requires the old name still free there, so the shell's
+  Replace or Skip dialog, during which a swap would go unseen, is never reached. What remains is the moment between
+  the shell's Pre callback and its own move, rename or delete, and the Recycle Bin confirmation: with "Display delete
+  confirmation" turned on, whether the shell shows it before or after its Pre callback was not checked (the test
+  machine has it off, and turning it on is a Windows setting the tests must not change). The shell's own operations
+  still apply (a delete goes to the Recycle Bin, where it can be restored), and only files the user can already
+  change are reachable.
+- **The desktop helper trusts the shell's process.** It acts only on a desktop list owned by the process of the
+  shell's desktop window (`GetShellWindow`). A program that can run code inside explorer.exe is beyond this check,
+  as it is beyond any other.
 
 ## Sending a crash report
 
@@ -86,8 +94,9 @@ folder if that variable is not set):
   its name, the address, the module and offset when known, the thread and the UTC time.
 
 The newest 10 dumps are kept; each one's `.txt` goes with it. While rexplorer runs, one empty `.seh` file sits in
-that folder; that is normal and it is removed at the next start. After a crash the recovered window offers to open
-the folder.
+that folder; that is normal, a clean exit removes it, and one left by a run that was killed is removed at the next
+start. A crash in the last moments of exit, after that file is removed, leaves its minidump without the text record.
+After a crash the recovered window offers to open the folder.
 
 To report a crash, attach the `.txt` and the matching `.dmp` to a GitHub issue, or, if you would rather not make
 them public, to a private advisory (the **Report a vulnerability** button above). Say what you were doing and which
@@ -105,10 +114,32 @@ look before you share it, and send only the `.txt` if you prefer.
   renamed entries, archive link members (symbolic links and junctions), the smoke test's drag guard, and the order of
   the crash-recovery steps. Also fixed then: names in the long-path rename, and the jump list under the test install
   overrides.
-- **2026-11-13** (the v1 remaining-work round, not yet committed: undo of pastes and drops, multi-volume .rar,
-  native crash reports, tab hand-off between windows, right-to-left layout, fuzzing): its security review runs before
-  the round is committed, and this entry will name its findings. The desktop helper's low-level mouse and keyboard
-  hooks (`--desktop`) get an explicit pass then, because no record above names them. Hardening already in the round:
-  undo of a copied folder checks the folder's file id, the tab hand-off message carries no pointer, the Home drag
-  image is not built inside a cross-thread call, and a crash record of the wrong size is deleted unread. The two
-  limitations above remain.
+- **2026-11-13** (the v1 remaining-work round, released as 1.0.0-rc.1 and rc.2: undo of pastes and drops,
+  multi-volume .rar, native crash reports, tab hand-off between windows, right-to-left layout, fuzzing). Hardening
+  in the round: undo of a copied folder checks the folder's file id, the tab hand-off message carries no pointer, the
+  Home drag image is not built inside a cross-thread call, a crash record of the wrong size is deleted unread, worker
+  results carry no pointer, and undo checks each item's file id again when the shell acts on it. A review at the
+  rc.2 tag then gave the desktop helper's low-level hooks (`--desktop`) and the install their explicit pass
+  ([#60](https://github.com/CodingDiego/rexplorer/issues/60)) and found, all fixed after rc.2:
+  - medium: the helper decided "this is the desktop" from window class names alone, so a program's look-alike list
+    could make it build the menu for, and act on, the real desktop's icons at the look-alike's indices; and its
+    selection reads had no timeout, so a list that never answered froze the helper while its hooks kept taking every
+    desktop right-click. It now requires the list to belong to the shell's process and reads its selection first,
+    with a one-second timeout (no menu on a timeout), and drops a click it could not get to within 2 seconds. The
+    calls into Explorer after that first answer (finding the desktop's view, building and running the menu) still
+    have no timeout, so an Explorer that hangs between the read and those calls can still hold the helper.
+  - low: the helper's Delete compared only the number of selected icons with its menu's; `--register` registered the
+    exe it ran from (from a folder other accounts can write to, one of them could replace the exe that then runs at
+    sign-in); a right-drag released while the press was being handed back could leave the right button down; a menu
+    key whose release the helper missed was swallowed once in any window; uninstall deleted any file, and any
+    registry value or empty key, its records named; `install.ps1` in a release folder fell back to building; `restore-explorer.ps1 -RestartShell` started
+    `explorer.exe` by bare name (App Paths may still name rexplorer); the jump list quoted a drive root as `C:"`.
+  - a further read of the search syntax, settings and session files found one more: a tab name with a line break
+    (from an FTP server) could add lines to the session file, such as a `tab=` that opens a network path at the next
+    start. Fixed.
+  - the leftovers of [#84](https://github.com/CodingDiego/rexplorer/issues/84): the accessibility request, the custom
+    controls' notifications and the bitmap results trusted a pointer or handle from the sender (now ours only, or
+    queued); with a conflict dialog on screen the undo re-check missed a swap made while the dialog waited (a test
+    showed it; undo now never reaches that dialog); items the shell cancelled after a refused one lost their undo
+    entry; the thumbnail worker's apartment did not pump between requests.
+  The limitations above are what remains.
