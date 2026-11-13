@@ -3,7 +3,9 @@
 pub use crate::archive::fuzz_check as archive_member;
 pub use crate::cli::fuzz_check as command_line;
 pub use crate::i18n::fuzz_check as language_file;
+pub use crate::query::fuzz_check as search_query;
 pub use crate::settings::fuzz_check as ini_file;
+pub use crate::update::fuzz_check as update_response;
 
 pub struct Rng(u64);
 
@@ -43,6 +45,49 @@ pub const TOKENS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hostile shapes the seeded junk rarely builds: huge lines, NUL, a lone surrogate (lossy-decoded, as every
+    /// file read does), deep nesting and numbers past every integer width.
+    fn hostile() -> Vec<String> {
+        let surrogate = String::from_utf16_lossy(&[0xD800, b'a' as u16, 0xDC00, 0xD83D]);
+        let big = "99999999999999999999999999999999";
+        let mut v = vec![
+            "a".repeat(1 << 20),
+            "[".repeat(100_000),
+            "=".repeat(100_000),
+            format!("k={}", "v".repeat(1 << 20)),
+            format!("[{}]\nk=v", "s".repeat(1 << 16)),
+            "\n".repeat(100_000),
+            "\0".into(),
+            format!("[\0]\n\0=\0\n{surrogate}={surrogate}"),
+            surrogate.clone(),
+            "{".repeat(100_000) + "\"tag_name\":\"v1.2.3\"",
+            format!("{{\"tag_name\": \"{big}.{big}.{big}\"}}"),
+            format!("{{\"tag_name\": \"{}\"}}", "9.".repeat(100_000)),
+            "\"tag_name\":\"".into(),
+            format!("size:>{big}kb size:{big}..{big} size:18446744073709551615gb size:-{big} size:1e999 size:{}", "9".repeat(5000)),
+            format!("date:{big}-1-1 date:>{big} date:{big} days ago date:last {big} date:9223372036854775807 date:-{big}"),
+            format!("ext:{} kind:\0 \"{}", ";".repeat(100_000), "x".repeat(1 << 16)),
+            "\"".repeat(100_001),
+            format!("#{big} #FFFFF\0 {surrogate}"),
+            format!("0:{big}"),
+        ];
+        v.push(v[0].replace('a', "\u{202e}\u{1F600}"));
+        v
+    }
+
+    #[test]
+    fn hostile_inputs_through_every_text_parser() {
+        for t in hostile() {
+            ini_file(&t);
+            language_file(&t);
+            archive_member(&t);
+            search_query(&t);
+            update_response(t.as_bytes());
+            let parts: Vec<String> = t.split('\n').take(6).map(String::from).collect();
+            command_line(&t, &parts, &parts, true);
+        }
+    }
 
     #[test]
     fn same_seed_same_stream_and_bounded() {

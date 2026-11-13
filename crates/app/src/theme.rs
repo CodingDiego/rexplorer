@@ -144,7 +144,7 @@ pub unsafe fn draw_text(dc: HDC, s: &str, r: &mut RECT, flags: DRAW_TEXT_FORMAT)
         return;
     }
     let mut v: Vec<u16> = s.encode_utf16().collect();
-    unsafe { DrawTextW(dc, &mut v, r, flags) };
+    unsafe { DrawTextW(dc, &mut v, r, crate::rtl::text(flags)) };
 }
 
 /// Share of pixel (x, y) of a corner square `r` px wide that lies inside the quarter circle of radius `r` centered
@@ -228,7 +228,7 @@ pub unsafe fn paint_card_corners(card: HWND, owner: HWND, dc: HDC, outer: u32) {
         }
         let mut o = POINT::default();
         let _ = ClientToScreen(owner, &mut o);
-        let rect = RECT { left: wr.left - o.x, top: wr.top - o.y, right: wr.right - o.x, bottom: wr.bottom - o.y };
+        let rect = crate::rtl::screen_to_local(wr, o, crate::rtl::mirrored(owner));
         paint_corners(dc, &rect, card_radius(GetDpiForWindow(card)), outer);
     }
 }
@@ -260,7 +260,11 @@ pub unsafe fn paint_frame_corners(hwnd: HWND, radius: i32, outer: u32) {
         let mut origin = POINT::default();
         let _ = ClientToScreen(hwnd, &mut origin);
         let dc = GetWindowDC(Some(hwnd));
-        let (ox, oy) = (origin.x - wr.left, origin.y - wr.top);
+        // A mirrored window DC's (0, 0) is the window's top-right corner.
+        let rtl = crate::rtl::mirrored(hwnd);
+        let corner = POINT { x: if rtl { wr.right } else { wr.left }, y: wr.top };
+        let at = crate::rtl::screen_to_local(RECT { left: origin.x, top: origin.y, right: origin.x, bottom: origin.y }, corner, rtl);
+        let (ox, oy) = (at.left, at.top);
         ExcludeClipRect(dc, ox, oy, ox + cr.right, oy + cr.bottom);
         paint_corners(dc, &RECT { left: 0, top: 0, right: wr.right - wr.left, bottom: wr.bottom - wr.top }, radius, outer);
         ReleaseDC(Some(hwnd), dc);
@@ -542,6 +546,23 @@ mod tests {
             SelectObject(dc, old);
             let _ = DeleteObject(brush.into());
             let _ = DeleteObject(bmp.into());
+            let _ = DeleteDC(dc);
+        }
+    }
+
+    #[test]
+    fn empty_text_draws_nothing_and_measures_zero_wide() {
+        // The breadcrumb and group headers draw names that can be empty, with DT_END_ELLIPSIS (a Home start crashed).
+        unsafe {
+            let dc = CreateCompatibleDC(None);
+            let mut r = RECT { left: 10, top: 0, right: 200, bottom: 20 };
+            draw_text(dc, "", &mut r, DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            assert_eq!(r, RECT { left: 10, top: 0, right: 200, bottom: 20 }, "nothing drawn, rect untouched");
+            draw_text(dc, "", &mut r, DT_SINGLELINE | DT_CALCRECT);
+            assert_eq!(r.right, r.left, "an empty text measures zero wide");
+            let mut m = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            draw_text(dc, "abc", &mut m, DT_SINGLELINE | DT_CALCRECT);
+            assert!(m.right > 0, "a real text still measures");
             let _ = DeleteDC(dc);
         }
     }

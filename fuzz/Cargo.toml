@@ -43,3 +43,24 @@ path = "fuzz_targets/archive_member.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "search_query"
+path = "fuzz_targets/search_query.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "update_response"
+path = "fuzz_targets/update_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session_files"
+path = "fuzz_targets/session_files.rs"
+test = false
+doc = false
+bench = false

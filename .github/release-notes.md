@@ -1,80 +1,81 @@
-rexplorer 0.2.0, the v1 release candidate. The changes since 0.1.4 are listed in full in `CHANGELOG.md`.
+rexplorer 1.0.0-rc.1 is a release candidate for 1.0, published as a pre-release: the update notice and winget stay on 0.2.0. The changes since 0.2.0 are listed in full in `CHANGELOG.md` under 1.0.0-rc.1.
+
+**If you use 0.2.0, update.** 0.2.0 can rename the wrong file. In a window with Back history, each character typed
+in the rename box sends the window Back, and Enter then renames whatever item sits at the same position in the
+folder now shown. This release candidate fixes it: typing no longer navigates, and a rename always applies to the
+item it was opened on (22 of 22 live renames after the fix).
 
 **Download.** Two zips: `rexplorer-<version>-x64.zip` and `rexplorer-<version>-arm64.zip`. The arm64 build is
 cross-compiled and has not been tested on ARM hardware yet. `SHA256SUMS.txt` lists both zips and both exes, the exes
 with their folder (`rexplorer-<version>-x64/rexplorer.exe`); check a download with `Get-FileHash` against it.
 
-**Install (changed).** Installing and making rexplorer the default file manager are now two separate steps, so an
-install can no longer take over your folders by itself. Extract the zip and run `rexplorer.exe` to try it.
-`rexplorer.exe --install` installs it as a normal program for your user (Start menu, Settings > Apps, no
-administrator rights); Windows Explorer still opens folders. `rexplorer.exe --register` (or More > Make rexplorer the
-default file manager) then makes it the default, journaled so `--unregister` (More > Give folders back to Windows
-Explorer) and uninstall undo it exactly. The scripts `install.ps1` (program only) and `master-install.ps1` (program,
-then the default, after saving the keys it changes to a `.reg` backup) do the same from PowerShell, and
-`restore-explorer.ps1` puts Windows Explorer back without needing a working rexplorer.exe. Already installed by an
-earlier build? Run the new `rexplorer.exe --install` to replace the copy; folders keep opening in rexplorer until you
-give them back, and uninstall still reverts everything the old install did. Uninstall from Settings > Apps or with
-`%LOCALAPPDATA%\Programs\rexplorer\rexplorer.exe --uninstall`.
+**Install.** Unchanged since 0.2.0: `rexplorer.exe --install` installs the program for your user (Explorer still
+opens folders), `--register` makes it the default file manager, `--unregister` gives folders back, `--uninstall`
+removes it. The zip's `install.ps1`, `master-install.ps1` and `restore-explorer.ps1` do the same from PowerShell. To
+upgrade, run the new `rexplorer.exe --install`.
 
-**Added.**
-- Keyboard: F6 and Tab now reach the navigation toolbar, the tools bar and the command bar; arrows, Enter, Space,
-  Down and Esc work inside them. Left on the first crumb opens the breadcrumb's "..." menu.
-- Screen readers: the preview and details pane has an accessible name and reads its lines; the desktop icons
-  window is named "Desktop".
-- Text size: Windows' Accessibility > Text size (up to 225%) grows rexplorer's text and the bars and rows around
-  it, live.
-- Search: unelevated searches use the Windows Search index where it covers the folder, and walk what it leaves
-  out. The context menu works on results from several folders, and Back returns to the results.
-- Home: a Status column (cloud state) and sorting by column.
-- Archives (.rar): member icons in every view, picture thumbnails, and a preview of pictures and text; a password
-  prompt for encrypted archives; members can be dragged out to other programs.
-- Undo now also covers drops on the sidebar, crumbs, tabs and Home, the context menu's New submenu, and Delete and
-  rename in `--desktop-icons`. A new item from the context menu starts its rename at once.
-- An opt-in update check (Folder options > General, off by default): at most once a day, no telemetry, nothing
-  downloaded.
-- Crash reports stay on your PC in `%LOCALAPPDATA%\rexplorer\crashes` (a minidump, and a text report for a panic).
-  A UI thread blocked for 5 s is logged to `%APPDATA%\rexplorer\rexplorer.log`.
-- rexplorer's own icon and a version resource that names rexplorer only.
-- Paths over 260 characters, where Windows' LongPathsEnabled policy is on.
-- Taskbar: rexplorer's windows group on one button with a jump list (Frequent and Recent folders, New window),
-  installed or not.
-- Paste shortcut in the background menu, and Run as administrator (Ctrl+Shift+Enter) on programs.
-- Breadcrumb dropdowns on every crumb, This PC, Network and shares included, listed in the background; the folder
-  icon on the left lists the desktop's places, Control Panel and Libraries among them.
-- Marks for cloud files that are online-only or always kept on this device.
+**New since 0.2.0.**
+- Backspace goes Back, as in Windows 11 Explorer (it went up before; Alt+Up still does).
+- Long folder names in the address bar are cut with "..." and show their full name in a tooltip; the current folder
+  keeps the most room.
+- The folder tree sits next to the sidebar instead of replacing it. Ctrl+B shows or hides only the sidebar; More >
+  Folder tree shows or hides the tree.
+- F4 opens the address bar with your recent places listed under it. Ctrl+L and Alt+D open it without the list. Esc
+  closes the suggestions first, then the bar.
+- Undo (Ctrl+Z) and redo (Ctrl+Y) also cover "Keep both" copies, pastes where you chose Skip, drops on Home, items
+  made with the context menu's New submenu, paste and drop in `--desktop-icons`, and Delete in the desktop menu
+  helper. Undo only touches a file it can prove it made or moved.
+- Alt or F10 alone focuses the command bar. Holding Back or Forward opens the history menu. Home's Recent,
+  Favorites and Shared pills work from the keyboard. Tab and F6 leave the preview pane.
+- Drop a tab on another rexplorer window to move it there.
+- Renaming inside a .rar says why it cannot be done. Multi-volume .rar archives open from their first part.
+- New > Shortcut selects the new shortcut without opening a rename, because the wizard names it.
+- Native crashes also get a short text report beside the minidump. Right-to-left layout for languages that declare
+  it (no right-to-left translation ships yet).
 
 **Fixes.**
-- Extract here / Extract all to never replace a file already in the target, and never write outside it.
-- A drag the target refused or you cancelled no longer shows an error box.
-- A second launch of another version no longer loses the folder it was asked to open: the hand-off is versioned.
-- A failed COM start no longer crashes the app.
-- Uninstall also removes `rexplorer.old` and the empty folders install created.
+- The rename data-loss bug above.
+- Libraries and .zip folders showed rows without names, library rows did not open, and Ctrl+C on a zip member did
+  nothing. Opening Libraries in an icon view could crash rexplorer.
+- The address text you were typing was replaced whenever the folder refreshed.
+- A rename box stayed open after its file was deleted elsewhere. The Recycle Bin's Name column showed full paths,
+  and its items got packaged-app menu entries. A click on a sidebar row left the keyboard in the file list.
+- Every undo of a delete left an orphan record in the Recycle Bin; a drop that did nothing could be undone; search
+  results lost their sort on F5; the folder tree did not follow the current folder.
+- New from the context menu on the top-level Desktop could open the rename on another item. A library's own rows
+  could still show without names. Opening a Quick Access folder from the folder tree added two Back steps. A trimmed
+  crumb's tooltip could show the previous folder's name.
+- Undo no longer sends a moved folder to the Recycle Bin when something re-created its old path. A copy is undone
+  only while its source is unchanged, and a copied empty folder is never undone.
+- The update notice understands pre-release versions, so this candidate will announce 1.0.0.
 
-**Settings format.** Settings files now carry `format=1`. The first start adds that one line to `settings.ini` and
-each theme and changes nothing else; unknown keys are kept. Files from 0.1.x load as they are.
+**Known gaps.** The full checklist is `docs/EXPLORER-PARITY.md`: 123 behaviours, 103 proven on the exe (WORKS) and 3
+more on a scratch install base, 13 built but not proven (UNVERIFIED), 4 PARTIAL.
+- Drops onto the folder tree cannot be undone. Ctrl+Z after a cancelled folder copy leaves the partial folder (undo
+  never deletes what it cannot prove it made). After Delete in search results no row is selected.
+- Tearing out a Home tab once landed in the other rexplorer window (1 of 2 tries, not reproduced).
+- After Ctrl+C in rexplorer, Ctrl+C in Windows Explorer did not replace the clipboard (seen twice, cause unknown);
+  it works once another program has used the clipboard. Clicking a selected name again to rename puts the caret at
+  the click instead of selecting the name; F2 selects it.
+- Not run for this candidate: the 15-minute soak, the local smoke and budget scripts (CI runs smoke and budgets),
+  the fuzz targets, and multi-volume .rar (no test archive; two tests are skipped).
+- Not yet tried by a person: Narrator or NVDA, a Windows contrast theme, Text size above 100% and other display
+  scales (including the address bar trimming), ARM64 hardware, Windows 10, a clean-machine install, MTP phones,
+  OneDrive, WhatsApp as a drop target, and Libraries in an icon view before their thumbnails are cached.
+- Undo does not restore a file overwritten by Replace, does not undo a merged folder, and gives no undo for New,
+  rename or shortcuts on a share that reports no file ids.
+- Several internal window messages still carry a pointer, so another program in your session can crash rexplorer
+  with a forged message. Undo checks a file's identity before acting but not again while the shell's confirmation
+  dialog is open. See `SECURITY.md`.
+- Run as administrator was never invoked in testing. FTP is deferred (#36). The exe is not code-signed, so
+  SmartScreen may warn (#59). The winget submission is pending (#63). There is no app icon yet (#18).
 
-**Known gaps.** From the Known gaps in the README; the full checklist is `docs/EXPLORER-PARITY.md`, where 61
-behaviours were proven on this build (WORKS) and 3 more on a scratch install base, 44 are built and unit-tested but not yet tried on the exe
-(UNVERIFIED) and 10 are PARTIAL.
-- Not yet tried by a person: Narrator or NVDA, a Windows contrast theme, Text size above 100% and display scales
-  other than this machine's, two monitors, ARM64 hardware, Windows 10, and the taskbar jump list on the taskbar
-  itself (it was checked in its file).
-- Cloud marks were never seen on real OneDrive placeholders, and show only in Details and List. Run as
-  administrator was never invoked in testing.
-- MTP phones open in an embedded Explorer view; rename in search results is unverified.
-- The exe is not code-signed, so SmartScreen may warn.
-- A few internal window messages carry a pointer; another program at the same integrity level can crash
-  rexplorer with a bad value. This is a robustness gap, not a privilege boundary.
-- The breadcrumb's hidden crumbs are not keyboard stops.
-- Sorting, renaming and deleting in search results are untested.
-- Archive members cannot be sorted by column or renamed; an encrypted .rar's password is passed in the ANSI code
-  page, multi-volume .rar is untested, and only .rar gets the archive view.
-- Dragging files into browsers, WhatsApp and VS Code was not tried (#75); drags into other programs work.
-- Undo does not cover pastes staged in %TEMP%, Keep-both copies, or paste and drop on `--desktop-icons`.
-- Fixed widths (sidebar, panes, search field) do not grow with Text size.
-- Not part of 1.0: merging a tab into another window, right-to-left layout, and FTP is present but unverified.
+**Reporting problems.** Open an issue at https://github.com/CodingDiego/rexplorer/issues with the steps, what you
+expected and what happened, your Windows version, and `rexplorer.log` from `%APPDATA%\rexplorer` if it has lines
+from that time (it holds no file paths). After a crash, `%LOCALAPPDATA%\rexplorer\crashes` holds a `.dmp` and a `.txt`; attach them only
+if you are comfortable sharing them (`SECURITY.md` says what they contain). Report security problems privately, as
+`SECURITY.md` describes.
 
 **Roadmap.** `VERSION-1-X.md` lists what a stable 1.0 needs; each item has an issue in the v1.0 milestone (#71).
 
 The binary is built by GitHub Actions from the tagged commit, twice, and the job fails if the two builds differ.
-It is not code-signed, so SmartScreen may warn on first run.

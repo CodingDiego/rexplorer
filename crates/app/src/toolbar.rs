@@ -49,7 +49,14 @@ struct Button {
     dropdown: bool,
     /// Opens a menu without a chevron (More): Down opens it, screen readers hear a menu button.
     menu: bool,
+    /// Press-and-hold or Down asks the parent for this button's menu (WM_CONTEXTMENU): Back and Forward's history.
+    hold: bool,
 }
+
+/// Timer of a press that may become a hold.
+const HOLD_TIMER: usize = 1;
+/// How long a press must last to open the menu, as Explorer's Back button.
+const HOLD_MS: u32 = 500;
 
 impl Button {
     fn opens_menu(&self) -> bool {
@@ -190,6 +197,7 @@ pub fn create(parent: HWND, id: usize, buttons: &[(u32, u16, &str)]) -> Result<H
                     label: Vec::new(),
                     dropdown: false,
                     menu: false,
+                    hold: false,
                 })
                 .collect(),
             groups: 0,
@@ -236,6 +244,27 @@ pub fn set_menu(hwnd: HWND, cmd: u16) {
         if let Some(s) = state(hwnd) {
             s.buttons.iter_mut().filter(|b| b.cmd == cmd).for_each(|b| b.menu = true);
         }
+    }
+}
+
+/// Gives the buttons that send `cmds` a menu on press-and-hold and on Down, which the parent shows on WM_CONTEXTMENU.
+pub fn set_hold(hwnd: HWND, cmds: &[u16]) {
+    unsafe {
+        if let Some(s) = state(hwnd) {
+            s.buttons.iter_mut().filter(|b| cmds.contains(&b.cmd)).for_each(|b| b.hold = true);
+        }
+    }
+}
+
+/// The parent's WM_CONTEXTMENU at the center of button `i`, as a right-click there sends; no state reference may be
+/// used after it.
+unsafe fn hold_menu(hwnd: HWND, s: &State, i: usize) {
+    let r = rect(hwnd, s, i);
+    let mut p = POINT { x: (r.left + r.right) / 2, y: (r.top + r.bottom) / 2 };
+    let _ = ClientToScreen(hwnd, &mut p);
+    if let Ok(parent) = GetParent(hwnd) {
+        let at = ((p.y as i16 as u16 as isize) << 16) | p.x as i16 as u16 as isize;
+        SendMessageW(parent, WM_CONTEXTMENU, Some(WPARAM(hwnd.0 as usize)), Some(LPARAM(at)));
     }
 }
 
@@ -408,7 +437,7 @@ unsafe fn rect(hwnd: HWND, s: &State, i: usize) -> RECT {
 unsafe fn add_tooltips(hwnd: HWND) {
     let Some(s) = state(hwnd) else { return };
     let style = WS_POPUP | WINDOW_STYLE(TTS_ALWAYSTIP | TTS_NOPREFIX);
-    let Ok(tip) = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, PCWSTR::null(), style, 0, 0, 0, 0, Some(hwnd), None, None, None) else {
+    let Ok(tip) = CreateWindowExW(WS_EX_TOPMOST | crate::rtl::layout(), TOOLTIPS_CLASSW, PCWSTR::null(), style, 0, 0, 0, 0, Some(hwnd), None, None, None) else {
         return;
     };
     s.tip = tip;
@@ -454,6 +483,7 @@ unsafe fn paint(hwnd: HWND, s: &mut State) {
     let dc = CreateCompatibleDC(Some(wdc));
     let bmp = CreateCompatibleBitmap(wdc, cw, ch);
     let old_bmp = SelectObject(dc, bmp.into());
+    crate::rtl::match_dc(dc, wdc);
     let t = &s.theme;
     let bg = CreateSolidBrush(COLORREF(t.background));
     FillRect(dc, &RECT { left: 0, top: 0, right: cw, bottom: ch }, bg);
@@ -504,7 +534,7 @@ unsafe fn paint(hwnd: HWND, s: &mut State) {
             _ => t.text,
         };
         SetTextColor(dc, COLORREF(text));
-        let glyph = |c: u32| -> Vec<u16> { char::from_u32(c).map(|c| c.to_string()).unwrap_or_default().encode_utf16().collect() };
+        let glyph = |c: u32| -> Vec<u16> { char::from_u32(c).map(|c| crate::rtl::glyph(c).to_string()).unwrap_or_default().encode_utf16().collect() };
         let mut g = glyph(b.glyph);
         let flags = DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX;
         if b.label.is_empty() && !b.dropdown {
@@ -521,7 +551,7 @@ unsafe fn paint(hwnd: HWND, s: &mut State) {
             SelectObject(dc, ui_font.into());
             let mut label = b.label.clone();
             let mut tr = RECT { left: x + scale(8, dpi), right: r.right, ..r };
-            DrawTextW(dc, &mut label, &mut tr, flags);
+            DrawTextW(dc, &mut label, &mut tr, crate::rtl::text(flags));
             let mut size = windows::Win32::Foundation::SIZE::default();
             let _ = GetTextExtentPoint32W(dc, &b.label, &mut size);
             x = tr.left + size.cx;
@@ -602,7 +632,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
         WM_KEYDOWN | WM_SYSKEYDOWN => {
-            let key = VIRTUAL_KEY(wparam.0 as u16);
+            let key = crate::rtl::key(VIRTUAL_KEY(wparam.0 as u16));
             let cur = s.buttons.get(s.focus).filter(|b| b.cmd != 0 && b.enabled);
             match key {
                 VK_LEFT | VK_RIGHT | VK_HOME | VK_END if msg == WM_KEYDOWN => {
@@ -622,6 +652,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 VK_DOWN => {
                     if let Some(cmd) = cur.filter(|b| b.opens_menu()).map(|b| b.cmd) {
                         command(hwnd, cmd);
+                    } else if cur.is_some_and(|b| b.hold) {
+                        hold_menu(hwnd, s, s.focus);
                     }
                 }
                 // The main window hands the focus on to the view.
@@ -669,12 +701,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_LBUTTONDOWN => {
             s.pressed = hit_at(hwnd, s, lparam).filter(|&i| s.buttons[i].enabled);
-            if s.pressed.is_some() {
+            if let Some(i) = s.pressed {
                 SetCapture(hwnd);
+                if s.buttons[i].hold {
+                    SetTimer(Some(hwnd), HOLD_TIMER, HOLD_MS, None);
+                }
             }
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
+        // Held long enough: the menu instead of the click.
+        WM_TIMER if wparam.0 == HOLD_TIMER => {
+            let _ = KillTimer(Some(hwnd), HOLD_TIMER);
+            if let Some(i) = s.pressed.filter(|&i| s.buttons[i].hold) {
+                s.pressed = None;
+                let _ = ReleaseCapture();
+                let _ = InvalidateRect(Some(hwnd), None, false);
+                hold_menu(hwnd, s, i);
+            }
+        }
         WM_LBUTTONUP => {
+            let _ = KillTimer(Some(hwnd), HOLD_TIMER);
             let pressed = s.pressed.take();
             let over = hit_at(hwnd, s, lparam);
             let cmd = pressed.filter(|&i| over == Some(i)).map(|i| s.buttons[i].cmd);
@@ -825,6 +871,51 @@ mod tests {
             SendMessageW(tb, WM_RBUTTONDOWN, Some(WPARAM(2)), Some(at));
             SendMessageW(tb, WM_RBUTTONUP, Some(WPARAM(0)), Some(at));
             assert_eq!(LAST_CONTEXT.load(std::sync::atomic::Ordering::SeqCst), tb.0 as usize);
+            DestroyWindow(parent).unwrap();
+        }
+    }
+
+    thread_local! {
+        /// (message, wparam) of the WM_COMMAND and WM_CONTEXTMENU the hold test's parent got.
+        static HOLD_NOTES: std::cell::RefCell<Vec<(u32, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    unsafe extern "system" fn hold_parent(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        if msg == WM_CONTEXTMENU || msg == WM_COMMAND {
+            HOLD_NOTES.with(|n| n.borrow_mut().push((msg, wparam.0)));
+            return LRESULT(0);
+        }
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+
+    #[test]
+    fn press_and_hold_and_down_open_the_menu_instead_of_clicking() {
+        let take = || HOLD_NOTES.with(|n| std::mem::take(&mut *n.borrow_mut()));
+        unsafe {
+            let hinst = GetModuleHandleW(None).unwrap().into();
+            let wc = WNDCLASSW { lpfnWndProc: Some(hold_parent), hInstance: hinst, lpszClassName: w!("RexToolbarHoldParent"), ..Default::default() };
+            RegisterClassW(&wc);
+            let parent = CreateWindowExW(WINDOW_EX_STYLE(0), w!("RexToolbarHoldParent"), PCWSTR::null(), WS_OVERLAPPEDWINDOW, 0, 0, 400, 200, None, None, Some(hinst), None).unwrap();
+            let tb = create(parent, 7, &[(0xE72B, 21, "Back"), (0xE72A, 22, "Up")]).unwrap();
+            let _ = MoveWindow(tb, 0, 0, 200, 32, false);
+            set_hold(tb, &[21]);
+            let bw = button_width(GetDpiForWindow(tb)) as isize;
+            let (first, second) = (LPARAM(bw / 2 + (10 << 16)), LPARAM(bw + bw / 2 + (10 << 16)));
+            let menu = (WM_CONTEXTMENU, tb.0 as usize);
+            take();
+            SendMessageW(tb, WM_LBUTTONDOWN, Some(WPARAM(1)), Some(first));
+            SendMessageW(tb, WM_TIMER, Some(WPARAM(HOLD_TIMER)), None);
+            SendMessageW(tb, WM_LBUTTONUP, Some(WPARAM(0)), Some(first));
+            assert_eq!(take(), [menu], "held: the menu, no click");
+            // A button without a hold menu ignores the timer and clicks.
+            SendMessageW(tb, WM_LBUTTONDOWN, Some(WPARAM(1)), Some(second));
+            SendMessageW(tb, WM_TIMER, Some(WPARAM(HOLD_TIMER)), None);
+            SendMessageW(tb, WM_LBUTTONUP, Some(WPARAM(0)), Some(second));
+            assert_eq!(take(), [(WM_COMMAND, 22)]);
+            // Down on the focused hold button opens the same menu.
+            SendMessageW(tb, WM_SETFOCUS, None, None);
+            SendMessageW(tb, WM_KEYDOWN, Some(WPARAM(VK_DOWN.0 as usize)), None);
+            assert_eq!(take(), [menu]);
             DestroyWindow(parent).unwrap();
         }
     }
@@ -994,7 +1085,7 @@ mod tests {
 
     #[test]
     fn nth_button_skips_separators_and_spacer() {
-        let b = |glyph, cmd| Button { glyph, cmd, tip: vec![0], enabled: true, checked: false, group: None, label: vec![], dropdown: false, menu: false };
+        let b = |glyph, cmd| Button { glyph, cmd, tip: vec![0], enabled: true, checked: false, group: None, label: vec![], dropdown: false, menu: false, hold: false };
         let v = [b(1, 11), b(0, 0), b(2, 12), b(1, 0), b(3, 13)];
         assert_eq!([0, 1, 2, 3].map(|k| nth_button(&v, k)), [Some(0), Some(2), Some(4), None]);
     }

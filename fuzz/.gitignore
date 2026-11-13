@@ -1,5 +1,5 @@
-target
-corpus
-artifacts
-coverage
+/target
+/artifacts
+/work
+/coverage
 Cargo.lock

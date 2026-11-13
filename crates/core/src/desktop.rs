@@ -2,14 +2,14 @@
 //! selecting, and the View / Sort by settings of its background menu. The view lives in explorer.exe;
 //! `IShellWindows` hands out proxies to it.
 
-use windows::Win32::Foundation::{HWND, POINT};
+use windows::Win32::Foundation::{E_FAIL, HWND, POINT};
 use windows::Win32::System::Com::{CLSCTX_LOCAL_SERVER, CoCreateInstance, IServiceProvider};
 use windows::Win32::System::Variant::{VARIANT, VT_I4};
 use std::ffi::c_void;
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::UI::Accessibility::{AccessibleObjectFromWindow, IAccessible};
 use windows::Win32::UI::Shell::{
-    CSIDL_DESKTOP, IShellBrowser, IShellView, IShellWindows, SID_STopLevelBrowser,
+    CSIDL_DESKTOP, FolderItems2, IShellBrowser, IShellFolderViewDual, IShellView, IShellWindows, SID_STopLevelBrowser, SVGIO_BACKGROUND,
     SVSI_DESELECTOTHERS, SVSI_FOCUSED, SVSI_SELECT, SWC_DESKTOP, SWFO_NEEDDISPATCH, ShellWindows,
 };
 use windows::Win32::Foundation::{LPARAM, WPARAM};
@@ -149,6 +149,22 @@ impl DesktopView {
 
     pub fn refresh(&self) -> Result<()> {
         unsafe { self.shell_view.Refresh() }
+    }
+
+    /// Deletes the `count` selected icons inside explorer.exe (Shell automation), so Explorer's own Ctrl+Z on the
+    /// desktop undoes it: a delete run in this process lands in no undo history the desktop has. Fails, doing
+    /// nothing, only when Explorer cannot be asked or reports another selection; a cancel in Explorer's own
+    /// confirmation is no failure (the caller would ask again).
+    pub fn delete_selection(&self, count: usize) -> Result<()> {
+        unsafe {
+            let dual: IShellFolderViewDual = self.shell_view.GetItemObject(SVGIO_BACKGROUND)?;
+            let items: FolderItems2 = dual.SelectedItems()?.cast()?;
+            if usize::try_from(items.Count()?).ok() != Some(count) {
+                return Err(E_FAIL.into());
+            }
+            let _ = items.InvokeVerbEx(&VARIANT::from("delete"), &VARIANT::default());
+            Ok(())
+        }
     }
 }
 

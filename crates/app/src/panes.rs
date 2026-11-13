@@ -1,4 +1,4 @@
-//! Side panes: the places sidebar (or, instead of it, the shell's folder tree) left of the list, the preview right
+//! Side panes: the places sidebar and the shell's folder tree (either, both or none) left of the list, the preview right
 //! of it, and the splitters between them: the 8 px gaps around the content cards.
 //! Pane visibility and widths live in the session (widths in 96-DPI pixels; the sidebar uses the tree's width).
 
@@ -12,7 +12,7 @@ use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::{
     FDTF_SHORTDATE, FDTF_SHORTTIME, FOLDERID_Desktop, FOLDERID_Profile, FOLDERID_PublicDesktop, ILIsEqual, IShellFolder,
-    IShellFolder2, KF_FLAG_DEFAULT, SHFormatDateTimeW, SHGFI_ICON, SHGetKnownFolderPath,
+    IShellFolder2, KF_FLAG_DEFAULT, SHFormatDateTimeW, SHGFI_ICON, SHGetKnownFolderPath, SHGetNameFromIDList, SIGDN_FILESYSPATH,
 };
 use windows::core::{GUID, Interface};
 
@@ -74,7 +74,7 @@ pub(crate) unsafe fn ensure_tree(app: *mut App) {
             drop(unsafe { Box::from_raw(boxed) });
         }
     };
-    match tree::create(a.hwnd, RECT::default(), Box::new(post)) {
+    match tree::create(a.hwnd, RECT::default(), a.profile.show_hidden, Box::new(post)) {
         Ok(t) => a.panes.tree = Some(t),
         Err(_) => return,
     }
@@ -115,10 +115,17 @@ pub(crate) unsafe fn on_tree_select(app: *mut App, pidl: Box<Pidl>) {
         return;
     }
     let Some(l) = listing(app) else { return };
-    if ILIsEqual(l.folder.pidl.as_ptr(), pidl.as_ptr()).as_bool() {
+    if same_folder(&l.folder.pidl, &pidl) {
         return;
     }
     go(app, Target::Pidl(*pidl), nav::History::Push);
+}
+
+/// One folder under two pidls counts once: a Quick Access pick, then our sync selecting it again through This PC,
+/// must not push a second history entry.
+unsafe fn same_folder(a: &Pidl, b: &Pidl) -> bool {
+    let path = |p: &Pidl| SHGetNameFromIDList(p.as_ptr(), SIGDN_FILESYSPATH).ok().map(|s| rexplorer_core::com::take_cotaskmem_string(s));
+    ILIsEqual(a.as_ptr(), b.as_ptr()).as_bool() || matches!((path(a), path(b)), (Some(x), Some(y)) if !x.is_empty() && x.eq_ignore_ascii_case(&y))
 }
 
 pub(crate) unsafe fn create_preview(app: *mut App) -> Result<()> {
@@ -139,11 +146,10 @@ pub(crate) unsafe fn set_preview_fonts(app: *mut App) {
     a.panes.mono = mono;
 }
 
-/// More > Folder tree: the tree replaces the sidebar; turning it off brings the sidebar back.
+/// Folder tree: shown right of the sidebar, or alone when the sidebar is off.
 pub(crate) unsafe fn toggle_tree(app: *mut App) {
     let s = &mut (*app).session;
     s.show_tree = !s.show_tree;
-    s.show_sidebar |= !s.show_tree;
     if s.show_tree {
         ensure_tree(app);
         sync_tree(app);
@@ -151,22 +157,17 @@ pub(crate) unsafe fn toggle_tree(app: *mut App) {
     show_left(app);
 }
 
-/// Ctrl+B: hides whichever left pane is showing, or shows the sidebar.
+/// Ctrl+B: the sidebar on or off; the tree stays as it is.
 pub(crate) unsafe fn toggle_sidebar(app: *mut App) {
     let s = &mut (*app).session;
-    if s.show_tree || s.show_sidebar {
-        s.show_tree = false;
-        s.show_sidebar = false;
-    } else {
-        s.show_sidebar = true;
-    }
+    s.show_sidebar = !s.show_sidebar;
     show_left(app);
 }
 
-/// Shows the left pane the session asks for (tree, else sidebar, else none) and lays out.
+/// Shows the left panes the session asks for (the sidebar, the tree, both or none) and lays out.
 pub(crate) unsafe fn show_left(app: *mut App) {
     let s = &(*app).session;
-    let (tree, side) = (s.show_tree, !s.show_tree && s.show_sidebar);
+    let (tree, side) = (s.show_tree, s.show_sidebar);
     if let Some(t) = &(*app).panes.tree {
         let _ = ShowWindow(t.hwnd(), if tree { SW_SHOW } else { SW_HIDE });
     }
@@ -226,18 +227,23 @@ pub(crate) unsafe fn layout(app: *mut App, top: i32, bottom: i32, w: i32) {
         a.panes.split_preview = RECT { left: right - gap, top, right, bottom };
         right -= gap;
     }
-    let pane = if s.show_tree { a.panes.tree.as_ref().map(|t| t.hwnd()) } else { s.show_sidebar.then_some(a.sidebar) };
+    // The sidebar, then the tree right of it; both take the one width, and the splitter after the last sizes both.
+    let tree = a.panes.tree.as_ref().filter(|_| s.show_tree);
+    let n = s.show_sidebar as i32 + tree.is_some() as i32;
     let mut left = gap;
-    if pane.is_some() {
-        let tw = scale(s.tree_width, dpi).min((right - min_list - gap).max(0));
-        match (&a.panes.tree, s.show_tree) {
-            (Some(t), true) => t.set_rect(RECT { left: 0, top, right: tw, bottom }),
-            _ => {
-                let _ = MoveWindow(a.sidebar, 0, top, tw, h, true);
-            }
+    if n > 0 {
+        let tw = scale(s.tree_width, dpi).min(((right - min_list - n * gap) / n).max(0));
+        let mut x = 0;
+        if s.show_sidebar {
+            let _ = MoveWindow(a.sidebar, x, top, tw, h, true);
+            x += tw + gap;
         }
-        a.panes.split_tree = RECT { left: tw, top, right: tw + gap, bottom };
-        left = tw + gap;
+        if let Some(t) = tree {
+            t.set_rect(RECT { left: x, top, right: x + tw, bottom });
+            x += tw + gap;
+        }
+        a.panes.split_tree = RECT { left: x - gap, top, right: x, bottom };
+        left = x;
     }
     let _ = MoveWindow(a.list, left, top, (right - left).max(0), h, true);
     let _ = MoveWindow(a.home, left, top, (right - left).max(0), h, true);
@@ -497,6 +503,11 @@ fn sidebar_rows(bookmarks: &[(String, String)]) -> SidebarRows {
     b
 }
 
+/// The width each of `n` side-by-side left panes, `gap` apart, gets when the splitter after them is dragged to `x`.
+fn pane_width_at(x: i32, n: i32, gap: i32) -> i32 {
+    (x - (n - 1).max(0) * gap) / n.max(1)
+}
+
 fn hit(r: &RECT, x: i32, y: i32) -> bool {
     x >= r.left && x < r.right && y >= r.top && y < r.bottom
 }
@@ -546,7 +557,10 @@ pub(crate) unsafe fn on_mouse_move(app: *mut App, lparam: LPARAM) {
     let mut rc = RECT::default();
     let _ = GetClientRect(a.hwnd, &mut rc);
     match split {
-        Split::Tree => a.session.tree_width = clamp_width(x * 96 / dpi),
+        Split::Tree => {
+            let n = a.session.show_sidebar as i32 + (a.session.show_tree && a.panes.tree.is_some()) as i32;
+            a.session.tree_width = clamp_width(pane_width_at(x, n, scale(SPLIT, dpi as u32)) * 96 / dpi);
+        }
         Split::Preview => a.session.preview_width = clamp_width((rc.right - x) * 96 / dpi),
     }
     ui::layout(app);
@@ -826,6 +840,32 @@ pub(crate) fn size_and_type_columns(folder: &IShellFolder) -> (Option<u32>, Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_splitter_follows_the_pointer_with_one_or_two_left_panes() {
+        assert_eq!(pane_width_at(200, 1, 8), 200);
+        // Sidebar 0..200, gap, tree 208..408: the splitter at 408.
+        assert_eq!(pane_width_at(408, 2, 8), 200);
+        assert_eq!(pane_width_at(200, 0, 8), 200, "no pane counts as one");
+    }
+
+    #[test]
+    fn one_folder_under_two_pidls_counts_once() {
+        let _com = ComInit::sta();
+        let desk = ShellFolder::parse(&known_folder(&FOLDERID_Desktop).unwrap()).unwrap();
+        let mut root = desk.parent().unwrap();
+        while !root.pidl.is_empty() {
+            root = root.parent().unwrap();
+        }
+        unsafe {
+            assert!(!ILIsEqual(root.pidl.as_ptr(), desk.pidl.as_ptr()).as_bool(), "the namespace root and This PC's path differ as pidls");
+            assert!(same_folder(&root.pidl, &desk.pidl), "but name one folder");
+            let temp = ShellFolder::parse(&std::env::temp_dir().to_string_lossy()).unwrap();
+            assert!(!same_folder(&temp.pidl, &desk.pidl));
+            let pc = ShellFolder::parse("::{20D04FE0-3AEA-1069-A2D8-08002B30309D}").unwrap();
+            assert!(!same_folder(&pc.pidl, &ShellFolder::parse("::{645FF040-5081-101B-9F08-00AA002F954E}").unwrap().pidl), "no path: pidls only");
+        }
+    }
 
     #[test]
     fn sidebar_rows_of_this_machine() {

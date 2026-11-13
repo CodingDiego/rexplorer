@@ -139,7 +139,7 @@ fn strip_ext(name: &str) -> &str {
 /// whole file name (None: the text is the shell's display name, which renames as it is).
 pub(crate) fn name_cell(e: &ShellItem) -> (String, Option<String>) {
     thread_local!(static NEVER: std::cell::RefCell<HashMap<String, bool>> = Default::default());
-    let shown = e.display_name();
+    let shown = e.in_folder_name();
     if named_folder(e) {
         return (shown, None);
     }
@@ -329,7 +329,7 @@ pub(crate) fn load_archive(archive: &Path, dir: &str) -> Result<Loaded> {
     }
     let icon = sys_icon(&name, false);
     let icons = vec![ICON_UNKNOWN; rows.len()];
-    Ok(Loaded { source: Source::Archive(ArchiveView { listing, rows, icons }), crumbs, icon })
+    Ok(Loaded { source: Source::Archive(ArchiveView { listing, rows, icons }), crumbs, icon, unsorted: false })
 }
 
 /// System image list and small icon index for a name, by extension only (no disk access).
@@ -565,6 +565,15 @@ pub(crate) unsafe fn search_menu(app: *mut App, rows: &[usize]) -> Option<Contex
 
 // ---- search --------------------------------------------------------------------------------------
 
+/// A re-run of search results (F5, the reload after an undo) keeps the order the user picked; a new search starts in
+/// arrival order.
+fn kept_sort(push: bool, old: Option<&Source>) -> Option<(usize, bool)> {
+    match old {
+        Some(Source::Search(s)) if !push => s.sort,
+        _ => None,
+    }
+}
+
 /// Starts searching tab `t`'s folder (or the folder its search covers) for `needle` on a worker thread.
 /// `push` records the previous place in the history; a re-run (F5) does not.
 #[allow(clippy::needless_borrow)] // the explicit borrow of a raw-pointer field silences rustc's dangerous_implicit_autorefs
@@ -596,6 +605,7 @@ pub(crate) unsafe fn start_search(app: *mut App, t: usize, needle: &str, push: b
     tab.dirty = false;
     tab.watch = None;
     let old = tab.source.take();
+    let sort = kept_sort(push, old.as_ref());
     if let (true, Some(o)) = (push, old) {
         let left = tab.leave(o);
         tab.back.push(left);
@@ -605,7 +615,7 @@ pub(crate) unsafe fn start_search(app: *mut App, t: usize, needle: &str, push: b
     tab.crumbs = root_crumbs.clone();
     tab.crumbs.push(Crumb { name: trf("tabs.search", &[("needle", &needle)]), parsing: String::new(), pidl: None });
     tab.name = root_parsing.clone();
-    let drive = (usn::is_elevated() && root_parsing.len() == 3 && root_parsing.ends_with(":\\")).then(|| root_parsing.chars().next().unwrap());
+    let drive = root_parsing.chars().next().filter(|_| usn::is_elevated() && root_parsing.len() == 3 && root_parsing.ends_with(":\\"));
     let root_path = root_parsing.clone();
     let s = SearchListing {
         needle: needle.clone(),
@@ -615,7 +625,7 @@ pub(crate) unsafe fn start_search(app: *mut App, t: usize, needle: &str, push: b
         root_crumbs,
         rows: Vec::new(),
         icons: Vec::new(),
-        sort: None,
+        sort,
         generation,
         running: true,
         cancel: cancel.clone(),
@@ -1051,7 +1061,7 @@ mod tests {
             ("a10.txt", "C:\\x", "Text", Some(10), false),
             ("a2.txt", "C:\\y", "Text", Some(30), false),
             ("sub", "C:\\x", "File folder", None, true),
-            ("B.txt", "C:\\a", "Text", Some(20), false),
+            ("B.txt", "C:\\a", "Document", Some(20), false),
         ];
         let order = |col: usize| {
             let mut idx = [0usize, 1, 2, 3];
@@ -1061,6 +1071,7 @@ mod tests {
         assert_eq!(order(0), "cbad");
         assert_eq!(order(3), "cadb");
         assert_eq!(order(1), "cdab");
+        assert_eq!(order(2), "cdba");
     }
 
     #[test]
@@ -1215,6 +1226,9 @@ mod tests {
         }
         let ids: Vec<u64> = tab.kept.iter().map(|k| k.listing.generation).collect();
         assert_eq!(ids, [3, 4, 5, 6], "the oldest go; Back to them reloads their folder");
+        // A re-run keeps the picked order, a new search does not.
+        let old = Source::Search(listing(7));
+        assert_eq!((kept_sort(false, Some(&old)), kept_sort(true, Some(&old)), kept_sort(false, None)), (Some((1, true)), None, None));
     }
 
     #[test]

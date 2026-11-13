@@ -79,24 +79,31 @@ impl CrumbLayout {
 }
 
 /// `widths` are measured text widths. A crumb is its text plus `pad` on both sides, followed by a chevron slot of
-/// `chevron + pad`. When not everything fits, crumbs drop from the left and an overflow slot of `chevron + 2*pad` leads.
-pub fn layout(widths: &[i32], chevron: i32, pad: i32, avail: i32) -> CrumbLayout {
+/// `chevron + pad`. Every crumb but the last gets at most `max_text` of text (the painter ends a longer one with an
+/// ellipsis). When not everything fits, crumbs drop from the left and an overflow slot of `chevron + 2*pad` leads, until
+/// the last crumb shows whole; when it cannot even alone, they drop only until it has `max_text` of room, and it gets
+/// whatever is left, cut.
+pub fn layout(widths: &[i32], chevron: i32, pad: i32, avail: i32, max_text: i32) -> CrumbLayout {
     let n = widths.len();
-    let crumb_w = |i: usize| widths[i] + 2 * pad;
-    let step = |i: usize| crumb_w(i) + chevron + pad;
+    let full = |i: usize| widths[i] + 2 * pad;
+    let crumb_w = |i: usize| widths[i].min(max_text) + 2 * pad;
     let slot = chevron + 2 * pad;
-    let mut first = n.saturating_sub(1);
-    for s in 0..n {
-        let need: i32 = (s..n).map(step).sum::<i32>() + if s > 0 { slot } else { 0 };
-        if need <= avail {
-            first = s;
-            break;
-        }
-    }
+    // The first crumb shown when the last one claims `last` of width.
+    let first_fitting = |last: i32| {
+        (0..n).find(|&s| {
+            let ancestors: i32 = (s..n.saturating_sub(1)).map(|i| crumb_w(i) + chevron + pad).sum();
+            ancestors + last + chevron + pad + if s > 0 { slot } else { 0 } <= avail
+        })
+    };
+    let first = match n.checked_sub(1) {
+        Some(l) => first_fitting(full(l)).or_else(|| first_fitting(crumb_w(l))).unwrap_or(l),
+        None => 0,
+    };
     let mut x = if first > 0 { slot } else { 0 };
     let mut items = Vec::new();
     for i in first..n {
-        let c = RECT { left: x, top: 0, right: x + crumb_w(i), bottom: 0 };
+        let w = if i + 1 == n { full(i).min(avail - x - chevron - pad).max(2 * pad) } else { crumb_w(i) };
+        let c = RECT { left: x, top: 0, right: x + w, bottom: 0 };
         let ch = RECT { left: c.right, top: 0, right: c.right + chevron + pad, bottom: 0 };
         x = ch.right;
         items.push((c, ch));
@@ -132,6 +139,10 @@ struct State {
     focus: usize,
     focused: bool,
     acc: Option<access::Server>,
+    /// The tooltip showing a trimmed crumb's full name, made with the first one; its tools are `tips` (crumb index,
+    /// client rect).
+    tip: HWND,
+    tips: Vec<(usize, RECT)>,
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -177,6 +188,8 @@ pub fn create(parent: HWND, id: usize) -> Result<HWND> {
             focus: 0,
             focused: false,
             acc: None,
+            tip: HWND::default(),
+            tips: Vec::new(),
         }));
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -215,6 +228,8 @@ pub fn set_crumbs(hwnd: HWND, crumbs: &[String]) {
     unsafe {
         if let Some(s) = state(hwnd) {
             s.crumbs = crumbs.to_vec();
+            // The tools hold the old names; the next paint adds them again (same index and rect would be kept).
+            sync_tips(hwnd, s, Vec::new());
             s.focus = s.focus.min(s.crumbs.len().saturating_sub(1));
             s.hover = Hit::Empty;
             let _ = InvalidateRect(Some(hwnd), None, false);
@@ -353,7 +368,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
             WM_KEYDOWN | WM_SYSKEYDOWN => {
-                let key = VIRTUAL_KEY(wparam.0 as u16);
+                let key = crate::rtl::key(VIRTUAL_KEY(wparam.0 as u16));
                 match key {
                     // Left past the first shown crumb, with crumbs hidden behind the "...", opens that overflow menu.
                     VK_LEFT if msg == WM_KEYDOWN && st.layout.first_visible > 0 && st.focus <= st.layout.first_visible => {
@@ -411,6 +426,41 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     }
 }
 
+/// Makes the tooltip's tools the crumbs in `want` (crumb index, client rect), each with its whole name.
+unsafe fn sync_tips(hwnd: HWND, st: &mut State, want: Vec<(usize, RECT)>) {
+    if st.tips == want {
+        return;
+    }
+    unsafe {
+        if st.tip.is_invalid() {
+            let style = WS_POPUP | WINDOW_STYLE(TTS_ALWAYSTIP | TTS_NOPREFIX);
+            let Ok(tip) = CreateWindowExW(WS_EX_TOPMOST | crate::rtl::layout(), TOOLTIPS_CLASSW, None, style, 0, 0, 0, 0, Some(hwnd), None, None, None) else {
+                return;
+            };
+            st.tip = tip;
+        }
+        let info = |i: usize, rect: RECT, text: *mut u16| TTTOOLINFOW {
+            cbSize: size_of::<TTTOOLINFOW>() as u32,
+            uFlags: TTF_SUBCLASS,
+            hwnd,
+            uId: i,
+            rect,
+            lpszText: windows::core::PWSTR(text),
+            ..Default::default()
+        };
+        for &(i, r) in &st.tips {
+            SendMessageW(st.tip, TTM_DELTOOLW, None, Some(LPARAM(&info(i, r, std::ptr::null_mut()) as *const _ as isize)));
+        }
+        for &(i, r) in &want {
+            // The tooltip keeps its own copy of the text.
+            let mut text: Vec<u16> = st.crumbs.get(i).map_or_else(Vec::new, |c| wide(c));
+            text.push(0);
+            SendMessageW(st.tip, TTM_ADDTOOLW, None, Some(LPARAM(&info(i, r, text.as_mut_ptr()) as *const _ as isize)));
+        }
+        st.tips = want;
+    }
+}
+
 unsafe fn set_hover(hwnd: HWND, st: &mut State, h: Hit) {
     if st.hover != h {
         st.hover = h;
@@ -440,6 +490,10 @@ unsafe fn glyph_font(hdc: HDC, height: i32) -> HFONT {
 }
 
 unsafe fn text_width(hdc: HDC, s: &[u16]) -> i32 {
+    // An empty text's buffer pointer is dangling: GDI must not be handed one.
+    if s.is_empty() {
+        return 0;
+    }
     let mut sz = SIZE::default();
     unsafe {
         let _ = GetTextExtentPoint32W(hdc, s, &mut sz);
@@ -460,6 +514,7 @@ unsafe fn paint(hwnd: HWND, st: &mut State) {
         let mem = CreateCompatibleDC(Some(hdc));
         let bmp = CreateCompatibleBitmap(hdc, cw.max(1), ch.max(1));
         let old_bmp = SelectObject(mem, bmp.into());
+        crate::rtl::match_dc(mem, hdc);
 
         // The field: a borderless surface pill on the header.
         let bg = CreateSolidBrush(COLORREF(st.background));
@@ -478,7 +533,7 @@ unsafe fn paint(hwnd: HWND, st: &mut State) {
         let (ix, iy) = (s(8), (ch - s(16)) / 2);
         match st.icon {
             Some(icon) => {
-                let _ = DrawIconEx(mem, ix, iy, icon, s(16), s(16), 0, None, DI_NORMAL);
+                let _ = DrawIconEx(mem, ix, iy, icon, s(16), s(16), 0, None, DI_NORMAL | DI_NOMIRROR);
             }
             None => {
                 let accent = CreateSolidBrush(COLORREF(st.accent));
@@ -491,11 +546,20 @@ unsafe fn paint(hwnd: HWND, st: &mut State) {
         let old_font = SelectObject(mem, text_font.into());
         let widths: Vec<i32> = st.crumbs.iter().map(|c| text_width(mem, &wide(c))).collect();
         SelectObject(mem, glyph.into());
-        let chevron_w = text_width(mem, &wide("\u{E76C}"));
-        st.layout = layout(&widths, chevron_w, s(8), cw - st.origin - s(4));
+        let chevron = crate::rtl::glyph('\u{E76C}').to_string();
+        let chevron_w = text_width(mem, &wide(&chevron));
+        // A long folder name gets at most 160 px (at 96 dpi and 100 % text) unless it is the current folder.
+        let max_text = s(160) * crate::theme::text_scale() as i32 / 100;
+        st.layout = layout(&widths, chevron_w, s(8), cw - st.origin - s(4), max_text);
         if !st.layout.items.is_empty() {
             st.focus = st.focus.clamp(st.layout.first_visible, st.layout.first_visible + st.layout.items.len() - 1);
         }
+        // A trimmed crumb shows its whole name in a tooltip (its accessible name is always the whole name).
+        let trimmed: Vec<(usize, RECT)> = (st.layout.items.iter().enumerate())
+            .filter(|(k, (c, _))| c.right - c.left - 2 * s(8) < widths[st.layout.first_visible + k])
+            .map(|(k, (c, _))| (st.layout.first_visible + k, RECT { left: c.left + st.origin, top: 0, right: c.right + st.origin, bottom: ch }))
+            .collect();
+        sync_tips(hwnd, st, trimmed);
 
         // Each crumb is its own pill, 28 px in the 32 px field (both grow with the text size): hover fill, the
         // current folder (last crumb) in the selection color.
@@ -534,10 +598,14 @@ unsafe fn paint(hwnd: HWND, st: &mut State) {
             SelectObject(mem, text_font.into());
             let current = st.contrast.filter(|_| k + 1 == st.layout.items.len());
             SetTextColor(mem, COLORREF(current.map_or(st.text, |c| c.highlight_text)));
-            DrawTextW(mem, &mut wide(&st.crumbs[first + k]), &mut cr, flags);
+            // Inside the padding, so a trimmed name ends with an ellipsis instead of running into the chevron.
+            cr.left += s(8);
+            cr.right -= s(8);
+            // A crumb can be empty while a folder's name is still unknown (a start on Home crashed here, 2026-11-13).
+            crate::theme::draw_text(mem, &st.crumbs[first + k], &mut cr, flags | DT_END_ELLIPSIS);
             SelectObject(mem, glyph.into());
             SetTextColor(mem, COLORREF(chevron_color));
-            DrawTextW(mem, &mut wide("\u{E76C}"), &mut kr, flags);
+            DrawTextW(mem, &mut wide(&chevron), &mut kr, flags);
         }
 
         if st.focused
@@ -570,7 +638,7 @@ mod tests {
             let parent = CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), windows::core::PCWSTR::null(), WS_OVERLAPPEDWINDOW, 0, 0, 800, 600, None, None, None, None).unwrap();
             let h = create(parent, 7).unwrap();
             let _ = MoveWindow(h, 0, 0, 600, 32, false);
-            let l = layout(&[40, 50], 10, 8, 500);
+            let l = layout(&[40, 50], 10, 8, 500, i32::MAX);
             let (c1, chevron0) = (l.items[1].0, l.items[0].1);
             state(h).unwrap().layout = l;
             state(h).unwrap().origin = 30;
@@ -583,13 +651,19 @@ mod tests {
             assert_eq!(crumb_at_screen(h, p.x, p.y), Some(1));
             let p = screen(30 + chevron0.left + 1);
             assert_eq!(crumb_at_screen(h, p.x, p.y), None, "a chevron");
+            // A trimmed crumb's tooltip: new crumbs drop the tools holding the old names, even at the same index and rect.
+            let want = vec![(0, RECT { left: 30, top: 0, right: 70, bottom: 32 })];
+            sync_tips(h, state(h).unwrap(), want.clone());
+            assert_eq!(state(h).unwrap().tips, want);
+            set_crumbs(h, &["Other".into(), "Folder".into()]);
+            assert!(state(h).unwrap().tips.is_empty());
             let _ = DestroyWindow(parent);
         }
     }
 
     #[test]
     fn layout_all_fit() {
-        let l = layout(&[40, 30, 50], 10, 5, 1000);
+        let l = layout(&[40, 30, 50], 10, 5, 1000, i32::MAX);
         assert_eq!(l.first_visible, 0);
         assert_eq!(l.items.len(), 3);
         assert!(l.items.windows(2).all(|p| p[1].0.left > p[0].0.left));
@@ -598,18 +672,47 @@ mod tests {
 
     #[test]
     fn layout_too_narrow_drops_left() {
-        let l = layout(&[50; 5], 10, 5, 150);
+        let l = layout(&[50; 5], 10, 5, 150, i32::MAX);
         assert!(l.first_visible > 0);
         assert!(l.items.len() < 5);
         assert_eq!(l.first_visible + l.items.len(), 5);
         assert_eq!(l.hit(1), Hit::Overflow);
         // Even when nothing fits, the last crumb stays.
-        assert_eq!(layout(&[500, 500], 10, 5, 10).items.len(), 1);
+        assert_eq!(layout(&[500, 500], 10, 5, 10, i32::MAX).items.len(), 1);
+    }
+
+    #[test]
+    fn long_names_are_trimmed() {
+        let width = |r: &RECT| r.right - r.left;
+        // Ancestors get at most 100 of text (+ 2 * 5 padding); the current folder keeps its whole name when it fits.
+        let l = layout(&[400, 30, 300], 10, 5, 1000, 100);
+        assert_eq!(l.first_visible, 0);
+        assert_eq!(l.items.iter().map(|(c, _)| width(c)).collect::<Vec<_>>(), [110, 40, 310]);
+        // A current folder too long for the bar: the ancestor stays, the last crumb gets the rest and is cut.
+        let l = layout(&[50, 2000], 10, 5, 500, 100);
+        assert_eq!(l.first_visible, 0, "the ancestor fits beside 100 of the long name");
+        let (c, k) = l.items[1];
+        assert_eq!((c.left, width(&c)), (75, 410));
+        assert_eq!(k.right, 500, "the chevron ends at the edge");
+        // A current folder that can show whole does, ancestors dropping for it.
+        let l = layout(&[50, 50, 50, 300], 10, 5, 400, 100);
+        assert_eq!((l.first_visible, width(&l.items[0].0)), (3, 310));
+        // Less room: ancestors drop until the last crumb has its 100.
+        let l = layout(&[50, 50, 2000], 10, 5, 200, 100);
+        assert_eq!(l.first_visible, 2);
+        assert_eq!((l.items[0].0.left, l.items[0].1.right), (20, 200));
+        // Room for the ancestors once they are trimmed: none drops.
+        let l = layout(&[400, 400, 60], 10, 5, 400, 100);
+        assert_eq!(l.first_visible, 0);
+        assert_eq!(l.items.last().map(|(_, k)| k.right <= 400), Some(true));
+        // Nothing at all fits: the last crumb keeps at least its padding.
+        let l = layout(&[500], 10, 5, 10, 100);
+        assert_eq!((l.items.len(), width(&l.items[0].0)), (1, 10));
     }
 
     #[test]
     fn hit_regions() {
-        let l = layout(&[40, 30], 10, 5, 1000);
+        let l = layout(&[40, 30], 10, 5, 1000, i32::MAX);
         let (c0, k0) = l.items[0];
         assert_eq!(l.hit((c0.left + c0.right) / 2), Hit::Crumb(0));
         assert_eq!(l.hit(k0.left), Hit::Chevron(0));
@@ -683,7 +786,7 @@ mod tests {
             let bc = create(parent, 7).unwrap();
             let _ = MoveWindow(bc, 0, 0, 600, 32, false);
             set_crumbs(bc, &["This PC".to_string(), "C:".to_string(), "Users".to_string()]);
-            state(bc).unwrap().layout = layout(&[40, 50, 60], 10, 8, 1000);
+            state(bc).unwrap().layout = layout(&[40, 50, 60], 10, 8, 1000, i32::MAX);
             let key = |k: VIRTUAL_KEY| SendMessageW(bc, WM_KEYDOWN, Some(WPARAM(k.0 as usize)), None);
             let at = || state(bc).unwrap().focus;
             SendMessageW(bc, WM_SETFOCUS, None, None);
@@ -746,7 +849,7 @@ mod tests {
             let names = ["This PC".to_string(), "C:".to_string(), "Users".to_string()];
             set_crumbs(bc, &names);
             // Set before any pump: a paint would recompute the layout.
-            state(bc).unwrap().layout = layout(&[40, 50, 60], 10, 8, 210);
+            state(bc).unwrap().layout = layout(&[40, 50, 60], 10, 8, 210, i32::MAX);
             state(bc).unwrap().origin = 30;
             let acc = object(bc);
             let k = kids(&acc);

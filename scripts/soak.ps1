@@ -9,6 +9,10 @@
 # Margin: the first 5 minutes (at most a fifth of the run) are warm-up and not judged. Of the judged samples, the
 # baseline is the median of the first fifth and the end value the median of the last fifth; a resource fails when
 # end > baseline * 1.05 + slack, with slack GDI 50, USER 50, handles 200, threads 10, private bytes 50 MB.
+# GDI also gets one object per paste made between the baseline and the end samples (the app's Paste goes through the shell's copy engine, which leaks
+# about 0.7 to 1.1 GDI objects per copy in any process: 8 hours would end near +2,300 objects; see
+# scripts/bench-results.md, run 3: 102 pastes, GDI 259 -> 330, over the plain margin's limit of 322 by 8, and a plain
+# PowerShell process doing IFileOperation::CopyItem 150 times went 38 -> 203). A leak elsewhere still fails.
 # Safety: the app runs on a scratch %APPDATA% and %LOCALAPPDATA%, scratch install folder and scratch registry base, and is driven only
 # by window messages to its own window (no keys, no mouse, no foreground needed). Files are created and deleted by
 # this script inside its own temp tree, never through the Recycle Bin: the app's Delete and Undo recycle, so they
@@ -95,7 +99,7 @@ function Iteration {
   Go $Work 1
   # Only in the work folder: after a missed navigation, Copy and Paste would act on whatever folder is showing.
   if ((Count) -ge 1 -and [S]::Title($script:main) -eq "$(Split-Path $Work -Leaf) - rexplorer") {
-    Key (List) 0x24; Start-Sleep -Milliseconds 200; Cmd 43; Start-Sleep -Milliseconds 300; Cmd 44
+    Key (List) 0x24; Start-Sleep -Milliseconds 200; Cmd 43; Start-Sleep -Milliseconds 300; Cmd 44; $script:copies++
     Wait-Until { (Count) -ge 2 } 5000 'paste'
   } else { $script:misses++; $script:missedBy['not in the work folder']++ }
   $tag = $script:iterations
@@ -114,6 +118,7 @@ function Sample {
     handles   = $script:p.HandleCount
     threads   = $script:p.Threads.Count
     privateMB = [math]::Round($script:p.PrivateMemorySize64 / 1MB, 1)
+    copies    = $script:copies
   }
 }
 function Median($v) { $s = @($v | Sort-Object); if ($s.Count % 2) { $s[($s.Count - 1) / 2] } else { ($s[$s.Count / 2 - 1] + $s[$s.Count / 2]) / 2 } }
@@ -133,7 +138,7 @@ function Restore-Clipboard($d) {
 
 # ---- run --------------------------------------------------------------------------------------------
 $clip = Save-Clipboard
-$script:misses = 0; $script:missedBy = @{}; $script:iterations = 0; $samples = New-Object Collections.ArrayList; $died = $null
+$script:misses = 0; $script:missedBy = @{}; $script:iterations = 0; $script:copies = 0; $samples = New-Object Collections.ArrayList; $died = $null
 $script:p = $null
 try {
   $script:p = [Diagnostics.Process]::Start($psi); $null = $script:p.Handle
@@ -167,13 +172,16 @@ $judged = @($samples | Where-Object { $_.minute -ge $warm })
 if ($judged.Count -lt 5) { Write-Output "FAIL soak: only $($judged.Count) samples after the $warm min warm-up; lower -SampleSeconds or raise -Minutes"; exit 1 }
 $k = [math]::Max(1, [int][math]::Floor($judged.Count / 5))
 $slack = [ordered]@{ gdi = 50; user = 50; handles = 200; threads = 10; privateMB = 50 }
+$first = $judged[0..($k - 1)]; $last = $judged[($judged.Count - $k)..($judged.Count - 1)]
+# Only the pastes between the baseline and the end samples: the warm-up's are already in the baseline.
+$allow = @{ gdi = [int]((Median ($last | ForEach-Object { $_.copies })) - (Median ($first | ForEach-Object { $_.copies }))) }
 $failed = $false
 foreach ($m in $slack.Keys) {
-  $base = Median ($judged[0..($k - 1)] | ForEach-Object { $_.$m })
-  $end = Median ($judged[($judged.Count - $k)..($judged.Count - 1)] | ForEach-Object { $_.$m })
-  $limit = $base * 1.05 + $slack[$m]
+  $base = Median ($first | ForEach-Object { $_.$m })
+  $end = Median ($last | ForEach-Object { $_.$m })
+  $limit = $base * 1.05 + $slack[$m] + [int]$allow[$m]
   $status = if ($end -gt $limit) { $failed = $true; 'FAIL' } else { 'PASS' }
-  Write-Output ("{0} {1}: {2} -> {3} (limit {4:N1})" -f $status, $m, $base, $end, $limit)
+  Write-Output ("{0} {1}: {2} -> {3} (limit {4:N1}{5})" -f $status, $m, $base, $end, $limit, $(if ($allow[$m]) { ", incl. $($allow[$m]) for the pastes" }))
 }
 Write-Output "$iterations iterations in $Minutes min, $($script:misses) waits missed$(if ($script:misses) { ' (' + (($script:missedBy.GetEnumerator() | ForEach-Object { "$($_.Key) x$($_.Value)" }) -join ', ') + ')' }); samples in $Csv"
 if ($failed) { exit 1 }

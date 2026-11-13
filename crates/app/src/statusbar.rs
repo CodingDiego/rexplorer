@@ -181,6 +181,7 @@ unsafe fn paint(hwnd: HWND, st: &State) {
     let mem = CreateCompatibleDC(Some(hdc));
     let bmp = CreateCompatibleBitmap(hdc, w.max(1), h.max(1));
     let old_bmp = SelectObject(mem, bmp.into());
+    crate::rtl::match_dc(mem, hdc);
     let font = if st.font.is_invalid() { GetStockObject(DEFAULT_GUI_FONT) } else { st.font.into() };
     let old_font = SelectObject(mem, font);
 

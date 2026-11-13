@@ -153,12 +153,15 @@ unsafe fn text(dc: HDC, font: HFONT, color: u32, s: &str, r: &mut RECT, flags: D
     let old = SelectObject(dc, font.into());
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, COLORREF(color));
-    let mut u: Vec<u16> = s.encode_utf16().collect();
-    DrawTextW(dc, &mut u, r, flags | DT_NOPREFIX);
+    theme::draw_text(dc, s, r, flags | DT_NOPREFIX);
     SelectObject(dc, old);
 }
 
 unsafe fn text_width(dc: HDC, font: HFONT, s: &str) -> i32 {
+    // An empty text's buffer pointer is dangling: GDI must not be handed one.
+    if s.is_empty() {
+        return 0;
+    }
     let old = SelectObject(dc, font.into());
     let u: Vec<u16> = s.encode_utf16().collect();
     let mut sz = SIZE::default();
@@ -207,8 +210,7 @@ unsafe fn draw_option(dc: HDC, r: &RECT, kind: Kind, on: bool, enabled: bool, fo
     let color = fade(t.text);
     let mut calc = tr;
     let old = SelectObject(dc, f.ui.into());
-    let mut u: Vec<u16> = label.encode_utf16().collect();
-    DrawTextW(dc, &mut u, &mut calc, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+    theme::draw_text(dc, label, &mut calc, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
     SelectObject(dc, old);
     text(dc, f.ui, color, label, &mut tr, DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     if focus {
@@ -290,6 +292,7 @@ unsafe fn list_paint(h: HWND, ls: &ListState) {
     let dc = CreateCompatibleDC(Some(wdc));
     let bmp = CreateCompatibleBitmap(wdc, rc.right, rc.bottom);
     let old = SelectObject(dc, bmp.into());
+    crate::rtl::match_dc(dc, wdc);
     let (t, dpi) = (&ls.theme, dpi_of(h));
     let (border, fill) = field_colors(t);
     solid(dc, &rc, t.surface);
@@ -901,6 +904,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let mem = CreateCompatibleDC(Some(dc));
             let bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
             let old = SelectObject(mem, bmp.into());
+            crate::rtl::match_dc(mem, dc);
             paint_background(hwnd, mem, st);
             let _ = BitBlt(dc, 0, 0, rc.right, rc.bottom, Some(mem), 0, 0, SRCCOPY);
             SelectObject(mem, old);
@@ -1093,7 +1097,7 @@ unsafe fn dialog(app: *mut App) {
     let _ = GetWindowRect(parent, &mut pr);
     let hinst = GetModuleHandleW(None).map(Into::into).unwrap_or_default();
     let created = CreateWindowExW(
-        WINDOW_EX_STYLE(0),
+        crate::rtl::layout(),
         w!("RexFolderOptions"),
         &HSTRING::from(loc("fo.title")),
         style,

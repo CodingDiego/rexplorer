@@ -26,6 +26,28 @@ jobs:
       # $DesktopOnly list in the script); run those locally with no switch. Windows PowerShell 5.1, as the script needs.
       - name: Smoke test (hosted subset)
         run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke.ps1 -Hosted
+      # Performance budgets (#48) on the same exe. A regression tripwire, not a performance claim: about 10x the
+      # medians in scripts\bench-results.md (start ~190 ms, 100,000-file list ~183 ms, idle 0.0 %), because a shared
+      # runner is slower and noisier than the machine the script's defaults were set on.
+      - name: Performance budgets (hosted values)
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\budgets.ps1 -StartMs 2000 -ListMs 2000 -IdlePct 3
+
+  # Builds with exactly the rust-version in Cargo.toml (read here, not repeated), so code or a dependency that needs a
+  # newer Rust fails CI (#56).
+  msrv:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the minimum supported Rust
+        run: |
+          $m = Select-String -Path Cargo.toml -Pattern '^rust-version = "([^"]+)"'
+          if (-not $m) { throw 'no rust-version in Cargo.toml' }
+          $v = $m.Matches[0].Groups[1].Value
+          rustup toolchain install $v --profile minimal
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          rustup default $v
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --all-targets
 
   clippy:
     runs-on: windows-latest

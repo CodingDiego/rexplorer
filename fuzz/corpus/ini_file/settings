@@ -1,0 +1,8 @@
+[general]
+format=1
+profile=default
+
+[profile default]
+font_size=9
+icon_theme=auto
+language=es

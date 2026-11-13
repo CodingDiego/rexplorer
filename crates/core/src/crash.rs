@@ -1,7 +1,8 @@
 //! Crash recovery: on an unhandled exception (typically a misbehaving in-process shell extension)
-//! the process writes a minidump (and, for a panic, a text report) to `%LOCALAPPDATA%\rexplorer\crashes` (local
+//! the process writes a minidump and a text report to `%LOCALAPPDATA%\rexplorer\crashes` (local
 //! only, nothing is sent) and relaunches
-//! itself with `--recover`. The crash path opens that one prepared file and nothing else: each `--recover` start
+//! itself with `--recover`. A panic writes its report at once; an SEH crash writes a fixed-size `.seh` record that
+//! the next start turns into the report. The crash path opens that one prepared file and nothing else: each `--recover` start
 //! counts itself in `crash-count.txt` (beside the state file) instead, and the second one within the guard window
 //! hands the folder to Windows Explorer rather than run (a crash loop ends there). A start without `--recover`
 //! resets the count.
@@ -12,12 +13,19 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use windows::Win32::Foundation::{CloseHandle, GENERIC_WRITE};
-use windows::Win32::Storage::FileSystem::{CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_MODE};
+use windows::Win32::Foundation::{CloseHandle, FILETIME, GENERIC_WRITE, HANDLE, HMODULE, SYSTEMTIME};
+use windows::Win32::Storage::FileSystem::{
+    CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_BEGIN, FILE_SHARE_MODE, SetFilePointerEx, WriteFile,
+};
 use windows::Win32::System::Diagnostics::Debug::{
     EXCEPTION_EXECUTE_HANDLER, EXCEPTION_POINTERS, MINIDUMP_EXCEPTION_INFORMATION, MiniDumpNormal, MiniDumpWriteDump,
     SetUnhandledExceptionFilter,
 };
+use windows::Win32::System::LibraryLoader::{
+    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleFileNameW,
+    GetModuleHandleExW,
+};
+use windows::Win32::System::Time::FileTimeToSystemTime;
 use windows::Win32::System::Threading::{
     CreateProcessW, GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, PROCESS_CREATION_FLAGS,
     PROCESS_INFORMATION, STARTUPINFOW,
@@ -138,13 +146,189 @@ fn excess(sorted: &[PathBuf], keep: usize) -> &[PathBuf] {
     &sorted[..sorted.len().saturating_sub(keep)]
 }
 
-/// The crash path: one relaunch, then one minidump. The relaunch goes first because an in-process dump can
-/// deadlock (heap or loader lock held by another thread) or fault again, and recovery must not depend on it.
+/// What the exception filter knows about an SEH crash, written as raw bytes: formatting text there would need the
+/// heap, which may be the thing that is broken.
+#[repr(C)]
+struct SehRecord {
+    magic: [u8; 4],
+    code: u32,
+    address: u64,
+    module_base: u64,
+    thread: u32,
+    _pad: u32,
+    time: u64,
+    version: [u8; 16],
+    module: [u16; 260],
+}
+
+const SEH_MAGIC: [u8; 4] = *b"RXS1";
+
+const fn version_bytes() -> [u8; 16] {
+    let v = env!("CARGO_PKG_VERSION").as_bytes();
+    let mut out = [0u8; 16];
+    let mut i = 0;
+    while i < v.len() && i < out.len() {
+        out[i] = v[i];
+        i += 1;
+    }
+    out
+}
+
+const SEH_EMPTY: SehRecord = SehRecord {
+    magic: SEH_MAGIC,
+    code: 0,
+    address: 0,
+    module_base: 0,
+    thread: 0,
+    _pad: 0,
+    time: 0,
+    version: version_bytes(),
+    module: [0; 260],
+};
+
+/// The record the filter fills, static so a stack overflow does not have to find room for it.
+struct SehBuf(UnsafeCell<SehRecord>);
+// SAFETY: only the crash path touches it, and the DUMPED flag lets one thread through.
+unsafe impl Sync for SehBuf {}
+static SEH: SehBuf = SehBuf(UnsafeCell::new(SEH_EMPTY));
+/// This process's `.seh` file, opened by `install` (no sharing, so another start leaves it alone while we live).
+static SEH_FILE: OnceLock<isize> = OnceLock::new();
+
+fn seh_bytes(r: &SehRecord) -> &[u8] {
+    // SAFETY: plain-data repr(C) struct with explicit padding, read as bytes for its own size.
+    unsafe { std::slice::from_raw_parts((r as *const SehRecord).cast::<u8>(), size_of::<SehRecord>()) }
+}
+
+fn parse_seh(bytes: &[u8]) -> Option<SehRecord> {
+    (bytes.len() == size_of::<SehRecord>() && bytes[..4] == SEH_MAGIC)
+        // SAFETY: the length matches and every bit pattern is a valid SehRecord.
+        .then(|| unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<SehRecord>()) })
+}
+
+fn code_name(code: u32) -> Option<&'static str> {
+    Some(match code {
+        0xC000_0005 => "access violation",
+        0xC000_0006 => "in-page error",
+        0xC000_001D => "illegal instruction",
+        0xC000_0094 => "integer divide by zero",
+        0xC000_0096 => "privileged instruction",
+        0xC000_00FD => "stack overflow",
+        0xC000_0374 => "heap corruption",
+        0xC000_0409 => "stack buffer overrun",
+        0x8000_0003 => "breakpoint",
+        0xE06D_7363 => "C++ exception",
+        _ => return None,
+    })
+}
+
+/// `time` (Unix seconds) as UTC, or the bare number when Windows cannot convert it.
+fn utc(time: u64) -> String {
+    let ticks = time.saturating_add(11_644_473_600).saturating_mul(10_000_000);
+    let ft = FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 };
+    let mut st = SYSTEMTIME::default();
+    // SAFETY: both pointers are to locals.
+    match unsafe { FileTimeToSystemTime(&ft, &mut st) } {
+        Ok(()) => format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
+        ),
+        Err(_) => time.to_string(),
+    }
+}
+
+/// The text report for an SEH record, in the shape of the panic one (version first).
+fn seh_report(r: &SehRecord) -> String {
+    let version = String::from_utf8_lossy(&r.version);
+    let name = code_name(r.code).map(|n| format!(" ({n})")).unwrap_or_default();
+    let module_len = r.module.iter().position(|&c| c == 0).unwrap_or(r.module.len());
+    let place = if r.module_base == 0 || module_len == 0 {
+        "module: not resolved".to_string()
+    } else {
+        format!("module: {}+{:#x}", String::from_utf16_lossy(&r.module[..module_len]), r.address.wrapping_sub(r.module_base))
+    };
+    format!(
+        "rexplorer {}\nexception {:#010X}{name} at {:#018X}\n{place}\nthread {}\ntime {}\n",
+        version.trim_end_matches('\0'),
+        r.code,
+        r.address,
+        r.thread,
+        utc(r.time)
+    )
+}
+
+/// Turns each finished `.seh` record in `dir` into the `.txt` beside its `.dmp`. An empty record (a run that did
+/// not crash) is deleted; one still open by a running process cannot be read and is left alone.
+fn convert_seh_records(dir: &Path) {
+    let records = std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| {
+        p.extension().is_some_and(|e| e.eq_ignore_ascii_case("seh"))
+            && p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("rexplorer-"))
+    });
+    for path in records {
+        // Never read a file of another size whole; a live run's record is locked, so removing it fails.
+        if std::fs::metadata(&path).map_or(true, |m| m.len() != size_of::<SehRecord>() as u64) {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let txt = path.with_extension("txt");
+        if let Some(r) = parse_seh(&bytes)
+            && !txt.exists()
+        {
+            let _ = std::fs::write(&txt, seh_report(&r));
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Fills and writes the SEH record; nothing here allocates. `info` is null for a panic, which has its own report.
+fn write_record(info: *const EXCEPTION_POINTERS) {
+    let Some(&h) = SEH_FILE.get() else {
+        return;
+    };
+    let file = HANDLE(h as *mut std::ffi::c_void);
+    // SAFETY: `info` is the filter's own exception pointers (or null); DUMPED lets one thread use the static.
+    unsafe {
+        let Some(ex) = info.as_ref().and_then(|i| i.ExceptionRecord.as_ref()) else {
+            return;
+        };
+        let rec = &mut *SEH.0.get();
+        rec.code = ex.ExceptionCode.0 as u32;
+        rec.address = ex.ExceptionAddress as u64;
+        rec.thread = GetCurrentThreadId();
+        rec.time = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        put_record(file, rec);
+        // The module lookup can block on a loader lock the dying process holds: the record above is on disk first.
+        let mut module = HMODULE::default();
+        let flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
+        if GetModuleHandleExW(flags, PCWSTR(ex.ExceptionAddress.cast()), &mut module).is_ok() {
+            rec.module_base = module.0 as u64;
+            GetModuleFileNameW(Some(module), &mut rec.module);
+            put_record(file, rec);
+        }
+        // Unlocks the record so the --recover start, if it scans after this, reports it instead of the start after.
+        let _ = CloseHandle(file);
+    }
+}
+
+fn put_record(file: HANDLE, rec: &SehRecord) {
+    let mut written = 0u32;
+    // SAFETY: `file` is the handle `install` opened for writing; the buffer outlives the call.
+    unsafe {
+        let _ = SetFilePointerEx(file, 0, None, FILE_BEGIN);
+        let _ = WriteFile(file, Some(seh_bytes(rec)), Some(&mut written), None);
+    }
+}
+
+/// The crash path: one relaunch, then the SEH record and one minidump. The relaunch goes first because an in-process
+/// dump can deadlock (heap or loader lock held by another thread) or fault again, and recovery must not depend on it.
 fn on_crash(info: *const EXCEPTION_POINTERS) {
     if !RELAUNCHED.swap(true, Ordering::SeqCst) {
         relaunch();
     }
     if !DUMPED.swap(true, Ordering::SeqCst) {
+        write_record(info);
         write_dump(info);
     }
 }
@@ -175,19 +359,26 @@ unsafe extern "system" fn filter(info: *const EXCEPTION_POINTERS) -> i32 {
     EXCEPTION_EXECUTE_HANDLER
 }
 
-/// Pre-builds the relaunch command line and the dump path (pruning old dumps), and installs the
-/// unhandled-exception filter and panic hook.
+/// Pre-builds the relaunch command line and the dump path (pruning old dumps), turns the last SEH crash's record
+/// into its text report, opens this run's record file, and installs the unhandled-exception filter and panic hook.
 pub fn install(relaunch_args: &[String]) {
     let exe = std::env::current_exe().unwrap_or_default();
     let _ = CMDLINE.set(CmdLine(UnsafeCell::new(command_line(&exe, relaunch_args))));
     let dir = crash_dir();
     let _ = std::fs::create_dir_all(&dir);
+    convert_seh_records(&dir);
     for old in excess(&dumps(&dir), KEEP_DUMPS - 1) {
         let _ = std::fs::remove_file(old);
         let _ = std::fs::remove_file(old.with_extension("txt"));
     }
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    let _ = DUMP.set(HSTRING::from(dir.join(format!("rexplorer-{now:011}-{}.dmp", std::process::id())).as_os_str()));
+    let stem = dir.join(format!("rexplorer-{now:011}-{}", std::process::id()));
+    let _ = DUMP.set(HSTRING::from(stem.with_extension("dmp").as_os_str()));
+    let seh = HSTRING::from(stem.with_extension("seh").as_os_str());
+    // SAFETY: plain file open; the handle stays open for the life of the process.
+    if let Ok(h) = unsafe { CreateFileW(&seh, GENERIC_WRITE.0, FILE_SHARE_MODE(0), None, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, None) } {
+        let _ = SEH_FILE.set(h.0 as isize);
+    }
     std::panic::set_hook(Box::new(|info| {
         // The dump of a panic carries no exception record: the message and stack go in a text report beside it.
         if let Some(dump) = DUMP.get() {
@@ -360,6 +551,54 @@ mod tests {
         log_to(&p, "three");
         assert!(std::fs::read_to_string(&p).unwrap().ends_with(" three\n"));
         assert!(std::fs::metadata(&p).unwrap().len() < 100, "a full log starts again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn sample_record() -> SehRecord {
+        let mut module = [0u16; 260];
+        for (d, s) in module.iter_mut().zip(r"C:\x\bad.dll".encode_utf16()) {
+            *d = s;
+        }
+        SehRecord { code: 0xC000_0005, address: 0x7FF0_0000_1234, module_base: 0x7FF0_0000_0000, thread: 42, time: 0, module, ..SEH_EMPTY }
+    }
+
+    #[test]
+    fn seh_record_round_trips_into_a_report() {
+        let r = parse_seh(seh_bytes(&sample_record())).expect("own bytes parse");
+        let text = seh_report(&r);
+        assert_eq!(
+            text,
+            format!(
+                "rexplorer {}\nexception 0xC0000005 (access violation) at 0x00007FF000001234\nmodule: C:\\x\\bad.dll+0x1234\nthread 42\ntime 1970-01-01 00:00:00 UTC\n",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+        let unresolved = SehRecord { code: 0x1234, module_base: 0, ..sample_record() };
+        assert!(seh_report(&unresolved).contains("exception 0x00001234 at"), "an unknown code has no name");
+        assert!(seh_report(&unresolved).contains("module: not resolved"));
+        assert!(parse_seh(&[]).is_none(), "an empty record (a run that did not crash) is no report");
+        assert_eq!(utc(u64::MAX), u64::MAX.to_string(), "a bad time falls back to the number, no overflow");
+        assert!(parse_seh(&seh_bytes(&sample_record())[1..]).is_none());
+    }
+
+    #[test]
+    fn seh_records_become_reports_and_are_removed() {
+        let dir = std::env::temp_dir().join(format!("rexplorer-seh-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("rexplorer-00000000100-1.seh"), seh_bytes(&sample_record())).unwrap();
+        std::fs::write(dir.join("rexplorer-00000000200-1.seh"), b"").unwrap();
+        std::fs::write(dir.join("rexplorer-00000000300-1.seh"), seh_bytes(&sample_record())).unwrap();
+        std::fs::write(dir.join("rexplorer-00000000300-1.txt"), "panic report").unwrap();
+        let mut big = seh_bytes(&sample_record()).to_vec();
+        big.resize(1 << 20, 0);
+        std::fs::write(dir.join("rexplorer-00000000400-1.seh"), big).unwrap();
+        convert_seh_records(&dir);
+        assert!(!dir.join("rexplorer-00000000400-1.txt").exists(), "a file of another size is no record");
+        assert!(std::fs::read_to_string(dir.join("rexplorer-00000000100-1.txt")).unwrap().contains("access violation"));
+        assert!(!dir.join("rexplorer-00000000200-1.txt").exists(), "an empty record makes no report");
+        assert_eq!(std::fs::read_to_string(dir.join("rexplorer-00000000300-1.txt")).unwrap(), "panic report");
+        let left = std::fs::read_dir(&dir).unwrap().flatten().filter(|e| e.path().extension().is_some_and(|x| x == "seh")).count();
+        assert_eq!(left, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

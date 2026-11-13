@@ -317,9 +317,10 @@ impl IAccessible_Impl for Accessible_Impl {
             }
             Some(i) => {
                 let r = t.items[i].rect;
-                let mut p = POINT { x: r.left, y: r.top };
-                let _ = unsafe { ClientToScreen(hwnd, &mut p) };
-                (p.x, p.y, r.right - r.left, r.bottom - r.top)
+                let (mut p, mut q) = (POINT { x: r.left, y: r.top }, POINT { x: r.right, y: r.top });
+                let _ = unsafe { (ClientToScreen(hwnd, &mut p), ClientToScreen(hwnd, &mut q)) };
+                // A mirrored (right-to-left) window's client left is the item's screen right.
+                (p.x.min(q.x), p.y, r.right - r.left, r.bottom - r.top)
             }
         };
         unsafe {

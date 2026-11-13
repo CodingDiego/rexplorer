@@ -166,6 +166,8 @@ fn mix(a: u32, b: u32, t: f32) -> u32 {
 impl Theme {
     /// Selection is the accent at 18% over the surface; border is the background 8% toward the text.
     fn palette(name: &str, dark: bool, [background, surface, text, secondary_text, accent]: [&str; 5]) -> Theme {
+        // Cannot fail: the strings are the #RRGGBB literals in `light`/`dark` below, parsed by the palettes test.
+        #[allow(clippy::unwrap_used)]
         let c = |s| parse_color(s).unwrap();
         let (background, surface, text, accent) = (c(background), c(surface), c(text), c(accent));
         Theme {

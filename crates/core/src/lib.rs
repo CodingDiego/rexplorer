@@ -1,4 +1,6 @@
 //! Headless shell-namespace layer. No window code lives here.
+// A shell, COM or file failure must degrade, not panic (#28); tests may still unwrap.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 pub mod access;
 pub mod archive;
 pub mod browser;

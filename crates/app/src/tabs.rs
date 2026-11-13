@@ -543,7 +543,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_KEYDOWN => {
             let (n, cur) = (count(hwnd), active(hwnd));
-            let to = match VIRTUAL_KEY(wparam.0 as u16) {
+            let to = match crate::rtl::key(VIRTUAL_KEY(wparam.0 as u16)) {
                 VK_LEFT => cur.saturating_sub(1),
                 VK_RIGHT => (cur + 1).min(n.saturating_sub(1)),
                 VK_HOME => 0,
@@ -616,6 +616,7 @@ unsafe fn paint(hwnd: HWND) {
         let dc = CreateCompatibleDC(Some(wdc));
         let bmp = CreateCompatibleBitmap(wdc, cw, ch);
         let old_bmp = SelectObject(dc, bmp.into());
+        crate::rtl::match_dc(dc, wdc);
         // The tabs hold titles: their size follows the text size, the glyphs only the DPI.
         draw(dc, s, &layout(s.titles.len(), cw, theme::text_dpi(dpi)), dpi, cw, ch);
         let _ = BitBlt(wdc, 0, 0, cw, ch, Some(dc), 0, 0, SRCCOPY);

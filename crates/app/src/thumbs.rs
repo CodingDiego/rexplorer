@@ -52,7 +52,9 @@ pub fn start(hwnd: HWND, msg: u32) -> Thumbs {
     let win = window.clone();
     let hwnd = hwnd.0 as isize;
     let worker = thread::spawn(move || {
-        let _com = ComInit::mta();
+        // An STA: thumbnails of a library's files asked from an MTA crash the process inside thumbcache's own worker
+        // (an access violation in Windows.Storage.Search); from an STA they work.
+        let _com = ComInit::sta();
         // recv fails once the sender is dropped.
         while let Ok(r) = rx.recv() {
             // Stale, or scrolled out of the window while queued.

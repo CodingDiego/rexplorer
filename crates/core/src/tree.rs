@@ -4,17 +4,17 @@ use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::Win32::System::Ole::IOleWindow;
 use windows::Win32::UI::Shell::{
     IContextMenu, INameSpaceTreeControl2, INameSpaceTreeControlEvents,
-    INameSpaceTreeControlEvents_Impl, IShellItem, IShellItemArray, NSTCIS_SELECTED,
+    INameSpaceTreeControlEvents_Impl, IShellItem, IShellItemArray, NSTCIS_EXPANDED, NSTCIS_SELECTED,
     NSTCRS_EXPANDED, NSTCRS_VISIBLE, NSTCS_AUTOHSCROLL, NSTCS_FADEINOUTEXPANDOS,
-    NSTCS_FULLROWSELECT, NSTCS_HASEXPANDOS, NSTCS_NOINFOTIP, NSTCS_ROOTHASEXPANDO,
-    NamespaceTreeControl, SHCONTF_FOLDERS, SHCreateItemFromIDList, SHCreateItemFromParsingName,
+    NSTCS_FULLROWSELECT, NSTCS_HASEXPANDOS, NSTCS_NOINFOTIP, NSTCS_ROOTHASEXPANDO, NSTCS_SHOWSELECTIONALWAYS,
+    NamespaceTreeControl, SHCONTF_FOLDERS, SHCONTF_INCLUDEHIDDEN, SHCreateItemFromIDList, SHCreateItemFromParsingName, SIGDN_FILESYSPATH,
     SHGetIDListFromObject,
 };
 use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos};
 use windows::core::{BOOL, GUID, HSTRING, Interface, PCWSTR, PWSTR, Ref, Result, implement};
 
 
-use crate::com::Pidl;
+use crate::com::{Pidl, take_cotaskmem_string};
 
 /// The hosted folder tree; selection changes are reported through the callback given to `create`.
 pub struct TreePane {
@@ -66,8 +66,10 @@ fn item_from_name(name: &str) -> Result<IShellItem> {
     unsafe { SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None) }
 }
 
-/// Creates the tree under `parent`, with Quick Access (if available) and This PC as roots.
-pub fn create(parent: HWND, rect: RECT, on_select: Box<dyn Fn(Pidl)>) -> Result<TreePane> {
+/// Creates the tree under `parent`, with Quick Access (if available) and This PC as roots; `hidden` lists hidden
+/// folders too.
+/// shortcut: `hidden` is read once, when the tree is made; a later change of the setting shows after a restart.
+pub fn create(parent: HWND, rect: RECT, hidden: bool, on_select: Box<dyn Fn(Pidl)>) -> Result<TreePane> {
     unsafe {
         let tree: INameSpaceTreeControl2 = CoCreateInstance(&NamespaceTreeControl, None, CLSCTX_INPROC_SERVER)?;
         let style = NSTCS_HASEXPANDOS.0
@@ -75,12 +77,14 @@ pub fn create(parent: HWND, rect: RECT, on_select: Box<dyn Fn(Pidl)>) -> Result<
             | NSTCS_AUTOHSCROLL.0
             | NSTCS_FULLROWSELECT.0
             | NSTCS_NOINFOTIP.0
-            | NSTCS_FADEINOUTEXPANDOS.0;
+            | NSTCS_FADEINOUTEXPANDOS.0
+            // The current folder stays marked while the list has the focus.
+            | NSTCS_SHOWSELECTIONALWAYS.0;
         tree.Initialize(parent, &rect, style as u32)?;
         let events: INameSpaceTreeControlEvents = Events { on_select }.into();
         let cookie = tree.TreeAdvise(&events)?;
         let pane = TreePane { tree, cookie }; // from here Drop unadvises and destroys on error
-        let folders = SHCONTF_FOLDERS.0 as u32;
+        let folders = (SHCONTF_FOLDERS.0 | if hidden { SHCONTF_INCLUDEHIDDEN.0 } else { 0 }) as u32;
         // Quick Access is absent on older Windows; its failure must not fail the pane.
         if let Ok(qa) = item_from_name("shell:::{679f85cb-0220-4080-b29b-5540cc05aab6}") {
             let _ = pane.tree.AppendRoot(&qa, folders, NSTCRS_VISIBLE.0 as u32, None);
@@ -119,6 +123,25 @@ impl TreePane {
     pub fn select(&self, pidl: &Pidl) -> Result<()> {
         unsafe {
             let item: IShellItem = SHCreateItemFromIDList(pidl.as_ptr())?;
+            // A folder under the user's profile is reached from the desktop's user folder, which is no root here: the
+            // tree shows it under This PC, so a file system folder is looked up by that route.
+            let item = item
+                .GetDisplayName(SIGDN_FILESYSPATH)
+                .map(|p| take_cotaskmem_string(p))
+                .and_then(|p| item_from_name(&format!("::{{20D04FE0-3AEA-1069-A2D8-08002B30309D}}\\{p}")))
+                .unwrap_or(item);
+            // The tree holds a folder only once its parent was expanded: open the ancestors, outermost first. Those
+            // above the roots (the desktop) are not in the tree and fail harmlessly.
+            let mut up = Vec::new();
+            let mut at = item.clone();
+            while let Ok(p) = at.GetParent() {
+                up.push(p.clone());
+                at = p;
+            }
+            let open = NSTCIS_EXPANDED.0 as u32;
+            for a in up.iter().rev() {
+                let _ = self.tree.SetItemState(a, open, open);
+            }
             let sel = NSTCIS_SELECTED.0 as u32;
             self.tree.SetItemState(&item, sel, sel)?;
             self.tree.EnsureItemVisible(&item)
@@ -158,7 +181,7 @@ mod tests {
     fn tree_creates_under_hidden_window() {
         let _c = ComInit::sta();
         let p = parent();
-        let pane = create(p, RECT400, Box::new(|_| {})).unwrap();
+        let pane = create(p, RECT400, false, Box::new(|_| {})).unwrap();
         let h = pane.hwnd();
         assert!(!h.is_invalid());
         assert!(unsafe { IsWindow(Some(h)) }.as_bool());
@@ -170,8 +193,35 @@ mod tests {
     fn select_this_pc_does_not_fail() {
         let _c = ComInit::sta();
         let p = parent();
-        let pane = create(p, RECT400, Box::new(|_| {})).unwrap();
+        let pane = create(p, RECT400, false, Box::new(|_| {})).unwrap();
         pane.select(&ShellFolder::parse("shell:MyComputerFolder").unwrap().pidl).unwrap();
+        drop(pane);
+        unsafe { DestroyWindow(p).unwrap() };
+    }
+
+    /// The parsing name of the tree's selection.
+    fn selected(pane: &TreePane) -> String {
+        unsafe {
+            let a = pane.tree.GetSelectedItems().unwrap();
+            take_cotaskmem_string(a.GetItemAt(0).unwrap().GetDisplayName(SIGDN_FILESYSPATH).unwrap())
+        }
+    }
+
+    #[test]
+    fn select_opens_the_way_to_a_deep_folder() {
+        let _c = ComInit::sta();
+        let p = parent();
+        // A folder no root shows until its parents are expanded; a hidden one only when the tree lists hidden folders.
+        let windir = std::env::var("SystemRoot").unwrap();
+        let deep = format!(r"{windir}\System32\drivers\etc");
+        let pane = create(p, RECT400, false, Box::new(|_| {})).unwrap();
+        pane.select(&ShellFolder::parse(&deep).unwrap().pidl).unwrap();
+        assert!(selected(&pane).eq_ignore_ascii_case(&deep), "{}", selected(&pane));
+        drop(pane);
+        let temp = std::env::temp_dir().to_string_lossy().trim_end_matches('\\').to_string();
+        let pane = create(p, RECT400, true, Box::new(|_| {})).unwrap();
+        pane.select(&ShellFolder::parse(&temp).unwrap().pidl).unwrap();
+        assert!(selected(&pane).eq_ignore_ascii_case(&temp), "{}", selected(&pane));
         drop(pane);
         unsafe { DestroyWindow(p).unwrap() };
     }

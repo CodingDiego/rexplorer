@@ -60,6 +60,8 @@ pub(crate) struct Loaded {
     pub source: Source,
     pub crumbs: Vec<Crumb>,
     pub icon: (usize, i32),
+    /// The worker left the listing unsorted, ungrouped and without icons: the UI thread sorts it once it holds it.
+    pub unsorted: bool,
 }
 
 pub(crate) struct EnumDone {
@@ -303,7 +305,7 @@ fn load(target: Target, show_hidden: bool, sort: Option<(u32, bool, Option<u32>)
             // An empty listing that says why: the embedded Explorer view could not read it either.
             Some(e) => (Vec::new(), Some(e)),
             // The folder exists but we cannot list it (a phone, an odd namespace extension): the embedded Explorer view.
-            None => return Ok(Loaded { source: Source::Browser(source::BrowserPlace::of(&folder)), crumbs, icon }),
+            None => return Ok(Loaded { source: Source::Browser(source::BrowserPlace::of(&folder)), crumbs, icon, unsorted: false }),
         },
     };
     if superseded() {
@@ -331,6 +333,14 @@ fn load(target: Target, show_hidden: bool, sort: Option<(u32, bool, Option<u32>)
     if is_home(&l) {
         l.home = Some(home::build(&l.folder, &l.items));
     }
+    // A library (Windows.Storage.Search) crashes on any property read made in this MTA (GetDetailsEx: an access
+    // violation, not an error), and sorting, grouping and icons read properties: libraries and archive folders get
+    // them on the UI thread instead.
+    // shortcut: a big library sorts on the UI thread; give those an STA worker of their own if one stalls.
+    let unsorted = l.home.is_none() && sorts_on_ui_thread(&l.folder.parsing_name);
+    if unsorted {
+        return Ok(Loaded { source: Source::Shell(l), crumbs, icon, unsorted });
+    }
     // After the Home build: its tiles keep the enumeration order.
     unsafe { sort_listing(&mut l) };
     // Home's list is hidden, nothing asks it for icons.
@@ -339,7 +349,16 @@ fn load(target: Target, show_hidden: bool, sort: Option<(u32, bool, Option<u32>)
             *icon = item.icon_index(&l.folder.pidl).1;
         }
     }
-    Ok(Loaded { source: Source::Shell(l), crumbs, icon })
+    Ok(Loaded { source: Source::Shell(l), crumbs, icon, unsorted })
+}
+
+/// The Libraries root, a library, or a folder inside an archive file (.zip, .cab): apartment-threaded folders whose
+/// properties only the UI thread may read. This PC, the Recycle Bin, Network and Control Panel are not.
+fn sorts_on_ui_thread(parsing_name: &str) -> bool {
+    let lower = parsing_name.to_lowercase();
+    lower.starts_with("::{031e4825-7b94-4dc3-b131-e946b44c8dd5}")
+        || lower.contains(".library-ms")
+        || (ui::is_fs_path(parsing_name) && !std::path::Path::new(parsing_name).is_dir() && std::path::Path::new(parsing_name).ancestors().any(|a| a.is_file()))
 }
 
 /// Downloads opens newest first (its first date column, descending) grouped by date; every other folder by name.
@@ -389,7 +408,17 @@ pub(crate) unsafe fn on_enum_done(app: *mut App, done: Box<EnumDone>) {
     let hwnd = (*app).hwnd;
     let list = (*app).list;
     let active = t == (*app).active;
-    let loaded = match done.result {
+    let mut result = done.result;
+    // Bound on the loader's thread: Libraries and .zip folders answer only there until bound again here (a plain
+    // directory answers on any thread). Unbound, every name would show empty: a failed load instead.
+    let unbound = match &mut result {
+        Ok(Loaded { source: Source::Shell(l), unsorted: true, .. }) => l.folder.adopt(&mut l.items).err().map(|err| LoadError { name: l.folder.parsing_name.clone(), err }),
+        _ => None,
+    };
+    if let Some(e) = unbound {
+        result = Err(e);
+    }
+    let loaded = match result {
         Err(LoadError { name, err }) => {
             // An archive with encrypted names: ask for its password and load it again. The prompt is modal over the
             // window; the tab is looked at again after it.
@@ -425,8 +454,8 @@ pub(crate) unsafe fn on_enum_done(app: *mut App, done: Box<EnumDone>) {
                     let (top, selected) = (tab.top, std::mem::take(&mut tab.selected));
                     show(app, Show::Restore { top, selected, columns: true });
                 }
-            } else if let Some(s) = source(app) {
-                set_text((*app).addr, &s.editing_name());
+            } else if active && let Some(s) = &(&(*app).tabs)[t].source {
+                set_address(app, &crate::connect::redact(&s.editing_name()));
             }
             if !cancelled {
                 message(hwnd, &trf("err.open", &[("name", &crate::connect::redact(&name)), ("error", &err)]));
@@ -435,6 +464,12 @@ pub(crate) unsafe fn on_enum_done(app: *mut App, done: Box<EnumDone>) {
         }
         Ok(loaded) => loaded,
     };
+    let mut loaded = loaded;
+    if let Source::Shell(l) = &mut loaded.source
+        && loaded.unsorted
+    {
+        sort_listing(l);
+    }
 
     let refresh = done.history == History::Refresh;
     // Read before the listing goes: in group view the list asks it (the groups callback) where each row is.
@@ -534,6 +569,7 @@ pub(crate) unsafe fn on_enum_done(app: *mut App, done: Box<EnumDone>) {
         tab.top = top;
         tab.selected = keep;
     }
+    crate::instance::signal_loaded(hwnd);
     let pending_search = if shell { (&mut (*app).tabs)[t].search_after.take() } else { None };
     if let Some(q) = pending_search {
         source::start_search(app, t, &q, true);
@@ -565,7 +601,7 @@ unsafe fn show_source(app: *mut App, mode: Show) {
         SendMessageW(list, LVM_SETITEMCOUNT, Some(WPARAM(0)), Some(LPARAM(0)));
         panes::schedule_preview(app);
         set_columns(app, &[]);
-        set_text((*app).addr, &crate::connect::redact(&tab.name));
+        set_address(app, &crate::connect::redact(&tab.name));
         set_text(hwnd, "rexplorer");
         ui::set_crumbs(app);
         sync_home(app);
@@ -595,7 +631,7 @@ unsafe fn show_source(app: *mut App, mode: Show) {
         apply_layout(app);
     }
     // The shell's FTP folder keeps user:password in its names; nothing on screen shows the password.
-    set_text((*app).addr, &crate::connect::redact(&src.editing_name()));
+    set_address(app, &crate::connect::redact(&src.editing_name()));
     set_text(hwnd, &format!("{} - rexplorer", crate::connect::redact(&src.title())));
     // Rewriting text the user is typing would move the caret to the start and drop trailing spaces.
     let needle = if let Source::Search(s) = src { s.needle.as_str() } else { "" };
@@ -1069,10 +1105,17 @@ pub(crate) unsafe fn refresh(app: *mut App) {
     if cur(app).loading.is_some() {
         return;
     }
-    // A reload would end a rename in progress (a new item's, right after its creation): wait for it.
+    // A reload would end a rename in progress (a new item's, right after its creation): wait for it, unless its item
+    // is gone from the disk (deleted or renamed elsewhere): that edit ends unsaved (on_end_edit drops it too).
     if SendMessageW((*app).list, LVM_GETEDITCONTROL, None, None).0 != 0 {
-        SetTimer(Some((*app).hwnd), TIMER_REFRESH, 500, None);
-        return;
+        if (*app).renaming.as_deref().is_some_and(|p| ui::is_fs_path(p) && std::fs::symlink_metadata(p).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)) {
+            // Forgotten first: the cancel still ends the edit with its text, and that commit must find nothing to rename.
+            (*app).renaming = None;
+            SendMessageW((*app).list, LVM_CANCELEDITLABEL, None, None);
+        } else {
+            SetTimer(Some((*app).hwnd), TIMER_REFRESH, 500, None);
+            return;
+        }
     }
     let target = match source(app) {
         Some(Source::Search(s)) => {
@@ -1224,7 +1267,7 @@ pub(crate) unsafe fn on_nav_context(app: *mut App, lparam: LPARAM) {
     if entries.is_empty() {
         return;
     }
-    let picked = ui::popup(app, &entries, &[], r.left, r.bottom);
+    let picked = ui::popup(app, &entries, &[], crate::rtl::menu_x(&r), r.bottom);
     if picked != 0 {
         jump(app, back, picked);
     }
@@ -1334,6 +1377,13 @@ fn destination(target: &Target) -> (String, String) {
     }
 }
 
+/// The address bar's text, left alone while it is open for typing (closing it puts the place back, ui::hide_edit).
+unsafe fn set_address(app: *mut App, text: &str) {
+    if !IsWindowVisible((*app).addr).as_bool() {
+        set_text((*app).addr, text);
+    }
+}
+
 /// The active tab is loading: its destination in the title, tab, breadcrumb, address and sidebar; "Loading..."
 /// in the status bar; the skeleton once the load has taken longer than SKELETON_DELAY.
 unsafe fn present_loading(app: *mut App) {
@@ -1341,9 +1391,7 @@ unsafe fn present_loading(app: *mut App) {
     let tab = cur(app);
     let Some(l) = &tab.loading else { return };
     set_text(hwnd, &format!("{} - rexplorer", l.name));
-    if !IsWindowVisible((*app).addr).as_bool() {
-        set_text((*app).addr, &crate::connect::redact(&l.parsing));
-    }
+    set_address(app, &crate::connect::redact(&l.parsing));
     sidebar::select((*app).sidebar, &l.parsing);
     let waited = l.since.elapsed();
     ui::set_crumbs(app);
@@ -1413,6 +1461,49 @@ unsafe fn show_tab(app: *mut App, t: usize, refresh_after: bool) {
         refresh(app);
     }
     session_changed(app);
+}
+
+/// A tab sent to another window that did not take it is waiting in RETURNED. The message carries no pointer: any
+/// program on the desktop can post it.
+pub(crate) const WM_TAB_RETURN: u32 = WM_APP + 14;
+static RETURNED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// The tabs handed back since the last call.
+pub(crate) fn take_returned() -> Vec<String> {
+    RETURNED.lock().map(|mut v| std::mem::take(&mut *v)).unwrap_or_default()
+}
+
+/// A tab dropped outside the window: onto another rexplorer window it moves there as a new tab, else it opens in a
+/// window of its own. Only a place a command line can carry moves out (no FTP password, not empty); the last tab stays.
+pub(crate) unsafe fn tear_tab(app: *mut App, t: usize) {
+    let tabs = &(*app).tabs;
+    let name = tabs.get(t).map(|t| t.name.clone()).unwrap_or_default();
+    if tabs.len() < 2 || instance::new_window_args(&name).len() != 2 {
+        let _ = MessageBeep(MB_OK);
+        return;
+    }
+    // Where the button came up: the message being handled is the strip's WM_LBUTTONUP.
+    let pos = GetMessagePos();
+    let at = WindowFromPoint(POINT { x: (pos & 0xFFFF) as i16 as i32, y: (pos >> 16) as i16 as i32 });
+    match instance::other_main_window(at, (*app).hwnd) {
+        Some(other) => {
+            // A busy window can take seconds to answer: the hand-off runs on a worker, and a refusal brings the tab back.
+            let (other, own, payload) = (other.0 as isize, (*app).hwnd.0 as isize, instance::tab_payload(&name));
+            close_tab(app, t);
+            std::thread::spawn(move || {
+                if !instance::send(HWND(other as *mut c_void), &payload) {
+                    if let Ok(mut v) = RETURNED.lock() {
+                        v.push(name);
+                    }
+                    let _ = unsafe { PostMessageW(Some(HWND(own as *mut c_void)), WM_TAB_RETURN, WPARAM(0), LPARAM(0)) };
+                }
+            });
+        }
+        None if instance::open_new_window(&name) => close_tab(app, t),
+        None => {
+            let _ = MessageBeep(MB_OK);
+        }
+    }
 }
 
 pub(crate) unsafe fn close_tab(app: *mut App, t: usize) {
@@ -1604,6 +1695,25 @@ mod tests {
         let after_close: Vec<_> = tabs[1..].to_vec();
         assert_eq!(find_tab(after_close.iter(), &id), Some(1), "a tab before it closed");
         assert_eq!(find_tab(tabs[..2].iter(), &id), None, "it closed");
+    }
+
+    #[test]
+    fn only_libraries_and_archives_sort_on_the_ui_thread() {
+        let dir = std::env::temp_dir().join(format!("rexplorer-test-sorts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let zip = dir.join("a.zip");
+        std::fs::write(&zip, b"PK\x05\x06").unwrap();
+        let d = dir.to_string_lossy();
+        assert!(!sorts_on_ui_thread(&d), "a plain directory");
+        assert!(sorts_on_ui_thread(&zip.to_string_lossy()));
+        assert!(sorts_on_ui_thread(&format!("{d}\\a.zip\\sub\\deeper")), "a folder inside the archive");
+        assert!(sorts_on_ui_thread("::{031E4825-7B94-4DC3-B131-E946B44C8DD5}"));
+        assert!(sorts_on_ui_thread("::{031E4825-7B94-4DC3-B131-E946B44C8DD5}\\Documents.library-ms"));
+        assert!(sorts_on_ui_thread("C:\\Users\\u\\AppData\\Roaming\\Microsoft\\Windows\\Libraries\\Music.library-ms"));
+        for loader in ["::{645FF040-5081-101B-9F08-00AA002F954E}", "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}", "::{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}", "::{26EE0668-A00A-44D7-9371-BEB064C98683}\\0"] {
+            assert!(!sorts_on_ui_thread(loader), "{loader}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

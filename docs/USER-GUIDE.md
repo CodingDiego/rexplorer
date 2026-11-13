@@ -102,17 +102,27 @@ These are the defaults, taken from the key table in the app. Where a key is rebo
 | Keys | Action |
 |---|---|
 | Enter, double-click | Open a folder, archive or file |
-| Backspace, Alt+Up | Up one folder |
-| Alt+Left, Alt+Right (mouse back and forward buttons) | Back, forward |
+| Alt+Up | Up one folder |
+| Alt+Left or Backspace, Alt+Right (mouse back and forward buttons) | Back, forward. Backspace goes Back as in Windows 11 Explorer; up to 0.2.0 it went up one folder |
 | F5, Ctrl+R | Refresh |
-| Ctrl+L, Alt+D, F4 | Edit the address |
+| Ctrl+L, Alt+D | Edit the address |
+| F4 | Edit the address, with your recent places listed under it (newest first); pick one to go there |
+| Esc in the address | Close the suggestion list first; a second Esc leaves the address |
+| Right-click Back or Forward, or hold it about half a second | History menu |
+| Alt or F10 alone | Move to the command bar (as in Windows 11 Explorer, there is no menu bar); again to come back |
 | Ctrl+F, Ctrl+E, F3 | Search box (Enter searches, Esc stops) |
 | Ctrl+P | Palette: recent places, bookmarks and subfolders, fuzzy matched |
 | Ctrl+D | Pin the selected folders (or this folder) to Home |
-| F6, Shift+F6 (also Tab, Shift+Tab) | Next, previous pane, the three toolbars included |
-| Left, Right, Home, End; Enter, Space, Down (in a toolbar) | Move between buttons; press one or open its menu; Esc returns to the files |
+| F6, Shift+F6 (also Tab, Shift+Tab) | Next, previous pane, the three toolbars included; they also leave a text preview |
+| Left, Right, Home, End; Enter, Space, Down (in a toolbar) | Move between buttons; press one or open its menu (Down on Back or Forward opens the history); Esc returns to the files |
+| Down past the last tiles on Home, then Left, Right, Space or Enter | Reach and pick the Recent, Favorites and Shared pills |
 | Ctrl+Shift+E | Open this folder in Windows Explorer |
 | Esc | Stop a search, or cancel a cut |
+
+Long folder names in the address bar: each parent folder's name is cut at about 160 pixels (more at a larger
+display scale or text size) and ends with "...". The current folder gets the rest of the space and is cut only when
+it cannot fit even alone. Hover a cut name to see it in full, or click the empty part of the bar to see the whole
+path as text.
 
 ### Tabs and windows
 
@@ -123,6 +133,7 @@ These are the defaults, taken from the key table in the app. Where a key is rebo
 | Ctrl+1 to Ctrl+8, Ctrl+9 | Tab number n, last tab |
 | Ctrl+Enter, Ctrl+double-click, middle-click on a folder | Open in a background tab |
 | Ctrl+N | New window |
+| Drag a tab | Reorder it; drop it on another rexplorer window to move it there, anywhere else to open it in a new window |
 | F11 | Full screen |
 
 ### Files
@@ -132,8 +143,9 @@ These are the defaults, taken from the key table in the app. Where a key is rebo
 | F2, Delete, Shift+Delete, Ctrl+C, Ctrl+X, Ctrl+V, Ctrl+A, Alt+Enter | The usual verbs on the selection (Alt+Enter is Properties) |
 | F2, or click the name of a selected item again | Rename (the name is selected without its extension); Tab and Shift+Tab rename the next or previous item |
 | Ctrl+Shift+N | New folder, then rename it |
+| Right-click the background, New | The shell's New submenu. A new text document or folder opens its rename; a new shortcut is only selected, because the shortcut wizard asks for its name |
 | Ctrl+Shift+Enter | Run the selected program as administrator |
-| Ctrl+Z, Ctrl+Y | Undo, redo |
+| Ctrl+Z, Ctrl+Y | Undo, redo: rename, new items, delete, paste (also "Keep both" copies) and drops. Undo only touches a file it can prove it made or moved; otherwise it beeps. A file overwritten by Replace cannot be brought back |
 | Ctrl+I | Invert the selection |
 | Ctrl+Shift+C | Copy the selected paths as text |
 | Ctrl+` | Terminal in this folder |
@@ -143,7 +155,7 @@ These are the defaults, taken from the key table in the app. Where a key is rebo
 
 | Keys | Action |
 |---|---|
-| Ctrl+B | Show or hide the sidebar |
+| Ctrl+B | Show or hide the sidebar (More > Folder tree shows or hides the folder tree beside it) |
 | Alt+P | Show or hide the preview pane |
 | Alt+Shift+P | Show or hide the details pane |
 | Ctrl+Shift+1 to 8 | Extra large icons, large icons, medium icons, small icons, list, details, tiles, content |
@@ -165,13 +177,14 @@ cmd.back=Alt+Left, Backspace
 If you bind a chord that another command already uses, it is taken from that command. For example, `Ctrl+Y` is
 Redo by default, so giving it to another command removes it from Redo.
 
-Commands: `cmd.back`, `cmd.forward`, `cmd.up`, `cmd.refresh`, `cmd.address`, `cmd.explorer`, `cmd.enter`,
+Commands: `cmd.back`, `cmd.forward`, `cmd.up`, `cmd.refresh`, `cmd.address`, `cmd.address_history`,
+`cmd.explorer`, `cmd.enter`,
 `cmd.escape`, `cmd.properties`, `cmd.new_tab`, `cmd.close_tab`, `cmd.next_tab`, `cmd.prev_tab`, `cmd.palette`,
 `cmd.terminal`, `cmd.toggle_sidebar`, `cmd.toggle_preview`, `cmd.toggle_details`, `cmd.search`, `cmd.pin`,
 `cmd.view_details`, `cmd.view_icons`, `cmd.view_thumbnails`, `cmd.view_extra_large`, `cmd.view_medium`,
 `cmd.view_small`, `cmd.view_list`, `cmd.view_tiles`, `cmd.view_content`, `cmd.new_folder`, `cmd.open_tab`,
 `cmd.fullscreen`, `cmd.invert_selection`, `cmd.next_pane`, `cmd.prev_pane`, `cmd.new_window`, `cmd.undo`,
-`cmd.redo`, `cmd.copy_path`, `cmd.fit_columns`.
+`cmd.redo`, `cmd.copy_path`, `cmd.fit_columns`, `cmd.paste_shortcut`, `cmd.run_as_admin`.
 
 A chord is any of `Ctrl`, `Alt`, `Shift` plus one key. The key can be a letter, digit or backquote (these need Ctrl
 or Alt), `F1` to `F24`, `Left`, `Right`, `Up`, `Down`, `Enter`, `Esc`, `Tab`, `Space`, `Backspace`, `Delete`,
@@ -198,9 +211,9 @@ starting with `;` or `#` are comments. A missing key takes its default. A value 
 | `start` | path, `shell:` name or `::{CLSID}` | Home (`shell:::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}`) | Where a plain start and a new tab open. |
 | `theme` | theme name, or `system` | `dark` | Theme file in `themes\` without `.ini`. `system` follows Windows' app mode (light or dark). |
 | `view` | `details`, `small`, `medium`, `icons`, `thumbnails`, `extra-large`, `list`, `tiles` or `content` | `details` | View for a first run or `--profile`; later runs use the saved session. |
-| `show_tree` | true or false | `false` | Folder tree instead of the sidebar. |
+| `show_tree` | true or false | `false` | Folder tree, right of the sidebar (alone when the sidebar is hidden). |
 | `show_preview` | true or false | `false` | Preview pane. |
-| `tree_width` | number | `220` | Sidebar or tree width in pixels at 96 DPI. |
+| `tree_width` | number | `220` | Width of the sidebar and of the tree (each) in pixels at 96 DPI. |
 | `preview_width` | number | `360` | Preview pane width, same units. |
 | `show_hidden` | true or false | `false` | Show hidden files, folders and drives. |
 | `show_extensions` | true or false | `true` | Show file extensions. |
@@ -265,7 +278,8 @@ checked by eye above 100%.
 rexplorer speaks English and Spanish. With `language=system` it follows Windows. Set `language=en` or
 `language=es` under `[general]` and restart to choose. To add or change a language, put a UTF-8 file
 `%APPDATA%\rexplorer\lang\<code>.ini` with `key=text` lines (under 1 MiB) in place and set `language=<code>`.
-Keys you leave out stay in English.
+Keys you leave out stay in English. A file with a `[meta]` section holding `direction=rtl` lays the window out
+right to left; no such translation ships yet, and that layout has not been checked on screen.
 
 ## Command line
 
@@ -312,11 +326,18 @@ extensions can take a while. Wait, or press Back or open another folder. F5 trie
 rexplorer may not be reaching the running window. Check that the app is not stuck, then try Ctrl+Shift+E to open
 the folder in Explorer. If this keeps happening, give folders back to Explorer (see above).
 
-**Dragging files to other programs does not work.** This is a known problem; see the release notes and
-`docs/EXPLORER-PARITY.md`. Copy and paste (Ctrl+C, Ctrl+V) works.
+**Dragging files to some program does not work.** Drags into other programs and Explorer were proven, but not
+yet into browsers, WhatsApp or VS Code ([#75](https://github.com/CodingDiego/rexplorer/issues/75)). A drag that did
+nothing leaves a line in `%APPDATA%\rexplorer\rexplorer.log`; add it to the issue. Copy and paste (Ctrl+C, Ctrl+V)
+works.
 
-**F2 or click-again rename does not work.** Reported but not reproduced; see `docs/EXPLORER-PARITY.md`. Right-click,
-Rename is the fallback.
+**F2 or click-again rename does not work.** Both were proven with a real keyboard and mouse (see
+[EXPLORER-PARITY.md](EXPLORER-PARITY.md)); if it fails for you, open an issue and say where. Right-click, Rename is
+the fallback.
+Inside a .rar, rename is not possible (archives are read-only) and F2 says so.
+
+**Undo beeps and does nothing.** Undo only touches a file it can prove it made or moved. If the file was changed,
+replaced or re-created since, it is left alone on purpose.
 
 **Search is slow or misses files.** Searches of non-indexed folders walk the disk. Turn off
 **Include system folders** or **Include compressed files** in Folder options > Search. A search of a whole
@@ -334,8 +355,12 @@ the folder in Windows Explorer instead. Two things are kept on your disk, and no
 
 - `%APPDATA%\rexplorer\rexplorer.log` records hangs of the window, panics and failed drags. It starts again once it
   passes 64 KB.
-- `%LOCALAPPDATA%\rexplorer\crashes` holds a crash dump (`.dmp`) for each crash, plus a `.txt` report with the
-  message and stack for a panic. The newest 10 dumps are kept. If that variable is not set, the temp folder is used.
+- `%LOCALAPPDATA%\rexplorer\crashes` holds a crash dump (`.dmp`) for each crash and a short `.txt` report beside
+  it: for a panic the message and stack, written at once; for any other crash the exception, the address and the
+  module, written when rexplorer next starts (usually right away, by the automatic restart). The newest 10 dumps are
+  kept, each with its report. One empty `.seh` file in that folder while rexplorer runs is normal. If that variable
+  is not set, the temp folder is used.
 
-To report a crash, attach what you are comfortable sharing from these files and say what you did before it and
-which version you ran.
+To report a crash, attach what you are comfortable sharing from these files (read the `.txt` first; the `.dmp` can
+hold names of files you had open) to a GitHub issue, or to a private report as `SECURITY.md` explains, and say what you did before it
+and which version you ran.

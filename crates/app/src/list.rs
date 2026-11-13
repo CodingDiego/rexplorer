@@ -6,7 +6,7 @@ use windows::Win32::Graphics::Gdi::{
     CreateSolidBrush, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DrawTextW, FillRect, SelectObject, SetBkMode,
     SetTextColor, TRANSPARENT,
 };
-use crate::nav::{self, cur, go_up, listing, open_in_background, sort_listing, source};
+use crate::nav::{self, cur, listing, open_in_background, sort_listing, source};
 use crate::source::Source;
 use crate::ui::Entry;
 use rexplorer_core::dragdrop;
@@ -73,12 +73,8 @@ pub(crate) unsafe fn on_notify(app: *mut App, lparam: LPARAM) -> LRESULT {
             // The ListView selects all the text after this returns, so the stem selection is posted behind it.
             // Tab and Shift+Tab in the edit are comctl32's own: commit, then edit the next / previous row.
             let i = (*(lparam.0 as *const NMLVDISPINFOW)).item.iItem as usize;
-            let item = match source(app) {
-                Some(Source::Shell(l)) => l.items.get(i).cloned(),
-                Some(Source::Search(_)) => source::search_item(app, i),
-                _ => None,
-            };
-            let Some(item) = item else { return LRESULT(1) };
+            let Some(item) = editable_item(app, i) else { return LRESULT(1) };
+            (*app).renaming = Some(item.parsing_name());
             if let Some(n) = source::rename_stem(&item) {
                 select_stem_later((*app).list, n);
             }
@@ -527,14 +523,14 @@ unsafe fn row_at(list: HWND, pt: POINTL) -> isize {
     SendMessageW(list, LVM_HITTEST, None, Some(LPARAM(&mut ht as *mut _ as isize))).0
 }
 
-/// What a paste or drop of `sources` into `dest` may create, read before the shell runs it: only names free now.
-pub(crate) fn plan_transfer(sources: &[String], dest: &str) -> Vec<(String, String)> {
+/// A paste or drop of `sources` into `dest`, read before the shell runs it (see `undo::plan_transfer`).
+pub(crate) fn plan_transfer(sources: &[String], dest: &str) -> Vec<undo::Sent> {
     if !ui::is_fs_path(dest) {
         return Vec::new();
     }
     let temp = std::env::temp_dir().to_string_lossy().to_lowercase();
     let sources: Vec<String> = sources.iter().filter(|s| !extracted_for_transfer(&s.to_lowercase(), &temp)).cloned().collect();
-    undo::plan_transfer(&sources, dest, |p| std::path::Path::new(p).exists())
+    undo::plan_transfer(&sources, dest)
 }
 
 /// Files an archive was extracted to for a transfer (the zip folder's `%TEMP%\Temp1_x.zip`, our own archive
@@ -588,15 +584,31 @@ pub(crate) unsafe fn register_drop(app: *mut App) {
     let _ = dragdrop::register((*app).list, Box::new(pick), Some(Box::new(on_drop)));
 }
 
-/// Plans a drop into `dest` before it runs, and records it for undo once the target says what it did: copies and
-/// moves as a transfer, shortcuts ("Create shortcuts here", Alt or a system folder) as the .lnk files that appeared.
-fn record_drop(app: usize, data: &IDataObject, dest: String) -> dragdrop::AfterDrop {
+/// Plans a drop into `dest` before it runs; what it returns gives the undo entry once the target says what it did:
+/// copies and moves as a transfer, shortcuts ("Create shortcuts here", Alt or a system folder) as the .lnk files
+/// that appeared. A drop that did nothing (refused, cancelled, its right-drag menu dismissed) gives an empty entry,
+/// which is not recorded.
+pub(crate) fn plan_drop(data: &IDataObject, dest: String) -> impl FnOnce(windows::Win32::System::Ole::DROPEFFECT) -> Op + use<> {
     let pairs = plan_transfer(&dragdrop::hdrop_paths(data), &dest);
     let links = shortcut_names(&dest);
-    Box::new(move |effect| unsafe {
-        let op = if effect == windows::Win32::System::Ole::DROPEFFECT_LINK { Op::Created(new_shortcuts(&dest, &links)) } else { Op::Transfer(pairs) };
-        (*(app as *mut App)).undo.record(op);
-    })
+    move |effect| drop_entry(effect, pairs, || new_shortcuts(&dest, &links))
+}
+
+fn drop_entry(effect: windows::Win32::System::Ole::DROPEFFECT, pairs: Vec<undo::Sent>, links: impl FnOnce() -> Vec<String>) -> Op {
+    use windows::Win32::System::Ole::{DROPEFFECT_LINK, DROPEFFECT_NONE};
+    if effect == DROPEFFECT_NONE {
+        Op::Transfer(Vec::new())
+    } else if effect == DROPEFFECT_LINK {
+        Op::created(links())
+    } else {
+        Op::Transfer(pairs)
+    }
+}
+
+/// Records a drop into `dest` for undo (`plan_drop`).
+fn record_drop(app: usize, data: &IDataObject, dest: String) -> dragdrop::AfterDrop {
+    let op = plan_drop(data, dest);
+    Box::new(move |effect| unsafe { (*(app as *mut App)).undo.record(op(effect)) })
 }
 
 /// The .lnk file names in `dir`.
@@ -779,8 +791,13 @@ pub(crate) unsafe fn show_menu(app: *mut App, on_item: bool, at: Option<POINT>) 
     let at = GetMenuItemCount(Some(hmenu)).max(0) as u32;
     let extended = GetKeyState(VK_SHIFT.0 as i32) < 0;
     (*app).active_menu = Some(menu);
-    let generation = (*app).generation;
-    let picked = (*app).active_menu.as_ref().unwrap().show_in(hwnd, hmenu, at, pt.x, pt.y, extended);
+    // What New will be told apart from: the menu pumps messages, and the change watch may reload the listing with the
+    // new item before the pick returns.
+    let before = if on_item { None } else { commands::names_now(app) };
+    let picked = (*app)
+        .active_menu
+        .as_ref()
+        .map_or(Err(windows::Win32::Foundation::E_UNEXPECTED.into()), |m| m.show_in(hwnd, hmenu, at, pt.x, pt.y, extended));
     (*app).active_menu = None;
     let _ = DestroyMenu(hmenu);
     for b in bitmaps {
@@ -803,8 +820,11 @@ pub(crate) unsafe fn show_menu(app: *mut App, on_item: bool, at: Option<POINT>) 
                 SetTimer(Some(hwnd), TIMER_REFRESH, 300, None);
             }
         }
-        // No load started meanwhile: the listing is still the one without the new item.
-        Ok(Picked::New) if (*app).generation == generation => commands::new_item_made(app),
+        Ok(Picked::New) => {
+            if let Some(before) = before {
+                commands::new_item_made(app, before);
+            }
+        }
         Ok(Picked::Invoked(verb)) if verb.eq_ignore_ascii_case("paste") => {
             (*app).undo.record(Op::Transfer(paste_pairs));
             if home {
@@ -928,8 +948,9 @@ pub(crate) unsafe fn on_key(app: *mut App, key: VIRTUAL_KEY) {
     let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
     let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
     match key {
-        VK_BACK => go_up(app),
-        VK_F2 if matches!(source(app), Some(Source::Shell(_) | Source::Search(_))) => begin_rename(app),
+        // Windows 11 Explorer: Backspace goes Back (Alt+Up goes up).
+        VK_BACK => nav::go_back(app),
+        VK_F2 if matches!(source(app), Some(Source::Shell(_) | Source::Search(_) | Source::Archive(_))) => begin_rename(app),
         VK_DELETE => verb_on_selection(app, "delete", shift),
         VK_C if ctrl && !shift => verb_on_selection(app, "copy", false),
         VK_X if ctrl => verb_on_selection(app, "cut", false),
@@ -1111,7 +1132,7 @@ pub(crate) unsafe fn paste_shortcut(app: *mut App) {
         dragdrop::paste_link(&l.folder, (*app).hwnd).map(|()| dir.zip(before).map(|(d, b)| new_shortcuts(&d, &b)))
     };
     match made {
-        Ok(Some(made)) => (*app).undo.record(Op::Created(made)),
+        Ok(Some(made)) => (*app).undo.record(Op::created(made)),
         Ok(None) => {}
         Err(_) => {
             let _ = MessageBeep(MB_OK);
@@ -1148,6 +1169,12 @@ pub(crate) unsafe fn undo_step(app: *mut App, redo: bool) {
 pub(crate) unsafe fn begin_rename(app: *mut App) {
     let list = (*app).list;
     let i = SendMessageW(list, LVM_GETNEXTITEM, Some(WPARAM(usize::MAX)), Some(LPARAM(LVNI_FOCUSED as isize))).0;
+    if i >= 0 && matches!(source(app), Some(Source::Archive(_))) {
+        // unrar only reads archives and rexplorer never rewrites them; say so instead of doing nothing.
+        let t = HSTRING::from(tr("err.archive_readonly"));
+        MessageBoxW(Some((*app).hwnd), PCWSTR(t.as_ptr()), w!("rexplorer"), crate::rtl::message_box() | MB_OK | MB_ICONINFORMATION);
+        return;
+    }
     if i < 0 || !matches!(source(app), Some(Source::Shell(_) | Source::Search(_))) {
         return;
     }
@@ -1176,10 +1203,40 @@ pub(crate) unsafe fn invert_selection(app: *mut App) {
     let _ = InvalidateRect(Some(list), None, true);
 }
 
-unsafe fn on_end_edit(app: *mut App, item: &LVITEMW) {
-    if !item.pszText.is_null() {
-        rename_item(app, item.iItem as usize, &item.pszText.to_string().unwrap_or_default(), true);
+/// Row `i` of the list when it can be renamed: shell items and search results.
+unsafe fn editable_item(app: *mut App, i: usize) -> Option<ShellItem> {
+    match source(app) {
+        Some(Source::Shell(l)) => l.items.get(i).cloned(),
+        Some(Source::Search(_)) => source::search_item(app, i),
+        _ => None,
     }
+}
+
+unsafe fn on_end_edit(app: *mut App, item: &LVITEMW) {
+    let opened = (*app).renaming.take();
+    if item.pszText.is_null() {
+        return;
+    }
+    // The commit names a row by position; it goes to the item the edit was opened on, wherever it is now, and is
+    // dropped when that item is gone (the folder changed under the edit).
+    let n = source(app).map_or(0, |s| s.len());
+    let row = opened.and_then(|o| edit_row(&o, item.iItem as usize, n, |i| editable_item(app, i).map(|it| it.parsing_name())));
+    if let Some(i) = row {
+        rename_item(app, i, &item.pszText.to_string().unwrap_or_default(), true);
+    }
+}
+
+/// The row now holding the item a label edit was opened on (`opened`, a parsing name): `index` when it still does,
+/// else wherever that item is among the `n` rows, None when it is gone.
+fn edit_row(opened: &str, index: usize, n: usize, name: impl Fn(usize) -> Option<String>) -> Option<usize> {
+    // Nothing remembered: an item without a parsing name would match it, and the commit would rename that item.
+    if opened.is_empty() {
+        return None;
+    }
+    if name(index).as_deref() == Some(opened) {
+        return Some(index);
+    }
+    (0..n).find(|&i| name(i).as_deref() == Some(opened))
 }
 
 /// Renames item `index` of the active listing to `name` (the shell shows its own error UI).
@@ -1198,9 +1255,10 @@ pub(crate) unsafe fn rename_item(app: *mut App, index: usize, name: &str, cell: 
                 Some(ext) => target.rename((*app).hwnd, &format!("{name}{ext}"), true),
                 None => target.rename((*app).hwnd, name, false),
             };
-            if done.is_ok() {
-                (*app).undo.record(Op::Rename { from: before, to: target.parsing_name() });
-            }
+            if done.is_ok()
+                && let Some(op) = Op::rename(before, target.parsing_name()) {
+                    (*app).undo.record(op);
+                }
             // Search results are updated in place: a refresh would run the search again.
             if let Some(Source::Search(s)) = &mut cur(app).source {
                 if let (Ok(()), Some(r)) = (done, s.rows.get_mut(index)) {
@@ -1319,8 +1377,7 @@ unsafe fn draw_group(app: *mut App, cd: &NMLVCUSTOMDRAW) -> u32 {
     let old = SelectObject(dc, windows::Win32::Graphics::Gdi::HGDIOBJ(font as *mut c_void));
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, COLORREF(t.text));
-    let mut text: Vec<u16> = label.encode_utf16().collect();
-    DrawTextW(dc, &mut text, &mut RECT { left: r.left + pad, ..r }, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+    crate::theme::draw_text(dc, label, &mut RECT { left: r.left + pad, ..r }, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
     SelectObject(dc, old);
     let b = CreateSolidBrush(COLORREF(t.border));
     FillRect(dc, &RECT { left: r.left + pad, top: r.bottom - dpi / 96, right: r.right - pad, bottom: r.bottom }, b);
@@ -1514,7 +1571,7 @@ unsafe fn draw_header(t: &Theme, nm: &NMCUSTOMDRAW) -> u32 {
             let p = 8 * dpi / 96;
             let mut tr = RECT { left: r.left + p, right: r.right - p, ..r };
             let align = if hi.fmt.0 & HDF_RIGHT.0 != 0 { DT_RIGHT } else { Default::default() };
-            DrawTextW(nm.hdc, &mut buf[..len], &mut tr, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX | align);
+            DrawTextW(nm.hdc, &mut buf[..len], &mut tr, crate::rtl::text(DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX | align));
             if hi.fmt.0 & (HDF_SORTUP.0 | HDF_SORTDOWN.0) != 0 {
                 let mut glyph = [if hi.fmt.0 & HDF_SORTUP.0 != 0 { 0xE70E } else { 0xE70D }];
                 let font = theme::icon_font(dpi as u32, 8);
@@ -1583,6 +1640,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_rename_commit_follows_the_item_not_the_row() {
+        let rows = |names: &'static [&'static str]| move |i: usize| names.get(i).map(|s| s.to_string());
+        assert_eq!(edit_row(r"C:\b\x.txt", 1, 3, rows(&[r"C:\b\a", r"C:\b\x.txt", r"C:\b\z"])), Some(1));
+        assert_eq!(edit_row(r"C:\b\x.txt", 1, 3, rows(&[r"C:\b\new", r"C:\b\a", r"C:\b\x.txt"])), Some(2), "moved");
+        // The window went Back to another folder: its row 1 is someone else's file.
+        assert_eq!(edit_row(r"C:\b\x.txt", 1, 3, rows(&[r"C:\a\1", r"C:\a\2", r"C:\a\3"])), None);
+        assert_eq!(edit_row(r"C:\b\x.txt", 5, 0, rows(&[])), None);
+        assert_eq!(edit_row("", 1, 3, rows(&[r"C:\b\a", "", r"C:\b\z"])), None, "an empty name matches nothing");
+    }
+
+    #[test]
     fn new_shortcuts_lists_only_lnk_files_made_since() {
         let dir = std::env::temp_dir().join(format!("rexplorer-newlnk-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1594,6 +1662,21 @@ mod tests {
         std::fs::write(dir.join("a.txt - Shortcut.lnk"), b"x").unwrap();
         std::fs::write(dir.join("b.txt"), b"x").unwrap();
         assert_eq!(new_shortcuts(&d, &before), [dir.join("a.txt - Shortcut.lnk").to_string_lossy().into_owned()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_drop_that_did_nothing_records_nothing() {
+        use windows::Win32::System::Ole::{DROPEFFECT_COPY, DROPEFFECT_MOVE, DROPEFFECT_NONE};
+        let dir = std::env::temp_dir().join(format!("rexplorer-dropentry-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("dst")).unwrap();
+        std::fs::write(dir.join("a.txt"), b"x").unwrap();
+        let plan = || undo::plan_transfer(&[dir.join("a.txt").to_string_lossy().into_owned()], &dir.join("dst").to_string_lossy());
+        assert_eq!(plan().len(), 1);
+        assert_eq!(drop_entry(DROPEFFECT_NONE, plan(), Vec::new), Op::Transfer(Vec::new()));
+        for e in [DROPEFFECT_COPY, DROPEFFECT_MOVE] {
+            assert_eq!(drop_entry(e, plan(), Vec::new), Op::Transfer(plan()), "{e:?}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

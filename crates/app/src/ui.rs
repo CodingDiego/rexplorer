@@ -16,7 +16,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::Storage::FileSystem::GetDriveTypeW;
 use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN};
-use windows::Win32::System::WindowsProgramming::DRIVE_REMOTE;
+use windows::Win32::System::WindowsProgramming::{DRIVE_FIXED, DRIVE_REMOTE};
 
 /// A tooltip: the translated name, then the untranslated key hint in parentheses (the accessible name splits there).
 pub(crate) fn tip(key: &'static str, hint: &str) -> String {
@@ -64,6 +64,11 @@ pub(crate) fn is_remote(p: &str) -> bool {
     p.starts_with("\\\\") || (drive && unsafe { GetDriveTypeW(&HSTRING::from(&p[..3])) } == DRIVE_REMOTE)
 }
 
+/// A path on a local fixed disk: quick to read from the UI thread.
+pub(crate) fn is_fixed_drive(p: &str) -> bool {
+    p.get(1..3) == Some(":\\") && unsafe { GetDriveTypeW(&HSTRING::from(&p[..3])) } == DRIVE_FIXED
+}
+
 pub(crate) unsafe fn create_children(app: *mut App) -> Result<()> {
     let hwnd = (*app).hwnd;
     let hinst: HINSTANCE = GetModuleHandleW(None)?.into();
@@ -72,6 +77,7 @@ pub(crate) unsafe fn create_children(app: *mut App) -> Result<()> {
     (*app).nav = toolbar::create(hwnd, ID_NAV, &[(0xE72B, CMD_BACK, &back), (0xE72A, CMD_FORWARD, &forward), (0xE74A, CMD_UP, &up), (0xE72C, CMD_REFRESH, &refresh)])?;
     let _ = SetWindowTextW((*app).nav, &HSTRING::from(tr("tb.nav_name"))); // the accessible name
     toolbar::set_group((*app).nav, &[CMD_BACK, CMD_FORWARD]);
+    toolbar::set_hold((*app).nav, &[CMD_BACK, CMD_FORWARD]);
     (*app).crumbs = breadcrumb::create(hwnd, ID_CRUMBS)?;
     // The address Edit sits on top of the breadcrumb while editing; keep the breadcrumb from painting over it.
     let style = GetWindowLongPtrW((*app).crumbs, GWL_STYLE);
@@ -91,7 +97,7 @@ pub(crate) unsafe fn create_children(app: *mut App) -> Result<()> {
         None,
     )?;
     (*app).search = CreateWindowExW(
-        WINDOW_EX_STYLE(0),
+        crate::rtl::reading(),
         WC_EDITW,
         PCWSTR::null(),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
@@ -120,7 +126,7 @@ pub(crate) unsafe fn create_children(app: *mut App) -> Result<()> {
     (*app).cmdbar = commands::create(hwnd)?;
     let _ = windows::Win32::System::DataExchange::AddClipboardFormatListener(hwnd);
     (*app).sidebar = sidebar::create(hwnd, ID_SIDEBAR)?;
-    if !(*app).session.show_tree && (*app).session.show_sidebar {
+    if (*app).session.show_sidebar {
         let _ = ShowWindow((*app).sidebar, SW_SHOW);
     }
     let list_style = LVS_REPORT | LVS_OWNERDATA | LVS_SHOWSELALWAYS | LVS_EDITLABELS | LVS_SHAREIMAGELISTS;
@@ -372,20 +378,21 @@ fn next_pane(at: Option<usize>, n: usize, back: bool) -> usize {
     }
 }
 
-/// The panes in F6 order; the crumbs, the left pane, the strip and the toolbars (navigation, tools, command bar)
-/// are left out when hidden.
-fn panes_in_order<T>(view: T, crumbs: Option<T>, addr: T, search: T, left: Option<T>, strip: Option<T>, bars: [Option<T>; 3]) -> Vec<T> {
+/// The panes in F6 order; the crumbs, the left panes (sidebar, folder tree), the strip and the toolbars (navigation,
+/// tools, command bar) are left out when hidden.
+fn panes_in_order<T>(view: T, crumbs: Option<T>, addr: T, search: T, left: [Option<T>; 2], strip: Option<T>, bars: [Option<T>; 3]) -> Vec<T> {
     let [nav, tools, cmds] = bars;
-    [Some(view), crumbs, Some(addr), Some(search), left, strip, nav, tools, cmds].into_iter().flatten().collect()
+    let [side, tree] = left;
+    [Some(view), crumbs, Some(addr), Some(search), side, tree, strip, nav, tools, cmds].into_iter().flatten().collect()
 }
 
 /// Moves the keyboard focus (F6, Tab) around the view, the breadcrumb, the address bar, the search box, the left
-/// pane (the folder tree, else the sidebar, when shown), the tab strip and the toolbars.
+/// panes (the sidebar and the folder tree, when shown), the tab strip and the toolbars.
 pub(crate) unsafe fn cycle_focus(app: *mut App, back: bool) {
     let view = source::browser_hwnd(app).unwrap_or_else(|| view_hwnd(app));
     let tree = (*app).panes.tree.as_ref().filter(|_| (*app).session.show_tree).map(|t| t.hwnd());
     let shown = |h: HWND| IsWindowVisible(h).as_bool().then_some(h);
-    let left = tree.or_else(|| shown((*app).sidebar));
+    let left = [shown((*app).sidebar), tree];
     // The address Edit covers the breadcrumb while it is shown.
     let crumbs = shown((*app).crumbs).filter(|_| !IsWindowVisible((*app).addr).as_bool());
     let bars = [(*app).nav, (*app).tools, (*app).cmdbar].map(shown);
@@ -401,6 +408,19 @@ pub(crate) unsafe fn cycle_focus(app: *mut App, back: bool) {
             SendMessageW(h, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
         }
     }
+}
+
+/// Alt or F10 pressed and released alone: SC_KEYMENU with no key (Alt+letter and Alt+Space carry theirs). Shift+F10
+/// is the context menu's.
+pub(crate) fn is_bare_menu_key(wparam: usize, lparam: isize, shift: bool) -> bool {
+    wparam & 0xFFF0 == SC_KEYMENU as usize && lparam == 0 && !shift
+}
+
+/// Alt or F10: Explorer has no menu bar, so the keyboard goes to the command bar; again, back to the view.
+pub(crate) unsafe fn focus_command_bar(app: *mut App) {
+    let bar = (*app).cmdbar;
+    let to = if GetFocus() == bar || !IsWindowVisible(bar).as_bool() { source::browser_hwnd(app).unwrap_or_else(|| view_hwnd(app)) } else { bar };
+    let _ = SetFocus(Some(to));
 }
 
 /// WM_PAINT of the main window: the frame color everywhere the children leave, and the search field.
@@ -428,6 +448,7 @@ pub(crate) unsafe fn paint(app: *mut App) {
         let _ = DeleteObject(glyphs.into());
     }
     let _ = EndPaint(hwnd, &ps);
+    crate::instance::signal_painted(hwnd);
 }
 
 // ---- address Edit over the breadcrumb ----------------------------------------------------------
@@ -462,12 +483,30 @@ pub(crate) unsafe fn show_edit(app: *mut App) {
     SendMessageW(addr, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
 }
 
+/// F4, Explorer's address dropdown: the bar opens for typing with the places last gone to listed under it, newest
+/// first; a pick goes there.
+pub(crate) unsafe fn address_history(app: *mut App) {
+    show_edit(app);
+    let places: Vec<String> = (*app).recent.items().iter().take(16).cloned().collect();
+    if places.is_empty() {
+        return;
+    }
+    let entries: Vec<(usize, String)> = places.iter().enumerate().map(|(i, p)| (i + 1, p.replace('&', "&&"))).collect();
+    let mut r = RECT::default();
+    let _ = GetWindowRect((*app).crumbs, &mut r);
+    let picked = popup(app, &entries, &[], crate::rtl::menu_x(&r), r.bottom);
+    if let Some(place) = picked.checked_sub(1).and_then(|i| places.get(i)) {
+        go(app, Target::Name(place.clone()), nav::History::Push);
+        let _ = SetFocus(Some(view_hwnd(app)));
+    }
+}
+
 /// On EN_KILLFOCUS: whatever was typed and not entered is dropped.
 pub(crate) unsafe fn hide_edit(app: *mut App) {
     if let Some(l) = &cur(app).loading {
-        set_text((*app).addr, &l.parsing);
+        set_text((*app).addr, &crate::connect::redact(&l.parsing));
     } else if let Some(s) = source(app) {
-        set_text((*app).addr, &s.editing_name());
+        set_text((*app).addr, &crate::connect::redact(&s.editing_name()));
     }
     let _ = ShowWindow((*app).addr, SW_HIDE);
     set_crumbs(app);
@@ -496,7 +535,7 @@ pub(crate) unsafe fn popup(app: *mut App, entries: &[(usize, String)], checked: 
             let _ = AppendMenuW(menu, MF_STRING | check, *id, PCWSTR(h.as_ptr()));
         }
     }
-    let picked = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, x, y, None, (*app).hwnd, None).0 as usize;
+    let picked = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | crate::rtl::menu(), x, y, None, (*app).hwnd, None).0 as usize;
     let _ = DestroyMenu(menu);
     picked
 }
@@ -573,7 +612,7 @@ pub(crate) unsafe fn build_menu(owner: HWND, entries: &[Entry], bitmaps: &mut Ve
 pub(crate) unsafe fn pick_entries(app: *mut App, entries: &[Entry], x: i32, y: i32) -> Option<usize> {
     let mut bitmaps = Vec::new();
     let menu = build_menu((*app).hwnd, entries, &mut bitmaps);
-    let picked = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, x, y, None, (*app).hwnd, None).0 as usize;
+    let picked = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | crate::rtl::menu(), x, y, None, (*app).hwnd, None).0 as usize;
     let _ = DestroyMenu(menu);
     for b in bitmaps {
         let _ = DeleteObject(b.into());
@@ -695,9 +734,8 @@ pub(crate) unsafe fn more_menu(app: *mut App) {
     } else {
         (CMD_REGISTER as usize, tr("menu.more.register").to_string())
     };
-    let tree = if (*app).session.show_tree { tr("menu.more.places_sidebar") } else { tr("menu.view.folder_tree") };
     let mut entries = vec![
-        (CMD_FOLDER_TREE as usize, tree.to_string()),
+        (CMD_FOLDER_TREE as usize, tr("menu.view.folder_tree").to_string()),
         (0, String::new()),
         (CMD_PIN as usize, hinted("menu.more.pin_home", "Ctrl+D")),
         (CMD_EXPLORER as usize, hinted("menu.more.open_explorer", "Ctrl+Shift+E")),
@@ -721,7 +759,8 @@ pub(crate) unsafe fn more_menu(app: *mut App) {
         entries.extend(quick.iter().enumerate().map(|(i, (label, _))| (QUICK + i, label.clone())));
     }
     let r = toolbar::button_rect((*app).cmdbar, CMD_MORE).unwrap_or_default();
-    let picked = popup(app, &entries, &[], r.left, r.bottom);
+    let tree_on = if (*app).session.show_tree { &[CMD_FOLDER_TREE as usize][..] } else { &[] };
+    let picked = popup(app, &entries, tree_on, crate::rtl::menu_x(&r), r.bottom);
     if let Some((_, target)) = picked.checked_sub(QUICK).and_then(|i| quick.get(i)) {
         go(app, Target::Name(target.clone()), nav::History::Push);
     } else if picked != 0 {
@@ -743,7 +782,7 @@ pub(crate) unsafe fn register_flow(owner: Option<HWND>, unregister: bool, quiet:
             trf("dlg.register.start", &[("plan", &install::takeover_plan(&base, &exe))])
         };
         let q = HSTRING::from(question);
-        if MessageBoxW(owner, PCWSTR(q.as_ptr()), w!("rexplorer"), MB_YESNO | MB_ICONQUESTION) != IDYES {
+        if MessageBoxW(owner, PCWSTR(q.as_ptr()), w!("rexplorer"), crate::rtl::message_box() | MB_YESNO | MB_ICONQUESTION) != IDYES {
             return InstallOutcome::Cancelled;
         }
     }
@@ -776,7 +815,7 @@ pub(crate) unsafe fn register_flow(owner: Option<HWND>, unregister: bool, quiet:
     };
     if let Some((text, icon)) = report.filter(|_| !quiet) {
         let t = HSTRING::from(text);
-        MessageBoxW(owner, PCWSTR(t.as_ptr()), w!("rexplorer"), MB_OK | icon);
+        MessageBoxW(owner, PCWSTR(t.as_ptr()), w!("rexplorer"), crate::rtl::message_box() | MB_OK | icon);
     }
     outcome
 }
@@ -804,7 +843,7 @@ pub(crate) unsafe fn install_flow(owner: Option<HWND>, uninstall: bool, confirm:
         };
         let q = HSTRING::from(question);
         // A standalone install changes no association any more: an ordinary question, Yes by default.
-        if MessageBoxW(owner, PCWSTR(q.as_ptr()), w!("rexplorer"), MB_YESNO | MB_ICONQUESTION) != IDYES {
+        if MessageBoxW(owner, PCWSTR(q.as_ptr()), w!("rexplorer"), crate::rtl::message_box() | MB_YESNO | MB_ICONQUESTION) != IDYES {
             return InstallOutcome::Cancelled;
         }
     }
@@ -843,7 +882,7 @@ pub(crate) unsafe fn install_flow(owner: Option<HWND>, uninstall: bool, confirm:
     }
     if let Some((text, icon)) = report.filter(|_| !quiet) {
         let t = HSTRING::from(text);
-        MessageBoxW(owner, PCWSTR(t.as_ptr()), w!("rexplorer"), MB_OK | icon);
+        MessageBoxW(owner, PCWSTR(t.as_ptr()), w!("rexplorer"), crate::rtl::message_box() | MB_OK | icon);
     }
     outcome
 }
@@ -865,7 +904,7 @@ unsafe fn offer_rollback(
     let config = TASKDIALOGCONFIG {
         cbSize: size_of::<TASKDIALOGCONFIG>() as u32,
         hwndParent: owner.unwrap_or_default(),
-        dwFlags: TDF_USE_COMMAND_LINKS,
+        dwFlags: TDF_USE_COMMAND_LINKS | crate::rtl::task_dialog(),
         pszWindowTitle: w!("rexplorer"),
         Anonymous1: TASKDIALOGCONFIG_0 { pszMainIcon: TD_WARNING_ICON },
         pszMainInstruction: PCWSTR(title.as_ptr()),
@@ -880,7 +919,7 @@ unsafe fn offer_rollback(
         picked == ROLL_BACK
     } else {
         let q = HSTRING::from(trf("dlg.rollback.question", &[("error", &error.message())]));
-        MessageBoxW(owner, PCWSTR(q.as_ptr()), w!("rexplorer"), MB_YESNO | MB_ICONWARNING) == IDYES
+        MessageBoxW(owner, PCWSTR(q.as_ptr()), w!("rexplorer"), crate::rtl::message_box() | MB_YESNO | MB_ICONWARNING) == IDYES
     };
     if roll_back {
         let (text, icon) = match rollback.run() {
@@ -888,7 +927,7 @@ unsafe fn offer_rollback(
             Err(e) => (e.message(), MB_ICONERROR),
         };
         let t = HSTRING::from(text);
-        MessageBoxW(owner, PCWSTR(t.as_ptr()), w!("rexplorer"), MB_OK | icon);
+        MessageBoxW(owner, PCWSTR(t.as_ptr()), w!("rexplorer"), crate::rtl::message_box() | MB_OK | icon);
     } else {
         rollback.commit(dir);
     }
@@ -909,13 +948,17 @@ pub(crate) unsafe fn import_explorer_flow(profile: Option<&str>, overwrite: bool
     let t = windows::Win32::System::SystemInformation::GetLocalTime();
     let day = format!("settings.ini.bak-{:04}-{:02}-{:02}", t.wYear, t.wMonth, t.wDay);
     // Never reuse an existing backup: it may predate values set by hand since.
-    let bak = (1..).map(|n| dir.join(if n == 1 { day.clone() } else { format!("{day}-{n}") })).find(|b| !b.exists()).unwrap();
-    let ok = write.is_empty() || (std::fs::copy(&ini, &bak).is_ok() && views::try_save_profile_keys(&p.name, &write).is_ok());
+    let bak = (1..u32::MAX).map(|n| dir.join(if n == 1 { day.clone() } else { format!("{day}-{n}") })).find(|b| !b.exists());
+    let ok = write.is_empty()
+        || bak.as_ref().is_some_and(|b| std::fs::copy(&ini, b).is_ok() && views::try_save_profile_keys(&p.name, &write).is_ok());
     let list = |v: Vec<String>| if v.is_empty() { format!("  {}", tr("dlg.import.none")) } else { v.join("\n") };
     let text = if !ok {
         trf("dlg.import.failed", &[("path", &ini.display())])
     } else {
-        let backup = if write.is_empty() { tr("dlg.import.not_needed").to_string() } else { bak.display().to_string() };
+        let backup = match bak {
+            Some(b) if !write.is_empty() => b.display().to_string(),
+            _ => tr("dlg.import.not_needed").to_string(),
+        };
         trf(
             "dlg.import.report",
             &[
@@ -929,7 +972,7 @@ pub(crate) unsafe fn import_explorer_flow(profile: Option<&str>, overwrite: bool
         )
     };
     let h = HSTRING::from(text);
-    MessageBoxW(None, PCWSTR(h.as_ptr()), w!("rexplorer"), MB_OK | if ok { MB_ICONINFORMATION } else { MB_ICONERROR });
+    MessageBoxW(None, PCWSTR(h.as_ptr()), w!("rexplorer"), crate::rtl::message_box() | MB_OK | if ok { MB_ICONINFORMATION } else { MB_ICONERROR });
     ok
 }
 
@@ -939,7 +982,7 @@ pub(crate) unsafe fn about(app: *mut App) {
         &[("version", &env!("CARGO_PKG_VERSION")), ("profile", &(*app).profile.name), ("theme", &(*app).theme.name), ("dir", &settings::dir().display())],
     );
     let h = HSTRING::from(text);
-    MessageBoxW(Some((*app).hwnd), PCWSTR(h.as_ptr()), w!("rexplorer"), MB_OK | MB_ICONINFORMATION);
+    MessageBoxW(Some((*app).hwnd), PCWSTR(h.as_ptr()), w!("rexplorer"), crate::rtl::message_box() | MB_OK | MB_ICONINFORMATION);
 }
 
 // ---- palette, terminal, status -----------------------------------------------------------------
@@ -1048,7 +1091,19 @@ pub(crate) unsafe fn update_status(app: *mut App) {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_fs_path, next_pane, panes_in_order};
+    use super::{is_bare_menu_key, is_fs_path, next_pane, panes_in_order};
+    use windows::Win32::UI::WindowsAndMessaging::{SC_CLOSE, SC_KEYMENU};
+
+    #[test]
+    fn alt_or_f10_alone_is_the_menu_key() {
+        let k = SC_KEYMENU as usize;
+        assert!(is_bare_menu_key(k, 0, false));
+        assert!(is_bare_menu_key(k | 3, 0, false), "the low four bits are the system's own");
+        assert!(!is_bare_menu_key(k, ' ' as isize, false), "Alt+Space: the window menu");
+        assert!(!is_bare_menu_key(k, 'f' as isize, false), "Alt+letter");
+        assert!(!is_bare_menu_key(k, 0, true), "Shift+F10: the context menu");
+        assert!(!is_bare_menu_key(SC_CLOSE as usize, 0, false));
+    }
 
     #[test]
     fn fs_paths() {
@@ -1068,10 +1123,11 @@ mod tests {
         assert_eq!(next_pane(Some(2), 3, true), 1);
         assert_eq!((next_pane(None, 3, false), next_pane(None, 3, true)), (0, 0));
         let bars = [Some("nav"), Some("tools"), Some("cmds")];
-        let order = panes_in_order("view", Some("crumbs"), "addr", "search", Some("left"), Some("strip"), bars);
-        assert_eq!(order, ["view", "crumbs", "addr", "search", "left", "strip", "nav", "tools", "cmds"]);
-        let walked: Vec<_> = std::iter::successors(Some(0), |&i| Some(next_pane(Some(i), order.len(), false))).take(10).map(|i| order[i]).collect();
-        assert_eq!(walked, ["view", "crumbs", "addr", "search", "left", "strip", "nav", "tools", "cmds", "view"]);
-        assert_eq!(panes_in_order("view", None, "addr", "search", None, None, [None, Some("tools"), None]), ["view", "addr", "search", "tools"], "hidden panes are skipped");
+        let order = panes_in_order("view", Some("crumbs"), "addr", "search", [Some("side"), Some("tree")], Some("strip"), bars);
+        assert_eq!(order, ["view", "crumbs", "addr", "search", "side", "tree", "strip", "nav", "tools", "cmds"]);
+        let walked: Vec<_> = std::iter::successors(Some(0), |&i| Some(next_pane(Some(i), order.len(), false))).take(11).map(|i| order[i]).collect();
+        assert_eq!(walked, ["view", "crumbs", "addr", "search", "side", "tree", "strip", "nav", "tools", "cmds", "view"]);
+        assert_eq!(panes_in_order("view", None, "addr", "search", [None, None], None, [None, Some("tools"), None]), ["view", "addr", "search", "tools"], "hidden panes are skipped");
+        assert_eq!(panes_in_order("view", None, "addr", "search", [None, Some("tree")], None, [None; 3]), ["view", "addr", "search", "tree"]);
     }
 }

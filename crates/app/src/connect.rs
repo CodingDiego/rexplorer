@@ -325,7 +325,7 @@ unsafe fn draw_button(st: &State, di: &DRAWITEMSTRUCT) {
     let old = SelectObject(dc, st.font.into());
     let mut r = di.rcItem;
     let mut text: Vec<u16> = if ok { st.ok_text.as_str() } else { tr("conn.cancel") }.encode_utf16().collect();
-    DrawTextW(dc, &mut text, &mut r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    DrawTextW(dc, &mut text, &mut r, crate::rtl::text(DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX));
     SelectObject(dc, old);
 }
 
@@ -465,7 +465,7 @@ pub fn form(parent: HWND, t: &Theme, f: &Form) -> Option<Vec<Vec<u16>>> {
         let y = pr.top + (pr.bottom - pr.top - h) / 2;
         let hinst = GetModuleHandleW(None).map(Into::into).unwrap_or_default();
         let created = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
+            crate::rtl::layout(),
             w!("RexConnect"),
             &HSTRING::from(f.title.as_str()),
             WS_POPUP | WS_CAPTION | WS_SYSMENU,

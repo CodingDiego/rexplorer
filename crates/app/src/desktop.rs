@@ -396,7 +396,8 @@ unsafe fn menu_for(hwnd: HWND, list: HWND, at: At) {
         Some(Ok(Picked::Rename)) => index.map_or(Ok(()), |i| view.rename(i)),
         Some(Ok(Picked::Own(REFRESH))) => view.refresh(),
         Some(Ok(Picked::Own(PASTE))) => menu.map_or(Ok(()), |m| m.invoke_verb(hwnd, "paste", false)),
-        Some(Ok(Picked::Delete)) => menu.map_or(Ok(()), |m| m.invoke_verb(hwnd, "delete", false)),
+        // In Explorer, so its Ctrl+Z on the desktop brings the icons back; here only when it cannot.
+        Some(Ok(Picked::Delete)) => view.delete_selection(items.len()).or_else(|_| menu.map_or(Ok(()), |m| m.invoke_verb(hwnd, "delete", false))),
         Some(Ok(Picked::Own(id))) if id >= SORT => SORT_KEYS.get(id - SORT).map_or(Ok(()), |(_, k)| view.sort_by(*k)),
         Some(Ok(Picked::Own(id))) if id >= ARRANGE_ID => ARRANGE.get(id - ARRANGE_ID).map_or(Ok(()), |(_, f)| view.toggle_flag(*f)),
         Some(Ok(Picked::Own(id))) if id >= ICON => ICON_SIZES.get(id - ICON).map_or(Ok(()), |(_, s)| view.set_icon_size(*s)),

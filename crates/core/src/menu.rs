@@ -7,13 +7,13 @@ use windows::Win32::UI::Shell::{
     CMF_CANRENAME, CMF_DEFAULTONLY, CMF_EXPLORE, CMF_EXTENDEDVERBS, CMF_NORMAL,
     CMF_OPTIMIZEFORINVOKE,
     CMIC_MASK_PTINVOKE, CMIC_MASK_SHIFT_DOWN, CMINVOKECOMMANDINFO, CMINVOKECOMMANDINFOEX,
-    FOLDERID_Desktop, GCS_VERBW, IContextMenu, IContextMenu2, IContextMenu3, ILCombine, KF_FLAG_DEFAULT, SEE_MASK_UNICODE, SHCreateShellItemArrayFromIDLists, BHID_DataObject,
+    FOLDERID_Desktop, GCS_VERBW, IContextMenu, IContextMenu2, IContextMenu3, ILCombine, KF_FLAG_DEFAULT, SEE_MASK_NOASYNC, SEE_MASK_UNICODE, SHCreateShellItemArrayFromIDLists, BHID_DataObject,
     SHGetDesktopFolder, SHGetKnownFolderPath, SHMultiFileProperties,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, DeleteMenu, DestroyMenu, GMDI_GOINTOPOPUPS, GetMenuDefaultItem, GetMenuItemCount, GetMenuItemID,
-    GetMenuItemInfoW, GetMenuStringW, GetSubMenu, HMENU, InsertMenuItemW, MENUITEMINFOW, MF_BYPOSITION, MFT_SEPARATOR, MFT_STRING, MIIM_BITMAP, MIIM_FTYPE, MIIM_ID, MIIM_STRING, SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    TrackPopupMenuEx, WM_INITMENUPOPUP,
+    GetMenuItemInfoW, GetMenuStringW, GetSubMenu, HMENU, InsertMenuItemW, MENUITEMINFOW, MF_BYPOSITION, MFT_SEPARATOR, MFT_STRING, MIIM_BITMAP, MIIM_FTYPE, MIIM_ID, MIIM_STRING, SW_SHOWNORMAL, TPM_LAYOUTRTL, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, TrackPopupMenuEx, WM_INITMENUPOPUP,
 };
 use windows::core::{HSTRING, Interface, PCSTR, PCWSTR, PSTR, PWSTR, Result};
 
@@ -138,7 +138,9 @@ impl ContextMenu {
             self.menu.QueryContextMenu(menu, at, ID_FIRST, ID_LAST, flags).ok()?;
             self.drop_hidden(menu, at);
             let (selection, cmds) = self.add_packaged(menu, at);
-            let picked = TrackPopupMenuEx(menu, (TPM_RETURNCMD | TPM_RIGHTBUTTON).0, x, y, hwnd, None).0 as u32;
+            // TPM_LAYOUTRTL mirrors the alignment too: left alignment then opens the menu leftwards from the point.
+            let rtl = if crate::i18n::is_rtl() { TPM_LAYOUTRTL.0 } else { 0 };
+            let picked = TrackPopupMenuEx(menu, (TPM_RETURNCMD | TPM_RIGHTBUTTON).0 | rtl, x, y, hwnd, None).0 as u32;
             for c in &cmds {
                 if let Some(b) = c.icon {
                     let _ = DeleteObject(b.into());
@@ -217,7 +219,7 @@ impl ContextMenu {
                 let paths: Vec<String> = items.iter().map(|i| i.parsing_name()).collect();
                 let mut targets = Vec::new();
                 for (item, p) in items.iter().zip(&paths) {
-                    if p.starts_with("::") {
+                    if p.starts_with("::") || in_recycle_bin(p) {
                         return None;
                     }
                     targets.push(if item.is_folder() {
@@ -310,7 +312,10 @@ impl ContextMenu {
             // The built-in verbs need no extension handlers; pins and "New" items do.
             let flags = if matches!(verb, "copy" | "cut" | "paste" | "delete" | "properties") { CMF_OPTIMIZEFORINVOKE } else { CMF_NORMAL };
             self.menu.QueryContextMenu(self.hmenu, 0, ID_FIRST, ID_LAST, flags).ok()?;
-            self.invoke(hwnd, PCSTR(narrow.as_ptr() as *const u8), PCWSTR(wide.as_ptr()), None, shift)
+            // The Recycle Bin restores on a thread of its own otherwise, and one cut short (our process closing) leaves
+            // the item's $I record behind in the bin.
+            let sync = verb.eq_ignore_ascii_case("undelete");
+            self.invoke(hwnd, PCSTR(narrow.as_ptr() as *const u8), PCWSTR(wide.as_ptr()), None, shift, sync)
         }
     }
 
@@ -360,10 +365,11 @@ impl ContextMenu {
 
     unsafe fn invoke_id(&self, hwnd: HWND, id: u32, at: Option<POINT>, shift: bool) -> Result<()> {
         // MAKEINTRESOURCE: the verb pointer carries the command id in its low word.
-        unsafe { self.invoke(hwnd, PCSTR(id as usize as *const u8), PCWSTR(id as usize as *const u16), at, shift) }
+        unsafe { self.invoke(hwnd, PCSTR(id as usize as *const u8), PCWSTR(id as usize as *const u16), at, shift, false) }
     }
 
-    unsafe fn invoke(&self, hwnd: HWND, verb: PCSTR, verb_w: PCWSTR, at: Option<POINT>, shift: bool) -> Result<()> {
+    /// `sync` asks the handler to finish before returning (CMIC_MASK_NOASYNC).
+    unsafe fn invoke(&self, hwnd: HWND, verb: PCSTR, verb_w: PCWSTR, at: Option<POINT>, shift: bool, sync: bool) -> Result<()> {
         let mut info = CMINVOKECOMMANDINFOEX {
             cbSize: std::mem::size_of::<CMINVOKECOMMANDINFOEX>() as u32,
             // CMIC_MASK_UNICODE is defined as SEE_MASK_UNICODE in the SDK.
@@ -380,6 +386,10 @@ impl ContextMenu {
         }
         if shift {
             info.fMask |= CMIC_MASK_SHIFT_DOWN;
+        }
+        // CMIC_MASK_NOASYNC is defined as SEE_MASK_NOASYNC in the SDK.
+        if sync {
+            info.fMask |= SEE_MASK_NOASYNC;
         }
         unsafe { self.menu.InvokeCommand(&info as *const _ as *const CMINVOKECOMMANDINFO) }
     }
@@ -419,11 +429,31 @@ impl Drop for ContextMenu {
     }
 }
 
+/// A Recycle Bin item: its parsing name is the deleted file's store path (`C:\$Recycle.Bin\<sid>\$R1234.txt`), a file
+/// system path no app should open as the user's file. Any segment: `\\?\` paths, a share's bin and a volume mounted
+/// in a folder put it deeper than a drive's root.
+fn in_recycle_bin(path: &str) -> bool {
+    path.split(['\\', '/']).any(|dir| dir.eq_ignore_ascii_case("$Recycle.Bin"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::com::ComInit;
     use crate::folder::list;
+
+    #[test]
+    fn recycle_bin_items_are_not_files_to_open() {
+        assert!(in_recycle_bin(r"C:\$RECYCLE.BIN\S-1-5-21-1-2-3-1001\$RCEDAGN.txt"));
+        assert!(in_recycle_bin(r"D:\$Recycle.Bin\S-1-5-21-1-2-3-1001\$R1.zip"));
+        assert!(in_recycle_bin(r"\\?\C:\$Recycle.Bin\S-1-5-21-1-2-3-1001\$R1.txt"));
+        assert!(in_recycle_bin(r"\\?\Volume{0b1c2d3e-0000-0000-0000-100000000000}\$Recycle.Bin\S-1-5-21-1-2-3-1001\$R1.txt"));
+        assert!(in_recycle_bin(r"\\server\share\$RECYCLE.BIN\S-1-5-21-1-2-3-1001\$R1.txt"), "a share's bin");
+        assert!(in_recycle_bin(r"C:\mnt\data\$Recycle.Bin\S-1-5-21-1-2-3-1001\$R1.txt"), "a volume mounted in a folder");
+        assert!(!in_recycle_bin(r"C:\Users\u\$Recycle.Bin.txt"));
+        assert!(!in_recycle_bin(r"C:\Users\u\a.txt"));
+        assert!(!in_recycle_bin(r"\\server\share\a.txt"));
+    }
 
     #[test]
     fn menus_build_for_items_and_background() {
