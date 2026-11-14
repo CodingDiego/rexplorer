@@ -18,7 +18,7 @@ jobs:
         with:
           persist-credentials: false
       # Pinned so a tag rebuilds to the same bytes; bump on purpose, together with the clippy job in ci.yml.
-      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # 1.99.1
         with:
           targets: aarch64-pc-windows-msvc
       - name: Tag matches the crate version
