@@ -6,6 +6,11 @@ a line under Unreleased. Sections up to 0.1.4 were rebuilt from git history and 
 
 ## Unreleased
 
+## 1.0.0 - 2026-11-14
+
+The first stable release of the 1.x line. Changes since 1.0.0-rc.2. `docs/EXPLORER-PARITY.md` says which behaviours
+were proven on the exe and how.
+
 - rexplorer has an icon: an orange crab with a white R, drawn for every size from 16 to 256 pixels by
   `scripts/make-icon.py` ([#18](https://github.com/CodingDiego/rexplorer/issues/18)).
 - The sidebar's Favorites lists folders only, your pins first and then the folders you use most, as Explorer does.
@@ -153,6 +158,22 @@ a line under Unreleased. Sections up to 0.1.4 were rebuilt from git history and 
   1000 ms) ([#48](https://github.com/CodingDiego/rexplorer/issues/48)).
 - The soak before a release is one hour with a stated operation count; the script prints its operation counts, and
   the weekly workflow runs that hour ([#29](https://github.com/CodingDiego/rexplorer/issues/29)).
+
+**Known gaps.** The full checklist is `docs/EXPLORER-PARITY.md`: 123 behaviours, 109 proven on the exe (WORKS) and 3
+more on a scratch install base, 5 built but not proven (UNVERIFIED), 6 PARTIAL.
+- Ctrl+Z after a cancelled folder copy leaves the partial folder (undo never deletes what it cannot prove it made).
+- Undo does not restore a file overwritten by Replace, does not undo a merged folder, and gives no undo for New,
+  rename or shortcuts on a share that reports no file ids.
+- A drag out to another program once went undelivered (1 of 4 tries) and was not reproduced. A drag that does
+  nothing leaves a line in `rexplorer.log`.
+- With rexplorer as the file manager, Win+E through the desktop helper was proven on a test profile, not yet on a
+  registered install of this build.
+- `ftp://` is for browsing: copying to or from an FTP folder in rexplorer's window was not proven.
+- The desktop icons view (`--desktop-icons`, opt-in) shows the desktop and follows it; its menu, rename, delete and
+  drops were never run. Run as administrator and Empty Recycle Bin were never invoked in testing.
+- Not yet tried by a person: Narrator or NVDA, ARM64 hardware, Windows 10, an install on a clean machine, MTP
+  phones, OneDrive, and a move between two monitors of different scale.
+- The exe is not code-signed, so SmartScreen may warn (#59). The winget submission is pending (#63).
 
 ## 1.0.0-rc.2 - 2026-11-13
 
