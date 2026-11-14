@@ -10,9 +10,9 @@ Corporation; they are named here only to say what rexplorer replaces.
 Supported Windows: Windows 10 22H2 and Windows 11. Older versions are not supported. Each release is meant to be
 smoke-tested on both (see CONTRIBUTING.md); the numbers below come from Windows 11 only.
 
-Every release is listed in [CHANGELOG.md](CHANGELOG.md). The newest is 1.0.0-rc.2 (2026-11-13), a release
-candidate published as a pre-release; the newest stable release is 0.2.0, which can rename the wrong file (fixed
-in 1.0.0-rc.1, see the changelog). Dependency upkeep and translations are described in
+Every release is listed in [CHANGELOG.md](CHANGELOG.md). The newest is 1.0.0 (2026-11-14), the first
+stable release of the 1.x line. If you still use 0.2.0, update: it can rename the wrong file (fixed since
+1.0.0-rc.1, see the changelog). Dependency upkeep and translations are described in
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Using rexplorer day to day (install, revert, keys, settings, troubleshooting): [docs/USER-GUIDE.md](docs/USER-GUIDE.md).
@@ -708,15 +708,16 @@ desktop and follows it; its menu, rename, delete and drops were never run). Stil
 proven on the exe): icon overlays on OneDrive files, Run as administrator and the elevation dialogs, Empty Recycle
 Bin, and the default folder handler on a real install of this build. Narrator and NVDA were never tried.
 
-Open in 1.0.0-rc.2:
+Open in 1.0.0:
 
 - Ctrl+Z after a cancelled folder copy leaves the partial folder: undo never deletes what it cannot prove it made.
-- Tearing out a Home tab once landed in the other rexplorer window instead of a new one (1 of 2 tries, not
-  reproduced).
-- Not run for this release candidate: the 15-minute soak script, the local smoke and budget scripts (CI runs smoke
-  and budgets) and the fuzz targets.
+- Tearing out a Home tab once landed in the other rexplorer window instead of a new one (1 of 2 tries). A release
+  on that window's invisible resize border counted as inside it, which is fixed; the tear was not run again by hand.
+- Run for this release on one Windows 11 PC: the local smoke script (the hosted checks and the real-input ones),
+  the budgets, the FTP check and the full test suite three times; the fuzz targets and the one-hour soak ran on
+  GitHub's runner and passed.
 - Only a person can check: MTP devices and OneDrive, Windows settings such as Text size, contrast themes and display
-  scale (including how the address bar trims long names), Narrator or NVDA, the one-hour soak, ARM hardware,
+  scale (including how the address bar trims long names), Narrator or NVDA, ARM hardware,
   Windows 10, an install on a clean machine, and Libraries in an icon view before their
   thumbnails are cached.
 
