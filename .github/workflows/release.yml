@@ -4,18 +4,21 @@ on:
   push:
     tags: ["v*"]
 
+# Actions are pinned to a commit; the comment names its tag. Only the publish job can write.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
+  build:
     runs-on: windows-latest
     env:
       TAG: ${{ github.ref_name }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       # Pinned so a tag rebuilds to the same bytes; bump on purpose, together with the clippy job in ci.yml.
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
         with:
           targets: aarch64-pc-windows-msvc
       - name: Tag matches the crate version
@@ -93,6 +96,38 @@ jobs:
             foreach ($f in "$d.zip", "$d/rexplorer.exe") { "{0}  {1}" -f (Get-FileHash $f -Algorithm SHA256).Hash.ToLower(), $f }
           }
           $sums | Set-Content -Encoding ascii SHA256SUMS.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-files
+          path: |
+            rexplorer-*-x64.zip
+            rexplorer-*-arm64.zip
+            SHA256SUMS.txt
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      # For .github/release-notes.md and gh's repository; no build runs here.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-files
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: |
+            rexplorer-*-x64.zip
+            rexplorer-*-arm64.zip
+            SHA256SUMS.txt
       - name: Publish
         shell: pwsh
         env:
