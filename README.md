@@ -696,17 +696,17 @@ through WM_APP+0x54.
 ### Known gaps
 
 **[docs/EXPLORER-PARITY.md](docs/EXPLORER-PARITY.md) is the full checklist against Windows Explorer**: every
-behaviour marked WORKS, BROKEN, UNVERIFIED, PARTIAL or MISSING. On 2026-11-13, after 1.0.0-rc.2: 123 rows, 108
-proven on the exe (2026-11-11 to 2026-11-13, most with a real keyboard and mouse, some by window messages; each note
-says how), 3 more on a scratch install base, 7 UNVERIFIED and 5 PARTIAL. Dragging into Edge and VS Code was proven on 2026-11-12
-([#75](https://github.com/CodingDiego/rexplorer/issues/75)); WhatsApp was not tried. High contrast, the light / dark
+behaviour marked WORKS, BROKEN, UNVERIFIED, PARTIAL or MISSING. On 2026-11-14: 123 rows, 109
+proven on the exe (2026-11-11 to 2026-11-14, most with a real keyboard and mouse, some by window messages; each note
+says how), 3 more on a scratch install base, 5 UNVERIFIED and 6 PARTIAL. Dragging into Edge and VS Code was proven on 2026-11-12
+and into WhatsApp on 2026-11-14 ([#75](https://github.com/CodingDiego/rexplorer/issues/75)). High contrast, the light / dark
 live switch and FTP browsing (not copying or uploading from rexplorer's window) were proven on 2026-11-13. PARTIAL: Text size and per-monitor DPI (fixed after the live
 test found Folder options off the screen at 225 % and list icons that kept their size after a scale change; the
 fixes are proven by tests, not seen again under the real Windows settings), screen readers (the data is there;
-nobody has listened), MTP phones and OneDrive placeholders. Still UNVERIFIED (built, not
-proven on the exe): the desktop icons view (`--desktop-icons`, never run), icon overlays on OneDrive files, Run as
-administrator, Empty Recycle Bin, the drag image from Home and the default folder handler
-on a real install. Narrator and NVDA were never tried.
+nobody has listened), MTP phones, OneDrive placeholders and the desktop icons view (`--desktop-icons` shows the
+desktop and follows it; its menu, rename, delete and drops were never run). Still UNVERIFIED (built, not
+proven on the exe): icon overlays on OneDrive files, Run as administrator and the elevation dialogs, Empty Recycle
+Bin, and the default folder handler on a real install of this build. Narrator and NVDA were never tried.
 
 Open in 1.0.0-rc.2:
 
@@ -717,7 +717,7 @@ Open in 1.0.0-rc.2:
   and budgets) and the fuzz targets.
 - Only a person can check: MTP devices and OneDrive, Windows settings such as Text size, contrast themes and display
   scale (including how the address bar trims long names), Narrator or NVDA, the one-hour soak, ARM hardware,
-  Windows 10, an install on a clean machine, WhatsApp as a drop target, and Libraries in an icon view before their
+  Windows 10, an install on a clean machine, and Libraries in an icon view before their
   thumbnails are cached.
 
 The list below holds the gaps of rexplorer's own features.

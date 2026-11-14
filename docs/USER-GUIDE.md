@@ -511,8 +511,8 @@ window that is already open. When that window is busy, the new launch waits for 
 opens a window of its own. If no window appears at all, try Ctrl+Shift+E to open the folder in Explorer. If this
 keeps happening, give folders back to Explorer (see [Go back to Explorer](#go-back-to-explorer)).
 
-**Dragging files to some program does not work.** Drags into other programs and Explorer were proven, but not yet
-into browsers, WhatsApp or VS Code ([#75](https://github.com/CodingDiego/rexplorer/issues/75)). A drag that did
+**Dragging files to some program does not work.** Drags into Explorer, Edge, VS Code, WhatsApp and other programs were
+proven ([#75](https://github.com/CodingDiego/rexplorer/issues/75)); other programs were not tried. A drag that did
 nothing leaves a line in `%APPDATA%\rexplorer\rexplorer.log`. Add it to the issue. Copy and paste (Ctrl+C, Ctrl+V)
 works.
 
