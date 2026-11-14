@@ -17,6 +17,9 @@ a line under Unreleased. Sections up to 0.1.4 were rebuilt from git history and 
   `--register`) takes the key.
 - A shortcut's arrow keeps its size and place on the small icon after the display scale changes
   ([#33](https://github.com/CodingDiego/rexplorer/issues/33)).
+- `--desktop-icons` showed folders the desktop never shows (Downloads, Documents, your own folder, a linked phone),
+  because Windows lists them under the desktop's root. It shows only what lies in your Desktop folder and the public
+  one, plus the Recycle Bin and the system icons you turned on.
 - `--uninstall` asks before it removes the program; `--quiet` (which Settings > Apps passes) skips the question.
 - After a crash, the automatic restart opens Home in place of a tab that was still loading when rexplorer crashed,
   so a folder that crashes it cannot do so again at every start. Signing out or shutting down saves the open tabs
