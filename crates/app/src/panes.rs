@@ -292,7 +292,7 @@ impl SidebarRows {
         if label.is_empty() || (dedupe && self.rows.iter().any(|r| r.target.eq_ignore_ascii_case(&target))) {
             return;
         }
-        self.rows.push(Row { section, label, target, icon: small_icon(pidl) });
+        self.rows.push(Row { section, label, target, icon: small_icon(pidl), pinned: kind == Kind::Pinned });
         self.kinds.push(kind);
     }
 }
@@ -346,29 +346,35 @@ pub(crate) unsafe fn on_sidebar_rows(app: *mut App, rows: Box<SidebarRows>) {
     }
 }
 
-/// Right-click on a sidebar row: "Unpin from Home" on a pinned Quick Access folder, "Pin to Home" on a frequent one,
-/// "Remove bookmark" on a bookmark.
+/// Right-click on a sidebar row: "Unpin from Home" on a pinned Quick Access folder, "Pin to Home" and "Remove from
+/// Home" on a frequent one, "Remove bookmark" on a bookmark.
 #[allow(clippy::needless_borrow)] // the explicit borrow of a raw-pointer field silences rustc's dangerous_implicit_autorefs
 pub(crate) unsafe fn sidebar_menu(app: *mut App, index: usize, at: Option<POINT>) {
     let kind = (&(*app).panes.sidebar_kinds).get(index).cloned();
-    let text = match &kind {
-        Some(Kind::Pinned) => tr("menu.list.unpin_home"),
-        Some(Kind::Frequent) => tr("menu.more.pin_home"),
-        Some(Kind::Bookmark(_)) => tr("side.remove_bookmark"),
-        _ => return,
-    };
+    let mut entries = vec![(
+        1,
+        match &kind {
+            Some(Kind::Pinned) => tr("menu.list.unpin_home"),
+            Some(Kind::Frequent) => tr("menu.more.pin_home"),
+            Some(Kind::Bookmark(_)) => tr("side.remove_bookmark"),
+            _ => return,
+        }
+        .to_string(),
+    )];
+    if kind == Some(Kind::Frequent) {
+        entries.push((2, tr("side.remove_frequent").to_string()));
+    }
     let target = sidebar::target((*app).sidebar, index);
     let pt = at.unwrap_or_else(|| {
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
         pt
     });
-    if ui::popup(app, &[(1, text.to_string())], &[], pt.x, pt.y) != 1 {
-        return;
-    }
+    let picked = ui::popup(app, &entries, &[], pt.x, pt.y);
     match kind {
+        _ if picked == 0 => {}
         Some(Kind::Pinned) => quick_access_verb(app, &target, "unpinfromhome"),
-        Some(Kind::Frequent) => quick_access_verb(app, &target, "pintohome"),
+        Some(Kind::Frequent) => quick_access_verb(app, &target, if picked == 2 { "removefromhome" } else { "pintohome" }),
         Some(Kind::Bookmark(label)) => {
             views::remove_profile_key(&(*app).profile.name, &format!("bookmark.{label}"));
             (*app).profile.bookmarks.retain(|(l, _)| *l != label);
@@ -378,7 +384,7 @@ pub(crate) unsafe fn sidebar_menu(app: *mut App, index: usize, at: Option<POINT>
     }
 }
 
-/// A canonical verb ("unpinfromhome", "pintohome") on the Quick Access item for `target`; beeps when the shell
+/// A canonical verb ("unpinfromhome", "pintohome", "removefromhome") on the Quick Access item for `target`; beeps when the shell
 /// refuses it (the item left Quick Access meanwhile). On a worker: Quick Access can hold network folders, and a
 /// shell context menu needs an STA. One at a time: two quick unpins racing on the shell's Quick Access list lose one.
 unsafe fn quick_access_verb(app: *mut App, target: &str, verb: &str) {
@@ -438,7 +444,7 @@ fn is_under(path: &str, dir: &str) -> bool {
 pub(crate) fn frequent_folders() -> Vec<String> {
     let Ok(qa) = ShellFolder::parse(&format!("shell:{}", nav::QUICK_ACCESS)) else { return Vec::new() };
     let items = qa.enumerate().unwrap_or_default();
-    items.iter().filter(|i| i.is_folder() && i.property_bool(&home::IS_PINNED) == Some(false)).map(|i| i.parsing_name()).collect()
+    items.iter().filter(|i| crate::source::named_folder(i) && i.property_bool(&home::IS_PINNED) == Some(false)).map(|i| i.parsing_name()).collect()
 }
 
 fn sidebar_rows(bookmarks: &[(String, String)]) -> SidebarRows {
@@ -451,11 +457,18 @@ fn sidebar_rows(bookmarks: &[(String, String)]) -> SidebarRows {
             b.add(tr("side.favorites"), label.clone(), f.parsing_name.clone(), &f.pidl, Kind::Bookmark(label.clone()), true);
         }
     }
-    // Quick Access in the shell's order and names: the pinned known folders, the Recycle Bin, the user's pins.
+    // Quick Access in the shell's order and names, the pins (known folders, the Recycle Bin, the user's) before the
+    // frequent folders, as Explorer lists them. Its recent files are left out, a .zip among them: the shell calls
+    // that a folder too.
     if let Ok(qa) = ShellFolder::parse(&format!("shell:{}", nav::QUICK_ACCESS)) {
-        for item in qa.enumerate().unwrap_or_default().iter().filter(|i| i.is_folder()) {
-            let kind = if item.property_bool(&home::IS_PINNED) == Some(false) { Kind::Frequent } else { Kind::Pinned };
-            b.add(tr("side.favorites"), item.display_name(), item.parsing_name(), &qa.child_pidl(item), kind, true);
+        let items = qa.enumerate().unwrap_or_default();
+        let folders: Vec<(&ShellItem, bool)> =
+            items.iter().filter(|i| crate::source::named_folder(i)).map(|i| (i, i.property_bool(&home::IS_PINNED) != Some(false))).collect();
+        for pinned in [true, false] {
+            for (item, _) in folders.iter().filter(|(_, p)| *p == pinned) {
+                let kind = if pinned { Kind::Pinned } else { Kind::Frequent };
+                b.add(tr("side.favorites"), item.display_name(), item.parsing_name(), &qa.child_pidl(item), kind, true);
+            }
         }
     }
     // The Recycle Bin is always a Favorites row; the dedupe skips it when Quick Access pinned it.
@@ -887,6 +900,13 @@ mod tests {
         let bins: Vec<usize> = rows.iter().enumerate().filter(|(_, r)| r.target.eq_ignore_ascii_case(recycle)).map(|(i, _)| i).collect();
         assert_eq!(bins.len(), 1, "Recycle Bin once: {names:?}");
         assert_eq!(rows[bins[0]].section, "Favorites");
+        // Favorites holds folders only (Quick Access also lists recent files, and a .zip among them is a folder to
+        // the shell), every pin before the first frequent folder, and only pins carry the mark.
+        let favorites: Vec<usize> = (0..rows.len()).filter(|&i| rows[i].section == "Favorites").collect();
+        assert!(favorites.iter().all(|&i| !std::path::Path::new(&rows[i].target).is_file()), "no files: {names:?}");
+        let quick: Vec<&Kind> = favorites.iter().map(|&i| &kinds[i]).filter(|k| matches!(k, Kind::Pinned | Kind::Frequent)).collect();
+        assert!(quick.is_sorted_by_key(|k| **k == Kind::Frequent), "pins first: {quick:?}");
+        assert!(rows.iter().zip(&kinds).all(|(r, k)| r.pinned == (*k == Kind::Pinned)));
         assert!(matches!(kinds[bins[0]], Kind::Pinned | Kind::Place));
         let libs = ShellFolder::parse("shell:Libraries").and_then(|f| f.enumerate()).is_ok_and(|v| !v.is_empty());
         assert_eq!(rows.iter().any(|r| r.target.eq_ignore_ascii_case("::{031E4825-7B94-4DC3-B131-E946B44C8DD5}")), libs, "Libraries row iff the shell has libraries");

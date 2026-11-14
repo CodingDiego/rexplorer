@@ -206,6 +206,8 @@ pub(crate) struct Views {
     slots: Vec<i32>,
     /// Goes into the high bits of each request id, so deliveries for an older listing are recognised.
     token: usize,
+    /// Bytes of archive members this listing's thumbnails have asked to extract (archive_view::VIEW_MAX).
+    member_bytes: u64,
     thumbs: Option<thumbs::Thumbs>,
     cache: ImageCache,
     icon_theme: Option<ThemeIcons>,
@@ -227,6 +229,7 @@ impl Views {
             size: 0,
             slots: Vec::new(),
             token: 0,
+            member_bytes: 0,
             thumbs: None,
             cache: ImageCache::new(512),
             icon_theme: None,
@@ -321,19 +324,31 @@ unsafe fn draw_small(dc: HDC, small: HIMAGELIST, base: i32, overlay: u32, px: i3
         return;
     }
     let (from, _keep) = scale_source(small, px);
-    let p = IMAGELISTDRAWPARAMS {
-        cbSize: size_of::<IMAGELISTDRAWPARAMS>() as u32,
-        himl: from,
-        i: base,
-        hdcDst: dc,
-        x: 0,
-        y,
-        cx: px,
-        cy: px,
-        fStyle: (style | ILD_SCALE).0,
-        ..Default::default()
+    let image = |i: i32| {
+        let p = IMAGELISTDRAWPARAMS {
+            cbSize: size_of::<IMAGELISTDRAWPARAMS>() as u32,
+            himl: from,
+            i,
+            hdcDst: dc,
+            x: 0,
+            y,
+            cx: px,
+            cy: px,
+            fStyle: (ILD_TRANSPARENT | ILD_PRESERVEALPHA | ILD_SCALE).0,
+            ..Default::default()
+        };
+        let _ = ImageList_DrawIndirect(&p);
     };
-    let _ = ImageList_DrawIndirect(&p);
+    image(base);
+    // ILD_SCALE scales the icon but draws its overlay at the list's own size (a shortcut arrow too big, outside
+    // the icon), so the overlay is drawn as the image it is.
+    let raw = from.0 as *mut std::ffi::c_void;
+    if overlay != 0
+        && let Some(list) = <IImageList as windows::core::Interface>::from_raw_borrowed(&raw)
+        && let Ok(i) = list.GetOverlayImage(overlay as i32)
+    {
+        image(i);
+    }
 }
 
 /// The list to scale a `px`-pixel small icon from, and what keeps it alive: for the system's small list, the
@@ -560,6 +575,7 @@ pub(crate) unsafe fn apply(app: *mut App) {
 pub(crate) unsafe fn reset(app: *mut App, count: usize) {
     let v = &mut (*app).views;
     v.token = (v.token + 1) & 0x7FFF_FFFF;
+    v.member_bytes = 0;
     if let Some(t) = &v.thumbs {
         t.invalidate();
     }
@@ -662,6 +678,24 @@ fn cache_key(view: View, size: i32, parsing: &str) -> String {
     format!("{}:{size}:{parsing}", view.name())
 }
 
+/// Whether `key` (`cache_key`) is an image of `parsing`, in any view and size.
+fn is_key_of(key: &str, parsing: &str) -> bool {
+    key.splitn(3, ':').nth(2).is_some_and(|p| p.eq_ignore_ascii_case(parsing))
+}
+
+/// WM_SHELL_CHANGE: the cached images of the notified items go (an edited picture), so their reload renders them again.
+pub(crate) unsafe fn forget_changed(app: *mut App, items: &[rexplorer_core::com::Pidl]) {
+    use windows::Win32::UI::Shell::{SHGetNameFromIDList, SIGDN_DESKTOPABSOLUTEPARSING};
+    let names: Vec<String> = items
+        .iter()
+        .filter_map(|p| SHGetNameFromIDList(p.as_ptr(), SIGDN_DESKTOPABSOLUTEPARSING).ok().map(|s| rexplorer_core::com::take_cotaskmem_string(s)))
+        .filter(|n| !n.is_empty())
+        .collect();
+    if !names.is_empty() {
+        (*app).views.cache.forget(|k| names.iter().any(|n| is_key_of(k, n)));
+    }
+}
+
 /// Whether the file is a picture by its extension (no registry access).
 fn is_picture(parsing: &str) -> bool {
     rexplorer_core::preview::is_image(std::path::Path::new(parsing).extension().and_then(|e| e.to_str()).unwrap_or(""))
@@ -707,7 +741,12 @@ unsafe fn request(app: *mut App, i: usize) -> i32 {
         Some(Source::Archive(a)) => {
             let e = &a.rows[i];
             let Some(abs) = archive_view::member_pidl(e) else { return 0 };
-            if archive_view::showable(e, false) {
+            let picture = archive_view::showable(e, false);
+            let cached = picture && archive_view::shown(&a.listing.archive, e);
+            if cached || (picture && archive_view::thumbnail_fits(a.listing.solid, v.member_bytes, e.size)) {
+                if !cached {
+                    v.member_bytes += e.size;
+                }
                 t.request_member(id, abs, v.size, a.listing.archive.clone(), e.clone());
             } else {
                 t.request(id, abs, v.size, true);
@@ -918,13 +957,18 @@ fn remove_ini_key(text: &str, section: &str, key: &str) -> String {
 pub(crate) fn remove_profile_key(profile: &str, key: &str) {
     let path = settings::dir().join("settings.ini");
     let Ok(text) = std::fs::read_to_string(&path) else { return };
-    let _ = std::fs::write(&path, remove_ini_key(&text, &format!("profile {profile}"), key));
+    let _ = settings::write_atomic(&path, remove_ini_key(&text, &format!("profile {profile}"), key));
 }
 
 pub(crate) unsafe fn save_profile_key(profile: &str, key: &str, value: &str) {
     let path = settings::dir().join("settings.ini");
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
-    let _ = std::fs::write(&path, set_ini_key(&text, &format!("profile {profile}"), key, value));
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        // Locked or not UTF-8 right now: writing from an empty text would erase every other setting.
+        Err(_) => return,
+    };
+    let _ = settings::write_atomic(&path, set_ini_key(&text, &format!("profile {profile}"), key, value));
 }
 
 /// Sets several keys of the profile's section in settings.ini in one write; an unreadable file is an error, not empty.
@@ -934,7 +978,7 @@ pub(crate) fn try_save_profile_keys(profile: &str, pairs: &[(&str, String)]) -> 
     for (k, v) in pairs {
         text = set_ini_key(&text, &format!("profile {profile}"), k, v);
     }
-    std::fs::write(&path, text)
+    settings::write_atomic(&path, text)
 }
 
 const STARTER: [&str; 2] = ["folder", "file"];
@@ -986,10 +1030,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_changed_item_names_its_images_in_every_view() {
+        let p = r"C:\pics\a.jpg";
+        assert!(is_key_of(&cache_key(View::Thumbnails, 96, p), p));
+        assert!(is_key_of(&cache_key(View::ExtraLarge, 256, p), r"c:\PICS\a.jpg"), "names differ only in case");
+        assert!(!is_key_of(&cache_key(View::Thumbnails, 96, r"C:\pics\a.jpg.bak"), p));
+        assert!(!is_key_of(&cache_key(View::Thumbnails, 96, r"C:\pics\b.jpg"), p));
+        assert!(is_key_of(&cache_key(View::Icons, 48, r"C:\x.rar\d:e.png"), r"C:\x.rar\d:e.png"), "a colon inside the name");
+    }
+
+    #[test]
     fn a_small_icon_is_scaled_to_the_windows_scale_not_clipped() {
         unsafe {
             // A 20 px source (a process started at 125 %): red, with a green 4 px square in its last corner.
-            let src = ImageList_Create(20, 20, ILC_COLOR32, 1, 1);
+            let src = ImageList_Create(20, 20, ILC_COLOR32 | ILC_MASK, 2, 1);
             let (bmp, bits) = dib(20, 20).unwrap();
             let px = std::slice::from_raw_parts_mut(bits, 20 * 20 * 4);
             for y in 0..20 {
@@ -998,15 +1052,31 @@ mod tests {
                     px[(y * 20 + x) * 4..][..4].copy_from_slice(if green { &[0, 255, 0, 255] } else { &[0, 0, 255, 255] });
                 }
             }
-            assert_eq!(ImageList_Add(src, bmp, None), 0);
+            // A list takes an overlay only with masks (as the system's lists have): 1 bit a pixel, rows of 4 bytes,
+            // a set bit transparent.
+            let mask = |rows: &[u8]| windows::Win32::Graphics::Gdi::CreateBitmap(20, 20, 1, 1, Some(rows.as_ptr().cast()));
+            let opaque = mask(&[0u8; 80]);
+            assert_eq!(ImageList_Add(src, bmp, Some(opaque)), 0);
+            // Its overlay 1 (a shortcut arrow's place): blue, in the lowest left 4 px, nothing elsewhere.
+            px.fill(0);
+            let mut rows = [0xFFu8; 80];
+            for y in 16..20 {
+                px[(y * 20) * 4..][..16].copy_from_slice(&[255, 0, 0, 255].repeat(4));
+                rows[y * 4] = 0x0F;
+            }
+            let corner = mask(&rows);
+            assert_eq!(ImageList_Add(src, bmp, Some(corner)), 1);
+            let _ = DeleteObject(opaque.into());
+            let _ = DeleteObject(corner.into());
+            assert!(ImageList_SetOverlayImage(src, 1, 1).as_bool());
             let _ = DeleteObject(bmp.into());
             // Drawn for a window now at 100 % (16 px) in a 16 x 28 row cell, and for one at 150 % (24 px) in 24 x 42.
-            for (size, row) in [(16, 28), (24, 42), (20, 35)] {
+            for (size, row, overlay) in [(16, 28, 0), (24, 42, 0), (20, 35, 0), (16, 28, 1), (24, 42, 1), (20, 35, 1)] {
                 let (out, obits) = dib(size, row).unwrap();
                 let dc = CreateCompatibleDC(None);
                 let old = SelectObject(dc, out.into());
                 let top = (row - size) / 2;
-                draw_small(dc, src, 0, 0, size, top);
+                draw_small(dc, src, 0, overlay, size, top);
                 let _ = GdiFlush();
                 SelectObject(dc, old);
                 let _ = DeleteDC(dc);
@@ -1017,6 +1087,11 @@ mod tests {
                 assert!(corner[1] > 200 && corner[2] < 60, "{size}: the source's last corner is the icon's last corner (scaled, not cut off): {corner:?}");
                 assert_eq!(at(1, top - 2)[3], 0, "{size}: nothing above the icon");
                 assert_eq!(at(1, top + size + 1)[3], 0, "{size}: nothing below the icon");
+                // The overlay is scaled with the icon: in its lowest left corner, and nowhere a 20 px one would reach.
+                let low = at(1, top + size - 2);
+                assert_eq!(low[0] > 200 && low[2] < 60, overlay == 1, "{size}, overlay {overlay}: blue in the lowest left corner: {low:?}");
+                let above = at(1, top + size - 1 - size * 6 / 20);
+                assert!(above[2] > 200 && above[0] < 60, "{size}, overlay {overlay}: red just above the overlay: {above:?}");
                 let _ = DeleteObject(out.into());
             }
             let _ = ImageList_Destroy(Some(src));

@@ -35,7 +35,7 @@ use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Controls::*;
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext, SystemParametersInfoForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, SetFocus, VIRTUAL_KEY, VK_CONTROL, VK_DELETE, VK_F2, VK_F5, VK_SHIFT};
-use windows::Win32::UI::Shell::{DefSubclassProc, SHGetImageList, SetWindowSubclass, SHIL_EXTRALARGE, FOLDERID_Desktop, FOLDERID_PublicDesktop};
+use windows::Win32::UI::Shell::{DefSubclassProc, SHGetImageList, SetWindowSubclass, SHIL_EXTRALARGE, FOLDERID_Desktop, FOLDERID_Profile, FOLDERID_PublicDesktop};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, Result, w};
 
@@ -159,13 +159,15 @@ fn parse_positions(text: &str) -> HashMap<String, Pos> {
 }
 
 /// Whether the desktop shows an item. `hide_value` is the DWORD under HideDesktopIcons\NewStartPanel named for the
-/// item's CLSID (1 hides, 0 shows); None when absent.
-fn shows_on_desktop(parsing: &str, hidden: bool, show_hidden: bool, hide_value: Option<u32>) -> bool {
-    let name = parsing.rsplit('\\').next().unwrap_or(parsing);
+/// item's CLSID (1 hides, 0 shows); None when absent. A file or folder shows only when it lies in one of `desktops`
+/// (the user's and the public Desktop folder, lowercase): the shell's desktop root also lists the profile's folders
+/// (Downloads, Documents, a linked phone), which the desktop never shows.
+fn shows_on_desktop(parsing: &str, hidden: bool, show_hidden: bool, hide_value: Option<u32>, desktops: &[String]) -> bool {
+    let (parent, name) = parsing.rsplit_once('\\').unwrap_or(("", parsing));
     if name.eq_ignore_ascii_case("desktop.ini") || (hidden && !show_hidden) {
         return false;
     }
-    let Some(clsid) = parsing.strip_prefix("::") else { return true };
+    let Some(clsid) = parsing.strip_prefix("::") else { return desktops.contains(&parent.to_lowercase()) };
     match clsid.to_ascii_lowercase().as_str() {
         "{645ff040-5081-101b-9f08-00aa002f954e}" => hide_value != Some(1),
         "{20d04fe0-3aea-1069-a2d8-08002b30309d}"
@@ -434,11 +436,18 @@ unsafe fn reload(hwnd: HWND) {
     let show_hidden = Settings::load().active_profile().show_hidden;
     // A failed enumeration changes nothing: an empty list would overwrite the saved positions.
     let Ok(all) = root.enumerate() else { return };
+    let folder = |id: &windows::core::GUID| rexplorer_core::install::known_folder(id).ok().map(|p| p.display().to_string().to_lowercase());
+    let desktops: Vec<String> = [folder(&FOLDERID_Desktop), folder(&FOLDERID_PublicDesktop)].into_iter().flatten().collect();
+    let profile = folder(&FOLDERID_Profile);
     let mut items: Vec<ShellItem> = all
         .into_iter()
         .filter(|i| {
-            let p = i.parsing_name();
-            shows_on_desktop(&p, i.is_hidden(), show_hidden, hide_value(&p))
+            let mut p = i.parsing_name();
+            // The shell lists the user's own folder by its path; the desktop shows it by the User's Files switch.
+            if Some(p.to_lowercase()) == profile {
+                p = "::{59031a47-3f72-44a7-89c5-5595fe6b30ee}".into();
+            }
+            shows_on_desktop(&p, i.is_hidden(), show_hidden, hide_value(&p), &desktops)
         })
         .collect();
     items.sort_by(|a, b| root.compare(0, a, b));
@@ -1050,22 +1059,27 @@ mod tests {
 
     #[test]
     fn shows_on_desktop_rules() {
+        let d = [r"c:\users\x\desktop".to_string(), r"c:\users\public\desktop".to_string()];
         let bin = "::{645FF040-5081-101B-9F08-00AA002F954E}";
-        assert!(shows_on_desktop(bin, false, false, None));
-        assert!(!shows_on_desktop(bin, false, false, Some(1)));
-        assert!(shows_on_desktop(bin, false, false, Some(0)));
+        assert!(shows_on_desktop(bin, false, false, None, &d));
+        assert!(!shows_on_desktop(bin, false, false, Some(1), &d));
+        assert!(shows_on_desktop(bin, false, false, Some(0), &d));
         let pc = "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}";
-        assert!(!shows_on_desktop(pc, false, false, None));
-        assert!(shows_on_desktop(pc, false, false, Some(0)));
-        assert!(!shows_on_desktop(pc, false, false, Some(1)));
+        assert!(!shows_on_desktop(pc, false, false, None, &d));
+        assert!(shows_on_desktop(pc, false, false, Some(0), &d));
+        assert!(!shows_on_desktop(pc, false, false, Some(1), &d));
         for other in ["::{59031a47-3f72-44a7-89c5-5595fe6b30ee}", "::{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}", "::{5399E694-6CE5-4D6C-8FCE-1D8870FDCBA0}"] {
-            assert!(!shows_on_desktop(other, false, false, None) && shows_on_desktop(other, false, false, Some(0)), "{other}");
+            assert!(!shows_on_desktop(other, false, false, None, &d) && shows_on_desktop(other, false, false, Some(0), &d), "{other}");
         }
-        assert!(!shows_on_desktop("::{031E4825-7B94-4dc3-B131-E946B44C8DD5}", false, false, Some(0)));
-        assert!(shows_on_desktop(&pc.to_lowercase(), false, false, Some(0)));
-        assert!(!shows_on_desktop(r"C:\Users\x\Desktop\h.txt", true, false, None));
-        assert!(shows_on_desktop(r"C:\Users\x\Desktop\h.txt", true, true, None));
-        assert!(!shows_on_desktop(r"C:\Users\x\Desktop\DESKTOP.INI", false, true, None));
-        assert!(shows_on_desktop(r"C:\Users\x\Desktop\a.txt", false, false, None));
+        assert!(!shows_on_desktop("::{031E4825-7B94-4dc3-B131-E946B44C8DD5}", false, false, Some(0), &d));
+        assert!(shows_on_desktop(&pc.to_lowercase(), false, false, Some(0), &d));
+        assert!(!shows_on_desktop(r"C:\Users\x\Desktop\h.txt", true, false, None, &d));
+        assert!(shows_on_desktop(r"C:\Users\x\Desktop\h.txt", true, true, None, &d));
+        assert!(!shows_on_desktop(r"C:\Users\x\Desktop\DESKTOP.INI", false, true, None, &d));
+        assert!(shows_on_desktop(r"C:\Users\x\Desktop\a.txt", false, false, None, &d));
+        assert!(shows_on_desktop(r"C:\Users\Public\Desktop\a.lnk", false, false, None, &d));
+        for other in [r"C:\Users\x\Downloads", r"C:\Users\x\Desktop", r"C:\Users\x", r"C:\Users\x\CrossDevice\phone", r"C:\Users\x\Desktop\sub\a.txt"] {
+            assert!(!shows_on_desktop(other, false, true, None, &d), "{other}");
+        }
     }
 }

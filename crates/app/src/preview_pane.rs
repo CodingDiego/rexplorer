@@ -354,7 +354,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_ERASEBKGND => LRESULT(1),
         WM_GETOBJECT if access::is_client(lparam) => (*s).acc.get_or_insert_with(|| access::Server::new(hwnd)).answer(wparam),
-        access::WM_ACC_ITEMS if access::own_pointer(lparam) => {
+        access::WM_ACC_ITEMS if access::own_send(hwnd, msg, lparam) => {
             acc_tree(hwnd, &*s, &mut *(lparam.0 as *mut access::Tree));
             LRESULT(1)
         }

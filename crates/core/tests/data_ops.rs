@@ -492,3 +492,22 @@ fn new_text_document_names_match_the_engine() {
     }
     assert_eq!(tree(&b), made);
 }
+
+/// Windows now and then asks a conflict in its older dialog (seen in one run of the drop test above), and every time
+/// when the progress window is off: the helper answers that one too, with the same result.
+#[test]
+fn the_older_conflict_dialog_takes_the_same_answers() {
+    use windows::Win32::UI::Shell::FOF_SILENT;
+    let _l = SHELL.lock();
+    let _c = ComInit::sta();
+    for (pick, kept) in [(SKIP, "old"), (REPLACE, "new")] {
+        let fx = fixture("old-dialog");
+        let (x, d) = conflict(&fx);
+        let answer = answer_conflict(pick);
+        let copied = copy(&x, &d, FOF_SILENT);
+        assert_eq!(answer.join().unwrap(), Ok(()), "pick {pick}: {copied:?}");
+        assert!(copied.is_ok(), "pick {pick}: {copied:?}");
+        assert_eq!(tree(&d), BTreeMap::from([("x.txt".into(), kept.into())]), "pick {pick}");
+        assert_eq!(std::fs::read_to_string(&x).unwrap(), "new", "pick {pick}");
+    }
+}

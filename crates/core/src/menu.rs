@@ -294,10 +294,10 @@ impl ContextMenu {
         unsafe {
             self.menu.QueryContextMenu(self.hmenu, 0, ID_FIRST, ID_LAST, CMF_DEFAULTONLY).ok()?;
             let id = GetMenuDefaultItem(self.hmenu, 0, GMDI_GOINTOPOPUPS);
-            if id == u32::MAX {
+            let Some(offset) = id.checked_sub(ID_FIRST).filter(|_| id <= ID_LAST) else {
                 return Err(windows::core::Error::empty());
-            }
-            self.invoke_id(hwnd, id - ID_FIRST, None, false)
+            };
+            self.invoke_id(hwnd, offset, None, false)
         }
     }
 
@@ -313,8 +313,8 @@ impl ContextMenu {
             let flags = if matches!(verb, "copy" | "cut" | "paste" | "delete" | "properties") { CMF_OPTIMIZEFORINVOKE } else { CMF_NORMAL };
             self.menu.QueryContextMenu(self.hmenu, 0, ID_FIRST, ID_LAST, flags).ok()?;
             // The Recycle Bin restores on a thread of its own otherwise, and one cut short (our process closing) leaves
-            // the item's $I record behind in the bin.
-            let sync = verb.eq_ignore_ascii_case("undelete");
+            // the item's $I record behind in the bin. A delete's caller reads which rows are gone right after.
+            let sync = verb.eq_ignore_ascii_case("undelete") || verb.eq_ignore_ascii_case("delete");
             self.invoke(hwnd, PCSTR(narrow.as_ptr() as *const u8), PCWSTR(wide.as_ptr()), None, shift, sync)
         }
     }
@@ -478,6 +478,7 @@ mod tests {
         assert!(in_bin(true, r"::{645FF040-5081-101B-9F08-00AA002F954E}\x"));
         assert!(in_bin(false, r"C:\$Recycle.Bin\S-1-5-21-1-2-3-1001\$RAB12CD\inner.txt"), "inside a recycled folder");
         assert!(!in_bin(false, r"C:\Users\u\a.txt"));
+        let _l = crate::com::SHELL_UI.lock();
         let _c = ComInit::sta();
         // Live: a folder of the user's named like the bin counts by its path (the safe side), and its parent does not
         // answer with the bin's class.
@@ -497,6 +498,7 @@ mod tests {
 
     #[test]
     fn menus_build_for_items_and_background() {
+        let _l = crate::com::SHELL_UI.lock();
         let _c = ComInit::sta();
         let (f, items) = list(r"C:\Windows").unwrap();
         let first: Vec<&ShellItem> = items.iter().take(1).collect();
@@ -507,6 +509,7 @@ mod tests {
 
     #[test]
     fn background_new_submenu_and_new_folder() {
+        let _l = crate::com::SHELL_UI.lock();
         let _c = ComInit::sta();
         let dir = std::env::temp_dir().join(format!("rexplorer-newmenu-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -523,6 +526,7 @@ mod tests {
 
     #[test]
     fn new_entries_are_told_from_the_rest() {
+        let _l = crate::com::SHELL_UI.lock();
         let _c = ComInit::sta();
         let f = ShellFolder::parse(std::env::temp_dir().to_str().unwrap()).unwrap();
         let m = ContextMenu::for_background(&f, HWND::default()).unwrap();
@@ -537,6 +541,7 @@ mod tests {
 
     #[test]
     fn several_items_get_one_menu_with_properties() {
+        let _l = crate::com::SHELL_UI.lock();
         let _c = ComInit::sta();
         // One fixed folder, reused by every run: it cannot be removed here (see the end), so it must not pile up.
         let dir = std::env::temp_dir().join("rexplorer-multimenu");
@@ -561,6 +566,7 @@ mod tests {
 
     #[test]
     fn hidden_verbs_leave_the_menu() {
+        let _l = crate::com::SHELL_UI.lock();
         let _c = ComInit::sta();
         let dir = std::env::temp_dir().join(format!("rexplorer-hidden-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("sub")).unwrap();
@@ -580,6 +586,7 @@ mod tests {
 
     #[test]
     fn items_of_two_folders_get_one_menu() {
+        let _l = crate::com::SHELL_UI.lock();
         let _c = ComInit::sta();
         let dir = std::env::temp_dir().join(format!("rexplorer-scattered-{}", std::process::id()));
         for sub in ["x", "y"] {

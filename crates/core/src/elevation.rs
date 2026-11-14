@@ -16,7 +16,7 @@ use windows::Win32::System::Threading::{
     OpenProcessToken, PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION, STARTUPINFOW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
-use windows::core::{Error, PCWSTR, PWSTR, Result};
+use windows::core::{Error, HSTRING, PCWSTR, PWSTR, Result};
 
 unsafe fn token_elevated(tok: HANDLE) -> bool {
     let mut e = TOKEN_ELEVATION::default();
@@ -63,6 +63,14 @@ pub fn relaunch_unelevated() -> Result<()> {
             let _ = CloseHandle(primary);
             return Err(Error::new(E_FAIL, "the shell runs elevated too"));
         }
+        // Named, not found by a search of the command line's first token.
+        let exe = match std::env::current_exe() {
+            Ok(p) => HSTRING::from(p.as_os_str()),
+            Err(e) => {
+                let _ = CloseHandle(primary);
+                return Err(Error::new(E_FAIL, e.to_string()));
+            }
+        };
         let mut cmd: Vec<u16> = GetCommandLineW().as_wide().iter().copied().chain(Some(0)).collect();
         // This process's environment, not the shell user's profile: APPDATA and REXPLORER_* overrides carry over.
         let mut env: Vec<u16> = std::env::vars_os()
@@ -79,7 +87,7 @@ pub fn relaunch_unelevated() -> Result<()> {
         let started = CreateProcessWithTokenW(
             primary,
             CREATE_PROCESS_LOGON_FLAGS(0),
-            PCWSTR::null(),
+            &exe,
             Some(PWSTR(cmd.as_mut_ptr())),
             CREATE_UNICODE_ENVIRONMENT,
             Some(env.as_mut_ptr() as *const c_void),

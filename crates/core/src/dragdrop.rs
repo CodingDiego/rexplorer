@@ -11,7 +11,7 @@ use windows::Win32::System::Ole::{
     IDropSource, IDropTarget, IDropTarget_Impl, OleGetClipboard, RegisterDragDrop, RevokeDragDrop, CF_HDROP, CF_UNICODETEXT,
     ReleaseStgMedium,
 };
-use windows::Win32::UI::Shell::{BHID_DataObject, CLSID_DragDropHelper, DROPFILES, DragQueryFileW, HDROP, IDropTargetHelper, IShellFolder, SHBindToParent, SHDoDragDrop};
+use windows::Win32::UI::Shell::{BHID_DataObject, CLSID_DragDropHelper, DROPFILES, IDropTargetHelper, IShellFolder, SHBindToParent, SHDoDragDrop};
 use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
 use windows::core::{Interface, Ref, Result, implement, w};
 
@@ -122,22 +122,54 @@ pub fn hdrop_paths(data: &IDataObject) -> Vec<String> {
     let fmt = FORMATETC { cfFormat: CF_HDROP.0, ptd: std::ptr::null_mut(), dwAspect: DVASPECT_CONTENT.0, lindex: -1, tymed: TYMED_HGLOBAL.0 as u32 };
     unsafe {
         let Ok(mut m) = data.GetData(&fmt) else { return Vec::new() };
-        // From any program: not a memory block, or one shorter than the DROPFILES header, is no file list.
-        if m.tymed != TYMED_HGLOBAL.0 as u32 || GlobalSize(m.u.hGlobal) < std::mem::size_of::<DROPFILES>() {
-            ReleaseStgMedium(&mut m);
-            return Vec::new();
+        let mut paths = Vec::new();
+        if m.tymed == TYMED_HGLOBAL.0 as u32 {
+            let h = m.u.hGlobal;
+            let p = GlobalLock(h) as *const u8;
+            if !p.is_null() {
+                paths = parse_dropfiles(std::slice::from_raw_parts(p, GlobalSize(h)));
+                let _ = GlobalUnlock(h);
+            }
         }
-        let h = HDROP(m.u.hGlobal.0);
-        let paths = (0..DragQueryFileW(h, u32::MAX, None))
-            .map(|i| {
-                let mut buf = vec![0u16; DragQueryFileW(h, i, None) as usize + 1];
-                let n = DragQueryFileW(h, i, Some(&mut buf)) as usize;
-                String::from_utf16_lossy(&buf[..n])
-            })
-            .collect();
         ReleaseStgMedium(&mut m);
         paths
     }
+}
+
+/// Most paths one file list yields.
+const MAX_DROP_FILES: usize = 65_536;
+
+/// The paths of a DROPFILES block from any program, in one pass that never reads outside `block`: the header's
+/// offset must point past the header and inside the block, a string the block ends before its terminator is
+/// dropped, and at most MAX_DROP_FILES come back.
+pub fn parse_dropfiles(block: &[u8]) -> Vec<String> {
+    let field = |at: usize| block.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let (Some(start), Some(wide)) = (field(0), field(16)) else { return Vec::new() };
+    let start = start as usize;
+    if start < std::mem::size_of::<DROPFILES>() || start >= block.len() {
+        return Vec::new();
+    }
+    let list = &block[start..];
+    if wide != 0 {
+        let units: Vec<u16> = list.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
+        terminated(&units, 0).map(String::from_utf16_lossy).collect()
+    } else {
+        terminated(list, 0).map(ansi_to_string).collect()
+    }
+}
+
+/// The strings of `units` up to the empty one that ends the list, each closed by `nul`.
+fn terminated<T: Copy + PartialEq>(units: &[T], nul: T) -> impl Iterator<Item = &[T]> {
+    let end = units.iter().rposition(|u| *u == nul).unwrap_or(0);
+    units[..end].split(move |u| *u == nul).take_while(|s| !s.is_empty()).take(MAX_DROP_FILES)
+}
+
+/// An ANSI path in the system code page, as DragQueryFileW converts it.
+fn ansi_to_string(bytes: &[u8]) -> String {
+    use windows::Win32::Globalization::{CP_ACP, MULTI_BYTE_TO_WIDE_CHAR_FLAGS, MultiByteToWideChar};
+    let mut buf = vec![0u16; bytes.len()];
+    let n = unsafe { MultiByteToWideChar(CP_ACP, MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0), bytes, Some(&mut buf)) };
+    String::from_utf16_lossy(&buf[..n.max(0) as usize])
 }
 
 /// The clipboard's cut files, from any program; none on a copy or when it cannot be read.
@@ -422,6 +454,55 @@ mod tests {
     use super::*;
     use crate::com::ComInit;
     use windows::Win32::System::SystemServices::MK_LBUTTON;
+    use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
+
+    /// A DROPFILES header with `start` and `wide`, then `list` as is.
+    fn dropfiles(start: u32, wide: bool, list: &[u8]) -> Vec<u8> {
+        let mut b = vec![0u8; 20];
+        b[..4].copy_from_slice(&start.to_le_bytes());
+        b[16] = wide as u8;
+        b.extend_from_slice(list);
+        b
+    }
+
+    fn wide(s: &str) -> Vec<u8> {
+        s.encode_utf16().flat_map(u16::to_le_bytes).collect()
+    }
+
+    #[test]
+    fn parse_dropfiles_reads_a_wide_list() {
+        let block = dropfiles(20, true, &wide("C:\\a.txt\0D:\\b \u{e9}\0\0"));
+        assert_eq!(parse_dropfiles(&block), ["C:\\a.txt", "D:\\b \u{e9}"]);
+        assert_eq!(parse_dropfiles(&dropfiles(20, false, b"C:\\a\0C:\\b\0\0")), ["C:\\a", "C:\\b"]);
+    }
+
+    #[test]
+    fn parse_dropfiles_rejects_a_bad_offset() {
+        let list = wide("C:\\a\0\0");
+        let len = 20 + list.len() as u32;
+        assert!(parse_dropfiles(&dropfiles(len, true, &list)).is_empty(), "offset at the end");
+        assert!(parse_dropfiles(&dropfiles(u32::MAX, true, &list)).is_empty(), "offset past the end");
+        assert!(parse_dropfiles(&dropfiles(19, true, &list)).is_empty(), "offset inside the header");
+        assert!(parse_dropfiles(&dropfiles(0, true, &list)).is_empty());
+        assert!(parse_dropfiles(&[0u8; 19]).is_empty(), "shorter than the header");
+    }
+
+    #[test]
+    fn parse_dropfiles_stops_at_the_block_end() {
+        assert_eq!(parse_dropfiles(&dropfiles(20, true, &wide("C:\\a\0C:\\partial"))), ["C:\\a"]);
+        assert!(parse_dropfiles(&dropfiles(20, true, &wide("C:\\nothing ends"))).is_empty());
+        let mut odd = wide("C:\\a\0C:\\b\0");
+        odd.push(b'x');
+        assert_eq!(parse_dropfiles(&dropfiles(20, true, &odd)), ["C:\\a", "C:\\b"]);
+    }
+
+    #[test]
+    fn parse_dropfiles_caps_the_count() {
+        let list = wide(&"a\0".repeat(70_000));
+        let paths = parse_dropfiles(&dropfiles(20, true, &list));
+        assert_eq!(paths.len(), MAX_DROP_FILES);
+        assert_eq!(MAX_DROP_FILES, 65_536);
+    }
 
     struct Fixture(std::path::PathBuf);
     impl Drop for Fixture {

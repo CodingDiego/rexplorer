@@ -582,10 +582,28 @@ fn file_dirs<'a>(dir: &'a Path, links: Option<&'a (PathBuf, PathBuf)>) -> Vec<&'
     v
 }
 
-fn remove_dirs(rec: &[String]) {
-    for d in rec.iter().filter_map(|l| l.strip_prefix("dir ")) {
+/// Removes the empty folders `rec` lists, in its order. A record is a file the user can edit, so only `dir` (the
+/// install folder) and its ancestors strictly below %LOCALAPPDATA% count; paths are compared canonical (8.3 names).
+fn remove_dirs(rec: &[String], dir: &Path) {
+    let real = |p: &Path| std::fs::canonicalize(p).ok();
+    let Some(dir) = real(dir) else { return };
+    let local = std::env::var_os("LOCALAPPDATA").and_then(|l| real(Path::new(&l)));
+    let ours: Vec<PathBuf> = rec
+        .iter()
+        .filter_map(|l| l.strip_prefix("dir "))
+        .map(Path::new)
+        .filter(|d| d.is_absolute() && !d.components().any(|c| c == std::path::Component::ParentDir))
+        .filter_map(real)
+        .filter(|d| removable(d, &dir, local.as_deref()))
+        .collect();
+    for d in ours {
         let _ = std::fs::remove_dir(d);
     }
+}
+
+/// `d` is the install folder `dir`, or an ancestor of it strictly below `local`; never a root. All canonical.
+fn removable(d: &Path, dir: &Path, local: Option<&Path>) -> bool {
+    d.parent().is_some() && (d == dir || local.is_some_and(|l| dir.starts_with(d) && d.starts_with(l) && d != l))
 }
 
 /// Gives folders back to Windows Explorer: reverts what `<dir>\takeover.txt` lists. Without it (an older build's
@@ -611,7 +629,7 @@ fn give_back_in(dir: &Path, reg_base: &str, links: Option<&(PathBuf, PathBuf)>) 
     } else {
         summary.extend(revert(&rec, &[], reg_base, &file_dirs(dir, links))?);
         let _ = std::fs::remove_file(dir.join(TAKEOVER));
-        remove_dirs(&rec);
+        remove_dirs(&rec, dir);
     }
     register::notify();
     Ok(summary.join("\n"))
@@ -654,7 +672,7 @@ fn uninstall_in(dir: &Path, reg_base: &str, links: Option<&(PathBuf, PathBuf)>) 
             }
         }
     }
-    remove_dirs(&rec);
+    remove_dirs(&rec, dir);
     summary.push(trf("inst.un.removed", &[("path", &exe.display())]));
     Ok(summary.join("\n"))
 }
@@ -1041,6 +1059,35 @@ mod tests {
         uninstall(&s.dir, &s.base).unwrap();
         assert!(!key_exists(&arp(&s.base)) && !s.dir.parent().unwrap().exists());
         assert!(uninstall(&s.dir, &s.base).is_err(), "nothing left to uninstall");
+    }
+
+    #[test]
+    fn a_record_removes_only_the_install_folder_and_its_parents_below_localappdata() {
+        let local = Path::new(r"C:\Users\u\AppData\Local");
+        let dir = local.join(r"Programs\rexplorer");
+        assert!(removable(&dir, &dir, Some(local)));
+        assert!(removable(&local.join("Programs"), &dir, Some(local)));
+        for not in [local.to_path_buf(), local.join("Other"), PathBuf::from(r"C:\Users\u"), PathBuf::from(r"C:\")] {
+            assert!(!removable(&not, &dir, Some(local)), "{}", not.display());
+        }
+        assert!(!removable(&local.join("Programs"), &dir, None), "no %LOCALAPPDATA%: only the install folder");
+        assert!(!removable(Path::new(r"C:\"), Path::new(r"C:\"), Some(local)), "never a drive root");
+
+        // On disk, a record with a foreign folder, one reached through `..` and a relative one: only ours goes.
+        let root = std::env::temp_dir().join(format!("rexplorer-remove-dirs-{}", std::process::id()));
+        let (ours, foreign) = (root.join("app"), root.join("elsewhere"));
+        std::fs::create_dir_all(&ours).unwrap();
+        std::fs::create_dir_all(&foreign).unwrap();
+        let rec = [
+            format!("dir {}", foreign.display()),
+            format!(r"dir {}\..\elsewhere", ours.display()),
+            "dir elsewhere".to_string(),
+            format!("dir {}", ours.display()),
+        ];
+        remove_dirs(&rec, &ours);
+        assert!(!ours.exists(), "the install folder, empty, is removed");
+        assert!(foreign.is_dir(), "a folder that is not ours stays, however the record names it");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -16,8 +16,10 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
       - run: cargo install cargo-fuzz --version 0.13.2 --locked
       # Three minutes per target, every target fuzz/Cargo.toml lists; a crash in one does not stop the others.
       # --sanitizer none: the targets are safe Rust, so the finds are panics (debug assertions are on), and an
@@ -38,7 +40,7 @@ jobs:
             if ($code -or -not $done) { $failed += $t }
           }
           if ($failed) { throw "fuzz targets failed: $($failed -join ', '); inputs in the fuzz-artifacts upload" }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: fuzz-artifacts
@@ -53,14 +55,16 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 100
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       # The release toolchain (release.yml), so the soaked exe is built like the one that ships.
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
       - run: cargo build --release --locked
       # Prints the operation counts and each resource's baseline, end and limit; fails under 300 rounds.
       - name: Soak, 60 minutes
         run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\soak.ps1 -Minutes 60 -Csv soak.csv
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: soak-samples

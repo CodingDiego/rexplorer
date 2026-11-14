@@ -183,6 +183,9 @@ fn names_in(dir: &str) -> Option<Vec<String>> {
 /// A paste or drop of `sources` into `dest`, read before the shell runs it: each source as it is now, and the names
 /// in `dest` its copy could get that are already taken. Sources that are gone, and a `dest` that cannot be read, give none.
 pub fn plan_transfer(sources: &[String], dest: &str) -> Vec<Sent> {
+    if sources.is_empty() {
+        return Vec::new();
+    }
     let Some(names) = names_in(dest) else { return Vec::new() };
     // Lowercase: a Replace may give the existing item the source's case, and it must still count as taken.
     let lower: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
@@ -651,9 +654,9 @@ mod tests {
         p.to_string()
     }
 
-    /// Held by every test that runs the shell's file operations or the bin's undelete: one at a time, so the copy
-    /// engine's windows a test waits for, answers or closes (tests/common/dialogs.rs) are its own.
-    static SHELL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Held by every test that runs the shell's file operations or the bin's undelete: one at a time, so the copy
+    // engine's windows a test waits for, answers or closes (tests/common/dialogs.rs) are its own.
+    use crate::com::SHELL_UI as SHELL;
 
     /// Takes `pairs` (original, bin item) back out of the user's Recycle Bin when the test ends, however it ends.
     struct OutOfBin(Vec<(String, String)>);
@@ -728,6 +731,16 @@ mod tests {
         assert_eq!((got[0].from.as_str(), got[0].dest.as_str(), got[0].taken.clone()), (src.as_str(), dst.as_str(), vec![s("x.txt")]));
         assert!(matches!(got[0].was, Was::File(5, _, Some(_))));
         assert!(plan_transfer(&[src], &p(&fx.0, "missing")).is_empty());
+    }
+
+    #[test]
+    fn plan_transfer_of_nothing_is_empty() {
+        let (_fx, _, dst) = transfer_fixture("plan-none");
+        assert!(plan_transfer(&[], &dst).is_empty());
+        // Unreachable (TEST-NET-1): with no sources the folder is never read, so this returns at once.
+        let at = std::time::Instant::now();
+        assert!(plan_transfer(&[], r"\\192.0.2.1\share").is_empty());
+        assert!(at.elapsed() < std::time::Duration::from_millis(500));
     }
 
     #[test]

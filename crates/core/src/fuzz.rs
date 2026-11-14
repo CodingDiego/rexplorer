@@ -2,6 +2,7 @@
 //! reproduces from its seed alone. The checks both the seeded tests and fuzz/'s cargo-fuzz targets run:
 pub use crate::archive::fuzz_check as archive_member;
 pub use crate::cli::fuzz_check as command_line;
+pub use crate::dragdrop::parse_dropfiles as drop_files;
 pub use crate::i18n::fuzz_check as language_file;
 pub use crate::query::fuzz_check as search_query;
 pub use crate::settings::fuzz_check as ini_file;
@@ -84,6 +85,7 @@ mod tests {
             archive_member(&t);
             search_query(&t);
             update_response(t.as_bytes());
+            drop_files(t.as_bytes());
             let parts: Vec<String> = t.split('\n').take(6).map(String::from).collect();
             command_line(&t, &parts, &parts, true);
         }

@@ -13,8 +13,12 @@ pub fn explorer_exe() -> PathBuf {
     PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into())).join("explorer.exe")
 }
 
-/// Opens a folder in Windows Explorer. Accepts paths and `::{CLSID}` parsing names alike.
+/// Opens a folder in Windows Explorer. Accepts paths and `::{CLSID}` parsing names alike. A name with a quote or a
+/// control character is refused: it would end the quoted argument and add Explorer arguments of its own.
 pub fn open_in_explorer(parsing_name: &str) -> Result<()> {
+    if parsing_name.chars().any(|c| c == '"' || c.is_control()) {
+        return Err(Error::from(windows::Win32::Foundation::E_INVALIDARG));
+    }
     let file = HSTRING::from(explorer_exe().as_os_str());
     let params = HSTRING::from(format!("\"{parsing_name}\""));
     let mut info = SHELLEXECUTEINFOW {
@@ -60,4 +64,14 @@ pub fn run_explorer(params: &str) -> Result<()> {
         let _ = CloseHandle(pi.hThread);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_name_that_would_add_explorer_arguments_is_refused() {
+        for bad in ["C:\\a\" /e,C:\\Windows", "C:\\a\nb"] {
+            assert!(super::open_in_explorer(bad).is_err(), "{bad:?}");
+        }
+    }
 }

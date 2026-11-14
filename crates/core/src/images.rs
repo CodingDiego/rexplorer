@@ -106,6 +106,17 @@ impl ImageCache {
         self.map.is_empty()
     }
 
+    /// Drops (and deletes) the entries whose key `stale` picks.
+    pub fn forget(&mut self, stale: impl Fn(&str) -> bool) {
+        self.map.retain(|k, (bmp, _)| {
+            let keep = !stale(k);
+            if !keep {
+                delete(*bmp);
+            }
+            keep
+        });
+    }
+
     pub fn clear(&mut self) {
         for (_, (bmp, _)) in self.map.drain() {
             delete(bmp);
@@ -218,5 +229,18 @@ mod tests {
         assert!(cache.get("b").is_none());
         assert!(cache.get("a").is_some());
         assert!(cache.get("c").is_some());
+    }
+
+    #[test]
+    fn cache_forgets_what_it_is_told() {
+        let _c = ComInit::sta();
+        let mk = || unsafe { CreateBitmap(1, 1, 1, 32, None) };
+        let mut cache = ImageCache::new(8);
+        for k in ["x:1:a", "y:2:a", "x:1:b"] {
+            cache.insert(k.into(), mk());
+        }
+        cache.forget(|k| k.ends_with(":a"));
+        assert_eq!(cache.len(), 1);
+        assert!(cache.get("x:1:b").is_some());
     }
 }

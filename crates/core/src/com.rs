@@ -116,6 +116,26 @@ impl Drop for Pidl {
     }
 }
 
+/// The security zone Windows gives a path by where it is (0 this PC, 1 intranet, 3 Internet, 4 restricted): a share
+/// reached by an IP address or a dotted name is Internet. The file is not opened, so a Zone.Identifier stream is the
+/// caller's to read. None without COM on this thread, or when Windows cannot tell.
+pub fn path_zone(path: &std::path::Path) -> Option<u32> {
+    use windows::Win32::System::Com::Urlmon::{CoInternetCreateSecurityManager, MUTZ_NOSAVEDFILECHECK};
+    unsafe {
+        let mut manager = None;
+        CoInternetCreateSecurityManager(None, &mut manager, 0).ok()?;
+        let mut zone = 0u32;
+        manager?.MapUrlToZone(&windows::core::HSTRING::from(path.as_os_str()), &mut zone, MUTZ_NOSAVEDFILECHECK).ok()?;
+        Some(zone)
+    }
+}
+
 // PIDLs are plain memory; the shell folder objects we pair them with are free-threaded in practice.
 unsafe impl Send for Pidl {}
 unsafe impl Sync for Pidl {}
+
+/// Held by every test that drives the shell's own UI (the folder tree, context menus, file operations and their
+/// dialogs): one at a time. That code keeps per-thread state over process-wide registrations, and one run of this test
+/// binary in 60 died inside DUI70.dll with those tests side by side (#94, not traced). The app has one UI thread.
+#[cfg(test)]
+pub(crate) static SHELL_UI: std::sync::Mutex<()> = std::sync::Mutex::new(());

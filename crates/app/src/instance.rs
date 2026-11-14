@@ -18,7 +18,8 @@ use windows::core::{Error, HSTRING, PCWSTR, Result, w};
 /// name that carries a password (an FTP URL) opens the start place instead.
 pub fn new_window_args(folder: &str) -> Vec<String> {
     let mut a = vec!["--new-window".to_string()];
-    if !folder.is_empty() && !folder.starts_with(['-', '/']) && crate::connect::redact(folder) == folder {
+    // A name with a line break stays out too: the hand-off payload has one value per line.
+    if !folder.is_empty() && !folder.starts_with(['-', '/']) && !folder.chars().any(char::is_control) && crate::connect::redact(folder) == folder {
         a.push(folder.to_string());
     }
     a
@@ -54,8 +55,12 @@ const GROUP_PROP: PCWSTR = w!("RexplorerGroup");
 
 /// Some(guard) if this is the first instance; None if another already holds the mutex.
 pub fn claim() -> Option<Guard> {
+    claim_group(group())
+}
+
+fn claim_group(group: usize) -> Option<Guard> {
     unsafe {
-        let name = HSTRING::from(format!("Local\\rexplorer-single-instance-{:x}", group()));
+        let name = HSTRING::from(format!("Local\\rexplorer-single-instance-{group:x}"));
         let h = CreateMutexW(None, false, &name).ok()?;
         if GetLastError() == ERROR_ALREADY_EXISTS {
             let _ = CloseHandle(h);
@@ -202,29 +207,28 @@ fn exec(file: &HSTRING, params: &HSTRING, dir: &HSTRING) -> bool {
     unsafe { ShellExecuteW(None, w!("open"), file, params, dir, SW_SHOWNORMAL).0 as isize > 32 }
 }
 
-/// `dir` quoted for a command line: a trailing backslash would escape the closing quote (`"C:\"` reads as `C:"`).
-fn quoted_dir(dir: &Path) -> String {
-    let d = dir.display().to_string();
-    let bs = if d.ends_with(BS) { BS } else { "" };
-    format!("\"{d}{bs}\"")
+/// Windows Terminal's arguments for a tab in `dir`. It splits its command line on every unescaped `;`, so each one is
+/// escaped; a quote or a control character cannot be passed safely and gives None.
+fn wt_params(dir: &str) -> Option<String> {
+    if dir.chars().any(|c| c == '"' || c.is_control()) {
+        return None;
+    }
+    // A trailing backslash would escape the closing quote (`"C:\"` reads as `C:"`).
+    let bs = if dir.ends_with('\\') { "\\" } else { "" };
+    Some(format!("-d \"{}{bs}\"", dir.replace(';', "\\;")))
 }
 
-const BS: &str = "\\";
-
 pub fn open_terminal(dir: &Path) -> Result<()> {
-    let d = HSTRING::from(dir.display().to_string());
+    let params = dir.to_str().filter(|_| dir.is_dir()).and_then(wt_params).ok_or_else(|| Error::from(E_FAIL))?;
+    let d = HSTRING::from(dir.as_os_str());
     // Absolute paths: ShellExecute resolves a bare name against the working directory (the browsed folder) first.
-    // The Store alias (a reparse point `is_file` cannot follow), then wt.exe in PATH's absolute folders (scoop, zip).
+    // The Store alias is a reparse point `is_file` cannot follow.
     let alias = std::env::var_os("LOCALAPPDATA").map(|l| Path::new(&l).join(r"Microsoft\WindowsApps\wt.exe")).filter(|a| a.symlink_metadata().is_ok());
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let on_path = std::env::split_paths(&path).filter(|p| p.is_absolute()).map(|p| p.join("wt.exe")).filter(|f| f.is_file());
-    let wt = HSTRING::from(format!("-d {}", quoted_dir(dir)));
-    if alias.into_iter().chain(on_path).any(|exe| exec(&HSTRING::from(exe.as_os_str()), &wt, &d)) {
+    if alias.is_some_and(|exe| exec(&HSTRING::from(exe.as_os_str()), &HSTRING::from(params), &d)) {
         return Ok(());
     }
     let cmd_exe = Path::new(&std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into())).join(r"System32\cmd.exe");
-    let cmd = HSTRING::from(format!("/K cd /d {}", quoted_dir(dir)));
-    if exec(&HSTRING::from(cmd_exe.as_os_str()), &cmd, &d) {
+    if exec(&HSTRING::from(cmd_exe.as_os_str()), &HSTRING::new(), &d) {
         Ok(())
     } else {
         Err(Error::from(E_FAIL))
@@ -242,18 +246,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn root_dirs_keep_their_closing_quote() {
-        assert_eq!(quoted_dir(Path::new("C:\\")), "\"C:\\\\\"");
-        assert_eq!(quoted_dir(Path::new("C:\\Users\\x")), "\"C:\\Users\\x\"");
+    fn terminal_params_escape_semicolons_and_refuse_quotes() {
+        assert_eq!(wt_params(r"C:\a b").as_deref(), Some(r#"-d "C:\a b""#));
+        assert_eq!(wt_params(r"C:\a;calc").as_deref(), Some(r#"-d "C:\a\;calc""#), "a ; would start a second command");
+        assert_eq!(wt_params(r"C:\").as_deref(), Some(r#"-d "C:\\""#), "the root keeps its closing quote");
+        assert_eq!(wt_params(r#"C:\a" ; calc"#), None);
+        assert_eq!(wt_params("C:\\a\nb"), None);
     }
 
     #[test]
     fn claim_is_exclusive() {
-        let a = claim();
+        // A group of its own: the real one is taken whenever a rexplorer window is open on this PC.
+        let group = 0x7E57_0000 | std::process::id() as usize;
+        let a = claim_group(group);
         assert!(a.is_some());
-        assert!(claim().is_none());
+        assert!(claim_group(group).is_none());
         drop(a);
-        assert!(claim().is_some());
+        assert!(claim_group(group).is_some());
     }
 
     #[test]
@@ -347,7 +356,7 @@ mod tests {
     #[test]
     fn new_window_args_keep_secrets_off_the_command_line() {
         assert_eq!(new_window_args("C:\\a b"), ["--new-window", "C:\\a b"]);
-        for none in ["", "ftp://bob:pw@h/x", "-x"] {
+        for none in ["", "ftp://bob:pw@h/x", "-x", "C:\\a\nselect=C:\\b"] {
             assert_eq!(new_window_args(none), ["--new-window"], "{none:?}");
         }
         assert_eq!(new_window_args("ftp://bob@h/x").len(), 2);

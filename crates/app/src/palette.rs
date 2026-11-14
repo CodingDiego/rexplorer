@@ -355,7 +355,7 @@ unsafe fn acc_tree(hwnd: HWND, st: *mut State, t: &mut access::Tree) {
         let c = &s.model.cands[ci];
         t.items.push(access::Item {
             name: c.text.clone(),
-            description: detail(c).unwrap_or_default().to_string(),
+            description: detail(c).unwrap_or_default(),
             role: ROLE_SYSTEM_LISTITEM,
             state: STATE_SYSTEM_SELECTABLE | if i == s.model.selected() { STATE_SYSTEM_SELECTED } else { 0 },
             rect: row_rect(i, rc.right, s.dpi),
@@ -366,8 +366,9 @@ unsafe fn acc_tree(hwnd: HWND, st: *mut State, t: &mut access::Tree) {
 }
 
 /// What a row shows after its name: where it leads, unless that is the name itself or a `::{GUID}` nobody reads.
-fn detail(c: &Candidate) -> Option<&str> {
-    (c.target != c.text && !c.target.starts_with("::")).then_some(c.target.as_str())
+/// Without the password: a folder inside an FTP place has it in its address, and the row is on screen and read out.
+fn detail(c: &Candidate) -> Option<String> {
+    (c.target != c.text && !c.target.starts_with("::")).then(|| crate::connect::redact(&c.target))
 }
 
 /// Result row under the mouse position packed in `lparam`.
@@ -396,7 +397,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_ERASEBKGND => return LRESULT(1),
         WM_PAINT => paint(hwnd, st),
         WM_GETOBJECT if access::is_client(lparam) => return (*st).acc.get_or_insert_with(|| access::Server::new(hwnd)).answer(wparam),
-        access::WM_ACC_ITEMS if access::own_pointer(lparam) => {
+        access::WM_ACC_ITEMS if access::own_send(hwnd, msg, lparam) => {
             acc_tree(hwnd, st, &mut *(lparam.0 as *mut access::Tree));
             return LRESULT(1);
         }
@@ -518,7 +519,7 @@ unsafe fn paint(hwnd: HWND, st: *mut State) {
         if let Some(target) = detail(c).filter(|_| left < cw - pad) {
             let mut tr = RECT { left, right: cw - pad, ..row };
             SetTextColor(mem, COLORREF(if selected && s.contrast { on_sel } else { secondary }));
-            theme::draw_text(mem, target, &mut tr, flags | DT_RIGHT | DT_PATH_ELLIPSIS);
+            theme::draw_text(mem, &target, &mut tr, flags | DT_RIGHT | DT_PATH_ELLIPSIS);
         }
     }
     if s.contrast {
@@ -539,6 +540,14 @@ mod tests {
 
     fn c(t: &str) -> Candidate {
         Candidate { text: t.into(), target: format!("C:\\{t}") }
+    }
+
+    #[test]
+    fn a_row_never_shows_or_reads_out_an_ftp_password() {
+        let row = Candidate { text: "docs".into(), target: "ftp://bob:hunter2@host.test/docs/".into() };
+        assert_eq!(detail(&row).as_deref(), Some("ftp://bob@host.test/docs/"));
+        assert_eq!(row.target, "ftp://bob:hunter2@host.test/docs/", "the place it opens keeps its address");
+        assert_eq!(detail(&c("x")).as_deref(), Some("C:\\x"));
     }
 
     #[test]
