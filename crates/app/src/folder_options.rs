@@ -12,8 +12,11 @@ use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, SIZE, WP
 use windows::Win32::Graphics::Dwm::{DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_COMBOBOXEDIT, ODS_DISABLED, ODS_FOCUS, ODS_SELECTED, ODT_COMBOBOX, SetScrollInfo, SetWindowTheme};
-use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
+use windows::Win32::UI::Controls::{
+    CDDS_PREPAINT, CDIS_DISABLED, CDIS_FOCUS, CDRF_SKIPDEFAULT, DRAWITEMSTRUCT, NM_CUSTOMDRAW, NMCUSTOMDRAW, NMHDR, ODS_COMBOBOXEDIT, ODS_DISABLED, ODS_FOCUS,
+    ODS_SELECTED, ODT_COMBOBOX, SetScrollInfo, SetWindowTheme,
+};
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{HSTRING, PCWSTR, w};
@@ -52,6 +55,7 @@ const PAGES: [&str; 3] = ["fo.page_general", "fo.page_view", "fo.page_search"];
 const TAB: (i32, i32, i32, i32) = (12, 12, 72, 28);
 /// Client size and page rectangle (x, y, w, h) in 96-DPI pixels; the controls are placed relative to the page.
 const CLIENT: (i32, i32) = (480, 480);
+const STYLE: WINDOW_STYLE = WINDOW_STYLE(WS_POPUP.0 | WS_CAPTION.0 | WS_SYSMENU.0 | WS_CLIPCHILDREN.0);
 const PAGE: (i32, i32, i32, i32) = (12, 40, 456, 390);
 const BUTTON: (i32, i32) = (84, 26);
 const ROW: i32 = 24;
@@ -471,18 +475,29 @@ struct State {
     dirty: bool,
     ready: bool,
     done: bool,
+    /// Where the content is scrolled to: a work area smaller than the dialog shows part of it.
+    scroll: crate::fit::Scroll,
 }
 
 unsafe fn page_origin(dpi: i32) -> (i32, i32) {
     (PAGE.0 * dpi / 96, PAGE.1 * dpi / 96)
 }
 
-unsafe fn place(hwnd: HWND, st: &State) {
+/// The size the dialog's content is laid out in: `CLIENT` at `dpi`, or the client area where that is larger.
+unsafe fn extent(hwnd: HWND, dpi: i32) -> (i32, i32) {
     let mut rc = RECT::default();
     let _ = GetClientRect(hwnd, &mut rc);
+    ((CLIENT.0 * dpi / 96).max(rc.right), (CLIENT.1 * dpi / 96).max(rc.bottom))
+}
+
+unsafe fn place(hwnd: HWND, st: &State) {
     let dpi = dpi_of(hwnd);
+    let (sx, sy) = (st.scroll.x, st.scroll.y);
+    let (cw, ch) = extent(hwnd, dpi);
+    let rc = RECT { left: -sx, top: -sy, right: cw - sx, bottom: ch - sy };
     let s = |v: i32| v * dpi / 96;
     let (ox, oy) = page_origin(dpi);
+    let (ox, oy) = (ox - sx, oy - sy);
     let eh = st.theme.font_size * dpi / 72 * 4 / 3 + s(4);
     for (i, ctl) in CTLS.iter().enumerate() {
         let h = st.hw[i];
@@ -529,10 +544,15 @@ unsafe fn create_children(hwnd: HWND, st: &mut State) {
     let tab = WS_TABSTOP.0;
     for (i, ctl) in CTLS.iter().enumerate() {
         st.hw[i] = match ctl.kind {
-            Kind::Check | Kind::Radio(_) | Kind::Push => mk(w!("BUTTON"), loc(ctl.text), tab | BS_OWNERDRAW as u32, ctl.id, std::ptr::null()),
+            // Real check and radio buttons, so a screen reader hears what they are and whether they are on; they are
+            // painted here all the same (NM_CUSTOMDRAW, `draw_check`). Not the auto kinds: WM_COMMAND keeps the state.
+            Kind::Check => mk(w!("BUTTON"), loc(ctl.text), tab | BS_CHECKBOX as u32, ctl.id, std::ptr::null()),
+            Kind::Radio(_) => mk(w!("BUTTON"), loc(ctl.text), tab | BS_RADIOBUTTON as u32, ctl.id, std::ptr::null()),
+            Kind::Push => mk(w!("BUTTON"), loc(ctl.text), tab | BS_OWNERDRAW as u32, ctl.id, std::ptr::null()),
             Kind::Edit => {
                 let h = mk(w!("EDIT"), "", tab | ES_AUTOHSCROLL as u32 | ES_NUMBER as u32, ctl.id, std::ptr::null());
                 crate::edit::attach(h);
+                name_after_label(h, i);
                 h
             }
             Kind::Combo => {
@@ -541,6 +561,7 @@ unsafe fn create_children(hwnd: HWND, st: &mut State) {
                 if dark {
                     let _ = SetWindowTheme(h, w!("DarkMode_CFD"), w!("Combobox"));
                 }
+                name_after_label(h, i);
                 h
             }
             Kind::List => {
@@ -571,6 +592,21 @@ unsafe fn create_children(hwnd: HWND, st: &mut State) {
     }
 }
 
+/// Names a box for screen readers after the painted label before it in `CTLS` (the label is not a window).
+fn name_after_label(h: HWND, i: usize) {
+    if let Some(label) = CTLS[..i].iter().rev().find(|c| c.kind == Kind::Label) {
+        let _ = rexplorer_core::access::set_name(h, loc(label.text).trim_end_matches(':'));
+    }
+}
+
+/// Tells the button of control `i` (a check box or a radio) its state, which is what a screen reader asks it for.
+unsafe fn sync_check(st: &State, i: usize) {
+    let h = st.hw[i];
+    SendMessageW(h, BM_SETCHECK, Some(WPARAM(st.on[i] as usize)), None);
+    // BM_SETCHECK takes the tab stop from a radio button that is off; every option here stays a tab stop.
+    SetWindowLongPtrW(h, GWL_STYLE, GetWindowLongPtrW(h, GWL_STYLE) | WS_TABSTOP.0 as isize);
+}
+
 unsafe fn show_page(st: &mut State, page: usize) {
     st.page = page;
     for (i, ctl) in CTLS.iter().enumerate() {
@@ -598,6 +634,7 @@ unsafe fn set_on(st: &mut State, id: i32, on: bool) {
         return;
     }
     st.on[at(id)] = on;
+    sync_check(st, at(id));
 }
 
 unsafe fn number(h: HWND, old: u32) -> u32 {
@@ -786,22 +823,20 @@ unsafe fn draw_combo(st: &State, di: &DRAWITEMSTRUCT) {
 unsafe fn draw_item(st: &State, di: &DRAWITEMSTRUCT) {
     if di.CtlType == ODT_COMBOBOX {
         draw_combo(st, di);
-        return;
-    }
-    let id = di.CtlID as i32;
-    let ctl = &CTLS[at(id)];
-    if ctl.id != id || ctl.kind == Kind::Push {
+    } else {
         draw_push(st, di);
-        return;
     }
-    let dpi = dpi_of(di.hwndItem);
-    solid(di.hDC, &di.rcItem, st.theme.surface);
-    let enabled = di.itemState.0 & ODS_DISABLED.0 == 0;
+}
+
+/// Paints the check box or radio button of control `i` whole, in place of the system's drawing.
+unsafe fn draw_check(st: &State, i: usize, cd: &NMCUSTOMDRAW) {
+    let h = cd.hdr.hwndFrom;
+    solid(cd.hdc, &cd.rc, st.theme.surface);
     let mut buf = [0u16; 128];
-    let n = GetWindowTextW(di.hwndItem, &mut buf) as usize;
+    let n = GetWindowTextW(h, &mut buf) as usize;
     let label = String::from_utf16_lossy(&buf[..n]);
-    let (kind, on) = (ctl.kind, st.on[at(id)]);
-    draw_option(di.hDC, &di.rcItem, kind, on, enabled, di.itemState.0 & ODS_FOCUS.0 != 0, &label, &st.theme, &st.fonts, dpi, st.theme.surface);
+    let (enabled, focus) = (cd.uItemState.0 & CDIS_DISABLED.0 == 0, cd.uItemState.0 & CDIS_FOCUS.0 != 0);
+    draw_option(cd.hdc, &cd.rc, CTLS[i].kind, st.on[i], enabled, focus, &label, &st.theme, &st.fonts, dpi_of(h), st.theme.surface);
 }
 
 fn tab_rect(i: usize, dpi: i32) -> RECT {
@@ -809,9 +844,9 @@ fn tab_rect(i: usize, dpi: i32) -> RECT {
 }
 
 unsafe fn paint_background(hwnd: HWND, dc: HDC, st: &State) {
-    let mut rc = RECT::default();
-    let _ = GetClientRect(hwnd, &mut rc);
     let (t, dpi) = (&st.theme, dpi_of(hwnd));
+    let (cw, ch) = extent(hwnd, dpi);
+    let rc = RECT { left: 0, top: 0, right: cw, bottom: ch };
     solid(dc, &rc, t.background);
     let line = line_color(t);
     let page = pos(PAGE, dpi);
@@ -873,11 +908,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     match msg {
         WM_SIZE => {
             if !st.ok.0.is_null() {
+                let dpi = dpi_of(hwnd);
+                st.scroll.fit(hwnd, (CLIENT.0 * dpi / 96, CLIENT.1 * dpi / 96));
                 place(hwnd, st);
             }
             LRESULT(0)
         }
-        // Moved to a monitor of another scale: take the suggested rect (WM_SIZE lays the controls out again).
+        WM_VSCROLL | WM_HSCROLL | WM_MOUSEWHEEL => {
+            if st.scroll.on_message(hwnd, msg, wparam, ROW * dpi_of(hwnd) / 96) {
+                place(hwnd, st);
+                let _ = InvalidateRect(Some(hwnd), None, true);
+            }
+            LRESULT(0)
+        }
+        // Moved to a monitor of another scale: sized for it again, inside its work area (WM_SIZE lays the controls
+        // out again).
         WM_DPICHANGED => {
             // The fonts were sized for the previous monitor: make both again for this one.
             let dpi = (wparam.0 & 0xFFFF) as u32;
@@ -892,28 +937,33 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let _ = DeleteObject(old.into());
             }
             (st.own_ui, st.fonts) = (ui, Fonts { ui, glyphs });
-            let r = &*(lparam.0 as *const RECT);
+            let text_dpi = theme::text_dpi(dpi) as i32;
+            let r = crate::fit::window_rect((CLIENT.0 * text_dpi / 96, CLIENT.1 * text_dpi / 96), STYLE, dpi, &*(lparam.0 as *const RECT));
             let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
             let _ = InvalidateRect(Some(hwnd), None, true);
             LRESULT(0)
         }
         WM_ERASEBKGND => {
+            // The whole content is painted, and the part scrolled to is copied.
+            // shortcut: a bitmap the size of the content on every erase (29 MB at 250 % scale and Text size 225 %),
+            // paint only the client area through a shifted origin if scrolling ever stutters.
             let dc = HDC(wparam.0 as *mut c_void);
             let mut rc = RECT::default();
             let _ = GetClientRect(hwnd, &mut rc);
+            let (cw, ch) = extent(hwnd, dpi_of(hwnd));
             let mem = CreateCompatibleDC(Some(dc));
-            let bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
+            let bmp = CreateCompatibleBitmap(dc, cw, ch);
             let old = SelectObject(mem, bmp.into());
             crate::rtl::match_dc(mem, dc);
             paint_background(hwnd, mem, st);
-            let _ = BitBlt(dc, 0, 0, rc.right, rc.bottom, Some(mem), 0, 0, SRCCOPY);
+            let _ = BitBlt(dc, 0, 0, rc.right, rc.bottom, Some(mem), st.scroll.x, st.scroll.y, SRCCOPY);
             SelectObject(mem, old);
             let _ = DeleteObject(bmp.into());
             let _ = DeleteDC(mem);
             LRESULT(1)
         }
         WM_LBUTTONDOWN => {
-            let (x, y) = (lparam.0 as i16 as i32, (lparam.0 >> 16) as i16 as i32);
+            let (x, y) = (lparam.0 as i16 as i32 + st.scroll.x, (lparam.0 >> 16) as i16 as i32 + st.scroll.y);
             let dpi = dpi_of(hwnd);
             if let Some(i) = (0..PAGES.len()).find(|&i| {
                 let r = tab_rect(i, dpi);
@@ -933,6 +983,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_DRAWITEM => {
             draw_item(st, &*(lparam.0 as *const DRAWITEMSTRUCT));
             LRESULT(1)
+        }
+        WM_NOTIFY => {
+            let hdr = &*(lparam.0 as *const NMHDR);
+            let option = st.hw.iter().position(|&h| h == hdr.hwndFrom && !h.0.is_null()).filter(|&i| matches!(CTLS[i].kind, Kind::Check | Kind::Radio(_)));
+            if let Some(i) = option.filter(|_| hdr.code == NM_CUSTOMDRAW) {
+                let cd = &*(lparam.0 as *const NMCUSTOMDRAW);
+                if cd.dwDrawStage == CDDS_PREPAINT {
+                    draw_check(st, i, cd);
+                    return LRESULT(CDRF_SKIPDEFAULT as isize);
+                }
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         // IsDialogMessageW asks this to find the Enter button; without it Enter does nothing in a plain window.
         DM_GETDEFID => LRESULT((DC_HASDEFID << 16) | IDOK.0 as isize),
@@ -974,12 +1036,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // Owner-drawn buttons report the second click of a double click as BN_DOUBLECLICKED (5).
                 _ if CTLS[i].id == id && (code == 0 || code == 5) => {
                     match CTLS[i].kind {
-                        Kind::Check => st.on[i] = !st.on[i],
+                        Kind::Check => {
+                            st.on[i] = !st.on[i];
+                            sync_check(st, i);
+                        }
                         Kind::Radio(g) => {
                             #[allow(clippy::needless_range_loop)] // j also indexes st.on and st.hw
                             for j in 0..CTLS.len() {
                                 if CTLS[j].kind == Kind::Radio(g) {
                                     st.on[j] = j == i;
+                                    sync_check(st, j);
                                     let _ = InvalidateRect(Some(st.hw[j]), None, false);
                                 }
                             }
@@ -1087,24 +1153,22 @@ unsafe fn dialog(app: *mut App) {
         dirty: false,
         ready: false,
         done: false,
+        scroll: Default::default(),
     });
-    let mut wr = RECT { left: 0, top: 0, right: CLIENT.0 * dpi / 96, bottom: CLIENT.1 * dpi / 96 };
-    let style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
-    // The frame itself follows the display scale only.
-    let _ = AdjustWindowRectExForDpi(&mut wr, style, false, WINDOW_EX_STYLE(0), GetDpiForWindow(parent));
-    let (w, h) = (wr.right - wr.left, wr.bottom - wr.top);
     let mut pr = RECT::default();
     let _ = GetWindowRect(parent, &mut pr);
+    // Over the main window, inside its monitor's work area; the frame itself follows the display scale only.
+    let wr = crate::fit::window_rect((CLIENT.0 * dpi / 96, CLIENT.1 * dpi / 96), STYLE, GetDpiForWindow(parent), &pr);
     let hinst = GetModuleHandleW(None).map(Into::into).unwrap_or_default();
     let created = CreateWindowExW(
         crate::rtl::layout(),
         w!("RexFolderOptions"),
         &HSTRING::from(loc("fo.title")),
-        style,
-        pr.left + (pr.right - pr.left - w) / 2,
-        pr.top + (pr.bottom - pr.top - h) / 2,
-        w,
-        h,
+        STYLE,
+        wr.left,
+        wr.top,
+        wr.right - wr.left,
+        wr.bottom - wr.top,
         Some(parent),
         None,
         Some(hinst),
@@ -1113,6 +1177,7 @@ unsafe fn dialog(app: *mut App) {
     if let Ok(hwnd) = created {
         // A contrast theme keeps the system's caption and frame.
         if t.contrast.is_none() {
+            theme::apply_control(hwnd, t); // its scroll bars, when it has them
             let dark = t.dark as i32;
             let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const i32 as *const c_void, 4);
             for attr in [DWMWA_CAPTION_COLOR, DWMWA_BORDER_COLOR] {
@@ -1122,6 +1187,9 @@ unsafe fn dialog(app: *mut App) {
         create_children(hwnd, &mut st);
         load(&mut st, &p, None);
         sync_enabled(&st);
+        // The WM_SIZE of creation came before the controls: the scroll range and the first layout are set here.
+        let content_dpi = dpi_of(hwnd);
+        st.scroll.fit(hwnd, (CLIENT.0 * content_dpi / 96, CLIENT.1 * content_dpi / 96));
         place(hwnd, &st);
         show_page(&mut st, 0);
         st.ready = true;
@@ -1136,6 +1204,11 @@ unsafe fn dialog(app: *mut App) {
             if !pre_translate(hwnd, &mut st, &msg) && !IsDialogMessageW(hwnd, &msg).as_bool() {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
+            }
+            // Tab can move the focus to a control scrolled out of view.
+            if msg.message == WM_KEYDOWN && st.scroll.reveal(hwnd, GetFocus()) {
+                place(hwnd, &st);
+                let _ = InvalidateRect(Some(hwnd), None, true);
             }
         }
         let _ = EnableWindow(parent, true); // before destroy, so activation returns to the parent

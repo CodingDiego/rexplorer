@@ -27,7 +27,9 @@ jobs:
       - name: Fuzz every target
         run: |
           $failed = @()
-          foreach ($t in (cargo +nightly fuzz list --fuzz-dir fuzz)) {
+          $targets = @(cargo +nightly fuzz list --fuzz-dir fuzz)
+          if (-not $targets) { throw "cargo fuzz list printed no target: nothing was fuzzed" }
+          foreach ($t in $targets) {
             New-Item -ItemType Directory -Force fuzz/work/$t | Out-Null
             cargo +nightly fuzz run $t fuzz/work/$t fuzz/corpus/$t --fuzz-dir fuzz --sanitizer none -- -max_total_time=180 -max_len=65536 2>&1 | Tee-Object -Variable log
             $code = $LASTEXITCODE

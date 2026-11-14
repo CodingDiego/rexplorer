@@ -1,0 +1,50 @@
+# unrar-ng 0.7.7 from crates.io with one fix (see VENDORED.md). The workspace's [patch.crates-io] points here.
+# Not a workspace member.
+
+[package]
+edition = "2024"
+rust-version = "1.85"
+name = "unrar-ng"
+version = "0.7.7"
+authors = [
+    "Danyel Bayraktar <rust@danyel.io>",
+    "vjoki <vjoki@zv.fi>",
+    "ttys3 <41882455+ttys3@users.noreply.github.com>",
+]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "list and extract RAR archives. Actively maintained fork of unrar."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ttys3/unrar.rs"
+
+[features]
+default = ["linux-batch-extract-utf8"]
+linux-batch-extract-setlocale = ["dep:libc"]
+linux-batch-extract-utf8 = ["unrar_ng_sys/linux-batch-extract-utf8"]
+
+[lib]
+name = "unrar_ng"
+path = "src/lib.rs"
+
+[dependencies.bitflags]
+version = "2"
+
+[dependencies.regex]
+version = "1"
+
+[dependencies.unrar_ng_sys]
+version = "0.7.7"
+features = ["std"]
+default-features = false
+package = "unrar-ng-sys"
+
+[dependencies.widestring]
+version = "1"
+
+[target.'cfg(all(unix, not(target_vendor = "apple")))'.dependencies.libc]
+version = "0.2"
+optional = true

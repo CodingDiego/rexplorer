@@ -354,6 +354,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             WM_SETFONT => {
                 st.font = HFONT(wparam.0 as *mut c_void);
+                // The tooltip is text too: without a font of its own it stays at the system's size at every text size.
+                if !st.tip.is_invalid() {
+                    SendMessageW(st.tip, WM_SETFONT, Some(wparam), Some(LPARAM(1)));
+                }
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
             WM_PAINT => paint(hwnd, st),
@@ -438,6 +442,9 @@ unsafe fn sync_tips(hwnd: HWND, st: &mut State, want: Vec<(usize, RECT)>) {
                 return;
             };
             st.tip = tip;
+            if !st.font.is_invalid() {
+                SendMessageW(tip, WM_SETFONT, Some(WPARAM(st.font.0 as usize)), Some(LPARAM(1)));
+            }
         }
         let info = |i: usize, rect: RECT, text: *mut u16| TTTOOLINFOW {
             cbSize: size_of::<TTTOOLINFOW>() as u32,

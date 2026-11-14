@@ -1,6 +1,6 @@
 """Read-only passive FTP server on 127.0.0.1 for scripts\ftp-check.ps1 (#36). Standard library only.
 usage: ftp-server.py <root> <port> <user> <password> <logfile>"""
-import os, socket, socketserver, sys, time
+import os, socket, socketserver, sys, threading, time
 
 ROOT, PORT, USER, PASSWORD, LOG = os.path.abspath(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
 
@@ -15,6 +15,7 @@ class Handler(socketserver.StreamRequestHandler):
         self.wfile.write((text + "\r\n").encode("utf-8"))
 
     def local(self, arg):
+        """The virtual path and the real one for `arg`; the real one is None when it would leave the root."""
         path = arg if arg.startswith("/") else self.cwd.rstrip("/") + "/" + arg
         parts = []
         for p in path.split("/"):
@@ -22,7 +23,10 @@ class Handler(socketserver.StreamRequestHandler):
                 parts = parts[:-1]
             elif p and p != ".":
                 parts.append(p)
-        return "/" + "/".join(parts), os.path.join(ROOT, *parts)
+        # A backslash or a drive colon in a name would make os.path.join leave the root; a link could too.
+        real = os.path.realpath(os.path.join(ROOT, *parts))
+        inside = not any("\\" in p or ":" in p for p in parts) and os.path.commonpath([ROOT, real]) == ROOT
+        return "/" + "/".join(parts), real if inside else None
 
     def data(self):
         conn, _ = self.pasv.accept()
@@ -64,7 +68,7 @@ class Handler(socketserver.StreamRequestHandler):
                 self.reply(f'257 "{self.cwd}"')
             elif cmd in ("CWD", "XCWD", "CDUP"):
                 virtual, real = self.local(".." if cmd == "CDUP" else arg)
-                if os.path.isdir(real):
+                if real and os.path.isdir(real):
                     self.cwd = virtual
                     self.reply("250 ok")
                 else:
@@ -78,7 +82,7 @@ class Handler(socketserver.StreamRequestHandler):
             elif cmd in ("LIST", "NLST"):
                 names = [a for a in arg.split() if not a.startswith("-")]
                 _, real = self.local(names[0] if names else ".")
-                if not os.path.isdir(real) or self.pasv is None:
+                if not real or not os.path.isdir(real) or self.pasv is None:
                     self.reply("550 no")
                     continue
                 self.reply("150 list")
@@ -94,7 +98,7 @@ class Handler(socketserver.StreamRequestHandler):
                 self.reply("226 done")
             elif cmd in ("SIZE", "MDTM"):
                 _, real = self.local(arg)
-                if os.path.isfile(real):
+                if real and os.path.isfile(real):
                     st = os.stat(real)
                     self.reply(f"213 {st.st_size}" if cmd == "SIZE" else "213 " + time.strftime("%Y%m%d%H%M%S", time.gmtime(st.st_mtime)))
                 else:
@@ -104,7 +108,7 @@ class Handler(socketserver.StreamRequestHandler):
                 self.reply("350 ok")
             elif cmd == "RETR":
                 _, real = self.local(arg)
-                if not os.path.isfile(real) or self.pasv is None:
+                if not real or not os.path.isfile(real) or self.pasv is None:
                     self.reply("550 no")
                     continue
                 self.reply("150 sending")
@@ -120,9 +124,13 @@ class Handler(socketserver.StreamRequestHandler):
 
 
 class Server(socketserver.ThreadingTCPServer):
-    allow_reuse_address = True
+    # False: on Windows a reused address would let a second server listen on the port beside a stale one.
+    allow_reuse_address = False
     daemon_threads = True
 
 
+ROOT = os.path.realpath(ROOT)
+# A test helper that nobody stopped (a closed console skips the caller's cleanup) ends by itself.
+threading.Timer(600, os._exit, [0]).start()
 log(f"listening on 127.0.0.1:{PORT}, root {ROOT}")
 Server(("127.0.0.1", PORT), Handler).serve_forever()

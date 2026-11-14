@@ -276,17 +276,19 @@ Automation clients read through Windows' bridge. None of it has been tried with 
   *Status 2026-11-13, later:* tested against a local server (a small read-only one on 127.0.0.1 written with Python's
   standard library; passive mode) by window messages on a copy of the release exe with a scratch profile. Found and
   fixed: the shell's FTP folder lists nothing from the MTA loader (EnumObjects E_UNEXPECTED), so the tab fell back
-  to the embedded Explorer view; `ftp://` loads now run on an STA worker (`nav.rs` `navigate`) and are bound again
-  on the UI thread (`sorts_on_ui_thread`, `folder.rs` `adopt`). After it: the root listed, Enter opened a subfolder,
-  Up came back, and the title, address bar, `recent.txt`, `session.txt` and `rexplorer.log` never held the password.
-  Limits: the preview pane did not fetch an FTP file; Copy / Paste out was not tried (no clipboard on the test PC
-  that day) and the shell's own copy from that server wrote 0 bytes; no real FTP server or TLS. README and the
-  parity row say so (PARTIAL). Redaction (`connect.rs` `redact`), from a review: a raw `/` in a typed password,
-  blanks before the scheme, and `ftps://` / `sftp://` (now any `scheme://`) slipped through; fixed, the password
-  now runs to the last `@` (`redact_finds_raw_passwords_other_schemes_and_leading_blanks`). The Connect dialog's
-  `ftp_url` percent-encodes `/ @ : %`, so only typed addresses carry them raw. Live, with the password `pa/ss@w0rd`:
-  the encoded address logged in and listed; the raw typed one failed to open, and neither the title, the address
-  bar, the error box, `recent.txt`, `session.txt` nor the log held any part of it.
+  to the embedded Explorer view, which showed a blank page and never contacted the server (0 connections in the
+  server's log). `ftp://` loads now run on a single-threaded apartment of their own (`nav.rs` `navigate`), sort
+  there, release their COM objects there (`folder.rs` `park`) and hand the UI thread only item IDs, which it binds
+  again (`rebind`). `scripts\ftp-check.ps1` with `scripts\ftp-server.py` is the proof and can be run again: the root
+  lists, Enter opens a subfolder, Up comes back, a refused login shows an error naming the place, the shell's copy
+  engine copies a file out with the same hash, and neither password is in the title, the address box, the message
+  or any file of the profile. Limits: only browsing is claimed. Opening a file, Copy and Paste, drag, rename,
+  delete and uploads from rexplorer's own window were not run; no real FTP server or TLS; the preview pane shows
+  nothing for an FTP file. README and the parity row ("FTP browsing") say so. Redaction (`connect.rs` `redact`),
+  after two reviews: the scheme is found anywhere in the text, every one of them, with any run of slashes; the
+  password ends at the last `@` of the authority, so an `@` in a folder name cannot move the host; a password typed
+  raw with a `/` is hidden to the last `@` of the address (too much hidden rather than too little). The Connect
+  dialog's `ftp_url` percent-encodes `/ @ : %`, so only typed addresses carry them raw.
 
 ## 5. Localization
 

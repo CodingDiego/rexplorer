@@ -209,7 +209,7 @@ $longTemp = New-Object System.Text.StringBuilder 1024
 if ([RexSmoke.Long]::GetLongPathNameW($env:TEMP, $longTemp, 1024) -gt 0) { $env:TEMP = $longTemp.ToString() }
 # Every variable this script sets, as found, put back in the finally at the end.
 $SavedEnv = @{}
-foreach ($n in 'APPDATA', 'LOCALAPPDATA', 'REXPLORER_INSTALL_DIR', 'REXPLORER_REG_BASE', 'REXPLORER_PROGRAMS_DIR', 'REXPLORER_STARTUP_DIR', 'REXPLORER_CRASH_AFTER_MS') { $SavedEnv[$n] = [Environment]::GetEnvironmentVariable($n) }
+foreach ($n in 'APPDATA', 'LOCALAPPDATA', 'REXPLORER_INSTALL_DIR', 'REXPLORER_REG_BASE', 'REXPLORER_PROGRAMS_DIR', 'REXPLORER_STARTUP_DIR', 'REXPLORER_CRASH_AFTER_MS', 'REXPLORER_TEXT_SCALE') { $SavedEnv[$n] = [Environment]::GetEnvironmentVariable($n) }
 $RealLocalAppData = $env:LOCALAPPDATA
 # A settings folder for a run: `rexplorer\settings.ini` with language=en, since the checks match English text.
 function New-Profile($path) {
@@ -1346,6 +1346,78 @@ function Get-Unnamed($h) {
     foreach ($b in [Msaa]::Unnamed($c)) { $bad += "$cls $b" }
   }
   $bad  # one line each down the pipeline; callers wrap it in @()
+}
+
+# Every window of ours stays inside its monitor's work area at the largest Windows text size (225 %, forced with
+# REXPLORER_TEXT_SCALE so no Windows setting changes), and one whose content is larger scrolls to its last control.
+Add-Type @"
+using System; using System.Runtime.InteropServices; using System.Text;
+public static class Fit {
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
+  [StructLayout(LayoutKind.Sequential)] public struct MI { public int cb; public RECT mon; public RECT work; public uint flags; }
+  [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr h, uint f);
+  [DllImport("user32.dll")] static extern bool GetMonitorInfo(IntPtr m, ref MI mi);
+  [DllImport("user32.dll")] static extern int MapWindowPoints(IntPtr from, IntPtr to, ref RECT r, int n);
+  [DllImport("user32.dll")] static extern IntPtr GetDlgItem(IntPtr h, int id);
+  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+  delegate bool Cb(IntPtr h, IntPtr l);
+  [DllImport("user32.dll")] static extern bool EnumWindows(Cb cb, IntPtr l);
+  // A visible top-level window of process `pid` with class `cls`.
+  public static IntPtr Top(uint pid, string cls) {
+    IntPtr found = IntPtr.Zero;
+    EnumWindows((h, l) => { uint p; GetWindowThreadProcessId(h, out p); var s = new StringBuilder(128); GetClassName(h, s, 128); if (p == pid && IsWindowVisible(h) && s.ToString() == cls) { found = h; return false; } return true; }, IntPtr.Zero);
+    return found;
+  }
+  // "" when the window lies inside its monitor's work area, else the two rectangles.
+  public static string Outside(IntPtr h) {
+    RECT r; GetWindowRect(h, out r); var mi = new MI(); mi.cb = Marshal.SizeOf(typeof(MI)); GetMonitorInfo(MonitorFromWindow(h, 2), ref mi);
+    bool inside = r.L >= mi.work.L && r.T >= mi.work.T && r.R <= mi.work.R && r.B <= mi.work.B;
+    return inside ? "" : String.Format("({0},{1})-({2},{3}) outside ({4},{5})-({6},{7})", r.L, r.T, r.R, r.B, mi.work.L, mi.work.T, mi.work.R, mi.work.B);
+  }
+  // Whether all of dialog control `id` shows in the dialog's client area.
+  public static bool Shown(IntPtr dlg, int id) {
+    RECT r, c; IntPtr ch = GetDlgItem(dlg, id); if (ch == IntPtr.Zero) return false;
+    GetWindowRect(ch, out r); MapWindowPoints(IntPtr.Zero, dlg, ref r, 2); GetClientRect(dlg, out c);
+    return Math.Min(r.L, r.R) >= 0 && r.T >= 0 && Math.Max(r.L, r.R) <= c.R && r.B <= c.B;
+  }
+}
+"@
+Run-Check 'fit' {
+  $env:REXPLORER_TEXT_SCALE = '225'
+  try { $up = Launch-Fresh 'C:\Windows\Web' } finally { Remove-Item Env:REXPLORER_TEXT_SCALE -ErrorAction SilentlyContinue }
+  try {
+    if (-not $up) { return @('FAIL', 'no main window within 5 s') }
+    Start-Sleep -Milliseconds 800
+    $bad = @(); $seen = @()
+    # CMD_FOLDER_OPTIONS 52, CMD_CONNECT 17, CMD_PALETTE 14; OK is control 1 in the two dialogs.
+    foreach ($w in @(@{ cmd = 52; cls = 'RexFolderOptions'; ok = 1 }, @{ cmd = 17; cls = 'RexConnect'; ok = 1 }, @{ cmd = 14; cls = 'RexPalette'; ok = 0 })) {
+      $null = Send-Command $w.cmd
+      $script:dlg = [IntPtr]::Zero
+      $null = Wait-Until { $script:dlg = [Fit]::Top([uint32]$script:cur.Id, $w.cls); $script:dlg -ne [IntPtr]::Zero } 5000
+      if ($script:dlg -eq [IntPtr]::Zero) { $bad += "$($w.cls) did not open"; continue }
+      Start-Sleep -Milliseconds 400
+      $out = [Fit]::Outside($script:dlg)
+      if ($out) { $bad += "$($w.cls) $out" }
+      if ($w.ok) {
+        $before = [Fit]::Shown($script:dlg, $w.ok)
+        # WM_VSCROLL SB_BOTTOM and WM_HSCROLL SB_RIGHT: the end of the content, where OK is.
+        $null = [W]::SendMessage($script:dlg, 0x115, [IntPtr]7, [IntPtr]::Zero); $null = [W]::SendMessage($script:dlg, 0x114, [IntPtr]7, [IntPtr]::Zero)
+        Start-Sleep -Milliseconds 200
+        if (-not [Fit]::Shown($script:dlg, $w.ok)) { $bad += "$($w.cls): OK is not reachable by scrolling" }
+        $seen += "$($w.cls) (OK in view at once: $before)"
+      } else { $seen += $w.cls }
+      # WM_CLOSE; the palette closes on the command that opened it.
+      $null = [W]::PostMessage($script:dlg, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)
+      if (-not $w.ok) { $null = Send-Command $w.cmd }
+      $null = Wait-Until { [Fit]::Top([uint32]$script:cur.Id, $w.cls) -eq [IntPtr]::Zero } 3000
+    }
+    if ($bad.Count) { return @('FAIL', ($bad -join '; ')) }
+    @('PASS', ('at Text size 225 % inside the work area: ' + ($seen -join ', ')))
+  } finally { Remove-Fresh }
 }
 
 Run-Check 'accessibility' {
