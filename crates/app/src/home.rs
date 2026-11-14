@@ -349,12 +349,14 @@ pub fn layout(width: i32, tiles: usize, rows: usize, pill_ws: &[i32], dpi: u32) 
     let mut y = s(PAD);
     let title = RECT { left, top: y, right, bottom: y + s(TITLE_H) };
     y = title.bottom + s(4);
-    let per_row = ((right - left + s(GAP)) / (s(TILE_W) + s(GAP))).max(1) as usize;
+    // A pane narrower than one tile (a large text size in a small window) gets one tile per row, as wide as it is.
+    let tile_w = s(TILE_W).min(right - left);
+    let per_row = ((right - left + s(GAP)) / (tile_w + s(GAP))).max(1) as usize;
     let tile_rects: Vec<RECT> = (0..tiles)
         .map(|i| {
             let (c, r) = ((i % per_row) as i32, (i / per_row) as i32);
-            let (x, top) = (left + c * (s(TILE_W) + s(GAP)), y + r * (s(TILE_H) + s(GAP)));
-            RECT { left: x, top, right: x + s(TILE_W), bottom: top + s(TILE_H) }
+            let (x, top) = (left + c * (tile_w + s(GAP)), y + r * (s(TILE_H) + s(GAP)));
+            RECT { left: x, top, right: x + tile_w, bottom: top + s(TILE_H) }
         })
         .collect();
     y = tile_rects.last().map_or(y, |r| r.bottom) + s(SECTION_GAP);
@@ -1905,6 +1907,7 @@ mod tests {
         // Too narrow for one: still one per row.
         let l = layout(200, 2, 0, &[80], 96);
         assert_eq!((l.tiles[1].left, l.tiles[1].top), (20, l.tiles[0].bottom + 8));
+        assert_eq!((l.tiles[0].left, l.tiles[0].right), (20, 180), "and no wider than the pane, inside its padding");
         assert_eq!(l.empty.bottom - l.empty.top, 48, "the empty line takes a row");
         assert_eq!(layout(956, 4, 2, &[80], 192).tiles[0].right - layout(956, 4, 2, &[80], 192).tiles[0].left, 560);
     }

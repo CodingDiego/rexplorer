@@ -428,6 +428,13 @@ unsafe fn content_rect(hwnd: HWND) -> RECT {
     RECT { left: p, top: p, right: (rc.right - p).max(p), bottom: (rc.bottom - p).max(p) }
 }
 
+/// Where the caption's two lines are drawn: the name, and the detail line under it, at the bottom of the card.
+unsafe fn caption_rects(hwnd: HWND) -> [RECT; 2] {
+    let (c, cap) = (content_rect(hwnd), caption_height(hwnd));
+    let top = c.top + (c.bottom - c.top - cap).max(1);
+    [RECT { left: c.left, top, right: c.right, bottom: top + cap / 2 }, RECT { left: c.left, top: top + cap / 2, right: c.right, bottom: top + cap }]
+}
+
 unsafe fn relayout(hwnd: HWND) {
     let s = state(hwnd);
     if s.is_null() {
@@ -475,11 +482,8 @@ unsafe fn paint(hwnd: HWND, s: *mut State) {
             };
             let of = SelectObject(mem, font);
             SetBkMode(mem, TRANSPARENT);
-            let half = cap / 2;
             let fmt = DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX;
-            let top = c.top + area_h;
-            let mut r1 = RECT { left: c.left, top, right: c.right, bottom: top + half };
-            let mut r2 = RECT { left: c.left, top: top + half, right: c.right, bottom: top + cap };
+            let [mut r1, mut r2] = caption_rects(hwnd);
             // An empty Vec<u16> hands DrawTextW the dangling pointer 0x2, which it read and faulted on (a Home entry
             // with no detail line crashed the window, 2026-11-11): empty lines are not drawn.
             for (text, r, color) in [(&(*s).name, &mut r1, (*s).text), (&(*s).detail, &mut r2, (*s).secondary)] {
@@ -659,8 +663,12 @@ unsafe fn acc_tree(hwnd: HWND, s: &State, t: &mut access::Tree) {
     let lines = spoken(s);
     t.name = lines.first().cloned().unwrap_or_else(|| tr("preview.pane_name").into());
     t.role = ROLE_SYSTEM_PANE;
-    let rect = client(hwnd);
-    for name in lines {
+    // The caption's lines are where they are drawn; the details rows are not laid out anywhere a reader can ask, so
+    // each stands for the whole pane.
+    let whole = client(hwnd);
+    let caption = if s.details.is_none() { caption_rects(hwnd).to_vec() } else { Vec::new() };
+    let drawn = [&s.name, &s.detail].into_iter().zip(caption).filter(|(text, _)| !text.is_empty()).map(|(_, r)| r);
+    for (name, rect) in lines.into_iter().zip(drawn.chain(std::iter::repeat(whole))) {
         t.items.push(access::Item { name, role: ROLE_SYSTEM_STATICTEXT, state: STATE_SYSTEM_READONLY, rect, ..Default::default() });
     }
 }
@@ -763,6 +771,9 @@ unsafe fn present(hwnd: HWND, s: *mut State, sub: &Subject, spawn: bool) {
                 if (*s).stamp != st {
                     let _ = SetWindowTextW((*s).edit, &HSTRING::from(t));
                     (*s).stamp = st;
+                    // A reader hears whose text this is, not just "Preview".
+                    let file = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned());
+                    let _ = rexplorer_core::access::set_name((*s).edit, file.as_deref().unwrap_or(tr("preview.pane_name")));
                 }
                 let _ = ShowWindow((*s).edit, SW_SHOW);
                 return;

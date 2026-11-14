@@ -239,6 +239,8 @@ impl Views {
 
 /// Details row height in 96-DPI pixels.
 const ROW: i32 = 28;
+/// Small icon size in 96-DPI pixels.
+const SMALL: i32 = 16;
 /// What the list adds to its image height for a row, in pixels.
 const ROW_PAD: i32 = 1;
 
@@ -255,10 +257,12 @@ pub(crate) unsafe fn rebuild_tall(app: *mut App) {
     if a.views.small.is_invalid() {
         return;
     }
-    let (mut w, mut h) = (0, 0);
-    let _ = ImageList_GetIconSize(a.views.small, Some(&mut w), Some(&mut h));
-    // The row holds a line of text, so its height follows the text size.
-    let tall = ImageList_Create(w, (ROW * theme::text_dpi(GetDpiForWindow(a.hwnd)) as i32 / 96 - ROW_PAD).max(h), ILC_COLOR32, 64, 64);
+    // The icon follows the window's display scale, whatever size the source list was made at (the system's small
+    // list keeps the scale the process started with). The row holds a line of text, so its height follows the text
+    // size.
+    let dpi = GetDpiForWindow(a.hwnd);
+    let w = SMALL * dpi as i32 / 96;
+    let tall = ImageList_Create(w, (ROW * theme::text_dpi(dpi) as i32 / 96 - ROW_PAD).max(w), ILC_COLOR32, 64, 64);
     let old = std::mem::replace(&mut a.views.tall, tall);
     a.views.tall_index.clear();
     SendMessageW(a.list, LVM_SETIMAGELIST, Some(WPARAM(LVSIL_SMALL as usize)), Some(LPARAM(tall.0)));
@@ -284,27 +288,76 @@ pub(crate) unsafe fn tall_icon(app: *mut App, index: i32) -> i32 {
         let _ = InvalidateRect(Some((*app).list), None, false);
     }
     let v = &mut (*app).views;
-    let (mut w, mut h, mut sw, mut sh) = (0, 0, 0, 0);
+    let (mut w, mut h) = (0, 0);
     let _ = ImageList_GetIconSize(v.tall, Some(&mut w), Some(&mut h));
-    let _ = ImageList_GetIconSize(v.small, Some(&mut sw), Some(&mut sh));
     let Some((bmp, bits)) = dib(w, h) else { return 0 };
     let dc = CreateCompatibleDC(None);
     let old = SelectObject(dc, bmp.into());
     let (base, overlay) = rexplorer_core::item::split_icon(index);
-    // INDEXTOOVERLAYMASK: the overlay image's 1-based index goes in bits 8-11 of the draw style.
-    let _ = ImageList_Draw(v.small, base, dc, 0, (h - sh) / 2, ILD_TRANSPARENT | ILD_PRESERVEALPHA | IMAGE_LIST_DRAW_STYLE(overlay << 8));
+    draw_small(dc, v.small, base, overlay, w, (h - w) / 2);
     let _ = GdiFlush();
     SelectObject(dc, old);
     let _ = DeleteDC(dc);
     let cloud = rexplorer_core::item::cloud_of(index);
     if cloud != 0 {
-        let m = (sw * 5 / 8).max(6);
-        cloud_mark(std::slice::from_raw_parts_mut(bits, (w * h * 4) as usize), w, h, ((h - sh) / 2 + sh - m).max(0), m, cloud);
+        let m = (w * 5 / 8).max(6);
+        cloud_mark(std::slice::from_raw_parts_mut(bits, (w * h * 4) as usize), w, h, ((h - w) / 2 + w - m).max(0), m, cloud);
     }
     let t = ImageList_Add(v.tall, bmp, None).max(0);
     let _ = DeleteObject(bmp.into());
     v.tall_index.insert(index, t);
     t
+}
+
+/// Draws image `base` of `small` with shell overlay `overlay` as a `px`-pixel square at (0, `y`): as it is when the
+/// list's images are that size, scaled otherwise (the window's display scale changed since the list was made).
+unsafe fn draw_small(dc: HDC, small: HIMAGELIST, base: i32, overlay: u32, px: i32, y: i32) {
+    // INDEXTOOVERLAYMASK: the overlay image's 1-based index goes in bits 8-11 of the draw style.
+    let style = ILD_TRANSPARENT | ILD_PRESERVEALPHA | IMAGE_LIST_DRAW_STYLE(overlay << 8);
+    let (mut sw, mut sh) = (0, 0);
+    let _ = ImageList_GetIconSize(small, Some(&mut sw), Some(&mut sh));
+    if sw == px && sh == px {
+        let _ = ImageList_Draw(small, base, dc, 0, y, style);
+        return;
+    }
+    let (from, _keep) = scale_source(small, px);
+    let p = IMAGELISTDRAWPARAMS {
+        cbSize: size_of::<IMAGELISTDRAWPARAMS>() as u32,
+        himl: from,
+        i: base,
+        hdcDst: dc,
+        x: 0,
+        y,
+        cx: px,
+        cy: px,
+        fStyle: (style | ILD_SCALE).0,
+        ..Default::default()
+    };
+    let _ = ImageList_DrawIndirect(&p);
+}
+
+/// The list to scale a `px`-pixel small icon from, and what keeps it alive: for the system's small list, the
+/// smallest of the system's larger lists (same image indices) that is at least that big, so the icon is scaled down
+/// from more detail; any other list (an icon theme's) itself.
+/// shortcut: an icon theme's list is scaled, not loaded again at the new size; reload it if themes look soft.
+unsafe fn scale_source(small: HIMAGELIST, px: i32) -> (HIMAGELIST, Option<IImageList>) {
+    use windows::Win32::UI::Shell::{SHGetImageList, SHIL_EXTRALARGE, SHIL_JUMBO, SHIL_LARGE, SHIL_SMALL};
+    use windows::core::Interface;
+    let system = |shil: u32| SHGetImageList::<IImageList>(shil as i32).ok();
+    let handle = |l: &IImageList| HIMAGELIST(l.as_raw() as isize);
+    if system(SHIL_SMALL).as_ref().map(handle) != Some(small) {
+        return (small, None);
+    }
+    for shil in [SHIL_LARGE, SHIL_EXTRALARGE, SHIL_JUMBO] {
+        if let Some(l) = system(shil) {
+            let (mut w, mut h) = (0, 0);
+            let _ = ImageList_GetIconSize(handle(&l), Some(&mut w), Some(&mut h));
+            if w >= px {
+                return (handle(&l), Some(l));
+            }
+        }
+    }
+    (small, None)
 }
 
 /// The colors and glyphs of the cloud marks: a blue cloud (online-only) or a green filled check (always kept).
@@ -931,6 +984,44 @@ fn starter_icon(name: &str, t: &Theme) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_small_icon_is_scaled_to_the_windows_scale_not_clipped() {
+        unsafe {
+            // A 20 px source (a process started at 125 %): red, with a green 4 px square in its last corner.
+            let src = ImageList_Create(20, 20, ILC_COLOR32, 1, 1);
+            let (bmp, bits) = dib(20, 20).unwrap();
+            let px = std::slice::from_raw_parts_mut(bits, 20 * 20 * 4);
+            for y in 0..20 {
+                for x in 0..20 {
+                    let green = x >= 16 && y >= 16;
+                    px[(y * 20 + x) * 4..][..4].copy_from_slice(if green { &[0, 255, 0, 255] } else { &[0, 0, 255, 255] });
+                }
+            }
+            assert_eq!(ImageList_Add(src, bmp, None), 0);
+            let _ = DeleteObject(bmp.into());
+            // Drawn for a window now at 100 % (16 px) in a 16 x 28 row cell, and for one at 150 % (24 px) in 24 x 42.
+            for (size, row) in [(16, 28), (24, 42), (20, 35)] {
+                let (out, obits) = dib(size, row).unwrap();
+                let dc = CreateCompatibleDC(None);
+                let old = SelectObject(dc, out.into());
+                let top = (row - size) / 2;
+                draw_small(dc, src, 0, 0, size, top);
+                let _ = GdiFlush();
+                SelectObject(dc, old);
+                let _ = DeleteDC(dc);
+                let o = std::slice::from_raw_parts(obits, (size * row * 4) as usize);
+                let at = |x: i32, y: i32| &o[((y * size + x) * 4) as usize..][..4];
+                assert_eq!(at(1, top + 1)[2], 255, "{size}: red at the icon's first corner");
+                let corner = at(size - 1, top + size - 1);
+                assert!(corner[1] > 200 && corner[2] < 60, "{size}: the source's last corner is the icon's last corner (scaled, not cut off): {corner:?}");
+                assert_eq!(at(1, top - 2)[3], 0, "{size}: nothing above the icon");
+                assert_eq!(at(1, top + size + 1)[3], 0, "{size}: nothing below the icon");
+                let _ = DeleteObject(out.into());
+            }
+            let _ = ImageList_Destroy(Some(src));
+        }
+    }
 
     #[test]
     fn cloud_marks_paint_their_color_in_the_lower_left_only() {

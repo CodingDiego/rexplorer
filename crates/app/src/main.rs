@@ -16,6 +16,7 @@ mod connect;
 mod desktop;
 mod desktop_icons;
 mod edit;
+mod fit;
 mod folder_options;
 mod home;
 #[allow(dead_code)] // parts of the API are for later steps

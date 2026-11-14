@@ -286,12 +286,12 @@ pub fn extract(archive: &Path, entry_path: &str, dest_dir: &Path) -> Result<Path
     let want = entry_path.replace('/', "\\");
     let want = want.trim_matches('\\');
     if escapes(want) {
-        return Err(err(format!("entry not found in archive: {entry_path}")));
+        return Err(err(crate::i18n::trf("err.archive_entry_missing", &[("name", &entry_path)])));
     }
     std::fs::create_dir_all(dest_dir).map_err(err)?;
     // unrar resolves a hard-link or file-copy member's target inside dest_dir: empty, it holds nothing of the user's.
     if std::fs::read_dir(dest_dir).map_err(err)?.next().is_some() {
-        return Err(err(format!("extraction folder is not empty: {}", dest_dir.display())));
+        return Err(err(crate::i18n::trf("err.extract_not_empty", &[("path", &dest_dir.display())])));
     }
     let fail = |e| rar_err(archive, e);
     let mut cur = with_archive(archive, |a| a.open_for_processing()).map_err(fail)?;
@@ -319,7 +319,7 @@ pub fn extract(archive: &Path, entry_path: &str, dest_dir: &Path) -> Result<Path
         }
         cur = h.skip().map_err(fail)?;
     }
-    Err(err(format!("entry not found in archive: {entry_path}")))
+    Err(err(crate::i18n::trf("err.archive_entry_missing", &[("name", &entry_path)])))
 }
 
 /// The password error, if any, before anything is written: the first encrypted member is test-decrypted (nothing

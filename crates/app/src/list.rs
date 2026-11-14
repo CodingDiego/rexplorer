@@ -443,7 +443,6 @@ unsafe fn group_runs<'a>(app: *mut App) -> &'a [(String, usize)] {
 
 /// Drags the selection with the shell's data object; the shell performs the operation and the change watch refreshes.
 pub(crate) unsafe fn begin_drag(app: *mut App) {
-    crate::watchdog::modal(); // the drag runs its own loop until the drop
     let sel = selected_indices((*app).list);
     let data = match source(app) {
         Some(Source::Shell(l)) => {
@@ -483,6 +482,7 @@ pub(crate) unsafe fn begin_drag(app: *mut App) {
             let strings: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
             match dragdrop::data_object_of_paths(&strings) {
                 Ok(d) => {
+                    crate::watchdog::modal(); // the drag runs its own loop until the drop
                     if let Err(e) = dragdrop::drag_with(&d, ui::view_hwnd(app), windows::Win32::System::Ole::DROPEFFECT_COPY) {
                         message((*app).hwnd, &trf("err.drag", &[("error", &e)]));
                     }
@@ -508,6 +508,7 @@ pub(crate) unsafe fn begin_drag(app: *mut App) {
     let r = {
         // Home answers the shell's request for the drag image only inside this call.
         let _grant = crate::home::grant_drag_image(ui::view_hwnd(app));
+        crate::watchdog::modal(); // the drag runs its own loop until the drop
         dragdrop::drag(&d, ui::view_hwnd(app))
     };
     // Every drag that moved nothing is logged, so the next live run can say why a target never got it.
@@ -1330,9 +1331,13 @@ unsafe fn draw_item(app: *mut App, cd: &mut NMLVCUSTOMDRAW) -> u32 {
             let state = SendMessageW(list, LVM_GETITEMSTATE, Some(WPARAM(i)), Some(LPARAM((LVIS_SELECTED.0 | LVIS_FOCUSED.0) as isize))).0 as u32;
             let selected = state & LVIS_SELECTED.0 != 0;
             let hot = cd.nmcd.uItemState.0 & CDIS_HOT.0 != 0;
-            // Contrast: the keyboard focus is a rectangle, drawn here since CDIS_FOCUS is stripped below.
-            let focus = t.contrast.is_some() && state & LVIS_FOCUSED.0 != 0 && GetFocus() == list;
-            if selected || hot || focus {
+            // The keyboard focus is drawn here, since CDIS_FOCUS is stripped below. Contrast: a rectangle. Other
+            // themes: an outline on a focused row that is not selected (Ctrl+arrows, Ctrl+Space), once the keyboard
+            // is in use (the system's focus-cue state, as for every other control).
+            let focused = state & LVIS_FOCUSED.0 != 0 && GetFocus() == list;
+            let focus = t.contrast.is_some() && focused;
+            let ring = t.contrast.is_none() && focused && !selected && SendMessageW(list, WM_QUERYUISTATE, None, None).0 as u32 & UISF_HIDEFOCUS == 0;
+            if selected || hot || focus || ring {
                 // nmcd.rc is the item's rect; asking the list for it here (LVM_GETITEMRECT) stops it drawing the item.
                 let r = cd.nmcd.rc;
                 let mut client = RECT::default();
@@ -1351,6 +1356,9 @@ unsafe fn draw_item(app: *mut App, cd: &mut NMLVCUSTOMDRAW) -> u32 {
                 }
                 if focus {
                     let _ = windows::Win32::Graphics::Gdi::DrawFocusRect(cd.nmcd.hdc, &pill);
+                }
+                if ring {
+                    theme::outline_round(cd.nmcd.hdc, &pill, t.text, 6 * dpi / 96, (dpi / 96).max(1));
                 }
             }
             cd.nmcd.uItemState.0 &= !(CDIS_SELECTED.0 | CDIS_HOT.0 | CDIS_FOCUS.0);

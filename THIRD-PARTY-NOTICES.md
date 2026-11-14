@@ -65,7 +65,7 @@ under MIT; the MIT text is below. CI fails when this table and `Cargo.lock` disa
 | `regex` | 1.13.1 | MIT OR Apache-2.0 | Copyright (c) 2014 The Rust Project Developers |
 | `regex-automata` | 0.4.18 | MIT OR Apache-2.0 | Copyright (c) 2014 The Rust Project Developers |
 | `regex-syntax` | 0.8.11 | MIT OR Apache-2.0 | Copyright (c) 2014 The Rust Project Developers |
-| `unrar-ng` | 0.7.7 | MIT OR Apache-2.0 | The unrar.rs authors (Danyel Bayraktar, vjoki, ttys3) |
+| `unrar-ng` | 0.7.7, modified: built from `vendor/unrar-ng` with one fix (`VENDORED.md` there) | MIT OR Apache-2.0 | The unrar.rs authors (Danyel Bayraktar, vjoki, ttys3) |
 | `unrar-ng-sys` | 0.7.7 | MIT OR Apache-2.0 (bindings; libunrar as above) | The unrar.rs authors (Danyel Bayraktar, ttys3) |
 | `widestring` | 1.2.1 | MIT OR Apache-2.0 | The widestring-rs authors |
 | `winapi` | 0.3.9 | MIT OR Apache-2.0 | Copyright (c) 2015-2018 The winapi-rs Developers |

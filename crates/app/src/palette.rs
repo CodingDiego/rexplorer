@@ -51,21 +51,30 @@ pub struct Model {
     cands: Vec<Candidate>,
     results: Vec<usize>,
     sel: usize,
+    /// How many results are shown: `MAX_ROWS`, or fewer on a screen without room for them.
+    max: usize,
 }
 
 impl Model {
     pub fn new(cands: Vec<Candidate>) -> Model {
-        let mut m = Model { cands, results: Vec::new(), sel: 0 };
+        let mut m = Model { cands, results: Vec::new(), sel: 0, max: MAX_ROWS };
         m.set_query("");
         m
+    }
+
+    /// Shows at most `max` results (never none, never more than `MAX_ROWS`).
+    pub fn limit(&mut self, max: usize) {
+        self.max = max.clamp(1, MAX_ROWS);
+        self.results.truncate(self.max);
+        self.sel = self.sel.min(self.results.len().saturating_sub(1));
     }
 
     pub fn set_query(&mut self, q: &str) {
         let q = q.trim();
         let results = if q.is_empty() {
-            (0..self.cands.len().min(MAX_ROWS)).collect()
+            (0..self.cands.len().min(self.max)).collect()
         } else {
-            rank(&self.cands, q, MAX_ROWS)
+            rank(&self.cands, q, self.max)
                 .iter()
                 .filter_map(|(c, _)| self.cands.iter().position(|x| std::ptr::eq(x, *c)))
                 .collect()
@@ -100,6 +109,11 @@ fn height_for(rows: usize, dpi: u32) -> i32 {
     sc(EDIT_AREA, dpi) + if rows > 0 { rows as i32 * sc(ROW_H, dpi) + sc(PAD, dpi) / 2 } else { 0 }
 }
 
+/// How many result rows fit between the popup's top `y` and the work area's `bottom`.
+fn rows_that_fit(y: i32, bottom: i32, dpi: u32) -> usize {
+    ((bottom - y - sc(EDIT_AREA, dpi) - sc(PAD, dpi) / 2) / sc(ROW_H, dpi).max(1)).max(0) as usize
+}
+
 /// Result row under client-space `y`, if any.
 fn row_at(y: i32, rows: usize, dpi: u32) -> Option<usize> {
     let rel = y - sc(EDIT_AREA, dpi);
@@ -121,6 +135,8 @@ struct State {
     brush: HBRUSH,
     id: usize,
     dpi: u32,
+    /// The popup's width: `WIDTH` at `dpi`, or the work area's where that is narrower.
+    width: i32,
     picked: Option<String>,
     tracking: bool,
     closing: bool,
@@ -148,12 +164,16 @@ pub fn open(parent: HWND, id: usize, candidates: Vec<Candidate>, t: &Theme, font
             0 => 96,
             d => d,
         });
-        let model = Model::new(candidates);
-        let (wd, ht) = (sc(WIDTH, dpi), height_for(model.results().len(), dpi));
+        let mut model = Model::new(candidates);
         let mut pr = RECT::default();
         GetWindowRect(parent, &mut pr)?;
-        let x = pr.left + (pr.right - pr.left - wd) / 2;
-        let y = pr.top + sc(TOP_GAP, dpi);
+        // Inside the work area of the parent's monitor: no wider than it, and only the rows it has room for.
+        let work = crate::fit::work_area(&pr);
+        let wd = sc(WIDTH, dpi).min(work.right - work.left);
+        let x = (pr.left + (pr.right - pr.left - wd) / 2).clamp(work.left, work.right - wd);
+        let y = (pr.top + sc(TOP_GAP, dpi)).clamp(work.top, (work.bottom - height_for(1, dpi)).max(work.top));
+        model.limit(rows_that_fit(y, work.bottom, dpi));
+        let ht = height_for(model.results().len(), dpi);
         // shortcut: if CreateWindowExW fails before WM_NCCREATE this Box leaks; negligible.
         let st = Box::into_raw(Box::new(State {
             model,
@@ -164,6 +184,7 @@ pub fn open(parent: HWND, id: usize, candidates: Vec<Candidate>, t: &Theme, font
             brush: CreateSolidBrush(COLORREF(t.surface)),
             id,
             dpi,
+            width: wd,
             picked: None,
             tracking: false,
             closing: false,
@@ -259,7 +280,7 @@ unsafe fn confirm(hwnd: HWND, st: *mut State) {
 
 unsafe fn refresh(hwnd: HWND, st: *mut State) {
     let h = height_for((*st).model.results().len(), (*st).dpi);
-    let _ = SetWindowPos(hwnd, None, 0, 0, sc(WIDTH, (*st).dpi), h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    let _ = SetWindowPos(hwnd, None, 0, 0, (*st).width, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     theme::round_corners(hwnd, sc(RADIUS, (*st).dpi));
     let _ = InvalidateRect(Some(hwnd), None, false);
 }
@@ -274,7 +295,7 @@ unsafe fn on_create(hwnd: HWND, st: *mut State) -> bool {
         WS_CHILD | WS_VISIBLE | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
         pad,
         sc((EDIT_AREA - EDIT_H) / 2, dpi),
-        sc(WIDTH, dpi) - 2 * pad,
+        (*st).width - 2 * pad,
         sc(EDIT_H, dpi),
         Some(hwnd),
         Some(HMENU(ID_EDIT as *mut c_void)),
@@ -289,6 +310,7 @@ unsafe fn on_create(hwnd: HWND, st: *mut State) -> bool {
     }
     let _ = SetWindowSubclass(edit, Some(edit_proc), 1, 0);
     crate::edit::attach(edit);
+    let _ = access::set_name(edit, tr("pal.name")); // an unlabeled box otherwise
     true
 }
 
@@ -333,7 +355,7 @@ unsafe fn acc_tree(hwnd: HWND, st: *mut State, t: &mut access::Tree) {
         let c = &s.model.cands[ci];
         t.items.push(access::Item {
             name: c.text.clone(),
-            description: if c.target != c.text { c.target.clone() } else { String::new() },
+            description: detail(c).unwrap_or_default().to_string(),
             role: ROLE_SYSTEM_LISTITEM,
             state: STATE_SYSTEM_SELECTABLE | if i == s.model.selected() { STATE_SYSTEM_SELECTED } else { 0 },
             rect: row_rect(i, rc.right, s.dpi),
@@ -341,6 +363,11 @@ unsafe fn acc_tree(hwnd: HWND, st: *mut State, t: &mut access::Tree) {
             ..Default::default()
         });
     }
+}
+
+/// What a row shows after its name: where it leads, unless that is the name itself or a `::{GUID}` nobody reads.
+fn detail(c: &Candidate) -> Option<&str> {
+    (c.target != c.text && !c.target.starts_with("::")).then_some(c.target.as_str())
 }
 
 /// Result row under the mouse position packed in `lparam`.
@@ -488,10 +515,10 @@ unsafe fn paint(hwnd: HWND, st: *mut State) {
         theme::draw_text(mem, &c.text, &mut measure, flags | DT_CALCRECT);
         theme::draw_text(mem, &c.text, &mut name, flags | DT_END_ELLIPSIS);
         let left = pad + (measure.right - measure.left) + pad;
-        if c.target != c.text && left < cw - pad {
+        if let Some(target) = detail(c).filter(|_| left < cw - pad) {
             let mut tr = RECT { left, right: cw - pad, ..row };
             SetTextColor(mem, COLORREF(if selected && s.contrast { on_sel } else { secondary }));
-            theme::draw_text(mem, &c.target, &mut tr, flags | DT_RIGHT | DT_PATH_ELLIPSIS);
+            theme::draw_text(mem, target, &mut tr, flags | DT_RIGHT | DT_PATH_ELLIPSIS);
         }
     }
     if s.contrast {
@@ -530,7 +557,18 @@ mod tests {
         m.set_query("zzz");
         assert!(m.results().is_empty() && m.pick().is_none());
         let many = (0..30).map(|i| c(&format!("f{i}"))).collect();
-        assert_eq!(Model::new(many).results().len(), 10);
+        let mut m = Model::new(many);
+        assert_eq!(m.results().len(), 10);
+        // A screen with room for three rows: three now, and three after typing.
+        m.move_sel(9);
+        m.limit(3);
+        assert_eq!((m.results().len(), m.selected()), (3, 2), "the selection stays on a shown row");
+        m.set_query("");
+        assert_eq!(m.results().len(), 3);
+        m.limit(0);
+        assert_eq!(m.results().len(), 1, "never none");
+        // 96 DPI: the edit area is 44 px, a row 32, the bottom gap 6.
+        assert_eq!([(0, 44 + 6 + 320), (0, 44 + 6 + 100), (500, 520), (900, 800)].map(|(y, bottom)| rows_that_fit(y, bottom, 96)), [10, 3, 0, 0]);
     }
 
     #[test]

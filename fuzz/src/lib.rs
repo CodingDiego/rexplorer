@@ -1,4 +1,4 @@
-﻿//! Shared by every fuzz target: `fuzz_target!(init: rexplorer_fuzz::init!(), |data: &[u8]| ...)`.
+//! Shared by every fuzz target: `fuzz_target!(init: rexplorer_fuzz::init!(), |data: &[u8]| ...)`.
 //!
 //! `init!` makes a panic leave a reproducer on Windows. libfuzzer-sys's panic hook ends in `std::process::abort`,
 //! which on Windows is `__fastfail` (exit 0xC0000409): no handler runs, so libFuzzer never writes

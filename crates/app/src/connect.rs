@@ -13,8 +13,8 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Storage::FileSystem::{GetLogicalDrives, GetVolumeInformationW};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_FOCUS, ODS_SELECTED};
-use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
-use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{HSTRING, PCWSTR, w};
 
@@ -63,36 +63,76 @@ pub fn is_ftp(name: &str) -> bool {
     name.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("ftp://"))
 }
 
-/// The first `scheme://user:pw@host/..` in `name` without the password, for titles, the address bar, the recent
-/// list, the session file, new-window arguments and messages; other names unchanged. The scheme is any run of two or
-/// more scheme characters (one is a drive letter) wherever it starts, so blanks, quotes or invisible characters
-/// before it and a sentence around it (an error text) do not hide it, and it may be followed by one or two slashes
-/// of either kind (`ftp:/`, `ftp:\\`).
-/// The password ends at the last `@` of the authority (the text before the next slash), so an `@` in the path never
-/// moves the host: a folder named `x@other.example` cannot turn a saved address into one for `other.example`.
-/// `ftp_url` percent-encodes `/`, `@`, `:` and `%`, but a password typed raw into the address bar may hold a `/`:
-/// when the authority has a `:` and no `@`, and what follows the `:` is not a port number, the password runs to the
-/// last `@` of the whole name. Such a name is not a URL the shell can open, so it is only ever shown, never loaded.
-/// shortcut: a raw password that is all digits up to its first `/` reads as a port and is shown; encode the `/`.
+/// `name` without the password of every `scheme://user:password@host/..` in it, for titles, the address box, the
+/// recent list, the session file, new-window arguments and messages; other names unchanged.
+/// A scheme is two or more scheme characters (one is a drive letter) wherever it starts, so blanks, quotes or
+/// invisible characters before it and a sentence around it (an error text) do not hide it, followed by any run of
+/// slashes of either kind (`ftp:/`, `ftp:\\`, `ftp:///`).
+/// The user info ends at the last `@` of the authority (the text up to the next `/`, `?` or `#`, where the shell
+/// ends it too; a `\` is a password character to the shell), so an `@` in the path never moves the host: a folder a
+/// server names `x@other.example` cannot turn a saved address into one for `other.example`.
+/// An address is read once, up to the next blank or quote after its host (a text can hold several addresses), so a
+/// folder named like a scheme (`ab:/x:y@z`) is left as it is.
+/// `ftp_url` percent-encodes `/`, `@`, `:`, `%`, `?`, `#` and blanks, but a password typed raw into the address box
+/// may hold a `/`, which ends the authority early. Then what is left of the host is `name:text` with text that is no
+/// port number, and the password runs to the last `@` of the whole text: too much hidden rather than too little (in
+/// an error text that can take the error code with it).
+/// shortcut: a raw password that is all digits up to its first `/` reads as a port and is shown, and so is the
+/// password of `ftp:user:password@host` (no slash; the shell refuses that address); encode the `/`, type the `//`.
+/// A folder named like a scheme with a password, after a blank in the path (`/my dir/ab:/x:y@z/`), loses its `:y`
+/// in the name shown and saved: the same host, another folder name. Addresses joined with no blank or quote
+/// between them (`http://a/x;ftp://u:pw@h/`) are one address, to the shell too, and the later password is shown.
 pub fn redact(name: &str) -> String {
-    let b = name.as_bytes();
+    let mut out = String::with_capacity(name.len());
+    let mut rest = name;
+    while let Some((cut, end)) = password(rest) {
+        out.push_str(&rest[..cut.start]);
+        out.push_str(&rest[cut.end..end]);
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The first password in `s`: the bytes from the `:` before it up to the `@` after it, and where its address ends.
+fn password(s: &str) -> Option<(std::ops::Range<usize>, usize)> {
+    let b = s.as_bytes();
     let scheme_char = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.');
     let slash = |c: u8| matches!(c, b'/' | b'\\');
-    let Some(colon) = (2..b.len().saturating_sub(1)).find(|&i| b[i] == b':' && slash(b[i + 1]) && scheme_char(b[i - 1]) && scheme_char(b[i - 2])) else {
-        return name.to_string();
-    };
-    let start = colon + 2 + usize::from(b.get(colon + 2).is_some_and(|&c| slash(c)));
-    let rest = &name[start..];
-    let auth = &rest[..rest.find(['/', '\\']).unwrap_or(rest.len())];
-    let Some(user_end) = auth.find(':') else { return name.to_string() };
-    let after = &auth[user_end + 1..];
-    // `[` starts an IPv6 host, whose colons are not a user name's.
-    let raw = !auth.starts_with('[') && !after.bytes().all(|d| d.is_ascii_digit());
-    let at = after.rfind('@').map(|i| user_end + 1 + i).or_else(|| rest.rfind('@').filter(|&at| raw && at > user_end));
-    match at {
-        Some(at) => format!("{}{}", &name[..start + user_end], &rest[at..]),
-        None => name.to_string(),
+    let mut colon = 2;
+    while colon + 1 < b.len() {
+        if b[colon] != b':' || !slash(b[colon + 1]) || !scheme_char(b[colon - 1]) || !scheme_char(b[colon - 2]) {
+            colon += 1;
+            continue;
+        }
+        let start = colon + 1 + b[colon + 1..].iter().take_while(|&&c| slash(c)).count();
+        let rest = &s[start..];
+        let ends_at = |from: usize| start + from + rest[from..].find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'')).unwrap_or(rest.len() - from);
+        let auth = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+        let host_at = auth.rfind('@').map_or(0, |at| at + 1);
+        if let Some(c) = auth[..host_at].find(':') {
+            return Some((start + c..start + host_at - 1, ends_at(host_at)));
+        }
+        // No password in the user info. A host that is `name:text`, text being no port, is the start of a raw
+        // password cut short by its `/` (`[` starts an IPv6 host, whose colons are its own).
+        let host = &auth[host_at..];
+        let c = host.find(':').filter(|&c| !host.starts_with('[') && !host[c + 1..].bytes().all(|d| d.is_ascii_digit()));
+        if let Some((c, at)) = c.and_then(|c| rest.rfind('@').filter(|&at| at > host_at + c).map(|at| (host_at + c, at))) {
+            return Some((start + c..start + at, ends_at(at)));
+        }
+        // The shell ignores what follows a `?` or `#`. With an `@` after it, that is the rest of a raw password whose
+        // start read as a port (`ftp://bob:2024#Summer@host/` opens `ftp://bob:2024/`): the name ends where the
+        // shell's does.
+        if rest[auth.len()..].starts_with(['?', '#'])
+            && let Some(at) = rest.rfind('@').filter(|&at| at > auth.len())
+        {
+            let end = ends_at(at);
+            return Some((start + auth.len()..end, end));
+        }
+        // No password here: the next address starts after this one, not inside its path.
+        colon = ends_at(0).max(colon + 1);
     }
+    None
 }
 
 /// The JSON string after the first `"path":`; shortcut: any `\x` escape yields `x` (no \uXXXX), enough for paths.
@@ -150,6 +190,7 @@ const ID_HOST: i32 = 101; // edits are ID_HOST.. in label order
 const LABELS: [&str; 5] = ["conn.host", "conn.port", "conn.user", "conn.password", "conn.path"];
 const DM_GETDEFID: u32 = 0x0400; // WM_USER
 const DC_HASDEFID: isize = 0x534B;
+const STYLE: WINDOW_STYLE = WINDOW_STYLE(WS_POPUP.0 | WS_CAPTION.0 | WS_SYSMENU.0);
 
 /// A small themed form: a title, an optional line of text above the fields, labeled one-line fields (`masked`
 /// shows dots) and OK / Cancel. The Connect dialog and the archive password prompt.
@@ -180,6 +221,8 @@ struct State {
     /// Each field's text as typed, on OK.
     result: Option<Vec<Vec<u16>>>,
     done: bool,
+    /// Where the content is scrolled to: a work area smaller than the dialog shows part of it.
+    scroll: crate::fit::Scroll,
 }
 
 type Rc4 = (i32, i32, i32, i32); // x, y, w, h
@@ -293,10 +336,22 @@ unsafe fn create_children(hwnd: HWND, st: &mut State, form: &Form) {
     st.cancel = mk(w!("BUTTON"), PCWSTR(cancel.as_ptr()), WS_TABSTOP.0 | BS_OWNERDRAW as u32, WINDOW_EX_STYLE(0), IDCANCEL.0);
 }
 
+/// The size the form's content needs at the window's DPI.
+unsafe fn content(hwnd: HWND, st: &State) -> (i32, i32) {
+    let (dpi, size) = (dpi_of(hwnd), client(st.edits.len() as i32 + i32::from(!st.note.0.is_null())));
+    (size.0 * dpi / 96, size.1 * dpi / 96)
+}
+
+/// Where everything is in the client area: the content's layout (the client area's where that is larger), moved by
+/// the scroll position.
 unsafe fn layout_of(hwnd: HWND, st: &State) -> Layout {
     let mut rc = RECT::default();
     let _ = GetClientRect(hwnd, &mut rc);
-    layout(rc.right, rc.bottom, dpi_of(hwnd), st.edits.len(), !st.note.0.is_null())
+    let (cw, ch) = content(hwnd, st);
+    let mut l = layout(cw.max(rc.right), ch.max(rc.bottom), dpi_of(hwnd), st.edits.len(), !st.note.0.is_null());
+    let by = |r: &mut Rc4| (r.0, r.1) = (r.0 - st.scroll.x, r.1 - st.scroll.y);
+    [&mut l.note, &mut l.connect, &mut l.cancel].into_iter().chain(&mut l.labels).chain(&mut l.edits).for_each(by);
+    l
 }
 
 unsafe fn place(hwnd: HWND, st: &State) {
@@ -367,14 +422,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     match msg {
         WM_SIZE => {
             if !st.ok.0.is_null() {
+                st.scroll.fit(hwnd, content(hwnd, st));
                 place(hwnd, st);
             }
             LRESULT(0)
         }
-        // Moved to a monitor of another scale: take the suggested rect (WM_SIZE lays the controls out again).
+        WM_VSCROLL | WM_HSCROLL | WM_MOUSEWHEEL => {
+            if st.scroll.on_message(hwnd, msg, wparam, 32 * dpi_of(hwnd) / 96) {
+                place(hwnd, st);
+                let _ = InvalidateRect(Some(hwnd), None, true);
+            }
+            LRESULT(0)
+        }
+        // Moved to a monitor of another scale: sized for it again, inside its work area (WM_SIZE lays the controls
+        // out again).
         WM_DPICHANGED => {
             // The font is sized for the previous monitor: make one for this one.
-            let f = theme::ui_font(&st.theme, (wparam.0 & 0xFFFF) as u32);
+            let frame_dpi = (wparam.0 & 0xFFFF) as u32;
+            let f = theme::ui_font(&st.theme, frame_dpi);
             for h in st.labels.iter().chain(&st.edits).copied().chain([st.note, st.ok, st.cancel]).filter(|h| !h.0.is_null()) {
                 SendMessageW(h, WM_SETFONT, Some(WPARAM(f.0 as usize)), Some(LPARAM(1)));
             }
@@ -382,7 +447,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let _ = DeleteObject(st.own.into());
             }
             (st.own, st.font) = (f, f);
-            let r = &*(lparam.0 as *const RECT);
+            let r = crate::fit::window_rect(content(hwnd, st), STYLE, frame_dpi, &*(lparam.0 as *const RECT));
             let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
             let _ = InvalidateRect(Some(hwnd), None, true);
             LRESULT(0)
@@ -474,25 +539,23 @@ pub fn form(parent: HWND, t: &Theme, f: &Form) -> Option<Vec<Vec<u16>>> {
             masked: f.masked,
             result: None,
             done: false,
+            scroll: Default::default(),
         });
         let dpi = theme::text_dpi(frame_dpi) as i32;
         let size = client(f.labels.len() as i32 + i32::from(f.note.is_some()));
-        // The window size that gives that client area under a caption (the frame follows the display scale only).
-        let mut wr = RECT { left: 0, top: 0, right: size.0 * dpi / 96, bottom: size.1 * dpi / 96 };
-        let _ = AdjustWindowRectExForDpi(&mut wr, WS_POPUP | WS_CAPTION | WS_SYSMENU, false, WINDOW_EX_STYLE(0), frame_dpi);
-        let (w, h) = (wr.right - wr.left, wr.bottom - wr.top);
         let mut pr = RECT::default();
         if !has_parent || GetWindowRect(parent, &mut pr).is_err() {
             pr = RECT { left: 0, top: 0, right: GetSystemMetrics(SM_CXSCREEN), bottom: GetSystemMetrics(SM_CYSCREEN) };
         }
-        let x = pr.left + (pr.right - pr.left - w) / 2;
-        let y = pr.top + (pr.bottom - pr.top - h) / 2;
+        // Over the parent, inside its monitor's work area; the frame itself follows the display scale only.
+        let wr = crate::fit::window_rect((size.0 * dpi / 96, size.1 * dpi / 96), STYLE, frame_dpi, &pr);
+        let (x, y, w, h) = (wr.left, wr.top, wr.right - wr.left, wr.bottom - wr.top);
         let hinst = GetModuleHandleW(None).map(Into::into).unwrap_or_default();
         let created = CreateWindowExW(
             crate::rtl::layout(),
             w!("RexConnect"),
             &HSTRING::from(f.title.as_str()),
-            WS_POPUP | WS_CAPTION | WS_SYSMENU,
+            STYLE,
             x,
             y,
             w,
@@ -506,6 +569,7 @@ pub fn form(parent: HWND, t: &Theme, f: &Form) -> Option<Vec<Vec<u16>>> {
             Ok(hwnd) => {
                 // A contrast theme keeps the system's caption and frame.
                 if t.contrast.is_none() {
+                    theme::apply_control(hwnd, t); // its scroll bars, when it has them
                     let dark = t.dark as i32;
                     let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const i32 as *const c_void, 4);
                     // The title bar and frame merge into the card.
@@ -514,6 +578,9 @@ pub fn form(parent: HWND, t: &Theme, f: &Form) -> Option<Vec<Vec<u16>>> {
                     }
                 }
                 create_children(hwnd, &mut st, f);
+                // The WM_SIZE of creation came before the controls: the scroll range and the first layout are set here.
+                let size = content(hwnd, &st);
+                st.scroll.fit(hwnd, size);
                 place(hwnd, &st);
                 if has_parent {
                     let _ = EnableWindow(parent, false);
@@ -530,6 +597,11 @@ pub fn form(parent: HWND, t: &Theme, f: &Form) -> Option<Vec<Vec<u16>>> {
                     if !IsDialogMessageW(hwnd, &msg).as_bool() {
                         let _ = TranslateMessage(&msg);
                         DispatchMessageW(&msg);
+                    }
+                    // Tab can move the focus to a field scrolled out of view.
+                    if msg.message == WM_KEYDOWN && st.scroll.reveal(hwnd, GetFocus()) {
+                        place(hwnd, &st);
+                        let _ = InvalidateRect(Some(hwnd), None, true);
                     }
                 }
                 if has_parent {
@@ -636,6 +708,31 @@ mod tests {
         assert_eq!(redact(r"ftp:\\u:pw@h\x"), r"ftp:\\u@h\x");
         assert_eq!(redact("The folder ftp://u:pw@h/x was not found."), "The folder ftp://u@h/x was not found.");
         assert_eq!(redact("ñ ftp://u:pw@h/ñ"), "ñ ftp://u@h/ñ");
+        // From the second review. An IPv6 host after a user: its colons are no password, and the path's @ stays.
+        for plain in ["ftp://u@[::1]/x@evil.example/", "ftp://[::1]/x@evil.example/", "ftp://u@[::1]:2121/a:b@c"] {
+            assert_eq!(redact(plain), plain);
+        }
+        assert_eq!(redact("ftp://u:pw@[::1]:2121/x@y"), "ftp://u@[::1]:2121/x@y");
+        // A backslash is a password character to the shell, which opens this address.
+        assert_eq!(redact(r"ftp://u:12\34@h.test/"), "ftp://u@h.test/");
+        // Any run of slashes, and every address in the text, not only the first.
+        assert_eq!(redact("ftp:///u:pw@h/"), "ftp:///u@h/");
+        assert_eq!(redact("http://a/ ftp://u:pw@h/"), "http://a/ ftp://u@h/");
+        assert_eq!(redact("ftp://a:one@h/x and sftp://b:two@g/y"), "ftp://a@h/x and sftp://b@g/y");
+        assert_eq!(redact("see ftp://a:1@h/ ftp://b:2@g/ ftp://c:3@k/"), "see ftp://a@h/ ftp://b@g/ ftp://c@k/");
+        // From the third review. The shell ends the authority at ? and # too: the host shown is the host it logs in to.
+        assert_eq!(redact("ftp://u:pw@evil.test#@good.test/"), "ftp://u@evil.test#@good.test/");
+        assert_eq!(redact("ftp://u:pw@evil.test?@good.test/"), "ftp://u@evil.test?@good.test/");
+        // A raw password that is digits up to its # or ?: the shell opens host bob, port 2024, and so does the name.
+        assert_eq!(redact("ftp://bob:2024#Summer@host.test/"), "ftp://bob:2024");
+        assert_eq!(redact("ftp://bob:123?a bc@host.test/x and more"), "ftp://bob:123 and more");
+        assert_eq!(redact("ftp://h.test/a?b#c"), "ftp://h.test/a?b#c");
+        assert_eq!(redact("see ftp://u@h and more?x"), "see ftp://u@h and more?x");
+        // An address is read once: a folder named like a scheme stays as the server named it.
+        assert_eq!(redact("ftp://u:pw@h.test/dir/ab:/x:y@evil/"), "ftp://u@h.test/dir/ab:/x:y@evil/");
+        assert_eq!(redact("ftp://h.test/dir/ab:/x:y@evil/"), "ftp://h.test/dir/ab:/x:y@evil/");
+        // A password with a blank or a quote in it.
+        assert_eq!(redact("ftp://u:my pa\"ss@h/"), "ftp://u@h/");
         for typed in ["ftp://u:p/w@h", "ftp://u:a/b@c@h/", "sftp://u:s3cr/e@t@h:22/"] {
             assert!(!redact(typed).contains("p/w") && !redact(typed).contains("a/b@c") && !redact(typed).contains("s3cr"), "{typed}");
         }

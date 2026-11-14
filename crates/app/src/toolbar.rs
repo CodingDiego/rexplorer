@@ -15,6 +15,7 @@ use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, W
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Accessibility::{ROLE_SYSTEM_BUTTONMENU, ROLE_SYSTEM_PUSHBUTTON, ROLE_SYSTEM_TOOLBAR, STATE_SYSTEM_HASPOPUP};
+use windows::Win32::UI::WindowsAndMessaging::STATE_SYSTEM_COLLAPSED;
 use windows::Win32::UI::Controls::*;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
@@ -393,8 +394,9 @@ unsafe fn acc_tree(hwnd: HWND, s: &State, t: &mut access::Tree) {
         if b.checked {
             state |= STATE_SYSTEM_CHECKED;
         }
+        // Collapsed: its menu is closed whenever a reader can ask (an open menu runs its own loop and has the focus).
         if b.opens_menu() {
-            state |= STATE_SYSTEM_HASPOPUP;
+            state |= STATE_SYSTEM_HASPOPUP | STATE_SYSTEM_COLLAPSED;
         }
         t.items.push(access::Item {
             name,
@@ -441,6 +443,9 @@ unsafe fn add_tooltips(hwnd: HWND) {
         return;
     };
     s.tip = tip;
+    if !s.ui_font.is_invalid() {
+        SendMessageW(tip, WM_SETFONT, Some(WPARAM(s.ui_font.0 as usize)), Some(LPARAM(1)));
+    }
     for (i, b) in s.buttons.iter_mut().enumerate() {
         let ti = TTTOOLINFOW {
             cbSize: size_of::<TTTOOLINFOW>() as u32,
@@ -667,6 +672,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_SETFONT => {
             s.ui_font = HFONT(wparam.0 as *mut c_void);
+            // The tooltip is text too: without a font of its own it stays at the system's size at every text size.
+            if !s.tip.is_invalid() {
+                SendMessageW(s.tip, WM_SETFONT, Some(wparam), Some(LPARAM(1)));
+            }
             update_tool_rects(hwnd, s);
             let _ = InvalidateRect(Some(hwnd), None, false);
         }

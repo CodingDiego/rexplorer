@@ -299,9 +299,11 @@ pub fn text_scale() -> u32 {
     }
 }
 
-/// Re-reads the text size (on WM_SETTINGCHANGE); true when it changed.
+/// Re-reads the text size (on WM_SETTINGCHANGE); true when it changed. `REXPLORER_TEXT_SCALE` (a percentage) stands
+/// in for the Windows setting, so a test can lay the app out at 225 % without changing the user's settings.
 pub fn refresh_text_scale() -> bool {
-    let s = clamp_text_scale(rexplorer_core::import_explorer::dword("Software\\Microsoft\\Accessibility", "TextScaleFactor"));
+    let forced = std::env::var("REXPLORER_TEXT_SCALE").ok().and_then(|v| v.trim().parse().ok());
+    let s = clamp_text_scale(forced.or_else(|| rexplorer_core::import_explorer::dword("Software\\Microsoft\\Accessibility", "TextScaleFactor")));
     TEXT_SCALE.swap(s, std::sync::atomic::Ordering::Relaxed) != s
 }
 

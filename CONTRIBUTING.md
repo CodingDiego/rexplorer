@@ -67,7 +67,10 @@ English and Spanish are built in. Text lives in `crates/core/src/lang/<code>.ini
 - The `windows` family (`windows`, `windows-core`, `windows-collections`) is pinned and ignored by Dependabot.
   Review a new minor every quarter, and at once on a security advisory. Upgrade in its own pull request.
 - `unrar-ng` (it bundles libunrar; `crates/core/Cargo.toml`) is checked against RARLAB's releases every month. Bump
-  it within 14 days of a release that fixes a security issue, and sooner for a published CVE.
+  it within 14 days of a release that fixes a security issue, and sooner for a published CVE. It is built from
+  `vendor/unrar-ng` (0.7.7 with one fix) through `[patch.crates-io]` in both `Cargo.toml` and `fuzz/Cargo.toml`:
+  after a bump Cargo only warns that the patch is unused and builds the published code again, so follow
+  `vendor/unrar-ng/VENDORED.md` (drop the folder if the new release has the fix, else carry the fix over).
 
 ## Releasing
 

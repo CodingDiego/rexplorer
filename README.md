@@ -75,7 +75,8 @@ the monitor DPI). Minimum size 640x400. Windows' Text size (Settings > Accessibi
 the fonts and every bar, row and tile that holds text, live; icons and glyphs follow the display scale only, and
 fixed or user-set widths (the sidebar, the panes, the search field, a tab's maximum) do not grow, so long text gets
 an ellipsis. Folder options and Connect pick up a Text size change when reopened, and rebuild their fonts when
-dragged to a monitor with another scale.
+dragged to a monitor with another scale. They never leave the screen's work area: where their content is larger
+than it (a large text size on a small screen) they scroll, and the palette shows the results there is room for.
 
 Sidebar, every row read from the shell with its localized name and icon:
 
@@ -264,6 +265,9 @@ Every change is written to the active profile in settings.ini and applies at onc
 | Right-click Back / Forward, hold it about 0.5 s, or Down on a focused one | History menu |
 | Drag a tab, right-click a tab | Reorder; drop it on another rexplorer window to move it there, anywhere else to open it in a new window (the last tab stays); Duplicate, Close others, Close to the right |
 | Connect button | FTP dialog (host, port, user, password, path); the `ftp://` URL opens in a new tab |
+| Folder tree focused | The shell's own tree with its own keys: Up, Down, Left (collapse), Right (expand), Home, End, type a letter; the folder the selection lands on opens |
+| Palette open | Type to filter; Up and Down move; Enter goes there; Esc closes |
+| Folder options, Connect | Tab and Shift+Tab move between controls and scroll the one they land on into view; Space toggles a check box; arrows move inside a radio group and inside the Advanced list (Home and End too); Ctrl+Tab, Ctrl+Shift+Tab, Ctrl+PageDown and Ctrl+PageUp switch tabs; Enter presses the focused button, anywhere else OK; Esc cancels |
 
 Shortcuts work while the tree, the search box or the embedded Explorer view has the focus, except Enter and
 Escape, which those keep.
@@ -621,7 +625,9 @@ under `%LOCALAPPDATA%\rexplorer-smoke`, with an extension registered in HKCU for
 and Enter opens it; afterwards it is removed from Home, the Recent shortcut, the keys and the files are deleted),
 remove-bookmark (a scratch profile's bookmark row, removed through its popup, leaves the sidebar and settings.ini),
 share (Share is enabled with a file selected and its click brings the share sheet to the foreground; WM_CLOSE
-closes it), access-denied (`C:\System Volume Information` shows "Access denied: ..." within 3 s), crash-recovery
+closes it), access-denied (`C:\System Volume Information` shows "Access denied: ..." within 3 s), fit (with the
+text size forced to 225 % through `REXPLORER_TEXT_SCALE`, read only for tests, Folder options, Connect and the
+palette lie inside the monitor's work area and each dialog's OK button comes into view by scrolling), crash-recovery
 (`REXPLORER_CRASH_AFTER_MS`, read only for this, raises an access violation; within 6 s a `--recover` process
 shows the same folder), dnd (a real `SendInput` drag of a file row onto a folder row moves the file; the file
 is moved back whatever happens), handoff (with one instance running, a second launch with a folder, timed from the
@@ -670,7 +676,7 @@ more than 1 reload a second while files churn in the shown folder (`-ChurnPerSec
 -ListMs 2000 -IdlePct 3 -ChurnPerSec 1 -UiMs 1000`, a tripwire, not a performance claim. It shares
 `%TEMP%\rexplorer-bench` with the smoke test and creates it when missing.
 
-`scriptstp-check.ps1` starts `scriptstp-server.py` (a read-only FTP server on 127.0.0.1; Python 3 on PATH) and
+`scripts\ftp-check.ps1` starts `scripts\ftp-server.py` (a read-only FTP server on 127.0.0.1; Python 3 on PATH) and
 checks FTP browsing on a copy of the exe with a scratch profile, by window messages: listing, a subfolder, Up, a
 refused login, a file copied out by the shell, and that the password is never shown or saved. It exits 1 on any FAIL.
 
@@ -686,12 +692,15 @@ through WM_APP+0x54.
 ### Known gaps
 
 **[docs/EXPLORER-PARITY.md](docs/EXPLORER-PARITY.md) is the full checklist against Windows Explorer**: every
-behaviour marked WORKS, BROKEN, UNVERIFIED, PARTIAL or MISSING. On 2026-11-13, after 1.0.0-rc.2: 123 rows, 105
+behaviour marked WORKS, BROKEN, UNVERIFIED, PARTIAL or MISSING. On 2026-11-13, after 1.0.0-rc.2: 123 rows, 108
 proven on the exe (2026-11-11 to 2026-11-13, most with a real keyboard and mouse, some by window messages; each note
-says how), 3 more on a scratch install base, 12 UNVERIFIED and 3 PARTIAL. Dragging into Edge and VS Code was proven on 2026-11-12
-([#75](https://github.com/CodingDiego/rexplorer/issues/75)); WhatsApp was not tried. Still UNVERIFIED (built, not
-proven on the exe): the desktop icons view (`--desktop-icons`, never run), high contrast (never seen under a
-contrast theme), Text size, per-monitor DPI, the light / dark live switch, icon overlays on OneDrive files, Run as
+says how), 3 more on a scratch install base, 7 UNVERIFIED and 5 PARTIAL. Dragging into Edge and VS Code was proven on 2026-11-12
+([#75](https://github.com/CodingDiego/rexplorer/issues/75)); WhatsApp was not tried. High contrast, the light / dark
+live switch and FTP browsing (not copying or uploading from rexplorer's window) were proven on 2026-11-13. PARTIAL: Text size and per-monitor DPI (fixed after the live
+test found Folder options off the screen at 225 % and list icons that kept their size after a scale change; the
+fixes are proven by tests, not seen again under the real Windows settings), screen readers (the data is there;
+nobody has listened), MTP phones and OneDrive placeholders. Still UNVERIFIED (built, not
+proven on the exe): the desktop icons view (`--desktop-icons`, never run), icon overlays on OneDrive files, Run as
 administrator, Empty Recycle Bin, the drag image from Home and the default folder handler
 on a real install. Narrator and NVDA were never tried.
 

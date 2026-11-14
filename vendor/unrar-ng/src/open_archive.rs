@@ -1,0 +1,1041 @@
+use super::error::*;
+use super::*;
+use std::fmt;
+use std::os::raw::{c_int, c_uint};
+use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
+
+bitflags::bitflags! {
+    #[derive(Debug, Default)]
+    struct ArchiveFlags: u32 {
+        const VOLUME = native::ROADF_VOLUME;
+        const COMMENT = native::ROADF_COMMENT;
+        const LOCK = native::ROADF_LOCK;
+        const SOLID = native::ROADF_SOLID;
+        const NEW_NUMBERING = native::ROADF_NEWNUMBERING;
+        const SIGNED = native::ROADF_SIGNED;
+        const RECOVERY = native::ROADF_RECOVERY;
+        const ENC_HEADERS = native::ROADF_ENCHEADERS;
+        const FIRST_VOLUME = native::ROADF_FIRSTVOLUME;
+    }
+}
+
+/// Volume information on the file that was *initially* opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeInfo {
+    /// the *initially* opened file is a single-part archive
+    None,
+    /// the *initially* opened file is the first volume in a multipart archive
+    First,
+    /// the *initially* opened file is any volume but the first in a multipart archive
+    Subsequent,
+}
+
+/// Extraction progress event for callbacks during batch extraction.
+///
+/// This enum is used with [`OpenArchive::extract_all_with_callback`] to receive
+/// notifications about extraction progress.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum ExtractEvent {
+    /// File extraction is starting.
+    Start {
+        /// The filename being extracted (relative path within the archive)
+        filename: PathBuf,
+        /// The uncompressed size of the file in bytes
+        size: u64,
+    },
+    /// File extraction completed successfully.
+    Ok {
+        /// The filename that was extracted
+        filename: PathBuf,
+        /// The uncompressed size of the file in bytes, carried over
+        /// from the matching `Start` event so callers do not have to
+        /// stash it themselves to log progress.
+        size: u64,
+    },
+    /// File extraction failed.
+    Err {
+        /// The filename that failed to extract
+        filename: PathBuf,
+        /// The error code from the extraction
+        error_code: i32,
+    },
+    /// The archive requires a dictionary larger than the build-time limit.
+    ///
+    /// Surfaced from the upstream `UCM_LARGEDICT` callback. Returning
+    /// `true` permits the DLL to proceed; returning `false` lets the DLL
+    /// fail the operation, which the caller then observes as
+    /// `Err(UnrarError { code:` [`Code::LargeDict`](crate::error::Code::LargeDict)`, when: When::Process })`.
+    LargeDictWarning {
+        /// The dictionary size required by the archive, in kilobytes.
+        dict_size_kb: u64,
+        /// The maximum dictionary size this build supports, in kilobytes.
+        max_dict_size_kb: u64,
+    },
+}
+
+/// Outcome of [`OpenArchive::extract_all_with_callback`].
+///
+/// The DLL maps a user-initiated cancel (the callback returning `false`
+/// from `Start`/`Ok`/`Err`) to `ERAR_SUCCESS`, so without this status
+/// the caller cannot tell whether the archive finished or was stopped
+/// early. Pattern-match to distinguish the two — `Completed` means the
+/// DLL exhausted the archive, `Cancelled` means the callback aborted
+/// the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExtractStatus {
+    /// Extraction ran to the end of the archive.
+    Completed,
+    /// The user callback returned `false` and aborted extraction early.
+    Cancelled,
+}
+
+#[derive(Debug)]
+struct Handle(NonNull<native::Handle>);
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        unsafe { native::RARCloseArchive(self.0.as_ptr() as *const _) };
+    }
+}
+
+/// An open RAR archive that can be read or processed.
+///
+/// See the [OpenArchive chapter](index.html#openarchive) for more information.
+#[derive(Debug)]
+pub struct OpenArchive<M: OpenMode, C: Cursor> {
+    handle: Handle,
+    flags: ArchiveFlags,
+    damaged: bool,
+    extra: C,
+    marker: std::marker::PhantomData<M>,
+}
+type Userdata<T> = (T, Option<widestring::WideCString>);
+
+mod private {
+    use super::native;
+    pub trait Sealed {}
+    impl Sealed for super::CursorBeforeHeader {}
+    impl Sealed for super::CursorBeforeFile {}
+    impl Sealed for super::List {}
+    impl Sealed for super::ListSplit {}
+    impl Sealed for super::Process {}
+
+    #[repr(i32)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Operation {
+        Skip = native::RAR_SKIP,
+        Test = native::RAR_TEST,
+        Extract = native::RAR_EXTRACT,
+    }
+
+    #[repr(u32)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum OpenModeValue {
+        Extract = native::RAR_OM_EXTRACT,
+        List = native::RAR_OM_LIST,
+        ListIncSplit = native::RAR_OM_LIST_INCSPLIT,
+    }
+}
+
+/// Type parameter for OpenArchive denoting a `read_header` operation must follow next.
+///
+/// See the chapter [OpenArchive: Cursors](index.html#openarchive-cursors) for more information.
+#[derive(Debug)]
+pub struct CursorBeforeHeader;
+/// Type parameter for OpenArchive denoting a `process_file` operation must follow next.
+///
+/// See the chapter [OpenArchive: Cursors](index.html#openarchive-cursors) for more information.
+#[derive(Debug)]
+pub struct CursorBeforeFile {
+    header: FileHeader,
+}
+
+/// The Cursor trait enables archives to keep track of their state.
+///
+/// See the chapter [OpenArchive: Cursors](index.html#openarchive-cursors) for more information.
+pub trait Cursor: private::Sealed {}
+impl Cursor for CursorBeforeHeader {}
+impl Cursor for CursorBeforeFile {}
+
+/// An OpenMode for processing RAR archive entries.
+///
+/// Process allows more sophisticated operations in the `ProcessFile` step.
+#[derive(Debug)]
+pub struct Process;
+#[derive(Debug)]
+/// An OpenMode for listing RAR archive entries.
+///
+/// List mode will list all entries. The payload itself cannot be processed and instead can only
+/// be skipped over. This will yield one header per individual file, regardless of how many parts
+/// the file is split across.
+pub struct List;
+/// An OpenMode for listing RAR archive entries.
+///
+/// ListSplit mode will list all entries. The payload itself cannot be processed and instead can
+/// only be skipped over. This will yield one header per individual file per part if the file is
+/// split across multiple parts. The [`FileHeader::is_split`] method will return true in that case.
+#[derive(Debug)]
+pub struct ListSplit;
+
+/// Mode with which the archive should be opened.
+///
+/// Possible modes are:
+///
+///    - [`List`](struct.List.html)
+///    - [`ListSplit`](struct.ListSplit.html)
+///    - [`Process`](struct.Process.html)
+pub trait OpenMode: private::Sealed {
+    const VALUE: private::OpenModeValue;
+}
+impl OpenMode for Process {
+    const VALUE: private::OpenModeValue = private::OpenModeValue::Extract;
+}
+impl OpenMode for List {
+    const VALUE: private::OpenModeValue = private::OpenModeValue::List;
+}
+impl OpenMode for ListSplit {
+    const VALUE: private::OpenModeValue = private::OpenModeValue::ListIncSplit;
+}
+
+impl<Mode: OpenMode, C: Cursor> OpenArchive<Mode, C> {
+    /// is the archive locked
+    pub fn is_locked(&self) -> bool {
+        self.flags.contains(ArchiveFlags::LOCK)
+    }
+
+    /// are the archive headers encrypted
+    pub fn has_encrypted_headers(&self) -> bool {
+        self.flags.contains(ArchiveFlags::ENC_HEADERS)
+    }
+
+    /// does the archive have a recovery record
+    pub fn has_recovery_record(&self) -> bool {
+        self.flags.contains(ArchiveFlags::RECOVERY)
+    }
+
+    /// does the archive have comments
+    pub fn has_comment(&self) -> bool {
+        self.flags.contains(ArchiveFlags::COMMENT)
+    }
+
+    /// is the archive solid (all files in a single compressed block).
+    pub fn is_solid(&self) -> bool {
+        self.flags.contains(ArchiveFlags::SOLID)
+    }
+
+    /// Volume information on the file that was *initially* opened.
+    ///
+    /// returns
+    ///   - `VolumeInfo::None` if the opened file is a single-part archive
+    ///   - `VolumeInfo::First` if the opened file is the first volume in a multipart archive
+    ///   - `VolumeInfo::Subsequent` if the opened file is any other volume in a multipart archive
+    ///
+    /// Note that this value *never* changes from `First` to `Subsequent` by advancing to a
+    /// different volume.
+    pub fn volume_info(&self) -> VolumeInfo {
+        if self.flags.contains(ArchiveFlags::FIRST_VOLUME) {
+            VolumeInfo::First
+        } else if self.flags.contains(ArchiveFlags::VOLUME) {
+            VolumeInfo::Subsequent
+        } else {
+            VolumeInfo::None
+        }
+    }
+
+    /// unsets the `damaged` flag so that `Iterator` will not refuse to yield elements.
+    ///
+    /// Normally, when an error is returned during iteration, the archive remembers this
+    /// so that subsequent calls to `next` return `None` immediately. This is to prevent
+    /// the same error from recurring over and over again, leading to endless loops in programs
+    /// that might not have considered this. However, maybe there are errors that can be recovered
+    /// from? That's where this method might come in handy if you really know what you're doing.
+    /// However, should that be the case, I urge you to submit an issue / PR with an archive where
+    /// the recoverable error can be reproduced so I can exclude that case from "irrecoverable
+    /// errors" (currently all errors).
+    ///
+    /// Use at your own risk. Might be removed in future releases if somehow it can be verified
+    /// which errors are recoverable and which are not.
+    ///
+    /// # Example how you *might* use this
+    ///
+    /// ```no_run
+    /// use unrar_ng::{Archive, error::{When, Code}};
+    ///
+    /// let mut archive = Archive::new("corrupt.rar").open_for_listing().expect("archive error");
+    /// loop {
+    ///     let mut error = None;
+    ///     for result in &mut archive {
+    ///         match result {
+    ///             Ok(entry) => println!("{entry}"),
+    ///             Err(e) => error = Some(e),
+    ///         }
+    ///     }
+    ///     match error {
+    ///         // your special recoverable error, please submit a PR with reproducible archive
+    ///         Some(e) if (e.when, e.code) == (When::Process, Code::BadData) => archive.force_heal(),
+    ///         Some(e) => panic!("irrecoverable error: {e}"),
+    ///         None => break,
+    ///     }
+    /// }
+    /// ```
+    pub fn force_heal(&mut self) {
+        self.damaged = false;
+    }
+}
+
+impl<Mode: OpenMode> OpenArchive<Mode, CursorBeforeHeader> {
+    pub(crate) fn new(
+        filename: &Path,
+        password: Option<&[u8]>,
+        recover: Option<&mut Option<Self>>,
+    ) -> UnrarResult<Self> {
+        let filename = pathed::construct(filename);
+
+        let mut data =
+            native::OpenArchiveDataEx::new(filename.as_ptr() as *const _, Mode::VALUE as u32);
+        let handle =
+            NonNull::new(unsafe { native::RAROpenArchiveEx(&mut data as *mut _) } as *mut _);
+
+        let arc = handle.and_then(|handle| {
+            if let Some(pw) = password {
+                let cpw = std::ffi::CString::new(pw).unwrap();
+                unsafe { native::RARSetPassword(handle.as_ptr(), cpw.as_ptr() as *const _) }
+            }
+            Some(OpenArchive {
+                handle: Handle(handle),
+                damaged: false,
+                flags: ArchiveFlags::from_bits(data.flags).unwrap(),
+                extra: CursorBeforeHeader,
+                marker: std::marker::PhantomData,
+            })
+        });
+        let result = Code::from(data.open_result as i32);
+
+        match (arc, result) {
+            (Some(arc), Code::Success) => Ok(arc),
+            (arc, _) => {
+                recover.and_then(|recover| arc.and_then(|arc| recover.replace(arc)));
+                Err(UnrarError::from(result, When::Open))
+            }
+        }
+    }
+
+    /// reads the next header of the underlying archive. The resulting OpenArchive will
+    /// be in "ProcessFile" mode, i.e. the file corresponding to the header (that has just
+    /// been read via this method call) will have to be read. Also contains header data
+    /// via [`archive.entry()`](OpenArchive::entry).
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// let archive = unrar_ng::Archive::new("data/version.rar").open_for_listing().unwrap().read_header();
+    /// assert!(archive.as_ref().is_ok_and(Option::is_some));
+    /// let archive = archive.unwrap().unwrap();
+    /// assert_eq!(archive.entry().filename.as_os_str(), "VERSION");
+    /// ```
+    pub fn read_header(self) -> UnrarResult<Option<OpenArchive<Mode, CursorBeforeFile>>> {
+        Ok(read_header(&self.handle)?.map(|entry| OpenArchive {
+            extra: CursorBeforeFile { header: entry },
+            damaged: self.damaged,
+            handle: self.handle,
+            flags: self.flags,
+            marker: std::marker::PhantomData,
+        }))
+    }
+}
+
+impl OpenArchive<Process, CursorBeforeHeader> {
+    /// Extracts all files from the archive to the specified directory in a single operation.
+    ///
+    /// This method is significantly faster than iterating through files individually,
+    /// especially for archives containing many small files. It bypasses the per-file
+    /// FFI overhead by using a batch extraction function internally.
+    ///
+    /// # Arguments
+    ///
+    /// * `dest` - The destination directory path. If the directory doesn't exist,
+    ///   it will be created. Pass an empty path or `"."` for current directory.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use unrar_ng::Archive;
+    ///
+    /// let archive = Archive::new("archive.rar")
+    ///     .open_for_processing()
+    ///     .expect("Failed to open archive");
+    ///
+    /// archive.extract_all("./output")
+    ///     .expect("Failed to extract archive");
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// This function will panic if `dest` contains nul characters.
+    pub fn extract_all<P: AsRef<Path>>(self, dest: P) -> UnrarResult<()> {
+        crate::locale::ensure_initialized();
+        let dest_path = pathed::construct(dest.as_ref());
+        let result = pathed::extract_all(self.handle.0.as_ptr(), &dest_path);
+        match Code::from(result) {
+            Code::Success => Ok(()),
+            code => Err(UnrarError::from(code, When::Process)),
+        }
+    }
+
+    /// Extracts all files from the archive with a progress callback.
+    ///
+    /// This method is similar to [`extract_all`](Self::extract_all) but allows you to
+    /// receive notifications about extraction progress through a callback function.
+    ///
+    /// # Arguments
+    ///
+    /// * `dest` - The destination directory path.
+    /// * `callback` - A closure that receives [`ExtractEvent`] notifications.
+    ///   For `Start`, `Ok` and `Err`, returning `false` cancels the rest
+    ///   of the extraction and the call returns `Ok(ExtractStatus::Cancelled)`.
+    ///   For `LargeDictWarning`, `false` rejects the oversized dictionary
+    ///   instead of cancelling — extraction then fails with
+    ///   [`Code::LargeDict`](crate::error::Code::LargeDict).
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(ExtractStatus::Completed)` — the DLL finished iterating the
+    ///   archive without the callback ever returning `false` from a
+    ///   cancellable event.
+    /// * `Ok(ExtractStatus::Cancelled)` — the callback aborted extraction
+    ///   early on a `Start`/`Ok`/`Err` event.
+    /// * `Err(UnrarError { .. })` — the DLL surfaced an error (incl.
+    ///   [`Code::LargeDict`](crate::error::Code::LargeDict) when the
+    ///   callback rejected an oversized dictionary).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use unrar_ng::{Archive, ExtractEvent, ExtractStatus};
+    ///
+    /// let archive = Archive::new("archive.rar")
+    ///     .open_for_processing()
+    ///     .expect("Failed to open archive");
+    ///
+    /// let status = archive.extract_all_with_callback("./output", |event| {
+    ///     match event {
+    ///         ExtractEvent::Start { filename, size } => {
+    ///             print!("extracting {}... ({} bytes) ", filename.display(), size);
+    ///             true // continue extraction
+    ///         }
+    ///         ExtractEvent::Ok { filename, size } => {
+    ///             println!("ok ({} bytes) {}", size, filename.display());
+    ///             true
+    ///         }
+    ///         ExtractEvent::Err { filename, error_code } => {
+    ///             println!("error (code: {})", error_code);
+    ///             true // continue with other files
+    ///         }
+    ///         ExtractEvent::LargeDictWarning { dict_size_kb, max_dict_size_kb } => {
+    ///             eprintln!("archive needs {dict_size_kb} KB dict, build supports {max_dict_size_kb} KB");
+    ///             false // refuse oversized dict; extraction fails with Code::LargeDict
+    ///         }
+    ///         _ => true,
+    ///     }
+    /// }).expect("Failed to extract archive");
+    /// match status {
+    ///     ExtractStatus::Completed => println!("done"),
+    ///     ExtractStatus::Cancelled => println!("user cancelled"),
+    ///     _ => {}
+    /// }
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// This function will panic if `dest` contains nul characters.
+    pub fn extract_all_with_callback<P, F>(
+        self,
+        dest: P,
+        mut callback: F,
+    ) -> UnrarResult<ExtractStatus>
+    where
+        P: AsRef<Path>,
+        F: FnMut(ExtractEvent) -> bool,
+    {
+        crate::locale::ensure_initialized();
+
+        // Userdata struct to pass to the C callback
+        struct CallbackData<'a, F> {
+            callback: &'a mut F,
+            cancelled: bool,
+            // Carried from UCM_EXTRACTFILE (Start) into UCM_EXTRACTFILE_OK
+            // (Ok) so the surfaced ExtractEvent::Ok can include the size
+            // the upstream library only reports at Start time.
+            pending_size: u64,
+        }
+
+        extern "C" fn extract_callback<F>(
+            msg: native::UINT,
+            user_data: native::LPARAM,
+            p1: native::LPARAM,
+            p2: native::LPARAM,
+        ) -> c_int
+        where
+            F: FnMut(ExtractEvent) -> bool,
+        {
+            if user_data == 0 {
+                return 0;
+            }
+            let data = unsafe { &mut *(user_data as *mut CallbackData<'_, F>) };
+
+            // Helper to read a wchar_t* string from p1.
+            // native::WCHAR is i32 on Unix, u16 on Windows.
+            //
+            // FIXME: the `char::from_u32 + filter_map` decode below silently
+            // drops unpaired surrogates on Windows (wchar_t = u16), so the
+            // filename reported via ExtractEvent can diverge from what
+            // pathed/all.rs writes to disk via lossless WideCString. The
+            // 2048-wchar truncation cap below is also a known gap — both
+            // problems disappear once this is rewritten with
+            // U16/U32CString::from_ptr_truncate -> OsString -> PathBuf.
+            fn read_filename(p1: native::LPARAM) -> Option<PathBuf> {
+                if p1 == 0 {
+                    return None;
+                }
+
+                let ptr = p1 as *const native::WCHAR;
+                if ptr.is_null() {
+                    return None;
+                }
+
+                // Find null terminator. 2048 mirrors the upstream maximum
+                // path length used by `WideCString::from_ptr_truncate` in
+                // `pathed/all.rs::construct` and elsewhere — see the comment
+                // on `Internal::callback`'s UCM_CHANGEVOLUMEW arm in this file.
+                let mut len = 0usize;
+                const MAX_LEN: usize = 2048;
+                unsafe {
+                    while len < MAX_LEN && *ptr.add(len) != 0 {
+                        len += 1;
+                    }
+                }
+
+                if len == 0 {
+                    return None;
+                }
+
+                // Convert wchar_t slice to PathBuf
+                let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+
+                // wchar_t is i32 on Unix, u16 on Windows
+                // Convert to chars respecting the platform's wchar_t representation
+                let path_string: String = slice
+                    .iter()
+                    .filter_map(|&c| char::from_u32(c as u32))
+                    .collect();
+
+                Some(PathBuf::from(path_string))
+            }
+
+            match msg {
+                native::UCM_EXTRACTFILE => {
+                    // p1 = filename (wchar_t*), p2 = file size
+                    let size = p2 as u64;
+                    // Stash the size unconditionally so a later OK event
+                    // still gets it even if read_filename fails here and
+                    // we end up skipping the Start callback.
+                    data.pending_size = size;
+                    if let Some(filename) = read_filename(p1) {
+                        let event = ExtractEvent::Start { filename, size };
+                        if !(data.callback)(event) {
+                            data.cancelled = true;
+                            return -1; // Cancel extraction
+                        }
+                    }
+                    0
+                }
+                native::UCM_EXTRACTFILE_OK => {
+                    // p1 = filename (wchar_t*), p2 = 0
+                    if let Some(filename) = read_filename(p1) {
+                        let event = ExtractEvent::Ok {
+                            filename,
+                            size: data.pending_size,
+                        };
+                        if !(data.callback)(event) {
+                            data.cancelled = true;
+                            return -1;
+                        }
+                    }
+                    0
+                }
+                native::UCM_EXTRACTFILE_ERR => {
+                    // p1 = filename (wchar_t*), p2 = error code
+                    if let Some(filename) = read_filename(p1) {
+                        let event = ExtractEvent::Err {
+                            filename,
+                            error_code: p2 as i32,
+                        };
+                        if !(data.callback)(event) {
+                            data.cancelled = true;
+                            return -1;
+                        }
+                    }
+                    0
+                }
+                native::UCM_LARGEDICT => {
+                    // Upstream `uiDictLimit` (vendor/unrar/uisilent.cpp): only
+                    // a return of 1 lets extraction continue; any other value
+                    // (including 0) makes the DLL fail with ERAR_LARGE_DICT.
+                    // P1/P2 are the required and max dict sizes in KB.
+                    //
+                    // Rejecting an oversized dictionary is not a user cancel —
+                    // it surfaces as `Err(Code::LargeDict)`, so we deliberately
+                    // do NOT set `data.cancelled` here. That keeps
+                    // `ExtractStatus::Cancelled` strictly meaning "callback
+                    // returned false from Start/Ok/Err".
+                    let event = ExtractEvent::LargeDictWarning {
+                        dict_size_kb: p1 as u64,
+                        max_dict_size_kb: p2 as u64,
+                    };
+                    if (data.callback)(event) { 1 } else { 0 }
+                }
+                native::UCM_CHANGEVOLUMEW => {
+                    // Handle volume change: -1 means stop (volume not found)
+                    match p2 {
+                        native::RAR_VOL_ASK => -1,
+                        _ => 0,
+                    }
+                }
+                _ => 0,
+            }
+        }
+
+        let dest_path = pathed::construct(dest.as_ref());
+
+        let mut callback_data = CallbackData {
+            callback: &mut callback,
+            cancelled: false,
+            pending_size: 0,
+        };
+
+        unsafe {
+            native::RARSetCallback(
+                self.handle.0.as_ptr(),
+                Some(extract_callback::<F>),
+                &mut callback_data as *mut _ as native::LPARAM,
+            );
+        }
+
+        let result = pathed::extract_all(self.handle.0.as_ptr(), &dest_path);
+
+        match Code::from(result) {
+            Code::Success if callback_data.cancelled => Ok(ExtractStatus::Cancelled),
+            Code::Success => Ok(ExtractStatus::Completed),
+            code => Err(UnrarError::from(code, When::Process)),
+        }
+    }
+}
+
+impl Iterator for OpenArchive<List, CursorBeforeHeader> {
+    type Item = Result<FileHeader, UnrarError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.damaged {
+            return None;
+        }
+        match read_header(&self.handle) {
+            Ok(Some(header)) => {
+                match Internal::<Skip>::process_file_raw(&self.handle, None, None) {
+                    Ok(_) => Some(Ok(header)),
+                    Err(s) => {
+                        self.damaged = true;
+                        Some(Err(s))
+                    }
+                }
+            }
+            Ok(None) => None,
+            Err(s) => {
+                self.damaged = true;
+                Some(Err(s))
+            }
+        }
+    }
+}
+
+impl Iterator for OpenArchive<ListSplit, CursorBeforeHeader> {
+    type Item = Result<FileHeader, UnrarError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.damaged {
+            return None;
+        }
+        match read_header(&self.handle) {
+            Ok(Some(header)) => {
+                match Internal::<Skip>::process_file_raw(&self.handle, None, None) {
+                    Ok(_) => Some(Ok(header)),
+                    Err(s) => {
+                        self.damaged = true;
+                        Some(Err(s))
+                    }
+                }
+            }
+            Ok(None) => None,
+            Err(s) => {
+                self.damaged = true;
+                Some(Err(s))
+            }
+        }
+    }
+}
+
+impl<M: OpenMode> OpenArchive<M, CursorBeforeFile> {
+    /// returns the file header for the file that follows which is to be processed next.
+    pub fn entry(&self) -> &FileHeader {
+        &self.extra.header
+    }
+
+    /// skips over the next file, not doing anything with it.
+    pub fn skip(self) -> UnrarResult<OpenArchive<M, CursorBeforeHeader>> {
+        self.process_file::<Skip>(None, None)
+    }
+
+    fn process_file<PM: ProcessMode>(
+        self,
+        path: Option<&pathed::RarStr>,
+        file: Option<&pathed::RarStr>,
+    ) -> UnrarResult<OpenArchive<M, CursorBeforeHeader>> {
+        Ok(self.process_file_x::<PM>(path, file)?.1)
+    }
+
+    fn process_file_x<PM: ProcessMode>(
+        self,
+        path: Option<&pathed::RarStr>,
+        file: Option<&pathed::RarStr>,
+    ) -> UnrarResult<(PM::Output, OpenArchive<M, CursorBeforeHeader>)> {
+        let result = Ok((
+            Internal::<PM>::process_file_raw(&self.handle, path, file)?,
+            OpenArchive {
+                extra: CursorBeforeHeader,
+                damaged: self.damaged,
+                handle: self.handle,
+                flags: self.flags,
+                marker: std::marker::PhantomData,
+            },
+        ));
+        result
+    }
+}
+
+impl OpenArchive<Process, CursorBeforeFile> {
+    /// Reads the underlying file into a `Vec<u8>`
+    /// Returns the data as well as the owned Archive that can be processed further.
+    pub fn read(self) -> UnrarResult<(Vec<u8>, OpenArchive<Process, CursorBeforeHeader>)> {
+        Ok(self.process_file_x::<ReadToVec>(None, None)?)
+    }
+
+    /// Test the file without extracting it
+    pub fn test(self) -> UnrarResult<OpenArchive<Process, CursorBeforeHeader>> {
+        Ok(self.process_file::<Test>(None, None)?)
+    }
+
+    /// Extracts the file into the current working directory
+    /// Returns the OpenArchive for further processing
+    pub fn extract(self) -> UnrarResult<OpenArchive<Process, CursorBeforeHeader>> {
+        self.dir_extract(None)
+    }
+
+    /// Extracts the file into the specified directory.  
+    /// Returns the OpenArchive for further processing
+    ///
+    /// # Panics
+    ///
+    /// This function will panic if `base` contains nul characters.
+    pub fn extract_with_base<P: AsRef<Path>>(
+        self,
+        base: P,
+    ) -> UnrarResult<OpenArchive<Process, CursorBeforeHeader>> {
+        self.dir_extract(Some(base.as_ref()))
+    }
+
+    /// Extracts the file into the specified file.
+    /// Returns the OpenArchive for further processing
+    ///
+    /// # Panics
+    ///
+    /// This function will panic if `dest` contains nul characters.
+    pub fn extract_to<P: AsRef<Path>>(
+        self,
+        file: P,
+    ) -> UnrarResult<OpenArchive<Process, CursorBeforeHeader>> {
+        let dest = pathed::construct(file.as_ref());
+        self.process_file::<Extract>(None, Some(&dest))
+    }
+
+    /// extracting into a directory if the filename has unicode characters
+    /// does not work on Linux, so we must specify the full path for Linux
+    fn dir_extract(
+        self,
+        base: Option<&Path>,
+    ) -> UnrarResult<OpenArchive<Process, CursorBeforeHeader>> {
+        let (path, file) = pathed::preprocess_extract(base, &self.entry().filename);
+        self.process_file::<Extract>(path.as_deref(), file.as_deref())
+    }
+}
+
+fn read_header(handle: &Handle) -> UnrarResult<Option<FileHeader>> {
+    let mut userdata: Userdata<<Skip as ProcessMode>::Output> = Default::default();
+    unsafe {
+        native::RARSetCallback(
+            handle.0.as_ptr(),
+            Some(Internal::<Skip>::callback),
+            &mut userdata as *mut _ as native::LPARAM,
+        );
+    }
+    let mut header = native::HeaderDataEx::default();
+    let read_result = Code::from(unsafe {
+        native::RARReadHeaderEx(handle.0.as_ptr(), &mut header as *mut _)
+    });
+    match read_result {
+        Code::Success => Ok(Some(header.into())),
+        Code::EndArchive => Ok(None),
+        _ => Err(UnrarError::from(read_result, When::Read)),
+    }
+}
+
+#[derive(Debug)]
+struct Skip;
+#[derive(Debug)]
+struct ReadToVec;
+#[derive(Debug)]
+struct Extract;
+#[derive(Debug)]
+struct Test;
+
+trait ProcessMode: core::fmt::Debug {
+    const OPERATION: private::Operation;
+    type Output: core::fmt::Debug + std::default::Default;
+
+    fn process_data(data: &mut Self::Output, other: &[u8]);
+}
+impl ProcessMode for Skip {
+    const OPERATION: private::Operation = private::Operation::Skip;
+    type Output = ();
+
+    fn process_data(_: &mut Self::Output, _: &[u8]) {}
+}
+impl ProcessMode for ReadToVec {
+    const OPERATION: private::Operation = private::Operation::Test;
+    type Output = Vec<u8>;
+
+    fn process_data(my: &mut Self::Output, other: &[u8]) {
+        my.extend_from_slice(other);
+    }
+}
+impl ProcessMode for Extract {
+    const OPERATION: private::Operation = private::Operation::Extract;
+    type Output = ();
+
+    fn process_data(_: &mut Self::Output, _: &[u8]) {}
+}
+impl ProcessMode for Test {
+    const OPERATION: private::Operation = private::Operation::Test;
+    type Output = ();
+
+    fn process_data(_: &mut Self::Output, _: &[u8]) {}
+}
+
+struct Internal<M: ProcessMode> {
+    marker: std::marker::PhantomData<M>,
+}
+
+impl<M: ProcessMode> Internal<M> {
+    extern "C" fn callback(
+        msg: native::UINT,
+        user_data: native::LPARAM,
+        p1: native::LPARAM,
+        p2: native::LPARAM,
+    ) -> c_int {
+        if user_data == 0 {
+            return 0;
+        }
+        let user_data = unsafe { &mut *(user_data as *mut Userdata<M::Output>) };
+        match msg {
+            native::UCM_CHANGEVOLUMEW => {
+                // rexplorer's fix (see VENDORED.md): libunrar passes `std::wstring::data()`, a buffer only as
+                // long as the name, so the string is read up to its NUL, not as 2048 characters.
+                let next = unsafe { widestring::WideCString::from_ptr_str(p1 as *const _) };
+                user_data.1 = Some(next);
+                match p2 {
+                    // Next volume not found. -1 means stop
+                    native::RAR_VOL_ASK => -1,
+                    // Next volume found, 0 means continue
+                    _ => 0,
+                }
+            }
+            native::UCM_PROCESSDATA => {
+                let raw_slice = std::ptr::slice_from_raw_parts(p1 as *const u8, p2 as _);
+                M::process_data(&mut user_data.0, unsafe { &*raw_slice as &_ });
+                0
+            }
+            _ => 0,
+        }
+    }
+
+    fn process_file_raw(
+        handle: &Handle,
+        path: Option<&pathed::RarStr>,
+        file: Option<&pathed::RarStr>,
+    ) -> UnrarResult<M::Output> {
+        let mut user_data: Userdata<M::Output> = Default::default();
+        unsafe {
+            native::RARSetCallback(
+                handle.0.as_ptr(),
+                Some(Self::callback),
+                &mut user_data as *mut _ as native::LPARAM,
+            );
+        }
+        let process_result = Code::from(pathed::process_file(
+            handle.0.as_ptr(),
+            M::OPERATION as i32,
+            path,
+            file,
+        ));
+        match process_result {
+            Code::Success => Ok(user_data.0),
+            _ => Err(UnrarError::from(process_result, When::Process)),
+        }
+    }
+}
+
+bitflags::bitflags! {
+    #[derive(Debug)]
+    struct EntryFlags: u32 {
+        const SPLIT_BEFORE = 0x1;
+        const SPLIT_AFTER = 0x2;
+        const ENCRYPTED = 0x4;
+        // const RESERVED = 0x8;
+        const SOLID = 0x10;
+        const DIRECTORY = 0x20;
+    }
+}
+
+/// Metadata for an entry in a RAR archive
+///
+/// Created using the read_header methods in an OpenArchive, contains
+/// information for the file that follows which is to be processed next.
+#[allow(missing_docs)]
+#[derive(Debug)]
+pub struct FileHeader {
+    pub filename: PathBuf,
+    flags: EntryFlags,
+    pub unpacked_size: u64,
+    pub file_crc: u32,
+    pub file_time: u32,
+    pub method: u32,
+    pub file_attr: u32,
+}
+
+impl FileHeader {
+    /// is this entry split across multiple volumes.
+    ///
+    /// Will also work in open mode [`List`]
+    pub fn is_split(&self) -> bool {
+        self.flags.contains(EntryFlags::SPLIT_BEFORE)
+            || self.flags.contains(EntryFlags::SPLIT_AFTER)
+    }
+
+    /// is this entry split across multiple volumes, starting here
+    ///
+    /// Will also work in open mode [`List`]
+    pub fn is_split_after(&self) -> bool {
+        self.flags.contains(EntryFlags::SPLIT_AFTER)
+    }
+
+    /// is this entry split across multiple volumes, starting here
+    ///
+    /// Will always return false in open mode [`List`][^1].
+    ///
+    /// [^1]: this claim is not proven, however, the DLL seems to always skip
+    /// files where this flag would have been set.
+    pub fn is_split_before(&self) -> bool {
+        self.flags.contains(EntryFlags::SPLIT_BEFORE)
+    }
+
+    /// is this entry a directory
+    pub fn is_directory(&self) -> bool {
+        self.flags.contains(EntryFlags::DIRECTORY)
+    }
+
+    /// is this entry encrypted
+    pub fn is_encrypted(&self) -> bool {
+        self.flags.contains(EntryFlags::ENCRYPTED)
+    }
+
+    /// is this entry a file
+    pub fn is_file(&self) -> bool {
+        !self.is_directory()
+    }
+}
+
+impl fmt::Display for FileHeader {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self.filename)?;
+        if self.is_directory() {
+            write!(f, "/")?
+        }
+        if self.is_split() {
+            write!(f, " (partial)")?
+        }
+        Ok(())
+    }
+}
+
+impl From<native::HeaderDataEx> for FileHeader {
+    fn from(header: native::HeaderDataEx) -> Self {
+        // `native::HeaderDataEx` is `#[repr(C, packed(1))]` to match the C++
+        // `#pragma pack(push, 1)` layout, so taking `&header.filename_w` is
+        // forbidden. `&raw const` produces a raw pointer without creating a
+        // reference; the underlying wchar_t array happens to be 4-byte
+        // aligned at its real offset in memory, so the subsequent read is
+        // fine for `WideCString::from_ptr_truncate`.
+        let filename_w_ptr = &raw const header.filename_w as *const _;
+        let filename =
+            unsafe { widestring::WideCString::from_ptr_truncate(filename_w_ptr, 1024) };
+
+        // Packed-struct fields are `Copy` primitives here, so value reads
+        // are legal; we copy each scalar out into a local before passing it
+        // to the constructor so rustc can't be tempted into taking a
+        // reference to the packed field.
+        let flags = header.flags;
+        let unp_size = header.unp_size;
+        let unp_size_high = header.unp_size_high;
+        let file_crc = header.file_crc;
+        let file_time = header.file_time;
+        let method = header.method;
+        let file_attr = header.file_attr;
+
+        FileHeader {
+            filename: PathBuf::from(filename.to_os_string()),
+            flags: EntryFlags::from_bits(flags).unwrap(),
+            unpacked_size: unpack_unp_size(unp_size, unp_size_high),
+            file_crc,
+            file_time,
+            method,
+            file_attr,
+        }
+    }
+}
+
+fn unpack_unp_size(unp_size: c_uint, unp_size_high: c_uint) -> u64 {
+    ((unp_size_high as u64) << (8 * std::mem::size_of::<c_uint>())) | (unp_size as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn combine_size() {
+        use super::unpack_unp_size;
+        let (high, low) = (1u32, 1464303715u32);
+        assert_eq!(unpack_unp_size(low, high), 5759271011);
+    }
+}

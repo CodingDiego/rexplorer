@@ -1,4 +1,4 @@
-﻿# Fuzzing the parsers (#57)
+# Fuzzing the parsers (#57)
 
 One cargo-fuzz target per pure parser. The crate is outside the workspace (own `[workspace]`, lock file ignored), so
 the workspace never sees libfuzzer-sys. It needs nightly and `cargo install cargo-fuzz`.

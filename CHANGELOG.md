@@ -6,6 +6,36 @@ a line under Unreleased. Sections up to 0.1.4 were rebuilt from git history and 
 
 ## Unreleased
 
+- Folder options, Connect and the archive password prompt stay inside the screen's work area at every Windows text
+  size and display scale. When their content is larger than that (Folder options at Text size 225 % on a small
+  screen was taller than the screen), they scroll: a scroll bar, the wheel, and Tab brings the control it lands on
+  into view. The palette shows only as many results as the screen has room for
+  ([#24](https://github.com/CodingDiego/rexplorer/issues/24), [#33](https://github.com/CodingDiego/rexplorer/issues/33)).
+- The list's small icons follow the window's display scale after it changes while rexplorer runs (a new scale, or a
+  move to a monitor with another one); they kept the size of the scale rexplorer started at
+  ([#33](https://github.com/CodingDiego/rexplorer/issues/33)).
+- A focused row that is not selected (Ctrl+arrows, Ctrl+Space) shows an outline once the keyboard is in use, in every
+  theme, not only in a contrast theme ([#22](https://github.com/CodingDiego/rexplorer/issues/22)).
+- For screen readers: Folder options' check boxes and radio buttons say what they are and whether they are on, and
+  its start-folder and delay boxes have names; the New, Sort, View and More buttons say they are collapsed menus;
+  the palette's search box has a name, and a recent place such as This PC reads by its name, not its `::{GUID}`;
+  the preview caption's two lines report where they are, and the text preview is named by its file
+  ([#21](https://github.com/CodingDiego/rexplorer/issues/21)).
+- Toolbar and address-bar tooltips follow the Windows text size, a Home tile is never wider than its pane, and
+  About names "Windows contrast theme" while one is on
+  ([#24](https://github.com/CodingDiego/rexplorer/issues/24), [#23](https://github.com/CodingDiego/rexplorer/issues/23)).
+- `REXPLORER_TEXT_SCALE` (a percentage, for tests) stands in for the Windows text size, and the smoke test's new
+  `fit` check uses it to lay the app out at 225 % and check that every window fits and scrolls.
+- A multi-volume `.rar` (`.part1.rar`, `.part2.rar` and so on) could crash rexplorer now and then while it was
+  listed or extracted: at each change of volume the RAR crate (`unrar-ng` 0.7.7) copied 2048 characters from a
+  string only as long as the next volume's name. The crate is now built from `vendor/unrar-ng` with that read
+  fixed; `VENDORED.md` there says what changed and when to drop the folder. The core tests crashed with an access
+  violation in 3 of 47 runs before and in 0 of 60 after.
+- Two archive messages were English in every language ("entry not found in archive", "extraction folder is not
+  empty"); they come from the string table now
+  ([#37](https://github.com/CodingDiego/rexplorer/issues/37)).
+- The README's keys table covers the folder tree, the palette and the Folder options and Connect dialogs
+  ([#22](https://github.com/CodingDiego/rexplorer/issues/22)).
 - After you delete the selection in rexplorer, the row that takes its place is selected (the row after the focused
   deleted one, else the one before it), in search results and in folders, as in Explorer; not on Home and Quick
   Access. In a folder only the reload that follows your own delete does this: when the selected item goes any other

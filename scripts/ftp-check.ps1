@@ -117,11 +117,14 @@ try {
   Check (Wait-Until { (Get-Names) -contains 'hello.txt' } 20000) 'Up returns to the root' (((Get-Names) -join ', ') + '; ' + (Shown))
 
   # A refused login: a message that names the place without the password, and the tab stays where it was.
-  Go "ftp://${User}:$Wrong@127.0.0.1:$Port/docs/"
+  # Another user name: with the user it is logged in as, the shell can answer from the connection it holds and
+  # never ask the server (seen once in seven runs: no login in the server's log, and the folder opened).
+  Go "ftp://not-$User`:$Wrong@127.0.0.1:$Port/docs/"
   $box = [IntPtr]::Zero
   $null = Wait-Until { $script:box = [F]::Popup([uint32]$app.Id, $main); $script:box -ne [IntPtr]::Zero } 30000
   $said = if ($box -ne [IntPtr]::Zero) { [F]::AllText($box) } else { '' }
-  Check ($box -ne [IntPtr]::Zero -and $said -match '127\.0\.0\.1' -and -not $said.Contains($Wrong)) 'a refused login says so without the password' $said
+  $refused = @(Get-Content $ServerLog | Where-Object { $_ -match "login REFUSED for not-$User" }).Count -gt 0
+  Check ($box -ne [IntPtr]::Zero -and $refused -and $said -match '127\.0\.0\.1' -and -not $said.Contains($Wrong)) 'a refused login says so without the password' "$said; refused in the server's log: $refused"
   if ($box -ne [IntPtr]::Zero) { $null = [F]::PostMessage($box, 0x10, [IntPtr]::Zero, [IntPtr]::Zero); Start-Sleep -Milliseconds 500 }
   Check ((Get-Names) -contains 'hello.txt' -and -not (Shown).Contains($Wrong)) 'after it the tab still shows the root' (((Get-Names) -join ', ') + '; ' + (Shown))
 
@@ -155,7 +158,9 @@ try {
 } finally {
   foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k]) }
   if ($app -and -not $app.HasExited) { $app.Kill() }
-  if ($server -and -not $server.HasExited) { $server.Kill() }
+  # With its children: `python` can be a launcher (py, a venv) whose interpreter is the process that listens.
+  # Through cmd: under ErrorActionPreference Stop, PowerShell 5.1 throws on a native command's stderr line.
+  if ($server -and -not $server.HasExited) { & cmd.exe /c "taskkill /T /F /PID $($server.Id) >nul 2>&1" }
   $results | ForEach-Object { $_ }
   Start-Sleep -Milliseconds 300
   Remove-Item -LiteralPath $Work -Recurse -Force -ErrorAction SilentlyContinue

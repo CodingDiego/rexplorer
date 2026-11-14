@@ -12,6 +12,10 @@ windows = "=0.62.2"
 # Same version as windows: the #[implement] macro needs windows-core as a direct dependency.
 windows-core = "=0.62.2"
 
+# unrar-ng 0.7.7 with one out-of-bounds read fixed; vendor/unrar-ng/VENDORED.md says what, why and when to drop it.
+[patch.crates-io]
+unrar-ng = { path = "vendor/unrar-ng" }
+
 [profile.release]
 lto = true
 codegen-units = 1

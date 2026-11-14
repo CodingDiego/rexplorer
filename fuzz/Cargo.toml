@@ -66,3 +66,7 @@ path = "fuzz_targets/session_files.rs"
 test = false
 doc = false
 bench = false
+
+# The same unrar-ng as the workspace: 0.7.7 with one out-of-bounds read fixed (vendor/unrar-ng/VENDORED.md).
+[patch.crates-io]
+unrar-ng = { path = "../vendor/unrar-ng" }

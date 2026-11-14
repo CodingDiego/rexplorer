@@ -328,6 +328,10 @@ pub(crate) unsafe fn navigate(app: *mut App, t: usize, target: Target, history: 
                 Err(err) => result = Err(LoadError { name: l.folder.parsing_name.clone(), err }),
             }
         }
+        // An error made in that apartment can hold an error object of it (IErrorInfo): only its code travels.
+        if sta && let Err(e) = &mut result {
+            e.err = windows::core::Error::from_hresult(e.err.code());
+        }
         // A newer load of this tab would make on_enum_done drop this one anyway.
         if superseded() {
             return;
@@ -1452,6 +1456,12 @@ pub(crate) unsafe fn save_view_state(app: *mut App) {
 }
 
 // ---- loading state ------------------------------------------------------------------------------
+
+/// What to call the place `name` on screen: a `shell:` or `::{GUID}` name by its folder's display name, anything
+/// else as it is (without a password). Nothing here reaches a disk or the network.
+pub(crate) fn shown_name(name: &str) -> String {
+    destination(&Target::Name(name.to_string())).0
+}
 
 /// Display and parsing name of where a navigation goes, without loading it: PIDLs and `shell:` / `::{CLSID}`
 /// names resolve in the namespace (no disk access); anything else shows as typed.

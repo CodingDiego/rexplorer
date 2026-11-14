@@ -8,7 +8,7 @@
 
 use std::ffi::c_void;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicIsize, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use rexplorer_core::crash;
@@ -30,13 +30,14 @@ static LAST_OP: Mutex<&str> = Mutex::new("");
 /// The main window, which carries the slowest-message properties, and the slowest message so far in ms.
 static MAIN: AtomicIsize = AtomicIsize::new(0);
 static SLOWEST: AtomicUsize = AtomicUsize::new(0);
-/// The message being timed ran a message loop of its own.
-static MODAL: AtomicBool = AtomicBool::new(false);
+/// When the message being timed began a message loop of its own, if it did.
+static MODAL: Mutex<Option<Instant>> = Mutex::new(None);
 
-/// The message being handled runs a message loop of its own (a window move or resize, a menu, a dialog, a drag): it
-/// lasts as long as the user takes, so `timed` leaves it out of the slowest message and the `slow:` lines.
+/// The message being handled begins a message loop of its own here (a window move or resize, a menu, a dialog, a
+/// drag): from now on it lasts as long as the user takes, so `timed` counts it only up to this call. Call it right
+/// before the loop; what the handler does after the loop is not counted either.
 pub(crate) fn modal() {
-    MODAL.store(true, Relaxed);
+    MODAL.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Instant::now);
 }
 
 /// The main window's answer to the heartbeat.
@@ -61,23 +62,20 @@ impl Drop for Op {
 /// Runs one message of the main loop through `f` (`DispatchMessageW`, or `TranslateAcceleratorW`, which sends the
 /// command itself), recording it for a hang report and timing it. Cost per message: two `Instant::now` reads (QPC,
 /// tens of ns), one uncontended lock and a compare; the window properties are written only when a message beats the
-/// slowest so far. A message whose handler ran a message loop of its own (`modal`) is not counted. A loop nobody
-/// reported (a menu a child control owns) is timed as one message for as long as it runs: read such a line with its
-/// operation label.
+/// slowest so far. A message whose handler ran a message loop of its own counts up to where that loop began
+/// (`modal`). A loop nobody reported (a menu a child control owns) is timed as one message for as long as it runs:
+/// read such a line with its operation label.
 pub(crate) fn timed<R>(msg: &MSG, f: impl FnOnce() -> R) -> R {
     MSG.store(((msg.message as u64) << 32) | (msg.wParam.0 as u64 & 0xFFFF_FFFF), Relaxed);
     *LAST_OP.lock().unwrap_or_else(|e| e.into_inner()) = "";
     // Read before the handler runs: WM_CLOSE and friends destroy the window.
     #[cfg(debug_assertions)]
     let class = class_of(msg.hwnd);
-    MODAL.store(false, Relaxed);
+    *MODAL.lock().unwrap_or_else(|e| e.into_inner()) = None;
     let start = Instant::now();
     let r = f();
-    let took = start.elapsed();
-    if MODAL.swap(false, Relaxed) {
-        MSG.store(0, Relaxed);
-        return r;
-    }
+    let looped = MODAL.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let took = looped.map_or_else(|| start.elapsed(), |at| at.duration_since(start));
     let ms = took.as_millis() as usize;
     let main = MAIN.load(Relaxed);
     if new_slowest(ms) && main != 0 {

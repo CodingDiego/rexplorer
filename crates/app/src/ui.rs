@@ -291,7 +291,8 @@ pub(crate) unsafe fn refresh_theme(app: *mut App) {
 pub(crate) unsafe fn apply_font(app: *mut App) {
     let font = theme::ui_font(&(*app).theme, GetDpiForWindow((*app).hwnd));
     let a = &*app;
-    for h in [a.list, a.addr, a.search, a.strip, a.crumbs, a.status, a.sidebar, a.cmdbar, a.home] {
+    // The two glyph toolbars take it for their tooltips.
+    for h in [a.list, a.addr, a.search, a.strip, a.crumbs, a.status, a.sidebar, a.cmdbar, a.home, a.nav, a.tools] {
         SendMessageW(h, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
     }
     if !(*app).font.is_invalid() {
@@ -989,10 +990,9 @@ pub(crate) unsafe fn import_explorer_flow(profile: Option<&str>, overwrite: bool
 }
 
 pub(crate) unsafe fn about(app: *mut App) {
-    let text = trf(
-        "dlg.about",
-        &[("version", &env!("CARGO_PKG_VERSION")), ("profile", &(*app).profile.name), ("theme", &(*app).theme.name), ("dir", &settings::dir().display())],
-    );
+    // While a Windows contrast theme is on, its colors are in use, not the named theme's.
+    let theme = if (*app).theme.contrast.is_some() { tr("dlg.about.contrast") } else { (*app).theme.name.as_str() };
+    let text = trf("dlg.about", &[("version", &env!("CARGO_PKG_VERSION")), ("profile", &(*app).profile.name), ("theme", &theme), ("dir", &settings::dir().display())]);
     let h = HSTRING::from(text);
     MessageBoxW(Some((*app).hwnd), PCWSTR(h.as_ptr()), w!("rexplorer"), crate::rtl::message_box() | MB_OK | MB_ICONINFORMATION);
 }
@@ -1001,7 +1001,8 @@ pub(crate) unsafe fn about(app: *mut App) {
 
 pub(crate) unsafe fn open_palette(app: *mut App) {
     let a = &mut *app;
-    let mut c: Vec<Candidate> = a.recent.items().iter().map(|r| Candidate { text: r.clone(), target: r.clone() }).collect();
+    // A recent place is its address, except a `::{GUID}` or `shell:` one, which is shown by the folder's name.
+    let mut c: Vec<Candidate> = a.recent.items().iter().map(|r| Candidate { text: nav::shown_name(r), target: r.clone() }).collect();
     let pairs = a.profile.bookmarks.iter().chain(CLOUD.get().into_iter().flatten());
     c.extend(pairs.map(|(label, target)| Candidate { text: label.clone(), target: target.clone() }));
     if let Some(l) = listing(app) {
