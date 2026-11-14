@@ -1,5 +1,3 @@
-Draft: read these notes, then delete this line and the empty line under it. The release job refuses to publish while it is here.
-
 rexplorer 1.0.0 is the first stable release of the 1.x line. It replaces Windows Explorer's folder windows; the desktop, the taskbar and Start stay Explorer's. The changes are listed in full in `CHANGELOG.md` under 1.0.0, 1.0.0-rc.2 and 1.0.0-rc.1.
 
 **If you use 0.2.0, update.** 0.2.0 can rename the wrong file. In a window with Back history, each character typed
