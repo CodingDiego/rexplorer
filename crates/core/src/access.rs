@@ -70,27 +70,28 @@ impl Drop for Server {
 }
 
 thread_local! {
-    /// The lParam this thread's `send_own` is sending right now; 0 when none.
-    static SENDING: Cell<isize> = const { Cell::new(0) };
+    /// The (window, message, lParam) this thread's `send_own` is sending right now; lParam 0 when none.
+    static SENDING: Cell<(isize, u32, isize)> = const { Cell::new((0, 0, 0)) };
 }
 
 /// Sends a private message whose lParam is a pointer (WM_ACC_ITEMS, a control's WM_NOTIFY) to `hwnd`, a window of
-/// this thread, marked so that its handler's `own_pointer` accepts it. Any program on the desktop can post or send
+/// this thread, marked so that its handler's `own_send` accepts it. Any program on the desktop can post or send
 /// these message ids with a pointer of its choosing; only a send made here is marked.
 pub fn send_own(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    let before = SENDING.replace(lparam.0);
+    let before = SENDING.replace((hwnd.0 as isize, msg, lparam.0));
     let r = unsafe { SendMessageW(hwnd, msg, Some(wparam), Some(lparam)) };
     SENDING.set(before);
     r
 }
 
-/// Whether the message being handled, with this `lparam`, is a `send_own` of this thread: the send to a window of
-/// the same thread is a direct call, so the mark is still set. A posted message (rexplorer posts none of these, and a
-/// modal loop dispatches posted ones too) or one sent from another thread or process is not marked. InSendMessageEx
-/// cannot decide it: inside a message another thread sent (WM_GETOBJECT from a screen reader, say) it reports a send
-/// for our own nested same-thread sends as well.
-pub fn own_pointer(lparam: LPARAM) -> bool {
-    lparam.0 != 0 && SENDING.get() == lparam.0
+/// Whether the message `hwnd` is handling, `msg` with this `lparam`, is a `send_own` of this thread to that window:
+/// the send to a window of the same thread is a direct call, so the mark is still set. A posted message (rexplorer
+/// posts none of these, and a modal loop dispatches posted ones too), one sent from another thread or process, or one
+/// that reaches another window or carries another message id while our send is on the stack is not marked.
+/// InSendMessageEx cannot decide it: inside a message another thread sent (WM_GETOBJECT from a screen reader, say) it
+/// reports a send for our own nested same-thread sends as well.
+pub fn own_send(hwnd: HWND, msg: u32, lparam: LPARAM) -> bool {
+    lparam.0 != 0 && SENDING.get() == (hwnd.0 as isize, msg, lparam.0)
 }
 
 pub fn is_client(lparam: LPARAM) -> bool {
@@ -454,7 +455,7 @@ mod tests {
             WM_GETOBJECT if is_client(lparam) => {
                 return SERVER.with(|s| s.borrow_mut().get_or_insert_with(|| Server::new(hwnd)).answer(wparam));
             }
-            WM_ACC_ITEMS if own_pointer(lparam) => {
+            WM_ACC_ITEMS if own_send(hwnd, msg, lparam) => {
                 return TREE.with(|t| match &*t.borrow() {
                     Some(tree) => {
                         let out = unsafe { &mut *(lparam.0 as *mut Tree) };
@@ -719,7 +720,7 @@ mod tests {
         let mut tree = Tree::default();
         assert_eq!(send_own(h, WM_ACC_ITEMS, WPARAM(0), LPARAM(&mut tree as *mut Tree as isize)).0, 1);
         assert_eq!(tree.name, "Test");
-        assert!(!own_pointer(LPARAM(&mut tree as *mut Tree as isize)), "the mark ends with the send");
+        assert!(!own_send(h, WM_ACC_ITEMS, LPARAM(&mut tree as *mut Tree as isize)), "the mark ends with the send");
         // The same message posted to the window (as another program could), even with a pointer that is valid here.
         let mut posted = Tree::default();
         unsafe { PostMessageW(Some(h), WM_ACC_ITEMS, WPARAM(0), LPARAM(&mut posted as *mut Tree as isize)).unwrap() };
@@ -742,11 +743,15 @@ mod tests {
         assert!(posted.name.is_empty());
         // Nested sends keep the outer mark.
         let outer = LPARAM(1234);
-        SENDING.set(outer.0);
+        SENDING.set((h.0 as isize, WM_NOTIFY, outer.0));
         let mut inner = Tree::default();
         assert_eq!(send_own(h, WM_ACC_ITEMS, WPARAM(0), LPARAM(&mut inner as *mut Tree as isize)).0, 1);
-        assert!(own_pointer(outer));
-        SENDING.set(0);
+        assert!(own_send(h, WM_NOTIFY, outer));
+        // The same pointer reaching another window, or under another message id, while our send is on the stack.
+        let other = HWND((h.0 as isize + 2) as *mut _);
+        assert!(!own_send(other, WM_NOTIFY, outer), "wrong window");
+        assert!(!own_send(h, WM_ACC_ITEMS, outer), "wrong message");
+        SENDING.set((0, 0, 0));
         unsafe { DestroyWindow(h).unwrap() };
     }
 

@@ -166,7 +166,7 @@ fn file_name_cell(shown: String, file: &str, show: bool, never_shown: impl FnOnc
 }
 
 /// A folder by name: archives (.zip) are folders to the shell but files by name.
-fn named_folder(e: &ShellItem) -> bool {
+pub(crate) fn named_folder(e: &ShellItem) -> bool {
     let (folder, stream) = (windows::Win32::System::SystemServices::SFGAO_FOLDER.0, windows::Win32::System::SystemServices::SFGAO_STREAM.0);
     let attrs = e.attributes(folder | stream);
     attrs & folder != 0 && attrs & stream == 0
@@ -198,12 +198,13 @@ impl Source {
         }
     }
 
-    /// Text of row `i`, column `sub` (header position).
+    /// Text of row `i`, column `sub` (header position). Only for a source nothing can replace while a shell call
+    /// pumps messages; the window's own listing goes through `row_text`.
     pub fn text(&self, i: usize, sub: usize) -> String {
         match self {
-            Source::Shell(l) => match (l.items.get(i), l.cells.get(i).and_then(|row| row.get_or_init(|| vec![std::cell::OnceCell::new(); l.columns.len().max(1)].into()).get(sub))) {
+            Source::Shell(l) => match (l.items.get(i), cell_of(l, i, sub)) {
                 (Some(e), Some(cell)) => cell.get().cloned().unwrap_or_else(|| {
-                    let text = if sub == 0 { name_cell(e).0 } else { e.detail(l.columns[sub].index) };
+                    let text = shell_text(e, column_of(l, sub));
                     // set, not get_or_init: a shell call that pumps messages may ask for this cell again meanwhile
                     let _ = cell.set(text.clone());
                     text
@@ -308,6 +309,61 @@ impl Source {
     }
 }
 
+/// Row `i`'s cell for header position `sub`; the row's cells are allocated on first use.
+fn cell_of(l: &Listing, i: usize, sub: usize) -> Option<&std::cell::OnceCell<String>> {
+    l.cells.get(i).and_then(|row| row.get_or_init(|| vec![std::cell::OnceCell::new(); l.columns.len().max(1)].into()).get(sub))
+}
+
+/// The shell column behind header position `sub`; None for the Name cell.
+fn column_of(l: &Listing, sub: usize) -> Option<u32> {
+    (sub > 0).then(|| l.columns[sub].index)
+}
+
+/// A shell row's cell text: its Name cell or a shell detail. Shell calls, which may pump messages.
+fn shell_text(e: &ShellItem, column: Option<u32>) -> String {
+    column.map_or_else(|| name_cell(e).0, |c| e.detail(c))
+}
+
+/// Text of row `i`, column `sub` of the active tab. A shell row's cell is worked out from copies of its item, with no
+/// borrow of the listing held: the shell calls may pump messages, and a reload, a search batch or a tab change may
+/// replace or drop the listing meanwhile. The text is kept only when the row still holds that item.
+pub(crate) unsafe fn row_text(app: *mut App, i: usize, sub: usize) -> String {
+    let (item, folder, column) = match source(app) {
+        Some(Source::Shell(l)) => {
+            let (Some(e), Some(cell)) = (l.items.get(i), cell_of(l, i, sub)) else { return String::new() };
+            if let Some(t) = cell.get() {
+                return t.clone();
+            }
+            (e.clone(), l.folder.pidl.clone(), column_of(l, sub))
+        }
+        Some(s) => return s.text(i, sub),
+        None => return String::new(),
+    };
+    let text = shell_text(&item, column);
+    if let Some(cell) = same_row(app, i, &folder, &item).and_then(|l| cell_of(l, i, sub)) {
+        let _ = cell.set(text.clone());
+    }
+    text
+}
+
+/// The active tab's listing, when it is still of `folder` and row `i` still holds `item`.
+unsafe fn same_row<'a>(app: *mut App, i: usize, folder: &Pidl, item: &ShellItem) -> Option<&'a mut Listing> {
+    let a = &mut *app;
+    match a.tabs.get_mut(a.active)?.source.as_mut()? {
+        Source::Shell(l) if same_pidl(&l.folder.pidl, folder) && l.items.get(i).is_some_and(|e| same_pidl(&e.pidl, &item.pidl)) => Some(l),
+        _ => None,
+    }
+}
+
+/// Whether two PIDLs hold the same bytes (a copy of an item matches it; another item, or the same one renamed, not).
+fn same_pidl(a: &Pidl, b: &Pidl) -> bool {
+    use windows::Win32::UI::Shell::ILGetSize;
+    unsafe {
+        let (n, m) = (ILGetSize(Some(a.as_ptr())) as usize, ILGetSize(Some(b.as_ptr())) as usize);
+        n == m && (n == 0 || std::slice::from_raw_parts(a.as_ptr() as *const u8, n) == std::slice::from_raw_parts(b.as_ptr() as *const u8, m))
+    }
+}
+
 // ---- archives ------------------------------------------------------------------------------------
 
 /// Up from directory `dir` ("" = root) of `archive`: the parent directory, the archive's root, or its folder.
@@ -360,37 +416,42 @@ unsafe fn name_icon(app: *mut App, name: &str, dir: bool) -> i32 {
 
 /// Details-view small icon of row `i` of the active tab, cached per row.
 pub(crate) unsafe fn small_icon(app: *mut App, i: usize) -> i32 {
-    #[allow(clippy::type_complexity)] // a one-off tuple of borrows out of the match below
-    let (cache, name, dir, shell, own): (&mut Vec<i32>, String, bool, Option<(&ShellItem, &Pidl)>, Option<i32>) = match &mut cur(app).source {
-        Some(Source::Shell(l)) => {
-            let Some(item) = l.items.get(i) else { return 0 };
-            (&mut l.icons, String::new(), false, Some((item, &l.folder.pidl)), None)
+    // A shell row's icon comes from shell calls that may pump messages: worked out from copies as in `row_text`.
+    if let Some(Source::Shell(l)) = source(app) {
+        let (Some(&known), Some(item)) = (l.icons.get(i), l.items.get(i)) else { return 0 };
+        if known != ICON_UNKNOWN {
+            return known;
         }
+        let (item, folder) = (item.clone(), l.folder.pidl.clone());
+        // shortcut: icon lookup runs on the UI thread, move it to a worker when a slow folder visibly stutters
+        let icon = views::theme_icon(app, &item).unwrap_or_else(|| item.icon_index(&folder).1);
+        if let Some(slot) = same_row(app, i, &folder, &item).and_then(|l| l.icons.get_mut(i)) {
+            *slot = icon;
+        }
+        return icon;
+    }
+    let (cache, name, dir, own): (&mut Vec<i32>, String, bool, Option<i32>) = match &mut cur(app).source {
         Some(Source::Archive(a)) => {
             let Some(e) = a.rows.get(i) else { return 0 };
-            (&mut a.icons, e.name.clone(), e.is_dir, None, None)
+            (&mut a.icons, e.name.clone(), e.is_dir, None)
         }
         Some(Source::Search(s)) => {
             let Some(r) = s.rows.get(i) else { return 0 };
-            (&mut s.icons, r.name.clone(), r.is_folder, None, Some(r.icon))
+            (&mut s.icons, r.name.clone(), r.is_folder, Some(r.icon))
         }
         _ => return 0,
     };
     let Some(slot) = cache.get_mut(i) else { return 0 };
     if *slot == ICON_UNKNOWN {
-        *slot = match shell {
-            // shortcut: icon lookup runs on the UI thread, move it to a worker when a slow folder visibly stutters
-            Some((item, folder)) => views::theme_icon(app, item).unwrap_or_else(|| item.icon_index(folder).1),
+        *slot = match own {
             // A search row has its file's own system icon already; the name only decides on a theme or on the list source.
-            None => match own {
-                Some(icon) => views::theme_icon_for(app, &name, dir).unwrap_or_else(|| {
-                    if !(*app).image_list_set {
-                        name_icon(app, &name, dir);
-                    }
-                    icon
-                }),
-                None => name_icon(app, &name, dir),
-            },
+            Some(icon) => views::theme_icon_for(app, &name, dir).unwrap_or_else(|| {
+                if !(*app).image_list_set {
+                    name_icon(app, &name, dir);
+                }
+                icon
+            }),
+            None => name_icon(app, &name, dir),
         };
     }
     *slot
@@ -424,7 +485,15 @@ pub(crate) static ARCHIVE_PASSWORD: Mailbox<Box<(PathBuf, bool, ArchiveJob)>> = 
 /// Runs `job` on a worker; an error goes back to window `hwnd` as a message box, a missing or wrong password as
 /// WM_ARCHIVE_PASSWORD.
 pub(crate) fn run_job(hwnd: isize, archive: PathBuf, job: ArchiveJob) {
+    struct Running;
+    impl Drop for Running {
+        fn drop(&mut self) {
+            JOBS.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    JOBS.fetch_add(1, Ordering::SeqCst);
     std::thread::spawn(move || {
+        let _running = Running;
         let _com = ComInit::sta();
         let r = match &job {
             ArchiveJob::Open(e) => archive_view::open(&archive, "").and_then(|l| l.extract_for_open(e)).and_then(|p| instance::open_default_app(&p)),
@@ -439,8 +508,22 @@ pub(crate) fn run_job(hwnd: isize, archive: PathBuf, job: ArchiveJob) {
             ArchiveJob::Open(e) => trf("err.open", &[("name", &e.name), ("error", &err)]),
             ArchiveJob::Extract(_) => trf("err.extract", &[("name", &archive.display()), ("error", &err)]),
         };
-        post_error(hwnd, text);
+        // The window can be gone by now (`wait_for_jobs`): the error still shows, with no owner.
+        if let Err(text) = WORKER_ERROR.post(hwnd, WM_WORKER_ERROR, text) {
+            unsafe { crate::message(HWND::default(), &text) };
+        }
     });
+}
+
+/// Archive jobs still running.
+static JOBS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Called after the window closed, before the process ends: a job stopped midway leaves a member cut short, and the
+/// next "Extract all" keeps that file as one that was already there.
+pub(crate) fn wait_for_jobs() {
+    while JOBS.load(Ordering::SeqCst) > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 /// WM_ARCHIVE_PASSWORD: asks, and runs the job again with the password typed; Cancel drops it.
@@ -501,10 +584,6 @@ unsafe fn pick_folder(owner: HWND) -> Option<PathBuf> {
     // Shell-allocated, so a path over 260 characters is not cut (SHGetPathFromIDListW's buffer is MAX_PATH).
     let path = SHGetNameFromIDList(p.as_ptr(), SIGDN_FILESYSPATH).ok()?;
     Some(PathBuf::from(rexplorer_core::com::take_cotaskmem_string(path)))
-}
-
-fn post_error(hwnd: isize, text: String) {
-    let _ = WORKER_ERROR.post(hwnd, WM_WORKER_ERROR, text);
 }
 
 // ---- activation ----------------------------------------------------------------------------------
@@ -865,21 +944,26 @@ fn remove_indices<T>(v: &mut Vec<T>, gone: &[usize]) {
     }
 }
 
-/// After a delete: drops the `rows` whose file is gone (a cancelled delete keeps them). Only file system rows are
-/// stat'ed, so no pass over network paths. A delete made outside rexplorer shows up after F5.
-pub(crate) unsafe fn prune_search(app: *mut App, rows: &[usize]) {
+/// The search result `rows` as (row, parsing name), taken before a delete: `prune_search` finds them again by name.
+pub(crate) unsafe fn search_picks(app: *mut App, rows: &[usize]) -> Vec<(usize, String)> {
+    match source(app) {
+        Some(Source::Search(s)) => rows.iter().filter_map(|&i| s.rows.get(i).map(|r| (i, r.item.parsing_name()))).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// After a delete: drops the `picks` (`search_picks`) whose file is gone (a cancelled delete keeps them). Only file
+/// system rows are stat'ed, so no pass over network paths. A delete made outside rexplorer shows up after F5.
+pub(crate) unsafe fn prune_search(app: *mut App, picks: &[(usize, String)]) {
     let list = (*app).list;
     let focused = usize::try_from(SendMessageW(list, LVM_GETNEXTITEM, Some(WPARAM(usize::MAX)), Some(LPARAM(LVNI_FOCUSED as isize))).0).ok();
     let Some(Source::Search(s)) = &mut cur(app).source else { return };
-    let mut gone: Vec<usize> = rows
+    // The delete's dialogs pump messages: rows may have moved or gone since the picks, so each is found by its name.
+    let name = |i: usize| s.rows.get(i).map(|r| r.item.parsing_name());
+    let mut gone: Vec<usize> = picks
         .iter()
-        .copied()
-        .filter(|&i| {
-            s.rows.get(i).is_some_and(|r| {
-                let p = r.item.parsing_name();
-                ui::is_fs_path(&p) && !Path::new(&p).exists()
-            })
-        })
+        .filter(|(_, p)| ui::is_fs_path(p) && !Path::new(p).exists())
+        .filter_map(|(i, p)| list::edit_row(p, *i, s.rows.len(), name))
         .collect();
     gone.sort_unstable();
     gone.dedup();
@@ -1196,6 +1280,17 @@ mod tests {
         let by_path = by_path.expect("path resolves to a shell item");
         assert_eq!(by_path[0].name, file.name);
         assert_eq!(by_path[0].size, file.size);
+    }
+
+    #[test]
+    fn a_cell_is_kept_only_for_a_copy_of_its_item() {
+        let _com = ComInit::mta();
+        let dir = std::env::temp_dir();
+        let a = ShellFolder::parse(dir.to_str().unwrap()).unwrap().pidl;
+        let b = ShellFolder::parse(dir.parent().unwrap().to_str().unwrap()).unwrap().pidl;
+        assert!(same_pidl(&a, &a.clone()));
+        assert!(!same_pidl(&a, &b));
+        assert!(!same_pidl(&b, &a));
     }
 
     #[test]

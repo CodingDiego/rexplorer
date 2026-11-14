@@ -113,6 +113,12 @@ fn first_volume(v: VolumeInfo) -> Result<()> {
     if matches!(v, VolumeInfo::Subsequent) { Err(err(crate::i18n::tr("err.rar_middle_volume"))) } else { Ok(()) }
 }
 
+/// Whether `archive` is solid: its members share one compressed stream, so reaching one unpacks every member before
+/// it. False when it cannot be opened.
+pub fn is_solid(archive: &Path) -> bool {
+    with_archive(archive, |a| a.open_for_listing()).is_ok_and(|o| o.is_solid())
+}
+
 /// A member whose data stops at a missing volume is left half written by unrar: it must not stay.
 fn drop_partial(dest_dir: &Path, path: &str) {
     for p in [dest_dir.join(path), dest_dir.join(usable(path))] {
@@ -166,7 +172,17 @@ fn norm(p: &Path) -> String {
 /// strips trailing dots and spaces (".. " is ".."); a name ending in a dot or a space (Windows writes another
 /// name); a DOS device name, with or without an extension (CON, com1.jpg, CONIN$).
 fn escapes(path: &str) -> bool {
-    path.contains(':') || path.split('\\').any(|c| c.trim_end_matches(['.', ' ']).is_empty() || c.ends_with(['.', ' ']) || is_device_name(c))
+    path.contains(':')
+        // A line break in a folder name would add lines to the files that list places (recent.txt).
+        || path.chars().any(char::is_control)
+        || path.split('\\').any(|c| c.trim_end_matches(['.', ' ']).is_empty() || c.ends_with(['.', ' ']) || is_device_name(c))
+}
+
+/// A member name unrar does not write as given, so the path checked here would not be the path written: unrar drops
+/// a leading separator and a `\\server\share\` prefix (its ConvertPath), hands over at most 1023 characters of a
+/// longer name, and a name that is not valid UTF-16 reads back changed. `//srv/share/x` would land on `dest\x`.
+fn rewritten(raw: &Path) -> bool {
+    raw.to_str().is_none_or(|s| s.starts_with(['\\', '/']) || s.encode_utf16().count() >= 1023)
 }
 
 /// A DOS device name, with or without an extension (CON, com1.jpg, CONIN$): Windows opens the device, not a file.
@@ -210,10 +226,14 @@ fn usable(path: &str) -> String {
     path.chars().map(|c| if matches!(c, '?' | '*' | '<' | '>' | '|' | '"') || c < ' ' { '_' } else { c }).collect()
 }
 
-/// Best-effort Mark-of-the-Web: the archive carries a Zone.Identifier stream only when it was downloaded.
+/// Best-effort Mark-of-the-Web: the archive carries a Zone.Identifier stream when it was downloaded. One on a share
+/// in the Internet zone may carry none (the server decides), and what comes out of it is from there all the same.
 fn inherit_motw(archive: &Path, target: &Path) {
     let stream = |p: &Path| format!("{}:Zone.Identifier", p.display());
-    if let Ok(z) = std::fs::read(stream(archive)) {
+    let mark = std::fs::read(stream(archive)).ok().or_else(|| {
+        crate::com::path_zone(archive).filter(|z| *z >= 3).map(|_| b"[ZoneTransfer]\r\nZoneId=3\r\n".to_vec())
+    });
+    if let Some(z) = mark {
         let _ = std::fs::write(stream(target), z);
     }
 }
@@ -237,7 +257,7 @@ pub fn list(archive: &Path) -> Result<Vec<Entry>> {
     for h in opened {
         let h = h.map_err(|e| rar_err(archive, e))?;
         let path = norm(&h.filename);
-        if path.is_empty() || escapes(&path) || !seen.insert(path.to_lowercase()) {
+        if path.is_empty() || escapes(&path) || rewritten(&h.filename) || !seen.insert(path.to_lowercase()) {
             continue;
         }
         let (parent, name) = split(&path);
@@ -298,7 +318,7 @@ pub fn extract(archive: &Path, entry_path: &str, dest_dir: &Path) -> Result<Path
     first_volume(cur.volume_info())?;
     while let Some(h) = cur.read_header().map_err(fail)? {
         let path = norm(&h.entry().filename);
-        if !escapes(&path) && path.eq_ignore_ascii_case(want) && !h.entry().is_directory() {
+        if !escapes(&path) && !rewritten(&h.entry().filename) && path.eq_ignore_ascii_case(want) && !h.entry().is_directory() {
             // The base-path form: with a whole destination name unrar has no base to keep a link's target inside
             // (dll.cpp DllDestName) and resolves it against the working directory.
             h.extract_with_base(dest_dir).map_err(|e| {
@@ -346,10 +366,10 @@ pub fn extract_all(archive: &Path, dest_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dest_dir).map_err(err)?;
     let fail = |e| rar_err(archive, e);
     let mut cur = with_archive(archive, |a| a.open_for_processing()).map_err(fail)?;
-    let (mut written, mut kept) = (Vec::new(), 0usize);
+    let mut kept = 0usize;
     while let Some(h) = cur.read_header().map_err(fail)? {
         let path = norm(&h.entry().filename);
-        let refused = escapes(&path);
+        let refused = escapes(&path) || rewritten(&h.entry().filename);
         let file = h.entry().is_file() && !refused;
         // unrar overwrites without asking; Explorer asks, and leaving the file there is the answer that loses nothing.
         let taken = file && (dest_dir.join(&path).symlink_metadata().is_ok() || dest_dir.join(usable(&path)).symlink_metadata().is_ok());
@@ -368,16 +388,14 @@ pub fn extract_all(archive: &Path, dest_dir: &Path) -> Result<()> {
                 made.iter().for_each(|p| remove_link(p));
                 kept += 1;
             } else {
-                written.push(path);
+                // Only what this call wrote ("Extract here" lands next to files that were already there), and at
+                // once: a later member that fails must not leave the earlier ones without the mark.
+                made.iter().for_each(|p| inherit_motw(archive, p));
             }
             next
         } else {
             h.skip().map_err(fail)?
         };
-    }
-    // Only what this call wrote: "Extract here" lands next to files that were already there.
-    for p in written {
-        inherit_motw(archive, &dest_dir.join(p));
     }
     if kept > 0 {
         return Err(err(crate::i18n::trf("err.extract_kept", &[("count", &kept)])));
@@ -705,6 +723,15 @@ mod tests {
     }
 
     #[test]
+    fn a_solid_archive_is_told_apart() {
+        // solid.rar: two text files packed with WinRAR's `rar a -s`.
+        let fx = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        assert!(is_solid(&fx.join("solid.rar")));
+        assert!(!is_solid(&fx.join("multivol/set.part1.rar")));
+        assert!(!is_solid(&fx.join("no-such.rar")));
+    }
+
+    #[test]
     fn multi_volume_set_lists_and_extracts_across_volumes() {
         let dir = multivol("mv-ok", None);
         let rar = dir.join("set.part1.rar");
@@ -856,6 +883,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(z1.unwrap().contains("ZoneId=3"));
         assert!(z2.unwrap().contains("ZoneId=3"));
+    }
+
+    #[test]
+    fn members_written_before_a_failure_keep_the_zone_stream() {
+        // Every volume is there (a missing one fails before anything is written), but the last member's data is
+        // damaged in the last volume: the two members before it are written, then the extraction fails.
+        let dir = multivol("mv-motw", None);
+        let last = dir.join("set.part3.rar");
+        let mut bytes = std::fs::read(&last).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        std::fs::write(&last, bytes).unwrap();
+        let rar = dir.join("set.part1.rar");
+        let stream = |p: &Path| format!("{}:Zone.Identifier", p.display());
+        std::fs::write(stream(&rar), "[ZoneTransfer]\r\nZoneId=3\r\n").unwrap();
+        let x = extract_all(&rar, &dir.join("out"));
+        let left: Vec<(String, bool)> = tree(&dir.join("out"))
+            .into_iter()
+            .map(|(p, _)| dir.join("out").join(p))
+            .filter(|p| p.is_file())
+            .map(|p| (p.display().to_string(), std::fs::read_to_string(stream(&p)).is_ok_and(|z| z.contains("ZoneId=3"))))
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(x.is_err(), "the last member is damaged");
+        assert_eq!(left.len(), 2, "the members before the damaged one are out, and it is not: {left:?}");
+        assert!(left.iter().all(|(_, marked)| *marked), "{left:?}");
+    }
+
+    #[test]
+    fn a_name_unrar_writes_elsewhere_never_replaces_a_file() {
+        let dir = tmp("rewritten");
+        let rar = rar_of(
+            &dir.join("src"),
+            &[M::File("//srv/share/mine.txt", b"evil"), M::File("/lead.txt", b"evil"), M::File("a\nb/x.txt", b"x"), M::File("ok.txt", b"fine")],
+        );
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        for f in ["mine.txt", "lead.txt"] {
+            std::fs::write(out.join(f), b"mine").unwrap();
+        }
+        let names: Vec<String> = list(&rar).unwrap().into_iter().map(|e| e.path).collect();
+        let all = extract_all(&rar, &out);
+        let one = extract(&rar, "srv\\share\\mine.txt", &dir.join("one"));
+        let kept = ["mine.txt", "lead.txt"].map(|f| std::fs::read(out.join(f)).unwrap());
+        let written = tree(&out);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(names, ["ok.txt"], "listed: only the member unrar writes under the name shown");
+        assert_eq!(all.unwrap_err().message(), crate::i18n::trf("err.extract_kept", &[("count", &3)]));
+        assert!(one.is_err());
+        assert_eq!(kept, [b"mine".to_vec(), b"mine".to_vec()], "the files that were there are untouched");
+        assert_eq!(written.len(), 3, "the two old files and ok.txt: {written:?}");
     }
 
     #[test]

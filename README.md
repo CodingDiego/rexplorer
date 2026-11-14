@@ -81,8 +81,9 @@ than it (a large text size on a small screen) they scroll, and the palette shows
 Sidebar, every row read from the shell with its localized name and icon:
 
 - **Home** ("Inicio" on a Spanish Windows) on top, without a section title.
-- **Favorites**: the profile's bookmarks, then the folders of Quick Access in the shell's order: the pinned known
-  folders, the Recycle Bin, your own pins and the frequent folders. A place is listed once.
+- **Favorites**: the profile's bookmarks, then the folders of Quick Access: first the pins (the known folders, the
+  Recycle Bin, your own), each marked with a pin, then the frequent folders, both in the shell's order. A place is
+  listed once. Quick Access's recent files are not listed, a `.zip` among them (a folder to the shell).
 - **This PC**: a row for This PC itself, then the drives, connected MTP phones and other devices This PC shows (not the user folders it also
   lists).
 - **Devices**: what the desktop root adds that is neither a file on the desktop nor a place shown elsewhere: Phone
@@ -92,7 +93,8 @@ Sidebar, every row read from the shell with its localized name and icon:
 - **Network**.
 
 Click a row to go there; the row of the current folder, or of its nearest ancestor, is highlighted. Right-click a
-pinned Quick Access folder for **Unpin from Home**, a frequent (not pinned) one for **Pin to Home**, a bookmark for
+pinned Quick Access folder for **Unpin from Home**, a frequent (not pinned) one for **Pin to Home** or **Remove
+from Home**, a bookmark for
 **Remove bookmark** (its `bookmark.<label>` line leaves settings.ini). Pinned and frequent are told apart by the
 shell's `System.Home.IsPinned` property. The rows are built on a worker thread, rebuilt when the window is activated, every 30 s while the sidebar shows, when a drive comes or goes, and right after
 a pin or unpin from rexplorer, so the sidebar fills in after the first listing. More > **Folder tree** (a check
@@ -192,7 +194,8 @@ Every change is written to the active profile in settings.ini and applies at onc
   never replaces a file already in the target, and never writes a member whose name would land outside it (a `..`
   step, a drive letter, or a `:` that would make a hidden stream); both kinds are skipped and counted in one
   message. Members with a `:` in their name (made on Linux or macOS) are not listed. Members show their type's
-  icon in every view; pictures get thumbnails, and pictures and text up to 32 MB a preview. To show them, members
+  icon in every view; pictures get thumbnails (up to 256 MB of extracted pictures per folder view, none in a solid
+  archive), and pictures and text up to 32 MB a preview. To show them, members
   are extracted to `%TEMP%\rexplorer-show-<pid>`, removed when the tab closes and when rexplorer exits. Archives
   are read-only: no rename, delete or drop. The archive is listed on a worker thread.
 - **Search results**: type in the search box and press Enter (Ctrl+F focuses it). The search walks the current
@@ -236,7 +239,7 @@ Every change is written to the active profile in settings.ini and applies at onc
 | Middle-click a folder | Open it in a background tab (middle-click a tab closes it) |
 | Ctrl+P | Palette: recent places, bookmarks, cloud roots and the current subfolders, fuzzy matched |
 | Ctrl+D | Pin the selected folders (or the current folder) to Home |
-| Right-click a sidebar row | Unpin from Home (Quick Access folders), Remove bookmark (bookmarks) |
+| Right-click a sidebar row | Unpin from Home (pinned folders), Pin to Home or Remove from Home (frequent folders), Remove bookmark (bookmarks) |
 | Ctrl+` | Terminal (Windows Terminal, else cmd) in the current filesystem folder |
 | Ctrl+B | Show / hide the sidebar (the folder tree stays as it is; More > Folder tree toggles it) |
 | Alt or F10 alone | Focus the command bar (Windows 11 Explorer has no menu bar either); again returns to the view |
@@ -273,7 +276,8 @@ Shortcuts work while the tree, the search box or the embedded Explorer view has 
 Escape, which those keep.
 
 They can be rebound in a `[keys]` section of `settings.ini`: one line per command, `cmd.new_tab=Ctrl+Y` or
-several chords `cmd.back=Alt+Left, Backspace`. Commands: `cmd.back`, `cmd.forward`, `cmd.up`, `cmd.refresh`,
+several chords ``cmd.terminal=Ctrl+Alt+T, Ctrl+` ``. A key that types or edits text (Space, Backspace) without Ctrl
+or Alt would also fire while you type in the address bar. Commands: `cmd.back`, `cmd.forward`, `cmd.up`, `cmd.refresh`,
 `cmd.address`, `cmd.address_history`, `cmd.explorer`, `cmd.enter`, `cmd.escape`, `cmd.properties`, `cmd.new_tab`, `cmd.close_tab`,
 `cmd.next_tab`, `cmd.prev_tab`, `cmd.palette`, `cmd.terminal`, `cmd.toggle_sidebar`, `cmd.toggle_preview`,
 `cmd.search`, `cmd.pin`, `cmd.view_details`, `cmd.view_icons`, `cmd.view_thumbnails`, `cmd.view_extra_large`,
@@ -302,18 +306,18 @@ rexplorer [options] [folder...]
   --select <path>     open the parent folder with <path> selected (also /select,<path>)
   --profile <name>    use the named settings profile
   --new-tab, -t       open in a new tab of the running window
-  --new-window        open a second window (it saves no tabs, placement or recents)
-  --desktop-icons     show the desktop's icons in a rexplorer window (opt-in, primary monitor)
-  --search <text>     search the (first) folder opened for <text>
+  --search <text>     start with a search for <text>
   --register          make rexplorer the default file manager (folders, drives, Win+E), recorded so it can be undone
   --unregister        give folders back to Windows Explorer (undo --register)
   --install           copy rexplorer to %LOCALAPPDATA%\Programs as a normal program (Start menu, Settings > Apps); Explorer still opens folders
   --uninstall         give folders back to Explorer, then undo --install
-  --quiet             with --install, --uninstall, --register or --unregister: no dialogs, a failure rolls back (exit code 0 done, 1 failed)
+  --quiet             with --install, --uninstall, --register or --unregister: no dialogs, a failure rolls back; the exit code is the result (0 done, 1 failed)
   --import-explorer   copy Windows Explorer's settings into the active profile (backs up settings.ini)
   --overwrite         with --import-explorer: also replace values you changed in rexplorer
   --recover           restore the previous session after a crash
-  --desktop           run the helper that shows rexplorer's context menu on the desktop (--register starts it)
+  --desktop           run the helper that shows rexplorer's context menu on the desktop
+  --desktop-icons     show the desktop's icons in a rexplorer window (opt-in, primary monitor)
+  --new-window        open a separate window (does not hand off; saves no session)
   --elevated          when started elevated, stay so (drive-wide indexed search) instead of restarting unelevated
   -h, --help          show this help
 ```
@@ -343,7 +347,7 @@ From 1.0 these options keep their meaning until 2.0: `--select` and `/select,`, 
 
 `--quiet` is for scripted installs (the winget package and the scripts below): with `--install` or `--register` it
 skips the question, rolls back a failure without asking and shows no summary; with `--uninstall` or `--unregister`
-it shows no summary. Exit codes: 0 done, 1 failed, and 2 when you answer No to the interactive question.
+it skips the question and shows no summary. Exit codes: 0 done, 1 failed, and 2 when you answer No to the interactive question.
 
 Hand-off to a running window: the second launch sends its arguments as `key=value` lines whose first line is
 `v=1` (`cli::PROTOCOL`). A running window answers 1 when it takes them and 0 when the version differs; the new
@@ -449,8 +453,8 @@ start), a leftover `rexplorer.old`, and the folders install created, if they are
 ### Make it the default file manager
 
 `rexplorer --register` (or More > **Make rexplorer the default file manager...**, or `master-install.ps1`) points
-Windows' entry points for folder windows at the exe it runs from (the installed copy, when you start it from the
-Start menu). It replaces Explorer's folder windows and the desktop's right-click menu: the desktop itself, the
+Windows' entry points for folder windows at the installed copy, whichever copy runs the command (without an install
+it refuses and changes nothing). It replaces Explorer's folder windows and the desktop's right-click menu: the desktop itself, the
 taskbar and the Start menu stay Explorer.
 
 | Entry point | After `--register` | How |

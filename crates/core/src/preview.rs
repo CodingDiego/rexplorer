@@ -78,11 +78,14 @@ pub fn handler_clsid(ext: &str) -> Option<GUID> {
     }
 }
 
-/// Mark-of-the-Web says the file came from the Internet (3) or Restricted (4) zone. Explorer stopped previewing
-/// those (handlers fetch what the document references); the caller shows the thumbnail and caption instead.
+/// The file came from the Internet (3) or Restricted (4) zone: its Mark-of-the-Web says so, or it sits on a share
+/// in that zone (a server chooses whether to serve the mark, so the place is asked first, without opening the
+/// file). Explorer stopped previewing those (handlers fetch what the document references); the caller shows the
+/// thumbnail and caption instead.
 fn internet_zone(path: &Path) -> bool {
-    std::fs::read_to_string(format!("{}:Zone.Identifier", path.display()))
-        .is_ok_and(|z| z.lines().any(|l| matches!(l.trim(), "ZoneId=3" | "ZoneId=4")))
+    crate::com::path_zone(path).is_some_and(|z| z >= 3)
+        || std::fs::read_to_string(format!("{}:Zone.Identifier", path.display()))
+            .is_ok_and(|z| z.lines().any(|l| matches!(l.trim(), "ZoneId=3" | "ZoneId=4")))
 }
 
 /// A live preview handler hosted in a parent window; unloaded on drop.
@@ -194,6 +197,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(!l && d);
         assert!(err.as_deref().is_some_and(|m| m.contains("internet zone")), "{err:?}");
+    }
+
+    #[test]
+    fn a_file_on_an_internet_zone_share_gets_no_handler_whatever_the_server_says() {
+        let _com = ComInit::sta();
+        // A share reached by a public address (TEST-NET-3): asked by name only, nothing connects.
+        assert!(internet_zone(Path::new(r"\\203.0.113.7\s\a.docx")));
+        assert!(!internet_zone(Path::new(r"C:\Windows\win.ini")));
     }
 
     #[test]

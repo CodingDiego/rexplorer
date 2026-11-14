@@ -28,8 +28,9 @@ use windows::Win32::System::Threading::{AttachThreadInput, CreateMutexW, GetCurr
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, INPUT, INPUT_0, INPUT_MOUSE, MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
-    MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT, SendInput, VIRTUAL_KEY, VK_APPS, VK_CONTROL, VK_F10, VK_MENU, VK_SHIFT,
+    GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE,
+    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT, SendInput, VIRTUAL_KEY, VK_APPS, VK_CONTROL, VK_E,
+    VK_F10, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, Result, w};
@@ -44,6 +45,8 @@ const WM_DESKTOP_MENU: u32 = WM_APP + 0x60;
 const WM_REPLAY: u32 = WM_APP + 0x61;
 /// Posted to the window by the keyboard hook: WPARAM = the focused desktop list.
 const WM_DESKTOP_KEYMENU: u32 = WM_APP + 0x62;
+/// Posted to the window by the keyboard hook: Win+E was pressed.
+const WM_DESKTOP_WIN_E: u32 = WM_APP + 0x63;
 /// dwExtraInfo of the input we inject: the hooks let it through untouched.
 const REPLAY_TAG: usize = 0x5245_5850;
 
@@ -317,6 +320,14 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
                     return LRESULT(1);
                 }
             }
+            // The shell opens its own window on Win+E whatever the registry says (seen on build 26300), so the key
+            // is taken here, in any window.
+            WM_KEYDOWN | WM_SYSKEYDOWN if is_win_e(vk as u16, held(VK_LWIN) || held(VK_RWIN), held(VK_SHIFT), held(VK_CONTROL), held(VK_MENU)) => {
+                SWALLOWED_KEY.store(vk, Ordering::SeqCst);
+                let target = HWND(TARGET.load(Ordering::SeqCst) as *mut _);
+                let _ = PostMessageW(Some(target), WM_DESKTOP_WIN_E, WPARAM(0), LPARAM(0));
+                return LRESULT(1);
+            }
             WM_KEYUP | WM_SYSKEYUP if taken => {
                 SWALLOWED_KEY.store(0, Ordering::SeqCst);
                 return LRESULT(1);
@@ -325,6 +336,28 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
         }
     }
     CallNextHookEx(None, code, wparam, lparam)
+}
+
+/// Win+E with no other modifier (Win+Shift+E and the like stay the system's).
+fn is_win_e(vk: u16, win: bool, shift: bool, ctrl: bool, alt: bool) -> bool {
+    vk == VK_E.0 && win && !shift && !ctrl && !alt
+}
+
+/// Win+E: starts rexplorer the way the File Explorer icon does (no argument: the start folder, or a hand-off to the
+/// window already open).
+unsafe fn open_file_manager(hwnd: HWND) {
+    // The shell never saw the E, and it opens Start when Win goes up with nothing pressed in between: a key no
+    // program uses is pressed for it to see.
+    let key = |flags| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VIRTUAL_KEY(0xE8), dwFlags: flags, dwExtraInfo: REPLAY_TAG, ..Default::default() } },
+    };
+    SendInput(&[key(KEYBD_EVENT_FLAGS(0)), key(KEYEVENTF_KEYUP)], size_of::<INPUT>() as i32);
+    // The new process inherits the right to come to the front from the one that has it.
+    take_foreground(hwnd);
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::process::Command::new(exe).spawn();
+    }
 }
 
 /// The keys that open a context menu: Menu, or Shift+F10 (no Ctrl or Alt).
@@ -358,7 +391,11 @@ fn unpack(v: isize) -> POINT {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         // Clicks taken while Explorer hung must not come out later as a run of menus.
-        WM_DESKTOP_MENU | WM_DESKTOP_KEYMENU if stale(GetMessageTime() as u32, windows::Win32::System::SystemInformation::GetTickCount()) => LRESULT(0),
+        WM_DESKTOP_MENU | WM_DESKTOP_KEYMENU | WM_DESKTOP_WIN_E if stale(GetMessageTime() as u32, windows::Win32::System::SystemInformation::GetTickCount()) => LRESULT(0),
+        WM_DESKTOP_WIN_E => {
+            open_file_manager(hwnd);
+            LRESULT(0)
+        }
         WM_DESKTOP_MENU => {
             show(hwnd, HWND(wparam.0 as *mut _), At::Point(unpack(lparam.0)));
             LRESULT(0)
@@ -549,6 +586,10 @@ mod tests {
 
     #[test]
     fn menu_keys() {
+        assert!(is_win_e(VK_E.0, true, false, false, false));
+        for (vk, win, shift, ctrl, alt) in [(VK_E.0, false, false, false, false), (VK_E.0, true, true, false, false), (VK_E.0, true, false, true, false), (VK_E.0, true, false, false, true), (VK_F10.0, true, false, false, false)] {
+            assert!(!is_win_e(vk, win, shift, ctrl, alt), "{vk} {win} {shift} {ctrl} {alt}");
+        }
         assert!(is_menu_key(VK_APPS.0, false, false, false));
         assert!(is_menu_key(VK_F10.0, true, false, false));
         assert!(!is_menu_key(VK_F10.0, false, false, false));

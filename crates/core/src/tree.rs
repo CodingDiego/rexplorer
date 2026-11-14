@@ -355,14 +355,29 @@ mod tests {
 
     const RECT400: RECT = RECT { left: 0, top: 0, right: 400, bottom: 400 };
 
+    /// Dispatches what the control posted to this thread before a test destroys it: its background work reports by
+    /// posting to its window, and these tests run no message loop (#94, a suspicion, not a traced cause).
+    fn settle() {
+        use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, MSG, PM_REMOVE, PeekMessageW};
+        let mut m = MSG::default();
+        for _ in 0..3 {
+            while unsafe { PeekMessageW(&mut m, None, 0, 0, PM_REMOVE) }.as_bool() {
+                unsafe { DispatchMessageW(&m) };
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn tree_creates_under_hidden_window() {
+        let _l = crate::com::SHELL_UI.lock();
         let _c = ComInit::sta();
         let p = parent();
         let pane = create(p, RECT400, false, Box::new(|_| {}), None).unwrap();
         let h = pane.hwnd();
         assert!(!h.is_invalid());
         assert!(unsafe { IsWindow(Some(h)) }.as_bool());
+        settle();
         drop(pane);
         unsafe { DestroyWindow(p).unwrap() };
     }
@@ -424,6 +439,7 @@ mod tests {
     #[test]
     fn a_tree_drop_reports_the_effect_the_control_had() {
         use windows::Win32::System::Ole::{DROPEFFECT_COPY, DROPEFFECT_MOVE, DROPEFFECT_NONE};
+        let _l = crate::com::SHELL_UI.lock();
         let _c = ComInit::ole();
         let data = crate::dragdrop::data_object_of_paths(&[std::env::temp_dir().to_string_lossy().into_owned()]).unwrap();
         assert_eq!(drop_through(true, DROPEFFECT_MOVE, &data), (true, Some(DROPEFFECT_MOVE)));
@@ -436,25 +452,30 @@ mod tests {
 
     #[test]
     fn the_tree_view_keeps_a_drop_target_with_or_without_a_plan() {
+        let _l = crate::com::SHELL_UI.lock();
         let _c = ComInit::ole();
         let p = parent();
         let view = |pane: &TreePane| unsafe { FindWindowExW(Some(pane.hwnd()), None, w!("SysTreeView32"), None) }.unwrap();
         let pane = create(p, RECT400, false, Box::new(|_| {}), Some(Box::new(|_, _| None))).unwrap();
         // The control's own was revoked to make room for ours: a target is still there (revoking succeeds).
         assert!(unsafe { RevokeDragDrop(view(&pane)) }.is_ok());
+        settle();
         drop(pane);
         let pane = create(p, RECT400, false, Box::new(|_| {}), None).unwrap();
         assert!(unsafe { RevokeDragDrop(view(&pane)) }.is_ok(), "the control's own target stays");
+        settle();
         drop(pane);
         unsafe { DestroyWindow(p).unwrap() };
     }
 
     #[test]
     fn select_this_pc_does_not_fail() {
+        let _l = crate::com::SHELL_UI.lock();
         let _c = ComInit::sta();
         let p = parent();
         let pane = create(p, RECT400, false, Box::new(|_| {}), None).unwrap();
         pane.select(&ShellFolder::parse("shell:MyComputerFolder").unwrap().pidl, true).unwrap();
+        settle();
         drop(pane);
         unsafe { DestroyWindow(p).unwrap() };
     }
@@ -469,6 +490,7 @@ mod tests {
 
     #[test]
     fn select_opens_the_way_to_a_deep_folder() {
+        let _l = crate::com::SHELL_UI.lock();
         let _c = ComInit::sta();
         let p = parent();
         // A folder no root shows until its parents are expanded; a hidden one only when the tree lists hidden folders.
@@ -477,18 +499,21 @@ mod tests {
         let pane = create(p, RECT400, false, Box::new(|_| {}), None).unwrap();
         pane.select(&ShellFolder::parse(&deep).unwrap().pidl, true).unwrap();
         assert!(selected(&pane).eq_ignore_ascii_case(&deep), "{}", selected(&pane));
+        settle();
         drop(pane);
         // The shell answers with long names; %TEMP% can be a short one (RUNNER~1 on CI).
         let temp = std::fs::canonicalize(std::env::temp_dir()).unwrap().to_string_lossy().trim_start_matches(r"\\?\").to_string();
         let pane = create(p, RECT400, true, Box::new(|_| {}), None).unwrap();
         pane.select(&ShellFolder::parse(&temp).unwrap().pidl, true).unwrap();
         assert!(selected(&pane).eq_ignore_ascii_case(&temp), "{}", selected(&pane));
+        settle();
         drop(pane);
         unsafe { DestroyWindow(p).unwrap() };
     }
 
     #[test]
     fn without_expand_only_a_shown_folder_is_selected() {
+        let _l = crate::com::SHELL_UI.lock();
         let _c = ComInit::sta();
         let p = parent();
         let windir = std::env::var("SystemRoot").unwrap();
@@ -509,6 +534,7 @@ mod tests {
         let shown = sel(&pane);
         pane.select(&pidl(&deep), false).unwrap();
         let collapsed = sel(&pane);
+        settle();
         drop(pane);
         unsafe { DestroyWindow(p).unwrap() };
         assert!(!hidden.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&deep)), "a folder no expanded parent shows: {hidden:?}");
@@ -518,6 +544,7 @@ mod tests {
 
     #[test]
     fn without_expand_a_folder_the_tree_cannot_show_clears_the_selection() {
+        let _l = crate::com::SHELL_UI.lock();
         let _c = ComInit::sta();
         let p = parent();
         let windir = std::env::var("SystemRoot").unwrap();
@@ -528,6 +555,7 @@ mod tests {
         // Control Panel: under the desktop, which is no root here, so under nothing the tree holds.
         pane.select(&ShellFolder::parse("::{26EE0668-A00A-44D7-9371-BEB064C98683}").unwrap().pidl, false).unwrap();
         let after = count(&pane);
+        settle();
         drop(pane);
         unsafe { DestroyWindow(p).unwrap() };
         assert_eq!((before, after), (1, 0));

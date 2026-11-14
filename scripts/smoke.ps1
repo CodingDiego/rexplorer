@@ -1204,7 +1204,7 @@ Run-Check 'install-scratch' {
     $g = Run-WithBox '--register' 'Make rexplorer the default file manager' (Join-Path $dir 'rexplorer.exe')
     $missing = @($keys | Where-Object { -not ((Get-ItemProperty -LiteralPath "$hk\$_" -ErrorAction SilentlyContinue).'(default)' -like "*$dir*") })
     $desk = Test-Path $deskLnk
-    $u = Run-WithBox '--uninstall'
+    $u = Run-WithBox '--uninstall' 'Uninstall rexplorer'
     $left = @(@($hk, $dir, $startLnk, $deskLnk) | Where-Object { Test-Path -LiteralPath $_ })
     if (-not $TestRootExisted -and (Test-Path 'HKCU:\Software\rexplorer-test')) { $left += 'HKCU:\Software\rexplorer-test' }
     $d = "install exit=$($r[0]) exe+install.txt+Start shortcut=$files desktop shortcut=$desk0 association keys after install=[$($early -join ', ')] UninstallString=$u0; register exit=$($g[0]) missing keys=[$($missing -join ', ')] desktop shortcut=$desk; uninstall exit=$($u[0]) left=[$($left -join ', ')]"

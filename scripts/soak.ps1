@@ -114,7 +114,9 @@ function Iteration {
   for ($k = 0; $k -lt 20; $k++) { [IO.File]::WriteAllText((Join-Path $Work "churn-$tag-$k.tmp"), 'x') }
   for ($k = 0; $k -lt 20; $k++) { [IO.File]::Move((Join-Path $Work "churn-$tag-$k.tmp"), (Join-Path $Work "churn-$tag-$k.txt")) }
   # A file the app still holds open is left for the next round.
-  $gone = @(Get-ChildItem -LiteralPath $Work -File | Where-Object { $_.FullName -ne $Keep })
+  # By name: on a hosted runner %TEMP% is a short path (RUNNER~1) and FullName comes back long, so a full-path
+  # comparison deleted keep.txt in the first round and every later round waited on an empty folder.
+  $gone = @(Get-ChildItem -LiteralPath $Work -File | Where-Object { $_.Name -ne (Split-Path $Keep -Leaf) })
   $gone | Remove-Item -Force -ErrorAction SilentlyContinue
   $script:ops.fileOps += 40 + $gone.Count
   Wait-Until { (Count) -eq 1 } 5000 'churn removed'

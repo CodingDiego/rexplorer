@@ -93,7 +93,7 @@ pub(crate) unsafe fn on_notify(app: *mut App, lparam: LPARAM) -> LRESULT {
             }
             let needle = nm.lvfi.psz.to_string().unwrap_or_default();
             let wrap = nm.lvfi.flags.contains(LVFI_WRAP);
-            let found = find_prefix(s.len(), nm.iStart.max(0) as usize, wrap, &needle, |i| s.text(i, 0));
+            let found = find_prefix(s.len(), nm.iStart.max(0) as usize, wrap, &needle, |i| source::row_text(app, i, 0));
             return LRESULT(found.map_or(-1, |i| i as isize));
         }
         _ => {}
@@ -178,7 +178,7 @@ unsafe fn fill_dispinfo(app: *mut App, item: &mut LVITEMW) {
         put_tile_columns(item, &views::tile_columns((*app).views.view, s.column_count()));
     }
     if item.mask.contains(LVIF_TEXT) {
-        copy_text(&s.text(i, item.iSubItem as usize), item.pszText, item.cchTextMax);
+        copy_text(&source::row_text(app, i, item.iSubItem as usize), item.pszText, item.cchTextMax);
     }
     if item.mask.contains(LVIF_IMAGE) && item.iSubItem == 0 && !icon_view {
         item.iImage = views::tall_icon(app, source::small_icon(app, i));
@@ -716,6 +716,10 @@ unsafe fn menu_point(list: HWND, item: Option<usize>) -> POINT {
 /// On the Home page our own entry on folders is "Unpin from Home" (pinned) or "Pin to Home" (frequent); elsewhere
 /// "Pin to Home".
 pub(crate) unsafe fn show_menu(app: *mut App, on_item: bool, at: Option<POINT>) {
+    // A previous menu's command may still be running (InvokeCommand pumps): its menu object must outlive it.
+    if (*app).active_menu.is_some() {
+        return;
+    }
     let _op = crate::watchdog::op("context menu");
     let hwnd = (*app).hwnd;
     let pt = at.unwrap_or_else(|| {
@@ -791,7 +795,8 @@ pub(crate) unsafe fn show_menu(app: *mut App, on_item: bool, at: Option<POINT>) 
         (true, _) => None,
         (false, _) => Some(l.folder.parsing_name.clone()),
     });
-    let paste_pairs = paste_dest.map(|d| plan_transfer(&dragdrop::clipboard_paths(), &d)).unwrap_or_default();
+    // Reading the folder can hang on a slow share: only when there is something to paste.
+    let paste_pairs = paste_dest.filter(|_| commands::clipboard_has_files()).map(|d| plan_transfer(&dragdrop::clipboard_paths(), &d)).unwrap_or_default();
     let mut bitmaps = Vec::new();
     let hmenu = ui::build_menu(hwnd, &own, &mut bitmaps);
     let at = GetMenuItemCount(Some(hmenu)).max(0) as u32;
@@ -1095,6 +1100,7 @@ pub(crate) unsafe fn verb_on_selection(app: *mut App, verb: &str, shift: bool) {
     }
     // Every delete of the selection (key, menu, command bar, palette) comes here: the reload after it selects the next row.
     let deleting = (verb == "delete").then(|| nav::delete_starts(app, &rows));
+    let picks = if verb == "delete" { source::search_picks(app, &rows) } else { Vec::new() };
     // To the Recycle Bin through IFileOperation, so Ctrl+Z can restore it; Shift+Delete, Home and virtual items keep the shell's verb.
     if verb == "delete" && !shift
         && let Some(paths) = selected_paths(app, &rows) {
@@ -1103,7 +1109,7 @@ pub(crate) unsafe fn verb_on_selection(app: *mut App, verb: &str, shift: bool) {
             if let Some(id) = &deleting {
                 nav::delete_over(app, id);
             }
-            source::prune_search(app, &rows);
+            source::prune_search(app, &picks);
             return;
         }
     if matches!(verb, "copy" | "cut") && to_clipboard(app, &rows, verb == "cut") {
@@ -1111,9 +1117,10 @@ pub(crate) unsafe fn verb_on_selection(app: *mut App, verb: &str, shift: bool) {
     }
     if let Some(menu) = selection_menu(app, &rows) {
         let _ = menu.invoke_verb(hwnd, verb, shift);
-        // The verb has finished when it returns (no async flag); a no-op outside search results.
+        // The verb has finished when it returns (invoke_verb runs a delete with CMIC_MASK_NOASYNC); a no-op outside
+        // search results.
         if verb == "delete" {
-            source::prune_search(app, &rows);
+            source::prune_search(app, &picks);
         }
     }
     if let Some(id) = &deleting {
@@ -1243,7 +1250,7 @@ unsafe fn on_end_edit(app: *mut App, item: &LVITEMW) {
 
 /// The row now holding the item a label edit was opened on (`opened`, a parsing name): `index` when it still does,
 /// else wherever that item is among the `n` rows, None when it is gone.
-fn edit_row(opened: &str, index: usize, n: usize, name: impl Fn(usize) -> Option<String>) -> Option<usize> {
+pub(crate) fn edit_row(opened: &str, index: usize, n: usize, name: impl Fn(usize) -> Option<String>) -> Option<usize> {
     // Nothing remembered: an item without a parsing name would match it, and the commit would rename that item.
     if opened.is_empty() {
         return None;
@@ -1271,29 +1278,33 @@ pub(crate) unsafe fn rename_item(app: *mut App, index: usize, name: &str, cell: 
                 None => target.rename((*app).hwnd, name, false),
             };
             if done.is_ok()
-                && let Some(op) = Op::rename(before, target.parsing_name()) {
+                && let Some(op) = Op::rename(before.clone(), target.parsing_name()) {
                     (*app).undo.record(op);
                 }
+            // The rename's error and conflict dialogs pump messages: the listing may have changed, so the row is found
+            // again by the old name, and nothing is written back when it is gone.
             // Search results are updated in place: a refresh would run the search again.
             if let Some(Source::Search(s)) = &mut cur(app).source {
-                if let (Ok(()), Some(r)) = (done, s.rows.get_mut(index)) {
+                let row = edit_row(&before, index, s.rows.len(), |i| s.rows.get(i).map(|r| r.item.parsing_name()));
+                if let (Ok(()), Some(i)) = (done, row) {
+                    let r = &mut s.rows[i];
                     r.name = source::name_cell(&target).0;
                     r.item = target;
-                    s.icons[index] = ICON_UNKNOWN;
-                    SendMessageW((*app).list, LVM_REDRAWITEMS, Some(WPARAM(index)), Some(LPARAM(index as isize)));
+                    s.icons[i] = ICON_UNKNOWN;
+                    SendMessageW((*app).list, LVM_REDRAWITEMS, Some(WPARAM(i)), Some(LPARAM(i as isize)));
                 }
                 return;
             }
             // The row asks the shell for its text again instead of showing the old name from the cache. The reload
             // waits while a Tab-chained edit is open, so the row takes the renamed item now (Shift+Tab edits it).
-            if let Some(Source::Shell(l)) = &mut cur(app).source {
-                if let Some(row) = l.cells.get_mut(index) {
+            if let Some(Source::Shell(l)) = &mut cur(app).source
+                && let Some(i) = edit_row(&before, index, l.items.len(), |i| l.items.get(i).map(|it| it.parsing_name()))
+            {
+                if let Some(row) = l.cells.get_mut(i) {
                     row.take();
                 }
-                if done.is_ok()
-                    && let Some(it) = l.items.get_mut(index)
-                {
-                    *it = target;
+                if done.is_ok() {
+                    l.items[i] = target;
                 }
             }
             SetTimer(Some((*app).hwnd), TIMER_REFRESH, 150, None);

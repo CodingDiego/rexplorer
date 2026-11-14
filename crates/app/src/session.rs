@@ -209,6 +209,18 @@ pub fn restores(recover: bool, restore_tabs: bool, new_window: bool, names_somet
     recover || (restore_tabs && !new_window && !names_something)
 }
 
+/// The saved tabs for a recovery start: one whose parsing name (`parsing`) is among the places that were loading
+/// (`loading`, one per line) opens `home` instead.
+pub fn recover_tabs(saved: Vec<String>, loading: &str, parsing: impl Fn(&str) -> String, home: &str) -> Vec<String> {
+    saved
+        .into_iter()
+        .map(|n| {
+            let p = parsing(&n);
+            if loading.lines().any(|l| !l.is_empty() && l.eq_ignore_ascii_case(&p)) { home.to_string() } else { n }
+        })
+        .collect()
+}
+
 pub fn path() -> PathBuf {
     let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
     base.join("rexplorer").join("session.txt")
@@ -226,7 +238,7 @@ pub fn save(s: &Session) {
         let _ = std::fs::create_dir_all(dir);
     }
     let _ = save_to(&p, s);
-    let _ = std::fs::write(folders_path(), format_folders(&s.folders, &s.folders_extra));
+    let _ = rexplorer_core::settings::write_atomic(&folders_path(), format_folders(&s.folders, &s.folders_extra));
 }
 
 pub fn load_from(p: &Path) -> Session {
@@ -234,7 +246,7 @@ pub fn load_from(p: &Path) -> Session {
 }
 
 pub fn save_to(p: &Path, s: &Session) -> std::io::Result<()> {
-    std::fs::write(p, format(s))
+    rexplorer_core::settings::write_atomic(p, format(s))
 }
 
 pub struct Debounce {
@@ -289,6 +301,17 @@ mod tests {
         assert!(!restores(false, true, true, false), "new window");
         assert!(!restores(false, true, false, true), "paths given");
         assert!(!restores(false, false, false, false));
+    }
+
+    #[test]
+    fn recovery_opens_home_for_the_tabs_that_were_loading() {
+        let tabs = |v: &[&str]| v.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+        let parsing = |n: &str| if n == "shell:Downloads" { r"C:\D".to_string() } else { n.to_string() };
+        let saved = tabs(&[r"C:\a", r"c:\CRASH", "shell:Downloads", "ftp://u@h/x"]);
+        let got = recover_tabs(saved.clone(), "C:\\crash\nC:\\D\nftp://u@h/x\n", parsing, "HOME");
+        assert_eq!(got, tabs(&[r"C:\a", "HOME", "HOME", "HOME"]), "by parsing name, any case");
+        assert_eq!(recover_tabs(saved.clone(), "", parsing, "HOME"), saved, "nothing was loading");
+        assert_eq!(recover_tabs(tabs(&[""]), "\n\n", parsing, "HOME"), tabs(&[""]), "an empty line matches nothing");
     }
 
     #[test]

@@ -6,6 +6,45 @@ a line under Unreleased. Sections up to 0.1.4 were rebuilt from git history and 
 
 ## Unreleased
 
+- rexplorer has an icon: an orange crab with a white R, drawn for every size from 16 to 256 pixels by
+  `scripts/make-icon.py` ([#18](https://github.com/CodingDiego/rexplorer/issues/18)).
+- The sidebar's Favorites lists folders only, your pins first and then the folders you use most, as Explorer does.
+  A pinned folder shows a pin. Right-click a pinned folder to unpin it, or a frequent one to pin it or remove it
+  from the list. A `.zip` you opened once no longer appears there (Windows counts it as a folder), nor in the jump
+  list's Frequent group.
+- With rexplorer as the file manager, Win+E opens rexplorer on Windows 11 builds where the shell opens its own
+  window whatever the registry says (seen on build 26300). The desktop helper (`--desktop`, started at sign-in by
+  `--register`) takes the key.
+- A shortcut's arrow keeps its size and place on the small icon after the display scale changes
+  ([#33](https://github.com/CodingDiego/rexplorer/issues/33)).
+- `--uninstall` asks before it removes the program; `--quiet` (which Settings > Apps passes) skips the question.
+- After a crash, the automatic restart opens Home in place of a tab that was still loading when rexplorer crashed,
+  so a folder that crashes it cannot do so again at every start. Signing out or shutting down saves the open tabs
+  and the window's place.
+- A thumbnail is drawn again when its picture changes on disk.
+- Pictures inside a `.rar` get thumbnails only up to 256 MB of extracted pictures per folder view, and not at all in
+  a solid archive; the rest show their type's icon.
+- Closing the window during an extraction lets the extraction finish; an error from it is still shown.
+- Security and reliability fixes from the audit before 1.0.0 (`SECURITY.md` lists them): a `.rar` member named like
+  a network path could replace a file in the destination; files extracted before a failure, or from an archive on
+  an Internet-zone share, missed the Mark-of-the-Web; an `ftp://` password showed in the palette, the titles and
+  the name handed to Explorer; a read error on `settings.ini` could empty it at the next save; "Open in Terminal"
+  on a folder with `;` in its name ran a second command; an uninstall record could remove folders that were not
+  rexplorer's; several crashes and hangs when a folder reloaded, or a second menu opened, while Windows was still
+  answering the first request.
+- Profile files (`settings.ini`, `session.txt`, `recent.txt`, `window.txt`) are replaced whole, never written in
+  place. A theme's `icon_theme` must be a folder name, and `font_size` is limited to 6 to 72.
+- Releases: every GitHub Action is pinned to a commit, the build job cannot write to the repository, and the
+  published files carry a build provenance attestation.
+- `scripts/soak.ps1` deleted its own keep file on runners whose temp path has a short (8.3) form, which made the
+  hosted soak fail its wait counts ([#29](https://github.com/CodingDiego/rexplorer/issues/29)).
+- After an Explorer switch (`/select,`, `/e,`, `/n`), `-` options on the command line are read as paths, as they
+  already were after a path. A program that starts `explorer.exe /select,<path>` without quoting the path could
+  otherwise be made to pass `--uninstall --quiet` by a file named that way.
+- Tests: Windows now and then asks a copy conflict in its older dialog, which the tests did not answer, so one test
+  run waited for a person. They answer both dialogs now. The tests that drive the shell's own UI (folder tree,
+  context menus, file operations) run one at a time, and a tree test dispatches its pending messages before it
+  destroys the control ([#94](https://github.com/CodingDiego/rexplorer/issues/94); the crash there was not traced).
 - Folder options, Connect and the archive password prompt stay inside the screen's work area at every Windows text
   size and display scale. When their content is larger than that (Folder options at Text size 225 % on a small
   screen was taller than the screen), they scroll: a scroll bar, the wheel, and Tab brings the control it lands on

@@ -42,25 +42,36 @@ Out of scope:
 
 ## How rexplorer limits exposure
 
-- Archive entries that would extract outside the destination (`..`) are skipped; extracted files keep the
-  archive's Mark-of-the-Web.
+- Archive entries that would extract outside the destination (`..`), that the RAR library would write under
+  another name than the one listed, or whose name holds a control character are skipped. Each extracted file gets
+  the archive's Mark-of-the-Web as soon as it is written; an archive on a share in the Internet zone marks its
+  files too.
+- Thumbnails of pictures inside an archive extract at most 32 MB per picture and 256 MB per folder view, and none
+  from a solid archive (each picture would unpack everything before it).
+- A password in an `ftp://` address is removed before the address is shown or saved: the address bar, tabs, the
+  window title, the palette, error messages, the session file and the crash state get it without the password.
+- Every file in `%APPDATA%\rexplorer` is replaced whole (written beside it, then renamed), so a crash or two windows
+  writing at once never leave half a file.
 - Preview handlers run out of process (`prevhost.exe`) and are not used for files from the Internet zone.
 - An elevated start restarts unelevated unless `--elevated` is passed.
 - Everything rexplorer installs is per-user (HKCU, `%LOCALAPPDATA%`); nothing needs administrator rights.
 - Dependencies are checked with `cargo audit` in CI every week; failures are triaged within 7 days (see
   CONTRIBUTING.md, Dependencies).
+- Releases are built by GitHub Actions with every action pinned to a commit. The job that builds cannot write to
+  the repository; a second job publishes what it built and attests where the files came from
+  (`gh attestation verify <zip> --repo CodingDiego/rexplorer`).
 - No telemetry: crash reports stay on your PC (next section).
 - The update check is off by default (Folder options > General). When on, it makes at most one HTTPS GET a day to
   `api.github.com` for the latest release, follows no redirects, reads at most 1 MiB, downloads nothing and sends
   nothing beyond the request itself.
 
-## Known limitations (after the 2026-11-13 review)
+## Known limitations (after the 2026-11-14 review)
 
 - **The list view's own notifications.** No message rexplorer's own code sends or posts carries a pointer or a
   handle that it trusts from the sender any more: worker results (thumbnails and Home icons included) wait in the
   window's own queue and their message carries nothing, and the accessibility request (`WM_ACC_ITEMS`) and the custom
-  controls' notifications (`WM_NOTIFY` with rexplorer's own structures) are read only when rexplorer itself sent them
-  on that thread. Two messages from the system are read through their pointer. The shell's drag image request
+  controls' notifications (`WM_NOTIFY` with rexplorer's own structures) are read only when rexplorer itself sent that
+  message, with that pointer, to that window on that thread. Two messages from the system are read through their pointer. The shell's drag image request
   (`ShellGetDragImage`) is answered by Home once per drag, only from Home's own thread and only during the call
   that starts a drag from Home; at any other time, or a second time, it is ignored. And what every Win32 program
   has: the notifications the system's list view sends the main window (`WM_NOTIFY` from comctl32) are read through
@@ -81,6 +92,16 @@ Out of scope:
 - **The desktop helper trusts the shell's process.** It acts only on a desktop list owned by the process of the
   shell's desktop window (`GetShellWindow`). A program that can run code inside explorer.exe is beyond this check,
   as it is beyond any other.
+- **Work that still runs on the window's thread can freeze the window.** None of these writes or exposes anything;
+  the window stops answering until the work ends. Dragging a large file out of a `.rar` extracts it before the drag
+  starts. Details columns the shell computes slowly (Length or Title on a network share, overlay icons from another
+  program) are read as rows are drawn. Ctrl+Z after a delete searches the Recycle Bin, which is slow with tens of
+  thousands of items in it.
+- **A change made while a folder loads can be missed.** The folder is watched from the moment its list is shown, so
+  a file renamed during a long load keeps its old name until the next change or F5.
+- **An archive job outlives the window.** Closing the window during an extraction leaves rexplorer running without
+  a window until the extraction ends, so that it is not cut short. An archive that never finishes keeps that process
+  until it is ended in Task Manager.
 
 ## Sending a crash report
 
@@ -142,4 +163,37 @@ look before you share it, and send only the `.txt` if you prefer.
     queued); with a conflict dialog on screen the undo re-check missed a swap made while the dialog waited (a test
     showed it; undo now never reaches that dialog); items the shell cancelled after a refused one lost their undo
     entry; the thumbnail worker's apartment did not pump between requests.
+- **2026-11-14** (the audit before 1.0.0: five read-throughs of the whole program, one each for archives and
+  content, the profile and credentials, launch and install, window messages, and reliability, then a live round on
+  Windows 11). Found and fixed:
+  - high: a `.rar` member named like a network path (`//server/share/x`) passed the "stays inside the destination"
+    check, and the RAR library then wrote it as `x` in the destination, over a file already there. Members the
+    library would write under another name are now skipped, as are names with control characters.
+  - medium: when an extraction failed part way, the files already written had no Mark-of-the-Web; an archive opened
+    from a share in the Internet zone gave its files no mark, and such a file could reach a preview handler; an
+    `ftp://` password showed in the palette's rows, the window and tab titles and the name handed to Windows
+    Explorer; a read error on `settings.ini` made the next setting saved replace the whole file; a folder name with
+    `;` started a second command in Windows Terminal ("Open in Terminal"), and `wt.exe` was looked up along `PATH`;
+    `--uninstall` removed the program without asking, and its record (a file the user can edit) could name any
+    empty folder for removal, in `restore-explorer.ps1` too; a tab that crashed rexplorer while loading was opened
+    again by the automatic recovery start.
+  - low: a theme's `icon_theme` could be a path; `font_size` had no limits; a recent place, a command-line folder
+    or a name passed to Explorer could carry a line break or a quote into the next program's arguments; profile
+    files were written in place; the restart of an elevated start searched for its exe by the command line's first
+    word, and `--desktop-icons` stayed elevated when that restart failed; `uxtheme.dll` was loaded by bare name; a
+    private message was accepted by its pointer alone, whichever window or message id it came with; a dropped file
+    list from another program was read through the shell's helper with no bound on count; a context menu's default
+    command id was used unchecked; the release workflow used actions by tag and built with a token that could write.
+    A last review of the whole change found one more: after an Explorer switch such as `/select,`, later `-` options
+    still counted, so a program that starts `explorer.exe /select,<path>` without quotes could be made to pass
+    `--uninstall --quiet` by a file named that way. They are paths now, as they already were after a path.
+  - reliability: a list cell or icon was worked out through a borrow of the listing while a shell call pumped
+    messages (a reload during it left a dangling row); a rename or delete in search results could act on the row
+    index after the rows had moved; a second context menu could open while the first one's command still ran;
+    opening a context menu read the destination folder even with nothing to paste (a hang on a slow share);
+    sign-out lost the session and window placement; the helper processes left no trace of a panic; a thumbnail kept
+    showing a picture's old content after the file changed; closing the window cut an extraction short.
+  - from the live round: with rexplorer registered, Win+E opened Windows Explorer on Windows 11 build 26300 (the
+    shell ignores the per-user override there), so the desktop helper takes Win+E itself; a shortcut's arrow was
+    drawn at the wrong size after the display scale changed.
   The limitations above are what remains.

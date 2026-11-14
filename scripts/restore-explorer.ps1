@@ -142,6 +142,18 @@ try {
     $f = Join-Path $InstallDir $name
     if (Test-Path -LiteralPath $f) { @(Get-Content -LiteralPath $f | Where-Object { $_ }) } else { @() }
   }
+  # Like install.rs remove_dirs(): of the `dir` lines, only the install folder and its ancestors strictly below
+  # %LOCALAPPDATA% (absolute, no `..`), each removed only when empty.
+  function Remove-OurEmptyDirs($dirs) {
+    $local = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA.TrimEnd('\') }
+    foreach ($d in @($dirs | ForEach-Object { $_.TrimEnd('\') })) {
+      if ($d -notmatch '^([A-Za-z]:|\\\\[^\\]+\\[^\\]+)\\[^\\]' -or $d -match '(^|\\)\.\.(\\|$)') { continue }
+      $ours = $d -eq $InstallDir -or ($local -and $d -ne $local -and $InstallDir.StartsWith("$d\", [StringComparison]::OrdinalIgnoreCase) -and $d.StartsWith("$local\", [StringComparison]::OrdinalIgnoreCase))
+      if ($ours -and (Test-Path -LiteralPath $d -PathType Container) -and -not (Get-ChildItem -LiteralPath $d -Force | Select-Object -First 1)) {
+        Change $d 'Delete empty folder' { Remove-Item -LiteralPath $d -Force }
+      }
+    }
+  }
   # One record's registry and file lines; `program`: also its named values and files (install.txt's).
   function Undo-Record($lines) {
     foreach ($l in $lines) {
@@ -188,19 +200,10 @@ try {
       if (Test-Path -LiteralPath $jl -PathType Leaf) { Change $jl 'Delete file' { Remove-Item -LiteralPath $jl -Force } }
     }
     # The folders install created (deepest first in the record), then the install folder, each only when empty.
-    $dirs = @($takeover + $install | Where-Object { $_ -like 'dir *' } | ForEach-Object { $_.Substring(4) }) + $InstallDir
-    foreach ($d in $dirs) {
-      if ((Test-Path -LiteralPath $d -PathType Container) -and -not (Get-ChildItem -LiteralPath $d -Force | Select-Object -First 1)) {
-        Change $d 'Delete empty folder' { Remove-Item -LiteralPath $d -Force }
-      }
-    }
+    Remove-OurEmptyDirs (@($takeover + $install | Where-Object { $_ -like 'dir *' } | ForEach-Object { $_.Substring(4) }) + $InstallDir)
   } else {
     # A record of what a take-over without an install created: its folders, when empty.
-    foreach ($d in @($takeover | Where-Object { $_ -like 'dir *' } | ForEach-Object { $_.Substring(4) })) {
-      if ((Test-Path -LiteralPath $d -PathType Container) -and -not (Get-ChildItem -LiteralPath $d -Force | Select-Object -First 1)) {
-        Change $d 'Delete empty folder' { Remove-Item -LiteralPath $d -Force }
-      }
-    }
+    Remove-OurEmptyDirs @($takeover | Where-Object { $_ -like 'dir *' } | ForEach-Object { $_.Substring(4) })
   }
 
   foreach ($l in $script:left) { Write-Host $l }

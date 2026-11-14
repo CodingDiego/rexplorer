@@ -291,6 +291,7 @@ pub(crate) unsafe fn navigate(app: *mut App, t: usize, target: Target, history: 
         if t == (*app).active {
             present_loading(app);
         }
+        note_loading(app);
     }
     let tab = &mut (&mut (*app).tabs)[t];
     // A new navigation stops a search still running in this tab; its results stay until the load lands.
@@ -541,7 +542,7 @@ pub(crate) unsafe fn on_enum_done(app: *mut App, done: Box<EnumDone>) {
             } else if was_loading {
                 // The old place comes back: its items, title and crumbs.
                 if let Some(s) = &(&(*app).tabs)[t].source {
-                    tabs::set_title((*app).strip, t, &s.title());
+                    tabs::set_title((*app).strip, t, &crate::connect::redact(&s.title()));
                 }
                 if active {
                     save_view_state(app);
@@ -552,6 +553,7 @@ pub(crate) unsafe fn on_enum_done(app: *mut App, done: Box<EnumDone>) {
             } else if active && let Some(s) = &(&(*app).tabs)[t].source {
                 set_address(app, &crate::connect::redact(&s.editing_name()));
             }
+            note_loading(app);
             if !cancelled {
                 message(hwnd, &trf("err.open", &[("name", &crate::connect::redact(&name)), ("error", &crate::connect::redact(&err.to_string()))]));
             }
@@ -675,6 +677,8 @@ pub(crate) unsafe fn on_enum_done(app: *mut App, done: Box<EnumDone>) {
         tab.top = top;
         tab.selected = keep;
     }
+    // After `show`: a crash while the listing goes on screen still leaves the place recorded.
+    note_loading(app);
     crate::instance::signal_loaded(hwnd);
     let pending_search = if shell { (&mut (*app).tabs)[t].search_after.take() } else { None };
     if let Some(q) = pending_search {
@@ -1277,6 +1281,8 @@ unsafe fn cancel_load(app: *mut App) {
     tab.pending = 0;
     tab.latest.store((*app).generation, Ordering::Relaxed);
     tab.loading = None;
+    note_loading(app);
+    let tab = cur(app);
     if let Some(s) = &tab.source {
         tabs::set_title((*app).strip, t, &s.title());
     }
@@ -1313,6 +1319,7 @@ unsafe fn restore_search(app: *mut App, kept: Kept, back: bool) {
     tab.latest.store((*app).generation, Ordering::Relaxed);
     tab.loading = None;
     tab.dirty = false;
+    note_loading(app);
     save_view_state(app);
     let tab = cur(app);
     if let Some(old) = tab.source.take() {
@@ -1468,7 +1475,7 @@ pub(crate) fn shown_name(name: &str) -> String {
 fn destination(target: &Target) -> (String, String) {
     let names = |p: *const windows::Win32::UI::Shell::Common::ITEMIDLIST| unsafe {
         let get = |k: SIGDN| SHGetNameFromIDList(p, k).map(|s| rexplorer_core::com::take_cotaskmem_string(s)).unwrap_or_default();
-        (get(SIGDN_NORMALDISPLAY), get(SIGDN_DESKTOPABSOLUTEPARSING))
+        (crate::connect::redact(&get(SIGDN_NORMALDISPLAY)), get(SIGDN_DESKTOPABSOLUTEPARSING)) // the first is shown
     };
     match target {
         Target::Pidl(p) | Target::Search(_, p) => names(p.as_ptr()),
@@ -1645,6 +1652,7 @@ pub(crate) unsafe fn close_tab(app: *mut App, t: usize) {
         forget_unshown(app, &a.listing.archive);
     }
     drop(removed);
+    note_loading(app);
     session_changed(app);
 }
 
@@ -1784,6 +1792,33 @@ pub(crate) unsafe fn session_changed(app: *mut App) {
     } else {
         SetTimer(Some((*app).hwnd), TIMER_SESSION, 2000, None);
     }
+}
+
+thread_local! {
+    /// What `note_loading` last wrote; None until the first write replaces the previous run's record.
+    static NOTED: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Records the places tabs are loading (crash::save_state, one per line, no password), for `skip_crashed`. A
+/// separate window has no crash recovery.
+pub(crate) unsafe fn note_loading(app: *mut App) {
+    if (*app).secondary {
+        return;
+    }
+    let places: Vec<String> = (*app).tabs.iter().filter_map(|t| t.loading.as_ref()).map(|l| crate::connect::redact(&l.parsing)).filter(|p| !p.contains(['\r', '\n'])).collect();
+    let text = places.join("\n");
+    NOTED.with(|n| {
+        if n.borrow().as_deref() != Some(&text) {
+            crash::save_state(&text);
+            *n.borrow_mut() = Some(text);
+        }
+    });
+}
+
+/// `--recover`: a saved tab whose place was loading when the app crashed would crash it again, so it opens Home.
+pub(crate) fn skip_crashed(saved: Vec<String>) -> Vec<String> {
+    let loading = crash::read_state().unwrap_or_default();
+    session::recover_tabs(saved, &loading, |n| destination(&Target::Name(n.to_string())).1, HOME)
 }
 
 pub(crate) unsafe fn save_session(app: *mut App) {

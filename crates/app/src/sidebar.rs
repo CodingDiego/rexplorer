@@ -48,6 +48,8 @@ pub struct Row {
     pub target: String,
     /// Owned by the sidebar once passed to `set_rows`.
     pub icon: Option<HICON>,
+    /// Drawn with a pin at its end, as Explorer's navigation pane marks what Quick Access has pinned.
+    pub pinned: bool,
 }
 
 // ---- pure model -----------------------------------------------------------------------------
@@ -152,6 +154,7 @@ struct State {
     font: HFONT,
     header_font: HFONT,
     header_dpi: u32,
+    pin_font: HFONT,
     acc: Option<access::Server>,
 }
 
@@ -217,6 +220,7 @@ pub fn create(parent: HWND, id: usize) -> Result<HWND> {
             font: HFONT::default(),
             header_font: HFONT::default(),
             header_dpi: 0,
+            pin_font: HFONT::default(),
             acc: None,
         }));
         CreateWindowExW(
@@ -246,12 +250,12 @@ pub fn set_theme(hwnd: HWND, t: &Theme) {
     }
 }
 
-/// Replaces the rows and takes ownership of their icons. Rows equal to the current ones (same sections, labels
-/// and targets) change nothing: their new icons are destroyed and the sidebar does not repaint.
+/// Replaces the rows and takes ownership of their icons. Rows equal to the current ones (same sections, labels,
+/// targets and pins) change nothing: their new icons are destroyed and the sidebar does not repaint.
 pub fn set_rows(hwnd: HWND, rows: Vec<Row>) {
     unsafe {
         let Some(s) = state(hwnd) else { return destroy_icons(&rows) };
-        let key = |r: &Row| (r.section, r.label.clone(), r.target.clone());
+        let key = |r: &Row| (r.section, r.label.clone(), r.target.clone(), r.pinned);
         if s.rows.len() == rows.len() && s.rows.iter().zip(&rows).all(|(a, b)| key(a) == key(b)) {
             return destroy_icons(&rows);
         }
@@ -352,7 +356,7 @@ unsafe fn acc_tree(hwnd: HWND, s: &State, t: &mut access::Tree) {
         let i = t.items.len();
         t.items.push(access::Item {
             name: row.label.clone(),
-            description: row.section.to_string(),
+            description: if row.pinned { format!("{}, {}", row.section, tr("side.pinned")) } else { row.section.to_string() },
             role: ROLE_SYSTEM_LISTITEM,
             state: STATE_SYSTEM_SELECTABLE | if s.selected == Some(i) { STATE_SYSTEM_SELECTED } else { 0 },
             rect: RECT { left: scale(INSET, dpi), top: r.top - s.scroll, right: rc.right - scale(INSET, dpi), bottom: r.bottom - s.scroll },
@@ -378,8 +382,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         if !p.is_null() {
             let s = Box::from_raw(p);
             destroy_icons(&s.rows);
-            if !s.header_font.is_invalid() {
-                let _ = DeleteObject(s.header_font.into());
+            for f in [s.header_font, s.pin_font] {
+                if !f.is_invalid() {
+                    let _ = DeleteObject(f.into());
+                }
             }
         }
         return DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -393,7 +399,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_PAINT => paint(hwnd, s),
         WM_GETOBJECT if access::is_client(lparam) => return s.acc.get_or_insert_with(|| access::Server::new(hwnd)).answer(wparam),
-        access::WM_ACC_ITEMS if access::own_pointer(lparam) => {
+        access::WM_ACC_ITEMS if access::own_send(hwnd, msg, lparam) => {
             acc_tree(hwnd, s, &mut *(lparam.0 as *mut access::Tree));
             return LRESULT(1);
         }
@@ -526,10 +532,13 @@ unsafe fn paint(hwnd: HWND, s: &mut State) {
     let (dpi, tdpi) = (GetDpiForWindow(hwnd), row_dpi(hwnd));
     // Keyed on the text DPI so a text size change rebuilds the font too.
     if s.header_dpi != tdpi {
-        if !s.header_font.is_invalid() {
-            let _ = DeleteObject(s.header_font.into());
+        for f in [s.header_font, s.pin_font] {
+            if !f.is_invalid() {
+                let _ = DeleteObject(f.into());
+            }
         }
         s.header_font = theme::header_font(&s.theme, dpi, 8);
+        s.pin_font = theme::icon_font(tdpi, 10);
         s.header_dpi = tdpi;
     }
     let dc = CreateCompatibleDC(Some(wdc));
@@ -570,8 +579,16 @@ unsafe fn paint(hwnd: HWND, s: &mut State) {
         if let Some(h) = row.icon {
             let _ = DrawIconEx(dc, pill.left + inset, top + (bottom - top - icon) / 2, h, icon, icon, 0, None, DI_NORMAL | DI_NOMIRROR);
         }
-        SetTextColor(dc, COLORREF(if s.selected == Some(i) { theme::on_selection(t, t.text) } else { t.text }));
         let mut lr = RECT { left: pill.left + inset + icon + inset, top, right: pill.right - inset, bottom };
+        if row.pinned {
+            let mut pr = RECT { left: lr.right - icon, ..lr };
+            lr.right = pr.left - inset / 2;
+            SelectObject(dc, s.pin_font.into());
+            SetTextColor(dc, COLORREF(if s.selected == Some(i) { theme::on_selection(t, t.secondary_text) } else { t.secondary_text }));
+            DrawTextW(dc, &mut [0xE718], &mut pr, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+            SelectObject(dc, font.into());
+        }
+        SetTextColor(dc, COLORREF(if s.selected == Some(i) { theme::on_selection(t, t.text) } else { t.text }));
         theme::draw_text(dc, &row.label, &mut lr, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
         if focused && s.focus == Some(i) {
             // The system's XOR rectangle shows on any fill, in a contrast theme too (as the folder options list does).
@@ -616,7 +633,7 @@ mod tests {
     }
 
     fn row(section: &'static str, target: &str) -> Row {
-        Row { section, label: target.to_string(), target: target.to_string(), icon: None }
+        Row { section, label: target.to_string(), target: target.to_string(), icon: None, pinned: false }
     }
 
     #[test]

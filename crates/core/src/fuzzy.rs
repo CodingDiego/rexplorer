@@ -72,6 +72,10 @@ impl Recent {
     }
 
     pub fn push(&mut self, target: &str) {
+        // One place per line in the file: a name with a line break (an FTP server's, an archive's) would add places.
+        if target.chars().any(char::is_control) {
+            return;
+        }
         self.remove(target);
         self.items.insert(0, target.to_string());
         self.items.truncate(RECENT_CAP);
@@ -82,7 +86,7 @@ impl Recent {
     }
 
     pub fn save(&self) {
-        let _ = std::fs::write(&self.path, self.items.join("\n"));
+        let _ = crate::settings::write_atomic(&self.path, self.items.join("\n"));
     }
 
     pub fn clear(&mut self) {
@@ -137,6 +141,11 @@ mod tests {
             r.push(&format!("p{i}"));
         }
         assert_eq!(r.items().len(), 200);
+        // A name with a line break would be two places in the file.
+        r.push("ftp://h/a\nC:\\Windows");
+        r.push("x\ry");
+        assert_eq!(r.items().len(), 200);
+        assert!(r.items().iter().all(|i| !i.contains(['\n', '\r'])));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

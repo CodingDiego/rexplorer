@@ -236,14 +236,17 @@ impl Theme {
         color("accent", &mut t.accent);
         color("selection", &mut t.selection);
         color("border", &mut t.border);
-        if let Some(v) = get("icon_theme").filter(|v| !v.is_empty()) {
+        // A folder name under `icons\`, nothing more: a path here (`\\host\share`, `..\..`, `C:\x`) would make every
+        // start read icons from wherever a shared theme file points.
+        let one_name = |v: &&str| matches!(Path::new(v).components().collect::<Vec<_>>()[..], [std::path::Component::Normal(_)]);
+        if let Some(v) = get("icon_theme").filter(one_name) {
             t.icon_theme = Some(v.to_string());
         }
         if let Some(v) = get("font").filter(|v| !v.is_empty()) {
             t.font = v.to_string();
         }
-        if let Some(n) = get("font_size").and_then(|v| v.parse().ok()) {
-            t.font_size = n;
+        if let Some(n) = get("font_size").and_then(|v| v.parse::<i32>().ok()) {
+            t.font_size = n.clamp(6, 72); // sizes are multiplied by the display scale: a huge one overflows
         }
         t.format = loaded_format(get("format"));
         let unknown: Vec<(String, String)> = keys.iter().filter(|(k, _)| !THEME_KEYS.contains(&k.as_str())).cloned().collect();
@@ -453,6 +456,20 @@ pub fn dir() -> PathBuf {
     std::env::var_os("APPDATA").map_or_else(std::env::temp_dir, PathBuf::from).join("rexplorer")
 }
 
+/// Writes a profile file whole or not at all: a temp file beside it, then a rename over it. A crash or a full disk
+/// midway leaves the old file, where a plain write leaves it empty or cut short.
+pub fn write_atomic(path: &Path, text: impl AsRef<[u8]>) -> std::io::Result<()> {
+    // A link (a settings file kept in a dotfiles folder) is written through: a rename would replace the link.
+    if path.is_symlink() {
+        return std::fs::write(path, text);
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".{}.tmp", std::process::id())); // per process: two windows never share a temp file
+    std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, path)).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
 fn theme_path(dir: &Path, name: &str) -> PathBuf {
     dir.join("themes").join(format!("{name}.ini"))
 }
@@ -534,10 +551,10 @@ impl Settings {
     pub fn save_to(&self, dir: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(dir.join("themes"))?;
         if self.format <= FORMAT {
-            std::fs::write(dir.join("settings.ini"), self.settings_text())?;
+            write_atomic(&dir.join("settings.ini"), self.settings_text())?;
         }
         for t in self.themes.iter().filter(|t| t.format <= FORMAT) {
-            std::fs::write(theme_path(dir, &t.name), t.to_ini())?;
+            write_atomic(&theme_path(dir, &t.name), t.to_ini())?;
         }
         Ok(())
     }
@@ -588,7 +605,7 @@ impl Settings {
         for t in &d.themes {
             let p = theme_path(dir, &t.name);
             if std::fs::read_to_string(&p).is_ok_and(|text| Theme::is_legacy_default(&text)) {
-                let _ = std::fs::write(&p, t.to_ini());
+                let _ = write_atomic(&p, t.to_ini());
             }
             write_new(p, t.to_ini());
         }
@@ -597,7 +614,7 @@ impl Settings {
             .chain(themes.filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("ini"))).map(|p| (p, "theme")))
         {
             if let Some(text) = std::fs::read_to_string(&p).ok().and_then(|t| stamp_format(&t, section)) {
-                let _ = std::fs::write(&p, text);
+                let _ = write_atomic(&p, text);
             }
         }
     }
@@ -817,6 +834,32 @@ dark=false").contrast, None);
         let ini = t.to_ini();
         assert!(ini.starts_with("top=1\n") && ini.contains("glass=0.5") && ini.contains("[extra]\nk=v"), "{ini}");
         assert_eq!(Theme::from_ini("x", &ini), t);
+    }
+
+    #[test]
+    fn a_theme_names_an_icon_folder_never_a_path_and_keeps_a_sane_font_size() {
+        let icon = |v: &str| Theme::from_ini("x", &format!("[theme]\nicon_theme={v}\n")).icon_theme;
+        assert_eq!(icon("fluent").as_deref(), Some("fluent"));
+        for bad in ["", r"\\host\share", r"..\..\x", "..", r"C:\icons", "a/b", "C:x"] {
+            assert_eq!(icon(bad), None, "{bad}");
+        }
+        let size = |v: &str| Theme::from_ini("x", &format!("[theme]\nfont_size={v}\n")).font_size;
+        assert_eq!((size("2000000000"), size("-4"), size("12"), size("junk")), (72, 6, 12, Theme::from_ini("x", "").font_size));
+    }
+
+    #[test]
+    fn a_profile_write_replaces_the_file_and_leaves_no_temp_file() {
+        let d = tmp("atomic");
+        let f = d.join("a.txt");
+        write_atomic(&f, "one").unwrap();
+        write_atomic(&f, "two").unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "two");
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1);
+        // A write that cannot land (the target is a folder) keeps what was there and removes its temp file.
+        std::fs::create_dir(d.join("dir")).unwrap();
+        assert!(write_atomic(&d.join("dir"), "x").is_err());
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 2);
+        cleanup("atomic");
     }
 
     #[test]

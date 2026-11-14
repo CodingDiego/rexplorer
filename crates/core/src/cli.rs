@@ -139,10 +139,13 @@ fn long_value(
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> std::result::Result<Args, String> {
     let mut out = Args::default();
     let mut it = args.into_iter();
+    // An Explorer switch was seen: the caller is a program that starts explorer.exe, and what follows `/select,` is
+    // a path it may not have quoted (Explorer splits at commas, not spaces).
+    let mut explorer = false;
     while let Some(a) = it.next() {
         // A `%1` holding a quote splits into extra arguments: after the first path, `-` options are paths too
         // (Explorer's own `/` switches stay, Explorer accepts them anywhere and none changes the registry).
-        if !out.paths.is_empty() && a.starts_with('-') {
+        if (!out.paths.is_empty() || explorer) && a.starts_with('-') {
             out.paths.push(clean(&a));
             continue;
         }
@@ -177,7 +180,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> std::result::Result<Arg
             _ if a.starts_with('/') && !explorer_switches(&a, &mut it, &mut out) => {
                 return Ok(Args { forward: true, ..Default::default() });
             }
-            _ if a.starts_with('/') => {}
+            _ if a.starts_with('/') => explorer = true,
             _ if forwarded_name(&a) => return Ok(Args { forward: true, ..Default::default() }),
             _ => out.paths.push(clean(&a)),
         }
@@ -249,13 +252,15 @@ pub const PROTOCOL: u32 = 1;
 /// Serialise for WM_COPYDATA: one `key=value` per line.
 pub fn payload(args: &Args) -> String {
     let mut s = format!("v={PROTOCOL}\n");
-    for p in &args.paths {
+    // A value with a line break is left out: the receiver would read its second line as another key.
+    let one_line = |v: &&String| !v.contains(['\n', '\r']);
+    for p in args.paths.iter().filter(one_line) {
         s.push_str(&format!("path={p}\n"));
     }
-    if let Some(p) = &args.select {
+    if let Some(p) = args.select.as_ref().filter(one_line) {
         s.push_str(&format!("select={p}\n"));
     }
-    if let Some(q) = &args.search {
+    if let Some(q) = args.search.as_ref().filter(one_line) {
         s.push_str(&format!("search={q}\n"));
     }
     if args.new_tab {
@@ -402,6 +407,14 @@ mod tests {
         let a = p(&["C:\\x", "--uninstall", "--profile"]).unwrap();
         assert!(!a.uninstall && a.profile.is_none());
         assert_eq!(a.paths, ["C:\\x", "--uninstall", "--profile"]);
+        // The same after an Explorer switch, which sets no path of its own: an unquoted `/select,` path with spaces.
+        for first in ["/select,C:\\dl\\a", "/n", "/e,/select,C:\\dl\\a"] {
+            let a = p(&[first, "--uninstall", "--quiet", "--import-explorer"]).unwrap();
+            assert!(!a.uninstall && !a.quiet && !a.import_explorer && !a.forward, "{first}");
+            assert_eq!(a.paths, ["--uninstall", "--quiet", "--import-explorer"], "{first}");
+        }
+        // Options before the switch are the caller's own.
+        assert!(p(&["--new-tab", "/select,C:\\dl\\a"]).unwrap().new_tab);
     }
 
     #[test]
@@ -435,6 +448,12 @@ mod tests {
         assert!(payload(&a).starts_with("v=1\n"));
         assert_eq!(parse_payload(&payload(&a)), Some(a));
         assert_eq!(parse_payload("junk\nfoo=bar\n"), Some(Args::default()));
+    }
+
+    #[test]
+    fn payload_leaves_out_a_value_with_a_line_break() {
+        let a = Args { paths: vec!["C:\\a\nselect=C:\\secret".into(), "C:\\b".into()], search: Some("x\rnewtab=1".into()), ..Default::default() };
+        assert_eq!(parse_payload(&payload(&a)), Some(Args { paths: vec!["C:\\b".into()], ..Default::default() }));
     }
 
     #[test]

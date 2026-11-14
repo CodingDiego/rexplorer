@@ -19,6 +19,8 @@ pub struct ArchiveListing {
     /// "" = root, backslashes.
     pub dir: String,
     entries: Vec<Entry>,
+    /// `archive::is_solid`: no member is extracted for a thumbnail.
+    pub solid: bool,
 }
 
 fn norm_dir(s: &str) -> String {
@@ -39,7 +41,7 @@ pub fn split_archive_path(text: &str) -> Option<(PathBuf, String)> {
 }
 
 pub fn open(archive: &Path, dir: &str) -> Result<ArchiveListing> {
-    Ok(ArchiveListing { archive: archive.to_path_buf(), dir: norm_dir(dir), entries: archive::list(archive)? })
+    Ok(ArchiveListing { archive: archive.to_path_buf(), dir: norm_dir(dir), entries: archive::list(archive)?, solid: archive::is_solid(archive) })
 }
 
 fn format_size(n: u64) -> String {
@@ -193,6 +195,20 @@ pub fn showable(e: &Entry, text: bool) -> bool {
     !e.is_dir && e.size <= MEMBER_MAX && (preview::is_image(ext) || text && preview::kind(ext) == preview::Kind::Text)
 }
 
+/// Most bytes one folder view extracts for its thumbnails: an archive of many pictures must not fill the temp folder.
+pub const VIEW_MAX: u64 = 256 << 20;
+
+/// Whether a member of `size` bytes is extracted for its thumbnail when the view has extracted `spent` already.
+/// Never from a solid archive: each member would cost unpacking every member before it.
+pub fn thumbnail_fits(solid: bool, spent: u64, size: u64) -> bool {
+    !solid && spent.saturating_add(size) <= VIEW_MAX
+}
+
+/// Whether member `e` is under `show_dir` already, whole: showing it again extracts nothing.
+pub fn shown(archive: &Path, e: &Entry) -> bool {
+    std::fs::metadata(show_dir(archive).join(&e.parent).join(&e.name)).is_ok_and(|m| m.len() == e.size)
+}
+
 /// This process's folder for members extracted to show them; removed on exit.
 pub fn session_dir() -> PathBuf {
     std::env::temp_dir().join(format!("rexplorer-show-{}", std::process::id()))
@@ -319,6 +335,11 @@ mod tests {
         assert!(!showable(&entry("a.txt", false, 10, 0), false), "text only for the preview");
         assert!(showable(&entry("a.txt", false, 10, 0), true));
         assert!(!showable(&entry("a.exe", false, 10, 0), true));
+        // A view's thumbnails stop extracting at VIEW_MAX, and a solid archive's never start.
+        assert!(thumbnail_fits(false, 0, MEMBER_MAX) && thumbnail_fits(false, VIEW_MAX - 10, 10));
+        assert!(!thumbnail_fits(false, VIEW_MAX - 9, 10), "past the view's budget");
+        assert!(!thumbnail_fits(false, u64::MAX, 10), "no overflow");
+        assert!(!thumbnail_fits(true, 0, 10), "a solid archive");
         let (a, b) = (show_dir(Path::new("C:\\x\\a.rar")), show_dir(Path::new("C:\\x\\b.rar")));
         assert!(a.starts_with(session_dir()) && b.starts_with(session_dir()) && a != b);
         assert_eq!(a, show_dir(Path::new("C:\\x\\a.rar")));

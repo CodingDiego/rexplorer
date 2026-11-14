@@ -47,10 +47,10 @@ static MENUS_DARK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 /// 2 forces dark, 3 forces light) and FlushMenuThemes (ordinal 136), as Explorer and Notepad do. Windows 11 also
 /// rounds their corners. Builds without the ordinals keep the classic menus.
 pub fn set_menu_theme(dark: bool) {
-    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW};
     MENUS_DARK.store(dark, std::sync::atomic::Ordering::Relaxed);
     unsafe {
-        let Ok(ux) = LoadLibraryW(w!("uxtheme.dll")) else { return };
+        let Ok(ux) = LoadLibraryExW(w!("uxtheme.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32) else { return };
         let (Some(set), Some(flush)) = (GetProcAddress(ux, PCSTR(135 as *const u8)), GetProcAddress(ux, PCSTR(136 as *const u8))) else { return };
         let set: unsafe extern "system" fn(i32) -> i32 = std::mem::transmute(set);
         let flush: unsafe extern "system" fn() = std::mem::transmute(flush);

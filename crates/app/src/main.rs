@@ -358,17 +358,22 @@ fn main() -> Result<()> {
         std::process::exit(code(unsafe { ui::register_flow(None, args.unregister, args.quiet) }));
     }
     if args.install || args.uninstall {
-        // Every install asks first (it replaces any running copy) unless --quiet; --uninstall stays unconfirmed.
-        std::process::exit(code(unsafe { ui::install_flow(None, args.uninstall, !args.uninstall, args.quiet) }));
+        // Both ask first unless --quiet, which the Apps and Features entry's UninstallString passes.
+        std::process::exit(code(unsafe { ui::install_flow(None, args.uninstall, true, args.quiet) }));
     }
     if args.import_explorer {
         std::process::exit(if unsafe { ui::import_explorer_flow(args.profile.as_deref(), args.overwrite) } { 0 } else { 1 });
     }
     // A folder window never runs elevated unless asked (see core::elevation); the registry flows above are HKCU-only.
     // The desktop icons view never stays elevated: its icons are files any program can replace.
-    if (!args.elevated || args.desktop_icons) && rexplorer_core::elevation::is_elevated() && rexplorer_core::elevation::relaunch_unelevated().is_ok() {
+    if (!args.elevated || args.desktop_icons) && rexplorer_core::elevation::is_elevated() && (rexplorer_core::elevation::relaunch_unelevated().is_ok() || args.desktop_icons) {
         return Ok(());
     }
+    // The processes below without crash recovery still leave a trace of a panic; crash::install replaces this hook.
+    std::panic::set_hook(Box::new(|info| {
+        crash::log(&format!("panic: {info}"));
+        std::process::abort();
+    }));
     if args.desktop {
         return desktop::run();
     }
@@ -562,6 +567,7 @@ fn main() -> Result<()> {
     // Last, after every teardown main does (COM above, the instance claim here): until then a crash keeps its record.
     drop(_instance);
     crash::finish();
+    source::wait_for_jobs();
     Ok(())
 }
 
@@ -656,7 +662,10 @@ fn accels(overrides: &[(String, String)]) -> Vec<ACCEL> {
 /// The session's tabs on --recover, or on a plain launch with restore_tabs; otherwise the command-line
 /// folders; else the profile's start.
 unsafe fn open_startup_tabs(app: *mut App, args: &cli::Args) {
-    let saved = std::mem::take(&mut (*app).session.tabs);
+    let mut saved = std::mem::take(&mut (*app).session.tabs);
+    if args.recover {
+        saved = nav::skip_crashed(saved);
+    }
     let names = !args.paths.is_empty() || args.select.is_some();
     if session::restores(args.recover, (*app).profile.restore_tabs, args.new_window, names) && !saved.is_empty() {
         let active = (*app).session.active;
@@ -870,7 +879,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_LBUTTONUP | WM_CAPTURECHANGED => panes::end_drag(app),
         WM_SHELL_CHANGE => {
             // A change in a tab we are not showing only marks that tab; it reloads when shown.
-            if nav::mark_changed(app, &ChangeWatch::acknowledge(wparam, lparam)) {
+            let items = ChangeWatch::acknowledge(wparam, lparam);
+            views::forget_changed(app, &items);
+            if nav::mark_changed(app, &items) {
                 if IsIconic(hwnd).as_bool() {
                     (*app).stale = true;
                 } else if !(*app).change_armed {
@@ -934,6 +945,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
             ui::rescale(app);
         }
+        // Sign-out and shutdown end the process after this, without a WM_DESTROY.
+        WM_ENDSESSION if wparam.0 != 0 => {
+            if !(*app).secondary {
+                save_placement(hwnd, (*app).fullscreen.map(|f| f.0));
+            }
+            nav::save_session(app);
+        }
         WM_DESTROY => {
             let _op = watchdog::op("close the window (save placement and session)");
             if !(*app).secondary {
@@ -984,7 +1002,7 @@ unsafe fn arm_change(app: *mut App, ms: u32) {
 unsafe fn on_notify(app: *mut App, lparam: LPARAM) -> LRESULT {
     // rexplorer's own controls notify through `access::send_own`, so their structures are read only from such a send;
     // anything else here is the list's (comctl32's own notifications).
-    if !rexplorer_core::access::own_pointer(lparam) {
+    if !rexplorer_core::access::own_send((*app).hwnd, WM_NOTIFY, lparam) {
         let hdr = &*(lparam.0 as *const NMHDR);
         return if hdr.hwndFrom == (*app).list { list::on_notify(app, lparam) } else { LRESULT(0) };
     }
@@ -1061,7 +1079,8 @@ unsafe fn on_command(app: *mut App, cmd: u16) {
         CMD_ADDRESS_HISTORY => ui::address_history(app),
         CMD_EXPLORER => {
             if let Some(s) = nav::source(app) {
-                let _ = open_in_explorer(&s.explorer_name());
+                // Without the password: a command line is readable by every process of the user. Explorer asks for it.
+                let _ = open_in_explorer(&connect::redact(&s.explorer_name()));
             }
         }
         CMD_ENTER => {
@@ -1230,7 +1249,7 @@ unsafe fn save_placement(hwnd: HWND, saved: Option<WINDOWPLACEMENT>) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(path, format!("{show} {} {} {} {}", r.left, r.top, r.right, r.bottom));
+    let _ = rexplorer_core::settings::write_atomic(&path, format!("{show} {} {} {} {}", r.left, r.top, r.right, r.bottom));
 }
 
 unsafe fn restore_placement(hwnd: HWND) -> bool {

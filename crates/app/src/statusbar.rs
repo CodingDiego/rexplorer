@@ -241,7 +241,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 return (*st).acc.get_or_insert_with(|| access::Server::new(hwnd)).answer(wparam);
             }
         }
-        access::WM_ACC_ITEMS if access::own_pointer(lparam) => {
+        access::WM_ACC_ITEMS if access::own_send(hwnd, msg, lparam) => {
             let st = state(hwnd);
             if !st.is_null() {
                 acc_tree(hwnd, &*st, &mut *(lparam.0 as *mut access::Tree));
