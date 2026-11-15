@@ -268,10 +268,14 @@ impl ShellFolder {
         unsafe { self.folder.cast::<IShellFolder2>().ok()?.MapColumnToSCID(column, &mut key) }.ok().map(|_| key)
     }
 
-    /// Shell-correct ordering by a column (folders first, locale-aware names, real dates and sizes).
-    pub fn compare(&self, column: u32, a: &ShellItem, b: &ShellItem) -> std::cmp::Ordering {
+    /// Sorts `items` in the shell's order for a column (folders first, locale-aware names, real dates and sizes).
+    pub fn sort(&self, column: u32, items: &mut Vec<ShellItem>) {
+        merge_sort(items, |a, b| self.compare(column, a, b));
+    }
+
+    fn compare(&self, column: u32, a: &ShellItem, b: &ShellItem) -> std::cmp::Ordering {
         let hr = unsafe { self.folder.CompareIDs(LPARAM(column as isize), a.pidl.as_ptr(), b.pidl.as_ptr()) };
-        // A failure HRESULT is no ordering; decoding it would make sort_by's comparator inconsistent.
+        // A failure HRESULT is no ordering; read as one, it would order the same pair both ways.
         if hr.is_err() {
             return std::cmp::Ordering::Equal;
         }
@@ -282,8 +286,34 @@ impl ShellFolder {
 
 /// Stable sort that never panics on a comparator that is not a total order, as some namespaces' CompareIDs is (Home's).
 /// std's sorts panic on one (Rust 1.81+).
-fn merge_sort<T>(items: &mut Vec<T>, cmp: impl FnMut(&T, &T) -> std::cmp::Ordering) {
-    items.sort_by(cmp);
+fn merge_sort<T>(items: &mut Vec<T>, mut cmp: impl FnMut(&T, &T) -> std::cmp::Ordering) {
+    let n = items.len();
+    let mut order: Vec<usize> = (0..n).collect();
+    let mut next = order.clone();
+    let mut width = 1;
+    while width < n {
+        for lo in (0..n).step_by(2 * width) {
+            let (mid, hi) = ((lo + width).min(n), (lo + 2 * width).min(n));
+            // Runs already in order are copied: a folder listed in name order costs one comparison per run.
+            if mid == hi || cmp(&items[order[mid]], &items[order[mid - 1]]).is_ge() {
+                next[lo..hi].copy_from_slice(&order[lo..hi]);
+                continue;
+            }
+            let (mut i, mut j) = (lo, mid);
+            for slot in &mut next[lo..hi] {
+                // The right run goes first only when strictly less, which keeps equal items in their order.
+                if j < hi && (i == mid || cmp(&items[order[j]], &items[order[i]]).is_lt()) {
+                    (*slot, j) = (order[j], j + 1);
+                } else {
+                    (*slot, i) = (order[i], i + 1);
+                }
+            }
+        }
+        std::mem::swap(&mut order, &mut next);
+        width *= 2;
+    }
+    let mut slots: Vec<Option<T>> = items.drain(..).map(Some).collect();
+    items.extend(order.into_iter().filter_map(|i| slots[i].take()));
 }
 
 /// Whether the header menu offers a column: Name, the defaults, and any not hidden or kept for the "More..." dialog.
@@ -482,7 +512,7 @@ mod tests {
         let (f, mut items) = list(dir.to_str().unwrap()).unwrap();
         // Display names follow the user's "hide extensions for known file types" setting.
         let bare = |s: String| s.trim_end_matches(".txt").to_string();
-        items.sort_by(|a, b| f.compare(0, a, b));
+        f.sort(0, &mut items);
         let names: Vec<(String, bool)> =
             items.iter().map(|i| (bare(i.display_name()), i.is_folder())).collect();
         // Column titles are localized; filesystem folders always expose Name, Size, Type, Date modified.

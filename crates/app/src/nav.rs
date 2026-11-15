@@ -1068,7 +1068,7 @@ fn group_rows<T>(items: &mut Vec<T>, rank: impl Fn(&T) -> usize, desc: bool) -> 
 pub(crate) unsafe fn sort_listing(l: &mut Listing) {
     let folder = &l.folder;
     let col = l.sort_col;
-    l.items.sort_by(|a, b| folder.compare(col, a, b));
+    folder.sort(col, &mut l.items);
     if l.sort_desc {
         l.items.reverse();
     }

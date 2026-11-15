@@ -6,6 +6,10 @@ a line under Unreleased. Sections up to 0.1.4 were rebuilt from git history and 
 
 ## Unreleased
 
+- Opening Home no longer crashes rexplorer once Home lists more than 20 items. Windows does not compare Home's items
+  in a consistent order, and the sort stopped the program when it noticed; folders, the desktop and the folder menus
+  now sort with one that accepts it.
+
 ## 1.0.0 - 2026-11-14
 
 The first stable release of the 1.x line. Changes since 1.0.0-rc.2. `docs/EXPLORER-PARITY.md` says which behaviours

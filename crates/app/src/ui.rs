@@ -695,7 +695,7 @@ pub(crate) unsafe fn crumb_dropdown(app: *mut App, index: usize, at: Option<POIN
             let folder = ShellFolder::from_pidl(&pidl).ok()?;
             let mut items = folder.subfolders_up_to(2000).ok()?;
             items.retain(|i| i.is_folder() && !i.is_hidden());
-            items.sort_by(|a, b| folder.compare(0, a, b));
+            folder.sort(0, &mut items);
             // shortcut: a menu past a few hundred entries is unusable anyway; a scrolling flyout would replace it
             items.truncate(500);
             Some(items.iter().map(|it| (it.display_name(), folder.child_pidl(it))).collect())

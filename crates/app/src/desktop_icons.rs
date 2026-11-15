@@ -450,7 +450,7 @@ unsafe fn reload(hwnd: HWND) {
             shows_on_desktop(&p, i.is_hidden(), show_hidden, hide_value(&p), &desktops)
         })
         .collect();
-    items.sort_by(|a, b| root.compare(0, a, b));
+    root.sort(0, &mut items);
     let keys: Vec<String> = items.iter().map(|i| i.parsing_name().to_lowercase()).collect();
     let (_, _, dims) = metrics(list);
     // Known items keep their cells; the first load reads the file.

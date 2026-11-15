@@ -10,7 +10,7 @@ fn main() {
     let _c = ComInit::sta();
 
     let t = Instant::now();
-    let (folder, items) = list(&path).expect("open");
+    let (folder, mut items) = list(&path).expect("open");
     let enumerate = t.elapsed();
 
     let t = Instant::now();
@@ -22,8 +22,7 @@ fn main() {
     let attrs_time = t.elapsed();
 
     let t = Instant::now();
-    let mut sorted: Vec<&_> = items.iter().collect();
-    sorted.sort_by(|a, b| folder.compare(0, a, b));
+    folder.sort(0, &mut items);
     let sort_time = t.elapsed();
 
     println!("folder     : {} ({})", folder.name, folder.parsing_name);
