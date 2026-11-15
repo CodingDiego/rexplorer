@@ -280,6 +280,12 @@ impl ShellFolder {
     }
 }
 
+/// Stable sort that never panics on a comparator that is not a total order, as some namespaces' CompareIDs is (Home's).
+/// std's sorts panic on one (Rust 1.81+).
+fn merge_sort<T>(items: &mut Vec<T>, cmp: impl FnMut(&T, &T) -> std::cmp::Ordering) {
+    items.sort_by(cmp);
+}
+
 /// Whether the header menu offers a column: Name, the defaults, and any not hidden or kept for the "More..." dialog.
 fn in_menu(state: Option<SHCOLSTATE>, index: u32) -> bool {
     index == 0 || state.is_some_and(|s| s.0 & SHCOLSTATE_ONBYDEFAULT.0 != 0 || s.0 & (SHCOLSTATE_HIDDEN.0 | SHCOLSTATE_SECONDARYUI.0) == 0)
@@ -297,6 +303,50 @@ mod tests {
     use super::*;
     use crate::com::ComInit;
     use windows::Win32::UI::Shell::Common::SHCOLSTATE_TYPE_STR;
+
+    /// 0..n in a fixed shuffle per seed.
+    fn shuffled(n: u32, seed: u32) -> Vec<u32> {
+        let mut v: Vec<u32> = (0..n).collect();
+        let mut s = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+        for i in (1..v.len()).rev() {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            v.swap(i, s as usize % (i + 1));
+        }
+        v
+    }
+
+    #[test]
+    fn merge_sort_survives_a_comparator_that_is_not_a_total_order() {
+        // Home's CompareIDs ties some items with others it orders around them (a < b, b == c, c < a); std's
+        // sort_by panicked on that with 37 Home items (2026-11-15).
+        let home_like = |a: &u32, b: &u32| if *a == 0 || *b == 0 { std::cmp::Ordering::Equal } else { a.cmp(b) };
+        for seed in 0..50 {
+            let mut v = shuffled(37, seed);
+            merge_sort(&mut v, home_like);
+            v.sort_unstable();
+            assert_eq!(v, (0..37).collect::<Vec<_>>(), "seed {seed}: every item once");
+        }
+    }
+
+    #[test]
+    fn merge_sort_is_stable_and_matches_std() {
+        for (n, seed) in [(0, 0), (1, 1), (2, 2), (37, 3), (1000, 4)] {
+            let v: Vec<(u32, u32)> = shuffled(n, seed).into_iter().map(|x| (x % 7, x)).collect();
+            let (mut ours, mut std) = (v.clone(), v);
+            merge_sort(&mut ours, |a, b| a.0.cmp(&b.0));
+            std.sort_by_key(|p| p.0);
+            assert_eq!(ours, std, "n {n}");
+        }
+        let mut sorted: Vec<u32> = (0..100).collect();
+        let mut calls = 0;
+        merge_sort(&mut sorted, |a, b| {
+            calls += 1;
+            a.cmp(b)
+        });
+        assert!(calls < 100, "an already sorted list costs about one comparison per item, not n log n: {calls}");
+    }
 
     #[test]
     fn descending_first_by_type() {
