@@ -9,6 +9,8 @@ a line under Unreleased. Sections up to 0.1.4 were rebuilt from git history and 
 - Opening Home no longer crashes rexplorer once Home lists more than 20 items. Windows does not compare Home's items
   in a consistent order, and the sort stopped the program when it noticed; folders, the desktop and the folder menus
   now sort with one that accepts it.
+- The sidebar fills in within about two seconds of rexplorer starting, also while the machine is busy; it used to
+  wait behind other programs for 30 seconds or more.
 
 ## 1.0.0 - 2026-11-14
 

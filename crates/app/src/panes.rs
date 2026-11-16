@@ -307,8 +307,12 @@ pub(crate) unsafe fn refresh_sidebar(app: *mut App) {
     }
     let bookmarks = (*app).profile.bookmarks.clone();
     let hwnd = (*app).hwnd.0 as isize;
+    // The first build fills the empty sidebar the user waits on: in background mode a busy machine held it back 11 s.
+    let first = (*app).panes.sidebar_kinds.is_empty();
     std::thread::spawn(move || {
-        crate::ui::background_priority();
+        if !first {
+            crate::ui::background_priority();
+        }
         let _com = ComInit::mta();
         let rows = Box::new(sidebar_rows(&bookmarks));
         SIDEBAR_BUSY.store(false, Ordering::SeqCst);
