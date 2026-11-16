@@ -11,6 +11,8 @@ a line under Unreleased. Sections up to 0.1.4 were rebuilt from git history and 
   now sort with one that accepts it.
 - The sidebar fills in within about two seconds of rexplorer starting, also while the machine is busy; it used to
   wait behind other programs for 30 seconds or more.
+- This PC lists drives, phones and other devices only, as Windows 11's does; your user folders stay in Home and the
+  sidebar.
 
 ## 1.0.0 - 2026-11-14
 

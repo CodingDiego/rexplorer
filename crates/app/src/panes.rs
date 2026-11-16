@@ -483,7 +483,7 @@ fn sidebar_rows(bookmarks: &[(String, String)]) -> SidebarRows {
     if let Ok(pc) = ShellFolder::parse("shell:MyComputerFolder") {
         // This PC itself heads its section, as Explorer's navigation pane node does.
         b.add(tr("side.this_pc"), pc.name.clone(), pc.parsing_name.clone(), &pc.pidl, Kind::Place, false);
-        // Drives, phones and other devices; not the user folders This PC shows too.
+        // Drives, phones and other devices; no other file system folder.
         let mut items: Vec<ShellItem> = pc.enumerate().unwrap_or_default();
         items.retain(|i| {
             let p = i.parsing_name();
